@@ -159,6 +159,42 @@
 //!   - When every replica is failed, `allAlternativesFailedDelay` (`fdbrpc/LoadBalance.cpp`
 //!     8.0:29-53) waits for one to come back for 50 ms, growing to 1 s (and, after minutes,
 //!     30 s) while failures continue, jittered, then fails with `all_alternatives_failed`.
+//!   - The same balancer serves `getKey`, on the replicas' `getKey` endpoints (the failure
+//!     monitor is asked about those); the queue model is kept per server, where C++ keeps it
+//!     per endpoint.
+//!
+//! ## Key selectors
+//!
+//! A [`KeySelector`](fdb_native_schema::domain::KeySelector) `(key, orEqual, offset)` names
+//! the `offset`-th key after the last key `< key` (`<= key` if `orEqual`); it is "backward"
+//! (`isBackward`, `FDBTypes.h` 7.4:656-658) when `!orEqual && offset <= 0`.
+//!
+//! * **`getKey`** (NativeAPI 7.4:4034-4140, 8.0:1826-1947; [`Reader::get_key`]) loops: a
+//!   selector at `allKeys.end` (`\xff\xff`) with `offset > 0` is `\xff\xff`, otherwise its
+//!   `orEqual` is dropped; a selector at `""` with `offset <= 0` is `""`. Else it locates the
+//!   shard of the selector's key, or for a backward selector the shard of the keys just
+//!   before it (`getKeyLocation(..., Reverse{isBackward})`: `rangeContainingKeyBefore` in the
+//!   cache, a `GetKeyServerLocationsRequest` with `reverse` set), and `loadBalance`s a
+//!   `GetKeyRequest(sel, version)` over its replicas' `getKey` endpoints. The reply's
+//!   selector replaces the selector; `(key, true, 0)` is the answer, anything else is the
+//!   rest of the way, and the loop goes on with it. `wrong_shard_server` and
+//!   `all_alternatives_failed` invalidate the cached shard (in the selector's direction),
+//!   wait `WRONG_SHARD_SERVER_DELAY` and go on; any other error is returned.
+//! * **What a server answers** (`getKeyQ` and `findKey`, `fdbserver/storageserver.actor.cpp`
+//!   7.4:7569-7666 and 4526-4626, `fdbserver/storageserver/storageserver.cpp` 8.0:6585-6668
+//!   and 3415-3516): it resolves the selector within the largest readable range around it
+//!   that it holds (`getShardKeyRange`, 7.4:4628-4656, 8.0:3518-3546). Found: `(key, true, 0)`.
+//!   Not found in that range: the range's end (forward) or begin (backward), with what is
+//!   left of the offset (`firstGreaterOrEqual(end) + n - 1`, `firstGreaterOrEqual(begin) - n`).
+//!   A selector with `|offset| > 1` scans at most `STORAGE_LIMIT_BYTES`; when the scan stops
+//!   early the reply is relative to the last key read (`keyAfter(last)` forward, `last`
+//!   backward). A server's shards span `["", \xff\xff)`, so walking off the database's end
+//!   reaches `\xff\xff` (and the start `""`), which the loop above turns into the answer: an
+//!   offset beyond the database is clamped, as C++ returns `allKeys.end` / `allKeys.begin`.
+//! * **Not ported:** the trace events, tags, read options, the version vector and
+//!   `connectionFileChanged`, as for values. The endpoint-failure refresh of a reverse
+//!   lookup invalidates the cached range containing the key (not the one before it), as C++
+//!   does (`getKeyLocation`, 7.4:3381, 8.0:1365).
 //!
 //! ## Deliberate differences
 //!
@@ -204,6 +240,7 @@ use crate::error::codes::*;
 
 mod balance;
 mod grv;
+mod key;
 mod location;
 pub(crate) mod util;
 mod watch_lb;
@@ -641,11 +678,31 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         version: i64,
         use_provisional: bool,
     ) -> Result<(KeyRange, Arc<Location>), Error> {
-        let cached = lock(&self.locations).get(key);
+        let stream = fdb_native_schema::streams::STORAGE_SERVER_STREAMS.get_value;
+        self.key_location_for(key, version, use_provisional, false, stream)
+            .await
+    }
+
+    /// `getKeyLocation(key, member, isBackward)`: [`key_location`](Self::key_location) for
+    /// a request to the storage stream `stream` (whose endpoints are the ones checked), of the
+    /// shard containing `key`, or if `reverse` the keys just before it.
+    pub(crate) async fn key_location_for(
+        &self,
+        key: &[u8],
+        version: i64,
+        use_provisional: bool,
+        reverse: bool,
+        stream: u32,
+    ) -> Result<(KeyRange, Arc<Location>), Error> {
+        let cached = if reverse {
+            lock(&self.locations).get_before(key)
+        } else {
+            lock(&self.locations).get(key)
+        };
         if let Some((range, location)) = cached {
             let mut refresh = false;
             for server in &location.servers {
-                let (address, token) = server.target();
+                let (address, token) = server.target_for(stream);
                 if self.check_only_endpoint_failed(address, token) {
                     refresh = true;
                 }
@@ -653,9 +710,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             if !refresh {
                 return Ok((range, location));
             }
+            // C++ invalidates the range containing `key` here, even for a reverse lookup.
             lock(&self.locations).invalidate_key(key);
         }
-        self.fetch_key_location(key, version, use_provisional).await
+        self.fetch_key_location(key, version, use_provisional, reverse)
+            .await
     }
 
     /// `checkOnlyEndpointFailed` (NativeAPI 7.4:3329-3355, 8.0:1315-1341).
@@ -686,12 +745,14 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         false
     }
 
-    /// `getKeyLocation_internal`.
+    /// `getKeyLocation_internal`: the shard containing `key`, or if `reverse` the keys just
+    /// before it.
     async fn fetch_key_location(
         &self,
         key: &[u8],
         version: i64,
         use_provisional: bool,
+        reverse: bool,
     ) -> Result<(KeyRange, Arc<Location>), Error> {
         loop {
             self.check_open()?;
@@ -718,7 +779,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 begin: key.to_vec(),
                 end: None,
                 limit: 100,
-                reverse: false,
+                reverse,
                 span_context: Default::default(),
                 min_tenant_version: version,
             };

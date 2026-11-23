@@ -191,8 +191,12 @@ pub mod codes {
     pub const VERSION_INVALID: u16 = 2011;
     /// `used_during_commit` (2017).
     pub const USED_DURING_COMMIT: u16 = 2017;
+    /// `invalid_mutation_type` (2018).
+    pub const INVALID_MUTATION_TYPE: u16 = 2018;
     /// `transaction_invalid_version` (2020).
     pub const TRANSACTION_INVALID_VERSION: u16 = 2020;
+    /// `no_commit_version` (2021).
+    pub const NO_COMMIT_VERSION: u16 = 2021;
     /// `transaction_read_only` (2023).
     pub const TRANSACTION_READ_ONLY: u16 = 2023;
     /// `transaction_too_large` (2101).

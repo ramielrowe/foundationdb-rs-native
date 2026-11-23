@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use fdb_native_schema::domain::GetValue;
+use fdb_native_schema::domain::{GetKey, GetKeyReply, GetValue, GetValueReply, KeySelector};
+use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::rpc::RequestError;
@@ -410,22 +411,40 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         }
     }
 
-    /// `loadBalance` (`LoadBalance.actor.h` 7.4:686-1022, `LoadBalance.h` 8.0:307-620) of a
-    /// `GetValueRequest` over a shard's replicas, with the queue model and without second
-    /// (speculative) requests. Returns the value, or the error to surface (`wrong_shard_server`,
-    /// `all_alternatives_failed`, `future_version`, `transaction_too_old`, ...).
+    /// [`load_balance`](Self::load_balance) of a `GetValueRequest`: the value.
     pub(crate) async fn load_balance_get_value(
         &self,
         location: &Location,
         request: GetValue,
     ) -> Result<Option<Vec<u8>>, Error> {
+        self.load_balance(location, request).await
+    }
+
+    /// `loadBalance` (`LoadBalance.actor.h` 7.4:686-1022, `LoadBalance.h` 8.0:307-620) of a
+    /// request to one stream of a shard's replicas ([`LoadBalanced`]), with the queue model
+    /// and without second (speculative) requests. Returns the reply's result, or the error to
+    /// surface (`wrong_shard_server`, `all_alternatives_failed`, `future_version`,
+    /// `transaction_too_old`, ...).
+    ///
+    /// The failure monitor is asked about the stream's own endpoint, as C++ does; the queue
+    /// model is kept per server (by its `getValue` token), where C++ keeps it per endpoint.
+    pub(crate) async fn load_balance<Q: LoadBalanced>(
+        &self,
+        location: &Location,
+        request: Q,
+    ) -> Result<Q::Output, Error> {
         let alternatives = &location.servers;
         let n = alternatives.len();
         if n == 0 {
             // An empty team (C++ asserts): nothing to ask until the location is refreshed.
             return Err(Error::new(ALL_ALTERNATIVES_FAILED));
         }
-        let targets: Vec<(NetworkAddress, Uid)> = alternatives.iter().map(|s| s.target()).collect();
+        let targets: Vec<(NetworkAddress, Uid)> = alternatives
+            .iter()
+            .map(|s| s.target_for(Q::STREAM))
+            .collect();
+        // The queue model's ids.
+        let ids: Vec<u64> = alternatives.iter().map(|s| s.target().1.first).collect();
         let count_best = location.best_count.max(1);
         let (mut best_alt, mut next_alt) = {
             let mut rng = lock(&self.rng);
@@ -453,7 +472,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     bad_servers += 1;
                     continue;
                 }
-                let qd = model.measurement(target.1.first);
+                let qd = model.measurement(ids[i]);
                 if now > qd.failed_until {
                     let metric = qd.smooth_outstanding.smooth_total(now);
                     if LOAD_BALANCE_PENALTY_IS_BAD && qd.penalty > 1.001 {
@@ -479,7 +498,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     if self.is_failed(target) {
                         continue;
                     }
-                    let qd = model.measurement(target.1.first);
+                    let qd = model.measurement(ids[i]);
                     if now > qd.failed_until {
                         let metric = qd.smooth_outstanding.smooth_total(now);
                         if metric < next_metric {
@@ -520,13 +539,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                         self.rt.sleep(secs(backoff)).await;
                     }
                     let (address, token) = targets[alt];
-                    let mut holder = ModelHolder::new(&self.model, &self.rt, token.first);
+                    let mut holder = ModelHolder::new(&self.model, &self.rt, ids[alt]);
                     let request = request.clone();
                     let result = try_get_reply(&self.peers, &address, token, move |s, r, out| {
                         request.encode_request_into(s, r, out)
                     })
                     .await;
-                    match check_and_process(result, &mut holder, tried_all) {
+                    match check_and_process::<R, Q>(result, &mut holder, tried_all) {
                         Outcome::Done(value) => return Ok(value),
                         Outcome::Fail(error) => return Err(error),
                         Outcome::Retry => {}
@@ -548,31 +567,63 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     }
 }
 
-/// A decoded `GetValueReply`: its penalty, its error code, and its value.
-type LoadBalancedReply = (f64, Option<u16>, Option<Vec<u8>>);
+/// A request [`Shared::load_balance`] sends to one stream of a shard's storage servers, whose
+/// reply is a `LoadBalancedReply`: a penalty and an error besides its result.
+pub(crate) trait LoadBalanced: Request + Clone + Send + 'static {
+    /// What a successful reply gives.
+    type Output;
+    /// The stream (`StorageServerInterface`'s adjusted-endpoint index).
+    const STREAM: u32;
+    /// The reply's penalty, error code and result.
+    fn split(reply: Self::Reply<'_>) -> LoadBalancedReply<Self::Output>;
+}
 
-enum Outcome {
-    Done(Option<Vec<u8>>),
+impl LoadBalanced for GetValue {
+    type Output = Option<Vec<u8>>;
+    const STREAM: u32 = STORAGE_SERVER_STREAMS.get_value;
+
+    fn split(reply: GetValueReply<'_>) -> LoadBalancedReply<Option<Vec<u8>>> {
+        (
+            reply.penalty,
+            reply.error.map(|e| e.code),
+            reply.value.map(<[u8]>::to_vec),
+        )
+    }
+}
+
+impl LoadBalanced for GetKey {
+    type Output = KeySelector;
+    const STREAM: u32 = STORAGE_SERVER_STREAMS.get_key;
+
+    fn split(reply: GetKeyReply<'_>) -> LoadBalancedReply<KeySelector> {
+        (
+            reply.penalty,
+            reply.error.map(|e| e.code),
+            reply.sel.into_owned(),
+        )
+    }
+}
+
+/// A decoded `LoadBalancedReply`: its penalty, its error code, and its result.
+pub(crate) type LoadBalancedReply<T> = (f64, Option<u16>, T);
+
+enum Outcome<T> {
+    Done(T),
     Retry,
     Fail(Error),
 }
 
 /// `RequestData::checkAndProcessResultImpl` (`LoadBalance.actor.h` 7.4:572-627,
-/// `LoadBalance.h` 8.0:175-229) for a `GetValueReply` (a `LoadBalancedReply`), not
-/// `AtMostOnce`.
-fn check_and_process<R: Runtime>(
+/// `LoadBalance.h` 8.0:175-229) for a `LoadBalancedReply`, not `AtMostOnce`.
+fn check_and_process<R: Runtime, Q: LoadBalanced>(
     result: Result<(SchemaVersion, Vec<u8>), RequestError>,
     holder: &mut ModelHolder<'_, R>,
     tried_all: bool,
-) -> Outcome {
-    // The reply decoded: `Ok` is a `LoadBalancedReply` (penalty, error, value).
-    let decoded: Result<LoadBalancedReply, RequestError> = match result {
-        Ok((schema, payload)) => match GetValue::decode_reply(schema, &payload) {
-            Ok(Ok(reply)) => Ok((
-                reply.penalty,
-                reply.error.map(|e| e.code),
-                reply.value.map(<[u8]>::to_vec),
-            )),
+) -> Outcome<Q::Output> {
+    // The reply decoded: `Ok` is a `LoadBalancedReply` (penalty, error, result).
+    let decoded: Result<LoadBalancedReply<Q::Output>, RequestError> = match result {
+        Ok((schema, payload)) => match Q::decode_reply(schema, &payload) {
+            Ok(Ok(reply)) => Ok(Q::split(reply)),
             Ok(Err(e)) => Err(RequestError::from_reply_error(e)),
             Err(e) => Err(RequestError::Decode(e)),
         },

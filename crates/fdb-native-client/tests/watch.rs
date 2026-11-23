@@ -975,3 +975,26 @@ async fn watch_checks_its_key_and_the_transaction() {
         codes::USED_DURING_COMMIT
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn versionstamped_operations_trigger_watches_as_atomic_operations_do() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let mut by_value = tx.watch(b"v").await.unwrap();
+    let mut by_key = tx.watch(b"k").await.unwrap();
+    // The key a versionstamped key writes is not known before the commit: no watch is
+    // triggered (C++ triggers on the key with the placeholder, which nobody watches).
+    let mut key = b"k".to_vec();
+    key.extend_from_slice(&[0xff; 10]);
+    key.extend_from_slice(&1i32.to_le_bytes());
+    tx.set_versionstamped_key(&key, b"x");
+    assert!(ready(&mut by_key).await.is_none());
+    // A versionstamped value's result is not known: the watch fires at once.
+    let mut value = vec![0xff; 10];
+    value.extend_from_slice(&0i32.to_le_bytes());
+    tx.set_versionstamped_value(b"v", &value);
+    assert!(ready(&mut by_value).await.unwrap().is_ok());
+    tx.commit().await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    assert_eq!(env.requests()[0].0.key, b"k");
+}

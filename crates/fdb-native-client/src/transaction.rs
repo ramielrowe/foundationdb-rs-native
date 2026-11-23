@@ -88,7 +88,7 @@
 //!
 //! # Not ported yet
 //!
-//! Range reads, key selectors, versionstamped operations, read-your-writes,
+//! Range reads, read-your-writes,
 //! snapshot read-your-writes options, the special key space (`\xff\xff`), transaction
 //! tags, priorities, idempotency ids, tenants, the `metadataVersion` key exception, and
 //! database-wide default transaction options.
@@ -99,7 +99,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use fdb_native_schema::domain::{INVALID_VERSION, MutationType};
+use fdb_native_schema::domain::{INVALID_VERSION, KeySelector, MutationType};
 #[cfg(feature = "tokio")]
 use fdb_native_transport::runtime::TokioRuntime;
 use fdb_native_transport::runtime::{Instant, Runtime};
@@ -326,6 +326,8 @@ struct State {
     commit: CommitStage,
     /// The operations in progress, to interrupt.
     interrupts: Vec<oneshot::Sender<Interrupt>>,
+    /// The futures of [`Transaction::get_versionstamp`] that wait for the commit.
+    versionstamp_waiters: Vec<oneshot::Sender<Result<[u8; 10], Error>>>,
     /// The watches to start when the transaction commits ([`Transaction::watch`]).
     watches: PendingWatches,
 }
@@ -350,7 +352,16 @@ impl State {
             dead: None,
             commit: CommitStage::Idle,
             interrupts: Vec::new(),
+            versionstamp_waiters: Vec::new(),
             watches: PendingWatches::default(),
+        }
+    }
+
+    /// Answers the [`Transaction::get_versionstamp`] futures that wait (the promise of
+    /// `trState->versionstampPromise` and the `resetPromise` of the read-your-writes layer).
+    fn resolve_versionstamp(&mut self, result: Result<[u8; 10], Error>) {
+        for waiter in self.versionstamp_waiters.drain(..) {
+            let _ = waiter.send(result.clone());
         }
     }
 
@@ -375,6 +386,7 @@ impl State {
     /// reset, and interrupts those in progress.
     fn kill(&mut self, error: Error) {
         let error = self.dead.get_or_insert(error).clone();
+        self.resolve_versionstamp(Err(error.clone()));
         self.interrupt(|| Interrupt::Abort(error.clone()));
     }
 
@@ -389,6 +401,7 @@ impl State {
         self.epoch += 1;
         self.interrupt(|| Interrupt::Abort(Error::new(TRANSACTION_CANCELLED)));
         self.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
+        self.resolve_versionstamp(Err(Error::new(TRANSACTION_CANCELLED)));
         self.read_version = ReadVersion::Unset;
         self.buffer = CommitBuffer::new(limits);
         self.deferred = None;
@@ -738,6 +751,97 @@ impl<R: Runtime> Transaction<R> {
         .await?
     }
 
+    /// `getKey(selector)`: the key `selector` resolves to at the transaction's read version
+    /// ([`Reader::get_key`](crate::read::Reader::get_key)), as `fdb_c` returns it with
+    /// read-your-writes disabled. **Does not see the transaction's own writes yet** (see the
+    /// [module documentation](self)).
+    ///
+    /// * **Bounds.** A selector that resolves before the first key gives the empty key; one
+    ///   that resolves past the last key the transaction may read gives that bound: `\xff`, or
+    ///   `\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option
+    ///   (`ReadYourWritesTransaction`'s `readThrough` clamps to `getMaxReadKey()`).
+    /// * **Errors.** `key_outside_legal_range` (2004) for a selector key after that bound
+    ///   (the bound itself is allowed); then as [`get`](Self::get). A selector key longer
+    ///   than any key can be is shortened first, as `KeySelectorRef::setKey` does (to one
+    ///   byte over the limit of `getMaxKeySize`).
+    /// * **Read conflict range** (`getKeyAndConflictRange`, NativeAPI 7.4:6077-6092,
+    ///   8.0:3817-3835), from the selector's key `k` and the (unclamped) result `r`: for an
+    ///   offset of 0 or less, `[r, k)` (`[r, k\x00)` if `or_equal`); otherwise `[k, r\x00)`
+    ///   (`[k\x00, r\x00)` if `or_equal`); none if that range is empty or the read fails. It
+    ///   is added when the result arrives: a commit that started before then does not carry
+    ///   it, as C++'s commit leaves out a conflict range that is not ready
+    ///   (`extraConflictRanges`, 7.4:7172-7176, 8.0:4863-4867). (C++'s read-your-writes
+    ///   layer makes the commit wait for the reads; here that comes with M5.) Unlike C++,
+    ///   which adds these ranges after its size check, the range counts toward the
+    ///   transaction's size.
+    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
+        self.get_key_with(selector, false).await
+    }
+
+    async fn get_key_with(&self, selector: &KeySelector, snapshot: bool) -> Result<Vec<u8>, Error> {
+        let (selector, max_read_key, use_provisional_proxies, epoch) = {
+            let mut state = self.state();
+            self.check_handle(&state)?;
+            if let Some(e) = state.deferred.clone() {
+                return Err(e);
+            }
+            state.check_alive(self.rt().now())?;
+            state.check_not_committing()?;
+            let max_read_key = state.flags.max_read_key();
+            let mut selector = selector.clone();
+            // `KeySelectorRef::setKey`: no key is longer than the limit.
+            let limit = state.buffer.limits().max_range_key_size(&selector.key);
+            selector.key.truncate(limit.saturating_add(1));
+            if selector.key.as_slice() > max_read_key {
+                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
+            }
+            (
+                selector,
+                max_read_key,
+                state.flags.use_provisional_proxies,
+                state.epoch,
+            )
+        };
+        let key = self
+            .guarded(async {
+                let version = self.read_version(false).await?;
+                self.inner
+                    .db
+                    .inner
+                    .reader
+                    .get_key_with(&selector, version, use_provisional_proxies)
+                    .await
+            })
+            .await??;
+        if !snapshot {
+            let k = &selector.key;
+            let (begin, end) = if selector.offset <= 0 {
+                let end = if selector.or_equal {
+                    key_after(k)
+                } else {
+                    k.clone()
+                };
+                (key.clone(), end)
+            } else {
+                let begin = if selector.or_equal {
+                    key_after(k)
+                } else {
+                    k.clone()
+                };
+                (begin, key_after(&key))
+            };
+            let mut state = self.state();
+            if begin < end && state.epoch == epoch && matches!(state.commit, CommitStage::Idle) {
+                state.buffer.add_read_conflict_range(&begin, &end)?;
+            }
+        }
+        // `readThrough`: results in keys the transaction may not read are clamped.
+        if key.as_slice() > max_read_key {
+            return Ok(max_read_key.to_vec());
+        }
+        Ok(key)
+    }
+
     /// A write: `f` on the buffer, unless the transaction is committing (`used_during_commit`)
     /// or dead, or the handle is stale; its error is deferred.
     fn write(&self, f: impl FnOnce(&mut CommitBuffer, &Flags) -> Result<(), Error>) {
@@ -800,8 +904,11 @@ impl<R: Runtime> Transaction<R> {
     }
 
     /// `atomicOp(key, operand, op)`: an atomic operation on `key` when the transaction
-    /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`]). The versionstamp
-    /// operations are not supported yet (`client_invalid_operation`, deferred).
+    /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`]), including the two
+    /// versionstamp operations (see [`set_versionstamped_key`](Self::set_versionstamped_key)).
+    /// Deferred errors: `invalid_mutation_type` (2018) if `op` is not an atomic operation,
+    /// `key_too_large`, `value_too_large`, `key_outside_legal_range`, and for the versionstamp
+    /// operations `client_invalid_operation` (2000) if the 4-byte offset is invalid.
     pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: MutationType) {
         self.watches_on_atomic_op(key, op);
         self.write(|buffer, flags| {
@@ -810,6 +917,57 @@ impl<R: Runtime> Transaction<R> {
             }
             buffer.atomic_op(key, operand, op)
         });
+    }
+
+    /// `atomicOp(key, value, SetVersionstampedKey)`: when the transaction commits, sets
+    /// `value` at `key` with 10 bytes of `key` replaced by the transaction's versionstamp
+    /// ([`versionstamp`](Self::versionstamp)): the commit version (8 bytes big-endian) and
+    /// the transaction's index in the commit batch (2 bytes big-endian). Keys written by
+    /// transactions that commit later sort after, whatever the batch.
+    ///
+    /// `key` is the key **with a placeholder and the offset**: ten bytes (their value is
+    /// ignored; the tuple layer uses `0xff`) at position `p`, and as the last 4 bytes `p`
+    /// as a little-endian `i32` (the encoding of API version 520 and later;
+    /// [`with_versionstamp_offset`](crate::commit::with_versionstamp_offset), or
+    /// `fdb_native_tuple::pack_with_versionstamp`, which builds it). The 4 bytes are removed
+    /// by the commit. `client_invalid_operation` (2000, deferred) if `key` has fewer than 4
+    /// bytes, or `p < 0`, or `p + 10 > len - 4`; the key and value size limits (`key_too_large`,
+    /// `value_too_large`) include the 4 bytes.
+    ///
+    /// **No write conflict range is added** for the key: the key is not known before the
+    /// commit (C++ adds none either: `Transaction::atomicOp` skips it for
+    /// `SetVersionstampedKey`). A transaction that writes nothing else is still sent, with
+    /// the self-conflicting key, as any blind write. Reads of the transaction do not see the
+    /// key (nothing is read-your-writes yet).
+    ///
+    /// ```no_run
+    /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+    /// use fdb_native_tuple::{Versionstamp, pack_with_versionstamp, tuple};
+    ///
+    /// let tx = db.create_transaction();
+    /// // The key `("log", <stamp>, "event")`, completed by the commit.
+    /// let key = pack_with_versionstamp(&tuple!["log", Versionstamp::incomplete(0), "event"])
+    ///     .expect("one incomplete versionstamp");
+    /// tx.set_versionstamped_key(&key, b"payload");
+    /// let stamp = tx.get_versionstamp(); // before the commit
+    /// tx.commit().await?;
+    /// let stamp = stamp.await?; // the 10 bytes now in the key
+    /// # let _ = stamp;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_versionstamped_key(&self, key: &[u8], value: &[u8]) {
+        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_KEY);
+    }
+
+    /// `atomicOp(key, value, SetVersionstampedValue)`: when the transaction commits, sets
+    /// `key` to `value` with 10 bytes of `value` replaced by the transaction's versionstamp
+    /// (see [`set_versionstamped_key`](Self::set_versionstamped_key)). `value` ends with the
+    /// 4-byte little-endian position of the placeholder: `client_invalid_operation` (2000,
+    /// deferred) if it has fewer than 4 bytes, or the position is negative or
+    /// `position + 10 > len - 4`. The key gets a write conflict range as for `set`.
+    pub fn set_versionstamped_value(&self, key: &[u8], value: &[u8]) {
+        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_VALUE);
     }
 
     /// `addReadConflictRange(begin, end)`: the commit conflicts if another transaction
@@ -876,6 +1034,45 @@ impl<R: Runtime> Transaction<R> {
             let buffer = std::mem::replace(&mut state.buffer, CommitBuffer::new(limits));
             (buffer, state.commit_options(), state.epoch)
         };
+        let outcome = self.send_commit(buffer, options, sent).await;
+        let (result, current) = {
+            let mut state = self.state();
+            let current = state.epoch == epoch;
+            match outcome {
+                Ok(outcome) => {
+                    let result = CommitResult::from(outcome);
+                    if current {
+                        state.commit = CommitStage::Committed(result.clone());
+                        // C++: the stamp, or `no_commit_version` for a transaction with
+                        // nothing to write.
+                        state.resolve_versionstamp(
+                            result.versionstamp().ok_or(Error::new(NO_COMMIT_VERSION)),
+                        );
+                    }
+                    (result, current)
+                }
+                Err(e) => {
+                    if current {
+                        // `commit`'s `catch`: `transaction_invalid_version`.
+                        state.resolve_versionstamp(Err(Error::new(TRANSACTION_INVALID_VERSION)));
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        if current {
+            // `commitAndWatch`: the watches start once the commit succeeded.
+            self.start_watches(result.committed_version()).await;
+        }
+        Ok(result)
+    }
+
+    async fn send_commit(
+        &self,
+        buffer: CommitBuffer,
+        options: CommitOptions,
+        sent: &Arc<AtomicBool>,
+    ) -> Result<CommitOutcome, Error> {
         let read_version = if buffer.is_empty() {
             // Nothing to send: the committer returns without using it.
             INVALID_VERSION
@@ -883,27 +1080,12 @@ impl<R: Runtime> Transaction<R> {
             self.read_version(true).await?
         };
         // The committer sets `sent` once the request may reach a proxy.
-        let outcome = self
-            .inner
+        self.inner
             .db
             .inner
             .committer
             .commit_buffer_tracked(buffer, read_version, &options, sent)
-            .await?;
-        let result = CommitResult::from(outcome);
-        let current = {
-            let mut state = self.state();
-            let current = state.epoch == epoch;
-            if current {
-                state.commit = CommitStage::Committed(result.clone());
-            }
-            current
-        };
-        if current {
-            // `commitAndWatch`: the watches start once the commit succeeded.
-            self.start_watches(result.committed_version()).await;
-        }
-        Ok(result)
+            .await
     }
 
     /// `getCommittedVersion()`: the version the last [`commit`](Self::commit) committed at;
@@ -916,12 +1098,66 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
-    /// `getVersionstamp()`: the versionstamp of the last [`commit`](Self::commit); `None`
-    /// if the transaction has not committed, or committed with nothing to write.
+    /// The versionstamp of the last [`commit`](Self::commit) (the 10 bytes the
+    /// versionstamped operations wrote); `None` if the transaction has not committed, or
+    /// committed with nothing to write. See [`get_versionstamp`](Self::get_versionstamp) for
+    /// the future C++ gives.
     pub fn versionstamp(&self) -> Option<[u8; 10]> {
         match &self.state().commit {
             CommitStage::Committed(result) => result.versionstamp(),
             _ => None,
+        }
+    }
+
+    /// `getVersionstamp()`: a future for the versionstamp of this transaction's commit, the
+    /// 10 bytes that [`set_versionstamped_key`](Self::set_versionstamped_key) and
+    /// [`set_versionstamped_value`](Self::set_versionstamped_value) write. **Call it before
+    /// [`commit`](Self::commit)** (as with every FoundationDB binding): the future is
+    /// registered by this call and resolves when the commit does, so it may be awaited
+    /// during, after or instead of the commit's own result.
+    ///
+    /// * The stamp when the commit succeeds (the same as [`versionstamp`](Self::versionstamp)).
+    /// * `no_commit_version` (2021) if the commit has nothing to write (a read-only
+    ///   transaction).
+    /// * `transaction_invalid_version` (2020) if the commit fails.
+    /// * `transaction_cancelled` (1025) if the transaction is reset (or `on_error` retries
+    ///   it) first, and the error of [`cancel`](Self::cancel), of a timeout or of
+    ///   `used_during_commit` if one of them kills it first.
+    ///
+    /// Unlike C++ (where a call after the commit started is `used_during_commit`), a call
+    /// after the commit **succeeded** returns the stamp at once, and does not disturb the
+    /// transaction; a call while the commit is in progress is `used_during_commit`.
+    pub fn get_versionstamp(
+        &self,
+    ) -> impl Future<Output = Result<[u8; 10], Error>> + Send + 'static {
+        enum Pending {
+            Done(Result<[u8; 10], Error>),
+            Wait(oneshot::Receiver<Result<[u8; 10], Error>>),
+        }
+        let pending = {
+            let mut state = self.state();
+            if let Err(e) = self.check_handle(&state) {
+                Pending::Done(Err(e))
+            } else if let CommitStage::Committed(result) = &state.commit {
+                Pending::Done(result.versionstamp().ok_or(Error::new(NO_COMMIT_VERSION)))
+            } else if let Some(e) = state.dead.clone() {
+                Pending::Done(Err(e))
+            } else if let Err(e) = state.check_not_committing() {
+                Pending::Done(Err(e))
+            } else {
+                let (tx, rx) = oneshot::channel();
+                state.versionstamp_waiters.push(tx);
+                Pending::Wait(rx)
+            }
+        };
+        async move {
+            match pending {
+                Pending::Done(result) => result,
+                // The transaction was dropped or reset without an answer.
+                Pending::Wait(rx) => rx
+                    .await
+                    .unwrap_or_else(|oneshot::Canceled| Err(Error::new(TRANSACTION_CANCELLED))),
+            }
         }
     }
 
@@ -1061,6 +1297,7 @@ impl<R: Runtime> Transaction<R> {
         }
         state.interrupt(|| Interrupt::Abort(Error::new(TRANSACTION_CANCELLED)));
         state.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
+        state.resolve_versionstamp(Err(Error::new(TRANSACTION_CANCELLED)));
         let epoch = state.epoch + 1;
         *state = State::new(&self.inner.db, epoch);
     }
@@ -1106,5 +1343,10 @@ impl<R: Runtime> Snapshot<'_, R> {
     /// [`Transaction::get`] without a read conflict range.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.tx.get_with(key, true).await
+    }
+
+    /// [`Transaction::get_key`] without a read conflict range.
+    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
+        self.tx.get_key_with(selector, true).await
     }
 }
