@@ -109,6 +109,24 @@ impl fmt::Display for PeerRejected {
 
 impl std::error::Error for PeerRejected {}
 
+/// An extra check on a peer whose chain validated and whose certificates a `verify_peers` rule
+/// accepted, run last by [`VerifyPeersVerifier`].
+///
+/// It can only make verification stricter: the chain validation and the rules always run
+/// first and cannot be bypassed. Use it for policy FDB does not have, such as checking a
+/// fingerprint or a name. The server name rustls passes to a verifier is a placeholder, so a
+/// policy that wants a host name must carry its own.
+pub trait PeerPolicy: fmt::Debug + Send + Sync {
+    /// Accepts the peer (`Ok`) or rejects it with a rustls error (for example
+    /// `rustls::CertificateError::ApplicationVerificationFailure`). `end_entity` and
+    /// `intermediates` are what the peer sent, in order.
+    fn check(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) -> Result<(), Error>;
+}
+
 /// A rustls [`ServerCertVerifier`] that behaves like FDB's TLS peer verification: it checks
 /// the peer's chain against the configured CA certificates, ignoring the server name, and
 /// then applies a [`VerifyPeers`] rule set.
@@ -159,6 +177,7 @@ pub struct VerifyPeersVerifier {
     /// The rest of the CA file: candidate intermediates.
     extra_intermediates: Vec<CertificateDer<'static>>,
     algorithms: WebPkiSupportedAlgorithms,
+    policy: Option<Arc<dyn PeerPolicy>>,
 }
 
 impl VerifyPeersVerifier {
@@ -210,7 +229,16 @@ impl VerifyPeersVerifier {
             anchor_roots,
             extra_intermediates: extra,
             algorithms,
+            policy: None,
         })
+    }
+
+    /// Adds a [`PeerPolicy`] that runs after the chain validation and the rules have
+    /// accepted a peer, replacing any earlier one.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<dyn PeerPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// The rules this verifier applies.
@@ -316,19 +344,21 @@ impl ServerCertVerifier for VerifyPeersVerifier {
             return Err(rejected(CertificateRejected::Purpose(problem)));
         }
 
-        if self.verify_peers.check_valid_disabled() || self.verify_peers.rules().is_empty() {
-            return Ok(ServerCertVerified::assertion());
+        if !(self.verify_peers.check_valid_disabled() || self.verify_peers.rules().is_empty()) {
+            let root = self
+                .verify_peers
+                .needs_root()
+                .then(|| &self.roots[root_index].cert);
+            if let Verdict::Rejected(failures) = self.verify_peers.evaluate(&leaf, root) {
+                return Err(Error::InvalidCertificate(CertificateError::Other(
+                    OtherError(Arc::new(PeerRejected { failures })),
+                )));
+            }
         }
-        let root = self
-            .verify_peers
-            .needs_root()
-            .then(|| &self.roots[root_index].cert);
-        match self.verify_peers.evaluate(&leaf, root) {
-            Verdict::Accepted(_) => Ok(ServerCertVerified::assertion()),
-            Verdict::Rejected(failures) => Err(Error::InvalidCertificate(CertificateError::Other(
-                OtherError(Arc::new(PeerRejected { failures })),
-            ))),
+        if let Some(policy) = &self.policy {
+            policy.check(end_entity, intermediates)?;
         }
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(

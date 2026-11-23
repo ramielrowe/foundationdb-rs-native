@@ -356,7 +356,7 @@ pub struct ParseError {
 ///
 /// ```
 /// # #[cfg(feature = "tls")] {
-/// use fdb_native_transport::tls_verify::VerifyPeers;
+/// use fdb_native_transport::tls::verify_peers::VerifyPeers;
 ///
 /// let vp = VerifyPeers::parse("Check.Valid=1,S.CN=fdb|I.O=Example\\, Inc.,R.CN=Root CA").unwrap();
 /// assert_eq!(vp.rules().len(), 2);
@@ -416,21 +416,6 @@ impl VerifyPeers {
             }
         }
         Ok(VerifyPeers { rules })
-    }
-
-    /// What FDB uses when the application gave no verify-peers string
-    /// (`LoadedTLSConfig::getVerifyPeers`): the explicitly configured strings if there are
-    /// any, otherwise the `FDB_TLS_VERIFY_PEERS` value (`env`), otherwise `Check.Valid=1`.
-    /// A *set but empty* environment variable is one empty rule, which is equivalent to the
-    /// default.
-    pub fn resolve<S: AsRef<str>>(explicit: &[S], env: Option<&str>) -> Result<Self, ParseError> {
-        if !explicit.is_empty() {
-            Self::parse_all(explicit)
-        } else if let Some(env) = env {
-            Self::parse(env)
-        } else {
-            Ok(Self::default())
-        }
     }
 
     /// The rules, in order.

@@ -5,7 +5,8 @@
 //!   ([`VerifyPeers::evaluate`]) over the fields of a [`PeerCert`], with no TLS stack involved.
 //! * [`VerifyPeersVerifier`] is a rustls [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier)
 //!   that validates the peer's chain against the configured CA certificates (ignoring the
-//!   server name) and then applies the rules.
+//!   server name) and then applies the rules. [`TlsConnector`](crate::tls::TlsConnector)
+//!   builds one from the loaded configuration.
 //!
 //! This is a port of `TLSPolicy` in `flow/TLSConfig.actor.cpp` and
 //! `flow/include/flow/TLSConfig.actor.h` on FDB `release-7.4`, which are
@@ -61,7 +62,9 @@
 //!   (`S.O=Apple Inc.`). A trailing `,` is allowed.
 //! * The empty `verify_peers` setting is not "no rules": FDB uses `FDB_TLS_VERIFY_PEERS` if no
 //!   string was configured and `Check.Valid=1` if neither is set
-//!   ([`VerifyPeers::resolve`], `LoadedTLSConfig::getVerifyPeers`, 63 (8.0: 62)).
+//!   (`LoadedTLSConfig::getVerifyPeers`, 63 (8.0: 62)). That resolution happens in one place,
+//!   [`TlsConfig::load`](crate::tls::TlsConfig::load), and [`VerifyPeers::parse_all`] takes its
+//!   result.
 //!
 //! # Evaluation
 //!
@@ -143,7 +146,7 @@ pub use eval::{AcceptReason, RuleFailure, Verdict};
 pub use rules::{
     Criterion, Field, Location, MatchType, ParseError, ParseErrorKind, Rule, Scope, VerifyPeers,
 };
-pub use verifier::{CertificateRejected, PeerRejected, RootError, VerifyPeersVerifier};
+pub use verifier::{CertificateRejected, PeerPolicy, PeerRejected, RootError, VerifyPeersVerifier};
 
 #[cfg(test)]
 mod tests;

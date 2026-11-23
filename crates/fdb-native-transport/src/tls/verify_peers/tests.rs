@@ -41,8 +41,9 @@ mod parse {
     }
 
     #[test]
-    fn default_and_resolution() {
-        // `LoadedTLSConfig::getVerifyPeers`: explicit, else environment, else Check.Valid=1.
+    fn default_rules() {
+        // `LoadedTLSConfig::getVerifyPeers`: the default is Check.Valid=1 (the explicit,
+        // environment and default sources are resolved by `tls::LoadedTlsConfig`).
         let default = VerifyPeers::default();
         assert_eq!(default, VerifyPeers::parse("Check.Valid=1").unwrap());
         assert_eq!(default.rules().len(), 1);
@@ -50,19 +51,6 @@ mod parse {
         assert!(default.rules()[0].check_unexpired());
         assert!(!default.check_valid_disabled());
 
-        let none: [&str; 0] = [];
-        assert_eq!(VerifyPeers::resolve(&none, None).unwrap(), default);
-        assert_eq!(
-            VerifyPeers::resolve(&none, Some("S.CN=env")).unwrap(),
-            VerifyPeers::parse("S.CN=env").unwrap()
-        );
-        assert_eq!(
-            VerifyPeers::resolve(&["S.CN=a", "S.CN=b"], Some("S.CN=env")).unwrap(),
-            VerifyPeers::parse("S.CN=a|S.CN=b").unwrap()
-        );
-        // A set-but-empty environment variable is one empty rule.
-        assert_eq!(VerifyPeers::resolve(&none, Some("")).unwrap(), default);
-        assert!(VerifyPeers::resolve(&none, Some("junk")).is_err());
         assert!(VerifyPeers::empty().rules().is_empty());
     }
 
