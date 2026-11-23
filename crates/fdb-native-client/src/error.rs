@@ -131,6 +131,12 @@ pub mod codes {
     pub const REQUEST_MAYBE_DELIVERED: u16 = 1030;
     /// `transaction_timed_out` (1031).
     pub const TRANSACTION_TIMED_OUT: u16 = 1031;
+    /// `too_many_watches` (1032): the database already has as many outstanding watches as
+    /// its cap (`MAX_WATCHES`, default 10 000).
+    pub const TOO_MANY_WATCHES: u16 = 1032;
+    /// `watch_cancelled` (1029): a storage server holds too many watches, so the client
+    /// polls instead.
+    pub const WATCH_CANCELLED: u16 = 1029;
     /// `process_behind` (1037): the storage server lags too far behind.
     pub const PROCESS_BEHIND: u16 = 1037;
     /// `database_locked` (1038).
