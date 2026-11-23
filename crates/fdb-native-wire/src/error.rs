@@ -154,4 +154,8 @@ pub enum EncodeError {
     /// spent).
     #[error("cannot re-encode a vector view: an element failed to decode: {0}")]
     ViewElement(DecodeError),
+    /// A value FDB's own writer refuses to serialize (its `serialize()` throws or asserts),
+    /// such as an inverted `KeyRangeRef`; a peer could not read it back as written.
+    #[error("invalid value: {0}")]
+    Invalid(&'static str),
 }
