@@ -354,6 +354,19 @@ positive vector or accepted corpus entry costs is 0.83 units per byte). The limi
 reached only by aliasing: the 824-byte `untrusted_alias_20x600` below (20 offsets to one
 600-byte string) costs 12,207 units against a limit of 4,320.
 
+A decoder that reads vectors lazily (the Rust `VectorView`) charges each element when it is
+read, not when the vector is decoded, so two things differ from a decode that finishes
+before returning:
+
+- Re-reading counts. Every read of an element charges its objects again, so a valid message
+  whose elements are read enough times (five full passes over a vector of a thousand small
+  tables measured) reaches `work_limit`. Reads of the same message share one budget.
+- Unread elements are never checked. A lazy decoder may accept a message that an eager
+  decoder rejects (including by one of the permitted checks above, or a negative vector's
+  out-of-bounds offset) when the only fault is in an element that is never read; reading
+  that element gives the error an eager decoder would have given. The vector's own header
+  (offset, count, and that `count` elements fit) is always checked when it is decoded.
+
 No other check is permitted: in particular not object overlap or aliasing (the C++ writer
 itself points every empty string/vector at one shared blob), not alignment of tables,
 strings, vectors or union payloads (union scalars are unaligned by design), and not
@@ -784,8 +797,9 @@ share a dump name only if their fields are identical (`reply_promise`, `request_
 little-endian, `size_t` is 8 bytes): u64 count of distinct tag localities; per locality run,
 in `Tag` order, i8 locality and u16 run length; if there is at least one entry, u8 tag-id
 width (1 if every id is at most 255, else 2), u8 version-delta width (1, 2, 4 or 8: the
-smallest that holds the largest minus the smallest entry version; the minimum and maximum are
-taken over the entries only, not over the trailing `maxVersion` field), i64 min version (the
+smallest that holds the largest minus the smallest entry version; the minimum is taken over the
+entries only, not over the trailing `maxVersion` field, and the maximum starts at -1, so it is the
+largest entry version or -1 if every entry is below -1), i64 min version (the
 smallest entry version), u64 entry count, then
 per entry the tag id and (version minus min version) in those widths; finally i64
 `maxVersion`. The vectors cover the empty form and the width pairs 1/1, 1/2, 1/4 and 2/8.

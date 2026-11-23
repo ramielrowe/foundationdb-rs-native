@@ -1,0 +1,41 @@
+error: each variant of a union must hold exactly one value, like `A(i32)`; the variant is the alternative and the value its payload (C++ std::variant alternatives cannot be empty or hold several values)
+ --> tests/ui/unions.rs:5:5
+  |
+5 |     Unit,
+  |     ^^^^
+
+error: each variant of a union must hold exactly one value, like `A(i32)`; the variant is the alternative and the value its payload (C++ std::variant alternatives cannot be empty or hold several values)
+ --> tests/ui/unions.rs:6:5
+  |
+6 |     Two(u8, u16),
+  |     ^^^^^^^^^^^^
+
+error: each variant of a union must hold exactly one value, like `A(i32)`; the variant is the alternative and the value its payload (C++ std::variant alternatives cannot be empty or hold several values)
+ --> tests/ui/unions.rs:7:5
+  |
+7 |     Named { a: u8 },
+  |     ^^^^^^^^^^^^^^^
+
+error: fdb attributes are not supported on enum variants
+ --> tests/ui/unions.rs:8:5
+  |
+8 |     #[fdb(skip)]
+  |     ^^^^^^^^^^^^
+
+error: a union needs at least one alternative (variant)
+  --> tests/ui/unions.rs:13:6
+   |
+13 | enum Empty {}
+   |      ^^^^^
+
+error: `#[fdb(struct)]` only applies to structs; an enum derives a union
+  --> tests/ui/unions.rs:16:7
+   |
+16 | #[fdb(struct)]
+   |       ^^^^^^
+
+error: Rust unions cannot derive Wire; a wire union (std::variant) is an enum whose variants each hold one value, like `enum V { A(i32), B(Inner) }`
+  --> tests/ui/unions.rs:22:1
+   |
+22 | union RustUnion {
+   | ^^^^^

@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["derive"]
+# `#[derive(Wire)]`, re-exported as `fdb_native_wire::Wire`.
+derive = ["dep:fdb-native-wire-derive"]
+
 [dependencies]
+fdb-native-wire-derive = { workspace = true, optional = true }
 thiserror = "2.0.21"
 
 [dev-dependencies]
@@ -16,3 +22,37 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
 [lints]
 workspace = true
+
+# The tests whose types come from tests/support use #[derive(Wire)]; they are skipped
+# under --no-default-features. A new test that does `mod support;` needs an entry here.
+[[test]]
+name = "adversarial"
+required-features = ["derive"]
+
+[[test]]
+name = "alias_data"
+required-features = ["derive"]
+
+[[test]]
+name = "cpp_crosscheck"
+required-features = ["derive"]
+
+[[test]]
+name = "fixtures"
+required-features = ["derive"]
+
+[[test]]
+name = "proptest"
+required-features = ["derive"]
+
+[[test]]
+name = "release_messages"
+required-features = ["derive"]
+
+[[test]]
+name = "containers"
+required-features = ["derive"]
+
+[[test]]
+name = "lazy_view"
+required-features = ["derive"]

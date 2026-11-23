@@ -79,10 +79,33 @@
 //!
 //! The crate implements them for integers, floats, `bool`, [`Uid`], tuples (FDB
 //! `std::tuple` structs), `&[u8]` (zero-copy strings), `Vec<T>`, `[T]` and `[T; N]`
-//! (vectors, `std::array`), `Option<T>` (`Optional`), [`ErrorOr<T>`] (`Result<T,
-//! FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`], plus `&T` and `Box<T>`.
+//! (vectors, `std::array`), `BTreeMap`/`BTreeSet`/`HashMap`/`HashSet` (`std::map`,
+//! `std::set`, `std::unordered_map`, `std::unordered_set`), `Option<T>` (`Optional`),
+//! [`ErrorOr<T>`] (`Result<T, FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`],
+//! plus `&T` and `Box<T>`.
 //!
-//! **Tables** are hand-written for now (a `#[derive]` comes later) and are mechanical: one
+//! **Maps and sets** are vectors on the wire: a set is a vector of its keys, a map a vector
+//! of `{first, second}` pair tables. They decode like C++ builds them, inserting in wire order, so
+//! the first of several entries with one key wins and the wire order need not be sorted.
+//! Only `HashSet` has a [file identifier](FileIdentified) (code 6), as in FDB. They are
+//! encoded straight from the container's iterator with [`Writer::vector_iter`], which a
+//! custom collection can use too.
+//!
+//! **Lazy vectors.** A [`VectorView`] field decodes only its vector's header and reads the
+//! elements as they are asked for (by index or with an iterator), under the same checks and
+//! the same shared [work limit](Reader#work-limit) as an eager `Vec`; this is how to walk a
+//! large reply without materializing it. For a collection of your own,
+//! [`Reader::vector_header`] and [`Decode::decode_element`] give the same element-wise
+//! access, and [`Reader::blob_range`] the position of a string in the message for owned
+//! zero-copy types (such as `bytes::Bytes` slices of a packet).
+//!
+//! Tables, unions and structs are normally derived with
+#![cfg_attr(feature = "derive", doc = "[`#[derive(Wire)]`](derive@Wire)")]
+#![cfg_attr(not(feature = "derive"), doc = "`#[derive(Wire)]`")]
+//! (the `derive` feature, on by default), whose docs are
+//! the attribute reference. **Field order is `serializer(ar, ...)` argument order.**
+//!
+//! By hand, **tables** are mechanical: one
 //! [`TableWriter::field`] / [`TableReader::field`] call per `serializer(ar, ...)` argument,
 //! in argument order, skipping `Arena` (which takes no slot). A table whose
 //! `serializer(ar)` call has no arguments at all (such as [`Void`]) decodes with
@@ -100,8 +123,26 @@
 //! [`Shape::struct_member_offset`]. **Blob codecs** (a type whose wire form is a single
 //! string-framed blob, such as FDB's pre-serialized `VectorRef<KeyValueRef>`) are types of
 //! shape [`Shape::Object`] that write with [`Writer::blob_with`] and read their payload
-//! from [`Reader::blob`]. All of these are what a derive macro would generate from the
-//! ordered field list.
+//! from [`Reader::blob`]; they are always written by hand.
+//!
+//! # FDB types with their own serializers
+//!
+//! A few FDB types are single string-framed blobs written by custom code; each is a blob
+//! codec here, identical on 7.4 and 8.0. Borrowed types are `XRef<'de>` and owned types
+//! plain `X`, as in FDB (`into_owned` and `borrowed` convert):
+//!
+//! | C++ | Rust |
+//! | --- | --- |
+//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` (`GetKeyValuesReply::data`) | [`KeyValueVectorRef`] / [`KeyValueVector`] |
+//! | `VersionVector` (with `Tag`) | [`VersionVector`] ([`Tag`]) |
+//! | `TagSet` | [`TagSetRef`] / [`TagSet`] |
+//! | `IdempotencyIdRef` | [`IdempotencyIdRef`] / [`IdempotencyId`] |
+//!
+//! [`KeyValueRef`] / [`KeyValue`] are the plain `{key, value}` tables. Their decoders
+//! check every length against the blob first (FDB's `ASSERT`s come after the read), reject
+//! trailing bytes and never allocate from an unchecked count. Memory: the KV views and
+//! `IdempotencyIdRef` borrow the blob; a decoded `VersionVector` takes at most 8 times
+//! its blob and a `TagSetRef` at most 16 times (see their docs).
 //!
 //! # Writer
 //!
@@ -147,21 +188,36 @@
 #![warn(missing_docs)]
 
 mod codec;
+mod codecs;
+mod collections;
 mod error;
 mod file_identifier;
 mod protocol_version;
 mod reader;
 mod shape;
 mod types;
+mod view;
 mod writer;
 
+#[doc(hidden)]
+#[path = "private.rs"]
+pub mod __private;
+
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
+pub use codecs::{
+    INVALID_VERSION, IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId, KeyValue, KeyValueIter,
+    KeyValueRef, KeyValueVector, KeyValueVectorRef, TAG_LOCALITY_INVALID, Tag, TagSet, TagSetRef,
+    Version, VersionVector,
+};
 pub use error::{DecodeError, EncodeError, StrictCheck};
+#[cfg(feature = "derive")]
+pub use fdb_native_wire_derive::Wire;
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
-pub use reader::{MAX_DEPTH, Reader, TableReader};
+pub use reader::{MAX_DEPTH, Reader, TableReader, VectorHeader};
 pub use shape::Shape;
 pub use types::{EnsureTable, ErrorOr, FdbError, Uid, Void};
+pub use view::{VectorIter, VectorView};
 pub use writer::{ObjectRef, TableWriter, UnionRef, Writer};
 
 /// Encodes `value` as the only member of a message with `T`'s file identifier.

@@ -89,6 +89,14 @@ pub enum DecodeError {
         /// The encoded count.
         found: u32,
     },
+    /// An element index past the end of a [`VectorView`](crate::VectorView).
+    #[error("index {index} is out of range for a vector of {len} elements")]
+    IndexOutOfRange {
+        /// The index asked for.
+        index: usize,
+        /// The vector's element count.
+        len: usize,
+    },
     /// A vector of unions has its tags slot but not its offsets slot.
     #[error("union vector has a tags slot but no offsets slot")]
     UnionVectorMissingOffsets,
@@ -141,4 +149,9 @@ pub enum EncodeError {
     /// An [`ObjectRef`](crate::ObjectRef) does not belong to this writer's current message.
     #[error("object reference does not belong to this message")]
     ForeignRef,
+    /// Re-encoding a [`VectorView`](crate::VectorView) failed because one of its elements
+    /// does not decode (the message it views is malformed there, or its work budget is
+    /// spent).
+    #[error("cannot re-encode a vector view: an element failed to decode: {0}")]
+    ViewElement(DecodeError),
 }

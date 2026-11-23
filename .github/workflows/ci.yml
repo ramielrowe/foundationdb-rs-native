@@ -32,6 +32,17 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The workspace's rust-version; dev-dependencies (trybuild) must resolve to versions
+  # that build on it too.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo check -p fdb-native-wire --no-default-features --all-targets
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -64,5 +75,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      # cpp_crosscheck is ignored because it needs the dev-only golden-vectors tool, not Docker.
-      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
+      # cpp_crosscheck (the binary, and the cpp_crosscheck_* tests in other binaries) is ignored because it
+      # needs the dev-only golden-vectors tool, not Docker.
+      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
