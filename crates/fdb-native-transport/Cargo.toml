@@ -1,0 +1,14 @@
+[package]
+name = "fdb-native-transport"
+description = "Runtime-agnostic FoundationDB connection layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fdb-native-wire.workspace = true

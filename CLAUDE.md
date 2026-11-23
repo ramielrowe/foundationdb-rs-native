@@ -60,18 +60,38 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo fmt --all --check                                        # formatting
+cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings are errors in CI)
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
+cargo nextest run --workspace                                  # unit tests
+cargo nextest run --workspace --run-ignored only --no-tests=pass  # Docker-backed integration tests (flag needed only while none exist)
 ```
+
+Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
+(`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+Pure-Rust native FoundationDB client that speaks the wire protocol directly (no `libfdb_c`),
+targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crates/`:
+
+- `fdb-native-wire`: sans-IO codec for FDB's flatbuffers dialect and the legacy binary format.
+- `fdb-native-schema`: per-protocol-version message schemas (7.4, 8.0); depends on `wire`.
+- `fdb-native-transport`: runtime-agnostic connection layer (`Runtime` trait, tokio adapter later); depends on `wire`.
+- `fdb-native-client`: public client API; depends on `schema` and `transport`.
+- `fdb-native-tuple`: tuple and subspace layers; independent of the other crates.
+- `fdb-native-testkit`: Docker test harness (`publish = false`).
+- `fdb-native-stacktester`: binary for the bindingtester stack machine (`publish = false`).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Shared package metadata comes from `[workspace.package]`; every crate sets `lints.workspace = true`.
+  Workspace lints: `unsafe_code = "forbid"`, `missing_debug_implementations`, `unreachable_pub`, clippy `all`.
+- Edition 2024, MSRV 1.85. No unstable rustfmt options.
+- **Docker-backed tests**: tests that need a live FDB container are marked
+  `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`.
+  The `FDB_IMAGE` env var selects the image (default `foundationdb/foundationdb:7.4.10`).
+- **Safety rule**: tests must only ever target disposable containers started by
+  `fdb-native-testkit`, never a shared or long-lived cluster. A malformed packet can make an
+  FDB 7.4/8.0 server process exit.
