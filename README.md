@@ -15,6 +15,7 @@ FoundationDB 7.4 and 8.0.
 | Crate | Purpose |
 | --- | --- |
 | `fdb-native-wire` | Sans-IO codec for FDB's flatbuffers dialect and the legacy binary format |
+| `fdb-native-wire-derive` | `#[derive(Wire)]`, re-exported by `wire` (its default `derive` feature). It dev-depends on `wire` while `wire` depends on it, so publish it first (see its crate docs) |
 | `fdb-native-schema` | Per-protocol-version message schemas (7.4, 8.0); depends on `wire` |
 | `fdb-native-transport` | Runtime-agnostic connection layer; depends on `wire` |
 | `fdb-native-client` | Public client API; depends on `schema` and `transport` |
