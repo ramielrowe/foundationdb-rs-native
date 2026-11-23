@@ -12,6 +12,7 @@
 //! | `commit` | `CommitTransactionRequest`-like: 1000 mutation tables | table vector encode (vtable dedup), eager vs `VectorView` decode |
 //! | `blob` | a 1 MiB `Vec<u8>` / `&[u8]` | bulk byte decode |
 //! | `strings_200` | a vector of 200 strings | offset vectors of blobs |
+//! | `vtables` | 2000 tables of few or many distinct shapes | vtable deduplication |
 
 use std::hint::black_box;
 
@@ -544,5 +545,82 @@ mod strings_200 {
             }
             total
         });
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// vtables
+
+/// A vector of tables with `variety` different shapes, which no derive produces (a derived
+/// table has one shape, or one per union variant): the worst case for vtable
+/// deduplication, which must find each table's vtable among all the distinct ones so far.
+mod vtables {
+    use fdb_native_wire::{Encode, EncodeError, ObjectRef, Shape, Writer};
+
+    use super::*;
+
+    struct Shapes {
+        tables: usize,
+        variety: usize,
+    }
+
+    /// A table with a field per bit of its number: a `u32` for a set bit, a `u8` for a
+    /// clear one, so every number has its own vtable.
+    struct Table(usize);
+
+    impl Wire for Table {
+        const SHAPE: Shape = Shape::Table;
+    }
+
+    impl Encode for Table {
+        fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+            let mut t = w.table();
+            for bit in 0..usize::BITS - self.0.leading_zeros() {
+                if self.0 >> bit & 1 == 1 {
+                    t.field(&bit)?;
+                } else {
+                    t.field(&(bit as u8))?;
+                }
+            }
+            t.finish()
+        }
+    }
+
+    impl Wire for Shapes {
+        const SHAPE: Shape = Shape::Object;
+    }
+
+    impl Encode for Shapes {
+        fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+            let tables: Vec<Table> = (0..self.tables)
+                .map(|i| Table(1 + (i.wrapping_mul(2_654_435_761) % self.variety)))
+                .collect();
+            w.vector(&tables)
+        }
+    }
+
+    fn bench_encode(bencher: Bencher, variety: usize) {
+        let msg = Shapes {
+            tables: 2000,
+            variety,
+        };
+        let len = fdb_native_wire::encode_with_identifier(&msg, 1)
+            .unwrap()
+            .len();
+        bencher
+            .counter(BytesCount::new(len))
+            .bench(|| fdb_native_wire::encode_with_identifier(black_box(&msg), 1).unwrap());
+    }
+
+    /// 2000 tables of at most 4 distinct shapes: the common case, a few vtables.
+    #[divan::bench]
+    fn encode_4_shapes(bencher: Bencher) {
+        bench_encode(bencher, 4);
+    }
+
+    /// 2000 tables of up to 1000 distinct shapes.
+    #[divan::bench]
+    fn encode_1000_shapes(bencher: Bencher) {
+        bench_encode(bencher, 1000);
     }
 }

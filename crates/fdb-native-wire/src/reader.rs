@@ -39,7 +39,10 @@ pub const MAX_DEPTH: usize = 64;
 /// absent values, so a message of `n` bytes can decode into about `n / 4 ×
 /// size_of::<T>()` bytes of `T` (about 128 × `n` for a 512-byte `T`). Bound the size of untrusted messages before decoding them. Vectors
 /// reserve at most 64 KiB before their elements are decoded, so a large count in a
-/// malformed message does not allocate by itself.
+/// malformed message does not allocate by itself. (A vector of integers, floats or
+/// `bool`s is decoded in one pass over bytes the header showed to be in the message, and
+/// is allocated at its final size, never more than the message holds of it: a `Vec<u8>`
+/// of a 1 MiB blob is one 1 MiB copy.)
 ///
 /// The budget is shared with the [`VectorView`](crate::VectorView)s a decode creates: a
 /// view charges it as its elements are read, after the decode that created it has
