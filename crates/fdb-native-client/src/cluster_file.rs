@@ -180,8 +180,32 @@
 //!   (`%eth0`) that `boost::asio::ip::address::from_string` allows. Output
 //!   formatting of IPv4-compatible addresses (`::1.2.3.4`) may differ from
 //!   boost (`::102:304` against `::1.2.3.4`); the value round-trips either way.
-//! * `(fromHostname)` is accepted and dropped rather than reproduced in the
-//!   output. It cannot occur in a cluster file written by FDB's client path.
+//! * `(fromHostname)` is accepted and dropped by the parser rather than
+//!   reproduced in the output (it cannot occur in a cluster file written by
+//!   FDB's client path). The flag is carried on the *resolved* form instead,
+//!   [`ResolvedCoordinator::from_hostname`], which is where FDB sets it
+//!   (`Hostname::resolve`): [`Coordinator::with_resolved`] sets it for
+//!   hostname coordinators and keeps the `:tls` flag.
+//! * A `\x0b` or `\x0c` before an IPv4 number is accepted by FDB, because
+//!   `sscanf`'s `%d` skips `isspace` characters; it is rejected here.
+//!
+//! # Printed text versus FDB's
+//!
+//! Anything this module prints parses back to an equal value, and FDB parses
+//! it to the same coordinators, but the text can differ from what FDB itself
+//! would print (or has in an existing file) byte for byte: leading zeros in
+//! ports and octets are normalised, IPv4-compatible IPv6 addresses may be
+//! formatted differently (see above), and `(fromHostname)` is dropped.
+//! Comments, whitespace and the mixed address/hostname input order are not
+//! kept either, since only [`Display`](fmt::Display) output is produced.
+//!
+//! # Platform note
+//!
+//! "An empty `FDB_CLUSTER_FILE` is used as is" is the Unix behaviour
+//! (`getenv` returns a non-null empty string). On Windows FDB's
+//! `getEnvironmentVar` throws `platform_error` for a zero-length value (7.4:
+//! `flow/Platform.actor.cpp` 3295-3301). This code follows the Unix behaviour
+//! on every platform.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -266,10 +290,84 @@ impl Coordinator {
         matches!(self, Self::Host { .. })
     }
 
+    /// For a hostname coordinator, the `(host, port)` pair to hand to the
+    /// transport runtime's `resolve(host, port)`. `None` for literal addresses.
+    pub fn host(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::Host { name, port, .. } => Some((name, *port)),
+            Self::Addr { .. } => None,
+        }
+    }
+
+    /// For a literal-address coordinator, its socket address. `None` for
+    /// hostnames, which need resolving first.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Addr { addr, .. } => Some(*addr),
+            Self::Host { .. } => None,
+        }
+    }
+
+    /// The connectable form of this coordinator once `addr` is known: `addr`
+    /// is typically one of the results of resolving [`host`](Self::host).
+    /// The TLS flag of this coordinator is kept. `from_hostname` is set for a
+    /// hostname coordinator and cleared for a literal one (where `addr` is
+    /// normally just [`socket_addr`](Self::socket_addr)).
+    ///
+    /// This mirrors `Hostname::resolve` (`flow/Hostname[.actor].cpp`, 7.4:
+    /// 63-77, 8.0: 61-75), which resets the flags of the resolved address,
+    /// re-applies `FLAG_TLS` from the `:tls` suffix and sets `fromHostname`.
+    pub fn with_resolved(&self, addr: SocketAddr) -> ResolvedCoordinator {
+        ResolvedCoordinator {
+            addr,
+            tls: self.tls(),
+            from_hostname: self.is_host(),
+        }
+    }
+
+    /// [`with_resolved`](Self::with_resolved) for a literal address; `None`
+    /// for a hostname.
+    pub fn resolved(&self) -> Option<ResolvedCoordinator> {
+        self.socket_addr().map(|a| self.with_resolved(a))
+    }
+
     /// Parses a single coordinator the way one comma-separated entry of a
     /// connection string is parsed. No whitespace or comment handling is done.
     pub fn parse(entry: &str) -> Result<Self, ConnectionStringError> {
         parse_coordinator(entry.as_bytes())
+    }
+}
+
+/// A coordinator with a concrete socket address: what the connection layer
+/// dials.
+///
+/// `from_hostname` is FDB's `NetworkAddress::fromHostname`: set when the
+/// address came from resolving a hostname coordinator. FDB does not include it
+/// in address identity (`NetworkAddress::operator==`). [`Coordinator::Addr`]
+/// never carries it: a `(fromHostname)` suffix in parsed text is accepted and
+/// dropped, and the flag lives only here, on resolved addresses, which is
+/// where FDB sets it (`Hostname::resolve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolvedCoordinator {
+    /// The address to connect to.
+    pub addr: SocketAddr,
+    /// Whether to use TLS.
+    pub tls: bool,
+    /// Whether the address came from resolving a hostname.
+    pub from_hostname: bool,
+}
+
+impl fmt::Display for ResolvedCoordinator {
+    /// FDB's `NetworkAddress::toString`: `ip:port[:tls][(fromHostname)]`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.addr)?;
+        if self.tls {
+            f.write_str(":tls")?;
+        }
+        if self.from_hostname {
+            f.write_str("(fromHostname)")?;
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +415,11 @@ impl ClusterConnectionString {
     /// Builds a connection string from parts, validating them exactly like a
     /// parsed one (character sets, duplicates) and additionally requiring at
     /// least one coordinator. Coordinators are put in canonical order.
+    ///
+    /// Host names must satisfy the same rule as when parsing (`Hostname::
+    /// isHostname` on `name:port`), and IPv6 addresses must have no scope id
+    /// or flow info, since neither can be written in a cluster file. This
+    /// guarantees that `new(..)?.to_string()` parses back to an equal value.
     pub fn new(
         description: &str,
         id: &str,
@@ -327,6 +430,7 @@ impl ClusterConnectionString {
         let mut seen = HashSet::new();
         let (mut addrs, mut hosts) = (Vec::new(), Vec::new());
         for c in coordinators {
+            validate_coordinator(&c)?;
             if !seen.insert(c.clone()) {
                 return Err(ConnectionStringError::DuplicateCoordinator(c.to_string()));
             }
@@ -448,6 +552,23 @@ fn strip_comments_and_whitespace(input: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Rejects coordinators whose text form would not parse back to themselves.
+fn validate_coordinator(c: &Coordinator) -> Result<(), ConnectionStringError> {
+    let ok = match c {
+        Coordinator::Addr {
+            addr: SocketAddr::V6(v6),
+            ..
+        } => v6.scope_id() == 0 && v6.flowinfo() == 0,
+        Coordinator::Addr { .. } => true,
+        Coordinator::Host { name, port, .. } => is_hostname(&format!("{name}:{port}")),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ConnectionStringError::InvalidCoordinator(c.to_string()))
+    }
 }
 
 fn lossy(bytes: &[u8]) -> String {

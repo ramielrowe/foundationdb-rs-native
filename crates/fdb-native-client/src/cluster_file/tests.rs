@@ -263,7 +263,7 @@ fn fdb_network_address_ipv6_and_tls() {
     // `(fromHostname)` is accepted and dropped.
     assert_eq!(c.to_string(), "[2001:db8:85a3::8a2e:370:7334]:4800:tls");
 
-    // IPAddress::parse on non-addresses fails: no brackets, no port.
+    // Neither a hostname nor an address: a bare number, junk after the port.
     assert!(Coordinator::parse("2001").is_err());
     assert!(Coordinator::parse("8.8.8.8:12:garbage").is_err());
 }
@@ -482,7 +482,10 @@ fn comments_and_whitespace() {
         assert_eq!(parse(input), want, "{input:?}");
     }
 
-    // Only the four FDB whitespace characters are removed.
+    // Only the four FDB whitespace characters are removed. FDB itself still
+    // accepts \v and \f in front of an IPv4 number, because sscanf's %d skips
+    // isspace characters; rejecting them is a documented divergence. U+00A0
+    // is invalid in FDB too.
     assert_invalid("desc:ID@1.1.1.1:1,\u{b}2.2.2.2:2");
     assert_invalid("desc:ID@1.1.1.1:1,\u{c}2.2.2.2:2");
     assert_invalid("desc:ID@1.1.1.1:1,\u{a0}2.2.2.2:2");
@@ -728,6 +731,66 @@ fn not_found_message_for_default_lookup() {
     assert!(msg.contains("FDB_CLUSTER_FILE unset"), "{msg}");
 }
 
+#[test]
+fn new_rejects_coordinators_that_would_not_round_trip() {
+    let bad_hosts = [
+        "1.2.3.4", "1234", "", "a,b", "a:b", ".x", "a..b", "h\u{e9}", "a b", "a@b",
+    ];
+    for name in bad_hosts {
+        let err = ClusterConnectionString::new("a", "b", [host(name, 80, false)]).unwrap_err();
+        assert!(
+            matches!(err, ConnectionStringError::InvalidCoordinator(_)),
+            "{name:?}: {err}"
+        );
+    }
+    // Names that are fine, including ones FDB's regex accepts but which look odd.
+    for name in ["h", "a-b_c.d", "1.2.3", "123", "host.", "-", "UPPER"] {
+        let cs = ClusterConnectionString::new("a", "b", [host(name, 80, true)]).unwrap();
+        assert_eq!(
+            cs.to_string().parse::<ClusterConnectionString>().unwrap(),
+            cs
+        );
+    }
+
+    let v6 = |scope, flow| Coordinator::Addr {
+        addr: SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            80,
+            flow,
+            scope,
+        )),
+        tls: false,
+    };
+    assert!(ClusterConnectionString::new("a", "b", [v6(0, 0)]).is_ok());
+    assert!(ClusterConnectionString::new("a", "b", [v6(3, 0)]).is_err());
+    assert!(ClusterConnectionString::new("a", "b", [v6(0, 7)]).is_err());
+}
+
+#[test]
+fn coordinator_resolution_helpers() {
+    let h = Coordinator::parse("db.example.com:4500:tls").unwrap();
+    assert_eq!(h.host(), Some(("db.example.com", 4500)));
+    assert_eq!(h.socket_addr(), None);
+    assert_eq!(h.resolved(), None);
+    let resolved = h.with_resolved("10.0.0.1:4500".parse().unwrap());
+    assert_eq!(
+        resolved,
+        ResolvedCoordinator {
+            addr: "10.0.0.1:4500".parse().unwrap(),
+            tls: true,
+            from_hostname: true,
+        }
+    );
+    assert_eq!(resolved.to_string(), "10.0.0.1:4500:tls(fromHostname)");
+
+    let a = Coordinator::parse("[::1]:4500").unwrap();
+    assert_eq!(a.host(), None);
+    assert_eq!(a.socket_addr(), Some("[::1]:4500".parse().unwrap()));
+    let r = a.resolved().unwrap();
+    assert!(!r.tls && !r.from_hostname);
+    assert_eq!(r.to_string(), "[::1]:4500");
+}
+
 // ---------------------------------------------------------------------------
 // Property tests.
 
@@ -776,6 +839,48 @@ fn arb_connection_string() -> impl Strategy<Value = ClusterConnectionString> {
         })
 }
 
+/// The two regexes of `Hostname::isHostname`, with ASCII classes spelled out
+/// (std::regex's `\w` and `\d` are ASCII in the C locale).
+fn fdb_is_hostname(s: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static VALIDATION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^([A-Za-z0-9_\-]+\.?)+:[0-9]+(:tls)?$").unwrap());
+    static IPV4: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^([0-9]{1,3}\.?){4,}:[0-9]+(:tls)?$").unwrap());
+    !IPV4.is_match(s) && VALIDATION.is_match(s)
+}
+
+/// Coordinators that include values `new` must refuse: host names that are not
+/// host names, and IPv6 addresses with scope id or flow info.
+fn arb_hostile_coordinator() -> impl Strategy<Value = Coordinator> {
+    prop_oneof![
+        arb_coordinator(),
+        (
+            prop_oneof!["[0-9.]{0,10}", r"[A-Za-z0-9_.:,\-]{0,10}", "\\PC{0,6}"],
+            any::<u16>(),
+            any::<bool>()
+        )
+            .prop_map(|(name, port, tls)| Coordinator::Host { name, port, tls }),
+        (
+            any::<[u16; 8]>(),
+            any::<u16>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<bool>()
+        )
+            .prop_map(|(segments, port, flow, scope, tls)| Coordinator::Addr {
+                addr: SocketAddr::V6(std::net::SocketAddrV6::new(
+                    segments.into(),
+                    port,
+                    flow,
+                    scope
+                )),
+                tls,
+            }),
+    ]
+}
+
 proptest! {
     #[test]
     fn round_trip(cs in arb_connection_string()) {
@@ -820,13 +925,67 @@ proptest! {
     }
 
     #[test]
-    fn grammar_shaped_text_never_panics(
-        s in "[a-zA-Z0-9_:@,.\\[\\]# \\n()%+-]{0,80}"
+    fn mutated_valid_text_is_a_fixed_point_when_accepted(
+        cs in arb_connection_string(),
+        edits in prop::collection::vec((any::<usize>(), prop::option::of(r"[:,.\[\]#@ \n()%+\-a-z0-9]")), 0..3),
     ) {
-        if let Ok(cs) = s.parse::<ClusterConnectionString>() {
-            // Anything accepted must be a fixed point of print and parse.
-            let printed = cs.to_string();
-            prop_assert_eq!(printed.parse::<ClusterConnectionString>().unwrap(), cs);
+        // Start from valid text and apply up to two single-character
+        // deletions or insertions, so that a large share of inputs is still
+        // accepted and the assertion below actually runs.
+        let mut chars: Vec<char> = cs.to_string().chars().collect();
+        for (at, ins) in edits {
+            let at = at % (chars.len() + 1);
+            match ins {
+                Some(s) => {
+                    chars.splice(at..at, s.chars());
+                }
+                None if at < chars.len() => {
+                    chars.remove(at);
+                }
+                None => {}
+            }
+        }
+        let text: String = chars.into_iter().collect();
+        if let Ok(parsed) = text.parse::<ClusterConnectionString>() {
+            let printed = parsed.to_string();
+            prop_assert_eq!(printed.parse::<ClusterConnectionString>().unwrap(), parsed);
+        }
+    }
+
+    #[test]
+    fn new_is_valid_or_round_trips(
+        description in arb_description(),
+        id in arb_id(),
+        coords in prop::collection::vec(arb_hostile_coordinator(), 0..5),
+    ) {
+        if let Ok(cs) = ClusterConnectionString::new(&description, &id, coords) {
+            let reparsed: ClusterConnectionString = cs.to_string().parse().unwrap();
+            prop_assert_eq!(reparsed, cs);
+        }
+    }
+
+    #[test]
+    fn is_hostname_matches_fdb_regexes(
+        s in prop_oneof![
+            r"[A-Za-z0-9_.\-]{0,12}:[0-9]{0,4}(:tls)?",
+            r"[0-9.]{0,10}:[0-9]{1,3}(:tls)?",
+            r"[A-Za-z0-9_.:\-]{0,16}",
+            "\\PC{0,12}",
+        ]
+    ) {
+        prop_assert_eq!(is_hostname(&s), fdb_is_hostname(&s), "{:?}", s);
+    }
+
+    #[test]
+    fn digit_and_dot_entries(s in r"[0-9.]{0,16}:[0-9]{1,6}(:tls)?") {
+        prop_assert_eq!(is_hostname(&s), fdb_is_hostname(&s), "{:?}", s);
+        if let Ok(c) = Coordinator::parse(&s) {
+            {
+                // Whatever is accepted prints and parses back to itself, and
+                // is a hostname exactly when FDB's regexes say so.
+                prop_assert_eq!(c.is_host(), fdb_is_hostname(&s));
+                prop_assert_eq!(Coordinator::parse(&c.to_string()).unwrap(), c);
+            }
         }
     }
 }

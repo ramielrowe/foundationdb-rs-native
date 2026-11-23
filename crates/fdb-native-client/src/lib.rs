@@ -6,7 +6,7 @@ pub mod cluster_file;
 
 pub use cluster_file::{
     ClusterConnectionString, ClusterFile, ClusterFileError, ClusterFileLocation, ClusterFileSource,
-    ConnectionStringError, Coordinator,
+    ConnectionStringError, Coordinator, ResolvedCoordinator,
 };
 
 #[cfg(test)]
