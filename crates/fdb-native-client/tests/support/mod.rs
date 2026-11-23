@@ -70,7 +70,15 @@ impl Net {
         self.resolves.lock().unwrap().clone()
     }
 
-    fn unlisten(&self, addr: SocketAddr) {
+    /// Starts listening at `addr`: every dial of it hands the server end of a stream to the
+    /// receiver.
+    pub fn listen(&self, addr: SocketAddr) -> mpsc::UnboundedReceiver<DuplexStream> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.listeners.lock().unwrap().insert(addr, tx);
+        rx
+    }
+
+    pub fn unlisten(&self, addr: SocketAddr) {
         self.listeners.lock().unwrap().remove(&addr);
     }
 }
