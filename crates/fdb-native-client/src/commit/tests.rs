@@ -105,8 +105,9 @@ fn clear_and_clear_range() {
     assert_eq!(
         CommitBuffer::new(limits())
             .clear_range(b"b", b"a")
-            .unwrap_err(),
-        Error::new(error_code::INVERTED_RANGE)
+            .unwrap_err()
+            .code(),
+        error_code::INVERTED_RANGE
     );
 }
 
@@ -279,8 +280,8 @@ fn read_only_option() {
     assert!(build(b.clone(), &options).unwrap().is_none());
     b.set(b"k", b"v").unwrap();
     assert_eq!(
-        build(b, &options).unwrap_err(),
-        Error::new(error_code::TRANSACTION_READ_ONLY)
+        build(b, &options).unwrap_err().code(),
+        error_code::TRANSACTION_READ_ONLY
     );
 }
 
@@ -360,7 +361,7 @@ fn errors_and_codes() {
     let nc = reply(1020);
     assert_eq!(nc.code(), 1020);
     assert!(nc.is_retryable_not_committed() && !nc.is_maybe_committed());
-    assert_eq!(reply(1007), Error::new(1007));
+    assert_eq!(reply(1007).code(), 1007);
     for code in [1038, 1042, 1051, 1037, 1213, 1223, 1235, 1242, 1078, 1009] {
         assert!(reply(code).is_retryable(), "{code}");
         assert!(reply(code).transaction_retry().is_some(), "{code}");

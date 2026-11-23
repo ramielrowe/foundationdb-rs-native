@@ -252,7 +252,7 @@ async fn conflicts() {
         let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
         env.commit_proxies[0].next().await.reply_commit(Err(1020));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, Error::new(1020));
+        assert_eq!(e.code(), 1020);
         assert_eq!(e.conflicting_ranges(), None);
         assert_eq!(e.code(), 1020);
         assert!(e.is_retryable() && !e.is_maybe_committed());
@@ -292,9 +292,7 @@ async fn server_errors_are_mapped_and_not_resent() {
     let mut env = env(SchemaVersion::V7_4, 1, 1).await;
     type Check = fn(&Error) -> bool;
     let cases: [(u16, Check); 4] = [
-        (1007u16, |e: &Error| {
-            *e == Error::new(1007) && e.is_retryable()
-        }),
+        (1007u16, |e: &Error| e.code() == 1007 && e.is_retryable()),
         (1038, |e: &Error| e.code() == 1038 && e.is_retryable()),
         (1042, |e: &Error| e.code() == 1042 && e.is_retryable()),
         (2101, |e: &Error| e.code() == 2101 && !e.is_retryable()),
@@ -328,7 +326,7 @@ async fn a_lost_connection_after_the_send_is_an_unknown_result_never_resent() {
         let handle = spawn_commit(&env.committer, 1, b, options);
         env.commit_proxies[0].next().await.close();
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, Error::new(1021));
+        assert_eq!(e.code(), 1021);
         assert_eq!(e.code(), 1021);
         assert!(e.is_maybe_committed());
         // Causal write risky: no dummy transaction, and the request is not sent again.
@@ -350,7 +348,7 @@ async fn broken_promise_and_commit_unknown_result_replies_are_unknown_results() 
         });
         let handle = spawn_commit(&env.committer, 1, b, options);
         env.commit_proxies[0].next().await.reply_commit(Err(code));
-        assert_eq!(done(handle).await.unwrap_err(), Error::new(1021), "{code}");
+        assert_eq!(done(handle).await.unwrap_err().code(), 1021, "{code}");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
     }
@@ -399,7 +397,7 @@ async fn an_unknown_result_commits_a_dummy_transaction_first() {
             version: 960,
             ..CommitId::default()
         }));
-        assert_eq!(done(handle).await.unwrap_err(), Error::new(1021));
+        assert_eq!(done(handle).await.unwrap_err().code(), 1021);
         assert!(env.commit_proxies[0].try_next().is_none());
     }
 }
@@ -474,7 +472,7 @@ async fn proxies_changing_mid_commit_is_an_unknown_result() {
         let long_poll = env.coord.next_call().await;
         long_poll.reply(&info(2, 1, 1, schema));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, Error::new(1021));
+        assert_eq!(e.code(), 1021);
 
         // A late reply to the abandoned request is ignored; it is not sent again.
         call.reply_commit(Ok(CommitId {
@@ -531,7 +529,7 @@ async fn proxies_changing_mid_commit_runs_the_dummy_transaction_on_the_new_proxi
         version: 301,
         ..CommitId::default()
     }));
-    assert_eq!(done(handle).await.unwrap_err(), Error::new(1021));
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
     drop(env.monitor.clone());
 }
 
@@ -627,7 +625,7 @@ async fn a_dummy_transaction_that_fails_for_good_is_still_an_unknown_result() {
         // 2000 client_invalid_operation: not on the retry list.
         env.commit_proxies[0].next().await.reply_commit(Err(2000));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, Error::new(1021));
+        assert_eq!(e.code(), 1021);
         assert!(e.is_maybe_committed());
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
@@ -647,7 +645,7 @@ async fn shutdown_while_a_commit_is_outstanding_is_an_unknown_result() {
         let grvs = auto_grv(env.grv_proxies.remove(0), 1000);
         env.monitor.shutdown().await;
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, Error::new(1021));
+        assert_eq!(e.code(), 1021);
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none(), "no dummy");
         grvs.abort();
@@ -668,7 +666,7 @@ async fn a_commit_after_shutdown_sends_nothing() {
             let e = done(spawn_commit(&env.committer, 1, b, options))
                 .await
                 .unwrap_err();
-            assert_eq!(e, Error::new(1101));
+            assert_eq!(e.code(), 1101);
             assert!(!e.is_maybe_committed());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -690,7 +688,7 @@ async fn shutdown_while_waiting_for_proxies_is_closed() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!handle.is_finished());
     env.monitor.shutdown().await;
-    assert_eq!(done(handle).await.unwrap_err(), Error::new(1101));
+    assert_eq!(done(handle).await.unwrap_err().code(), 1101);
     assert!(env.commit_proxies[0].try_next().is_none());
 }
 
@@ -709,7 +707,7 @@ async fn shutdown_while_the_dummy_waits_for_proxies_is_an_unknown_result() {
     assert!(!handle.is_finished());
     env.monitor.shutdown().await;
     let e = done(handle).await.unwrap_err();
-    assert_eq!(e, Error::new(1021));
+    assert_eq!(e.code(), 1021);
     assert!(e.is_maybe_committed());
 }
 
@@ -737,7 +735,7 @@ async fn the_dummy_transaction_has_a_conflict_range_for_a_truncated_key() {
         version: 501,
         ..CommitId::default()
     }));
-    assert_eq!(done(handle).await.unwrap_err(), Error::new(1021));
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
 }
 
 /// The dummy's read version is asked again when the proxies change while it waits, and a
@@ -763,5 +761,5 @@ async fn the_dummys_read_version_follows_the_proxies() {
         version: 401,
         ..CommitId::default()
     }));
-    assert_eq!(done(handle).await.unwrap_err(), Error::new(1021));
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
 }

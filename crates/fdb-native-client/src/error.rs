@@ -18,7 +18,9 @@
 //!   `tls_error`, ...; the cause is the [`source`](std::error::Error::source)).
 //!
 //! Besides its code an error may carry a message (sizes and limits, what was wrong), the
-//! cause, and the conflicting ranges. Two errors are equal when their codes are.
+//! cause, and the conflicting ranges. Errors are not comparable: compare their
+//! [`code`](Error::code)s, and ask the predicates (two errors of one code may differ in
+//! whether the transaction may have committed).
 //!
 //! # Retry semantics
 //!
@@ -241,7 +243,9 @@ pub enum TransactionRetry {
 /// client knows besides (a message, the cause, the conflicting ranges of a conflict). See the
 /// [module documentation](self) for the retry predicates.
 ///
-/// Two errors are equal when their codes are; the rest is diagnostic.
+/// Errors do not implement `PartialEq`: compare [`code`](Self::code)s, and use the
+/// predicates, which may say more than the code (see the [module
+/// documentation](self#where-the-predicates-know-more-than-the-code)).
 ///
 /// ```
 /// use fdb_native_client::{Error, TransactionRetry, error::codes};
@@ -325,25 +329,30 @@ impl Error {
         Error::with_source(code, error)
     }
 
-    /// The error a commit request gets when it fails the way `error` says (`tryCommit`):
-    /// a request that is not [certainly
-    /// undelivered](RequestError::certainly_not_delivered) and has no definite answer from
-    /// the server (a broken connection, `broken_promise`, a pending request to an endpoint
-    /// that went away, an undecodable reply, a cancellation, or a server reply of
-    /// `request_maybe_delivered`) is `commit_unknown_result` (1021): the transaction may have
-    /// committed. A server's other error replies keep their code (`not_committed`,
-    /// `transaction_too_old`, ...), and a request that certainly was not delivered is
-    /// [`from_request`](Self::from_request)'s code (`connection_failed` for `NotSent`, ...);
-    /// if it was a transient refusal ([`RequestError::should_retry`]: the connection failed
-    /// before the request was sent) it is retryable (see the [module
-    /// documentation](self#where-the-predicates-know-more-than-the-code)). The
-    /// [`RequestError`] is kept as the source.
+    /// The error a commit request gets when it fails the way `error` says (`tryCommit`'s
+    /// `catch`, as the [`Committer`](crate::Committer) classifies it):
+    ///
+    /// * a request that may have been delivered with no definite answer
+    ///   ([`RequestError::maybe_delivered`]: a broken connection, a cancellation, an
+    ///   undecodable reply, a pending request to an endpoint that went away, and the server
+    ///   replies `broken_promise` (1100), `request_maybe_delivered` (1030),
+    ///   `commit_unknown_result` (1021) and `default_error_or` (1035)), and a server reply of
+    ///   `never_reply` (1104, which 8.0's `tryCommit` treats so), is `commit_unknown_result`
+    ///   (1021): the transaction may have committed;
+    /// * a server's other error replies keep their code (`not_committed`,
+    ///   `transaction_too_old`, ...);
+    /// * a request that certainly was not delivered is [`from_request`](Self::from_request)'s
+    ///   code (`connection_failed` for `NotSent`, ...); if it was a transient refusal
+    ///   ([`RequestError::should_retry`]: the connection failed before the request was sent)
+    ///   it is retryable (see the [module
+    ///   documentation](self#where-the-predicates-know-more-than-the-code)).
+    ///
+    /// The [`RequestError`] is kept as the source.
     pub fn from_commit_request(error: RequestError) -> Error {
-        let code = match &error {
-            RequestError::Fdb(e) if e.code != REQUEST_MAYBE_DELIVERED => e.code,
-            RequestError::Fdb(_) => COMMIT_UNKNOWN_RESULT,
-            other if !other.certainly_not_delivered() => COMMIT_UNKNOWN_RESULT,
-            other => other.fdb_code(),
+        let code = if commit_maybe_delivered(&error) {
+            COMMIT_UNKNOWN_RESULT
+        } else {
+            error.fdb_code()
         };
         let not_delivered = error.should_retry();
         let e = Error::with_source(code, error);
@@ -548,13 +557,14 @@ fn entries(code: u16) -> impl Iterator<Item = &'static table::Entry> {
         .take_while(move |e| e.code == code)
 }
 
-impl PartialEq for Error {
-    fn eq(&self, other: &Error) -> bool {
-        self.code == other.code
-    }
+/// Whether a failed commit request may have been delivered without a definite answer, so
+/// that the transaction may have committed: `tryCommit`'s `catch` (NativeAPI 7.4:7060-7061,
+/// 8.0:4755-4757) for `request_maybe_delivered` and `commit_unknown_result` (and on 8.0
+/// `never_reply`), with `broken_promise` already turned into `request_maybe_delivered` by
+/// `tryGetReply` / `AtMostOnce`.
+pub(crate) fn commit_maybe_delivered(error: &RequestError) -> bool {
+    error.maybe_delivered() || matches!(error, RequestError::Fdb(e) if e.code == NEVER_REPLY)
 }
-
-impl Eq for Error {}
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -722,11 +732,11 @@ mod tests {
         assert_eq!(Error::new(2102).transaction_retry(), None);
         assert_eq!(Error::new(0).transaction_retry(), None);
         assert_eq!(
-            Error::new(0).on_error(),
-            Err(Error::new(CLIENT_INVALID_OPERATION))
+            Error::new(0).on_error().unwrap_err().code(),
+            CLIENT_INVALID_OPERATION
         );
-        assert_eq!(Error::new(1021).on_error(), Ok(Backoff));
-        assert_eq!(Error::new(2102).on_error(), Err(Error::new(2102)));
+        assert_eq!(Error::new(1021).on_error().unwrap(), Backoff);
+        assert_eq!(Error::new(2102).on_error().unwrap_err().code(), 2102);
     }
 
     #[test]
@@ -741,6 +751,12 @@ mod tests {
                 maybe_delivered: true,
             },
             RequestError::Fdb(FdbError::new(REQUEST_MAYBE_DELIVERED)),
+            // What the committer also treats as an unknown result: a server's
+            // broken_promise, commit_unknown_result, default_error_or, never_reply.
+            RequestError::Fdb(FdbError::new(BROKEN_PROMISE)),
+            RequestError::Fdb(FdbError::new(COMMIT_UNKNOWN_RESULT)),
+            RequestError::Fdb(FdbError::new(1035)),
+            RequestError::Fdb(FdbError::new(NEVER_REPLY)),
         ];
         for error in unknown {
             let e = Error::from_commit_request(error.clone());
@@ -774,7 +790,7 @@ mod tests {
         assert_eq!(e.code(), REQUEST_MAYBE_DELIVERED);
         assert!(e.request_error().is_some());
         assert!(std::error::Error::source(&e).is_some());
-        assert_eq!(e, Error::new(REQUEST_MAYBE_DELIVERED));
+        assert_eq!(e.code(), REQUEST_MAYBE_DELIVERED);
         let e = Error::from_request(RequestError::Fdb(FdbError::new(1009)));
         assert_eq!(e.code(), FUTURE_VERSION);
     }

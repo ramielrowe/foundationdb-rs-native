@@ -7,6 +7,8 @@
 //! cluster. Run with `cargo nextest run -p fdb-native-client --run-ignored only` (add
 //! `--features tls` for the TLS test).
 
+#![cfg(feature = "tokio")]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -433,6 +435,32 @@ async fn docker_run_completes_through_a_recovery() {
             Ok::<_, Error>(())
         }
     });
+    // A transaction that straddles the first recovery: its first attempt reads before the
+    // recovery and commits after it, which a new generation's resolvers refuse (its read
+    // version is older than the recovery). The background workload may or may not be caught
+    // by a recovery (it may be between two transactions), this one always is.
+    let recovered = Arc::new(tokio::sync::Notify::new());
+    let straddler_attempts = Arc::new(AtomicUsize::new(0));
+    let straddler = tokio::spawn({
+        let db = c.db.clone();
+        let recovered = recovered.clone();
+        let attempts = straddler_attempts.clone();
+        async move {
+            db.run(|tx, _| {
+                let (recovered, attempts) = (recovered.clone(), attempts.clone());
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx.get(b"straddle").await?;
+                    if attempt == 0 {
+                        recovered.notified().await;
+                    }
+                    tx.set(b"straddle", format!("{attempt}").as_bytes());
+                    Ok(attempt)
+                }
+            })
+            .await
+        }
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let monitor = c.db.cluster_monitor();
     for config in [
@@ -453,7 +481,20 @@ async fn docker_run_completes_through_a_recovery() {
             after.commit_proxies.len()
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
+        recovered.notify_one();
     }
+    let committed_on = within("straddler", straddler)
+        .await
+        .unwrap()
+        .expect("the straddling transaction committed");
+    println!(
+        "the straddling transaction committed on attempt {committed_on} of {}",
+        straddler_attempts.load(Ordering::SeqCst)
+    );
+    assert!(
+        committed_on > 0,
+        "the attempt across the recovery was retried"
+    );
     let done = progress.load(Ordering::SeqCst);
     assert!(
         done < WRITES,

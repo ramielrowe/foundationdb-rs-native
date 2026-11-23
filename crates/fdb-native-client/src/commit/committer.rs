@@ -25,9 +25,7 @@ use super::prepare::{intersects, prepare};
 use super::rng::Rng;
 use crate::cluster::{ClusterInfo, ClusterMonitor, CommitProxyEndpoints, MonitorClosed};
 use crate::error::Error;
-use crate::error::codes::{
-    COMMIT_UNKNOWN_RESULT, FUTURE_VERSION, NEVER_REPLY, TRANSACTION_TOO_OLD,
-};
+use crate::error::codes::{COMMIT_UNKNOWN_RESULT, FUTURE_VERSION, TRANSACTION_TOO_OLD};
 
 /// What a successful [`Committer::commit`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,8 +137,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         read_version: i64,
         options: &CommitOptions,
     ) -> Result<CommitOutcome, Error> {
+        self.commit_buffer_tracked(buffer, read_version, options, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`commit_buffer`](Self::commit_buffer), setting `sent` once the request may have
+    /// reached a proxy (from then on, abandoning the commit leaves its outcome unknown).
+    pub(crate) async fn commit_buffer_tracked(
+        &self,
+        buffer: CommitBuffer,
+        read_version: i64,
+        options: &CommitOptions,
+        sent: &AtomicBool,
+    ) -> Result<CommitOutcome, Error> {
         let (mutations, reads, writes) = buffer.into_parts();
-        self.commit(read_version, mutations, reads, writes, options)
+        self.commit_tracked(read_version, mutations, reads, writes, options, sent)
             .await
     }
 
@@ -184,6 +195,26 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         write_conflicts: Vec<KeyRange>,
         options: &CommitOptions,
     ) -> Result<CommitOutcome, Error> {
+        self.commit_tracked(
+            read_version,
+            mutations,
+            read_conflicts,
+            write_conflicts,
+            options,
+            &AtomicBool::new(false),
+        )
+        .await
+    }
+
+    async fn commit_tracked(
+        &self,
+        read_version: i64,
+        mutations: Vec<Mutation>,
+        read_conflicts: Vec<KeyRange>,
+        write_conflicts: Vec<KeyRange>,
+        options: &CommitOptions,
+        sent: &AtomicBool,
+    ) -> Result<CommitOutcome, Error> {
         let limits = self.limits();
         let uid = self.rng(|r| Uid::new(r.next_u64(), r.next_u64()));
         let Some(commit) = prepare(
@@ -199,7 +230,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             return Ok(CommitOutcome::NothingToCommit);
         };
         let request = Arc::new(commit);
-        match self.send_commit(&request, options).await {
+        match self.send_commit(&request, options, sent).await {
             Ok(id) => Ok(CommitOutcome::Committed(id)),
             Err(Attempt::Error(e)) => Err(e),
             Err(Attempt::Unknown) => Err(self.settle_unknown(&request, options, &limits).await),
@@ -300,7 +331,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             Uid::default,
         )?
         .ok_or_else(|| error::internal("the dummy transaction is empty".into()))?;
-        match self.send_commit(&Arc::new(commit), options).await {
+        match self
+            .send_commit(&Arc::new(commit), options, &AtomicBool::new(false))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(Attempt::Error(e)) => Err(e),
             // CAUSAL_WRITE_RISKY: no further dummy, `commit_unknown_result`.
@@ -413,6 +447,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         &self,
         request: &Arc<Commit>,
         options: &CommitOptions,
+        attempted: &AtomicBool,
     ) -> Result<CommitId, Attempt> {
         // C++ would take the proxies of the current `ClientDBInfo` and, if there are none
         // (a recovery), wait for the proxies to change and then report an unknown result
@@ -441,13 +476,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         }
 
         // choose { when(onProxiesChanged) {...} when(reply) {...} }, the first listed first.
-        let attempted = AtomicBool::new(false);
         let mut changed = pin!(self.monitor.proxies_changed(&info));
         let mut send = pin!(self.balance(
             &alternatives,
             request,
             options.commit_on_first_proxy,
-            &attempted
+            attempted
         ));
         let outcome = poll_fn(|cx| {
             if let Poll::Ready(changed) = changed.as_mut().poll(cx) {
@@ -640,7 +674,7 @@ fn decode_grv(reply: &Reply) -> Result<i64, RequestError> {
 /// is rethrown. `broken_promise` is `request_maybe_delivered` by the time it gets there
 /// (`brokenPromiseToMaybeDelivered`, `basicLoadBalance`'s `AtMostOnce`).
 fn classify(error: RequestError) -> Attempt {
-    if error.maybe_delivered() || matches!(&error, RequestError::Fdb(e) if e.code == NEVER_REPLY) {
+    if crate::error::commit_maybe_delivered(&error) {
         return Attempt::Unknown;
     }
     // A definite answer, or certainly not delivered: `from_commit_request` keeps the code

@@ -380,7 +380,13 @@ impl<R: Runtime> Database<R> {
     /// `on_error`, such as a timeout or the retry limit) is returned.
     ///
     /// `f` gets a handle to the transaction (cheap: a clone of the one the loop uses), and
-    /// [`MaybeCommitted`]: whether an earlier attempt may have committed.
+    /// [`MaybeCommitted`]: whether an earlier attempt may have committed. The handle belongs
+    /// to the attempt: once it is over, what is done with it fails with
+    /// `transaction_cancelled` (its writes fail the attempt in progress instead of slipping
+    /// into it; see [Handles of a retry loop](crate::transaction#handles-of-a-retry-loop)).
+    /// `f` should not commit itself: `run` commits, and a second commit is
+    /// `used_during_commit` (reported as [maybe committed](Error::is_maybe_committed), since
+    /// the first one may have committed).
     ///
     /// # Idempotency
     ///
@@ -394,8 +400,8 @@ impl<R: Runtime> Database<R> {
     /// [`is_maybe_committed`](Error::is_maybe_committed), whatever its code.
     ///
     /// Options set in `f` apply to that attempt only, except those that C++ keeps across
-    /// retries (`timeout`, `retry_limit`, `max_retry_delay`, `size_limit`); setting them on
-    /// every attempt is fine.
+    /// retries (`timeout`, `retry_limit`, `max_retry_delay`); setting them on every attempt
+    /// is fine.
     ///
     /// ```no_run
     /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
@@ -418,7 +424,7 @@ impl<R: Runtime> Database<R> {
         let tx = self.create_transaction();
         let mut maybe_committed = false;
         loop {
-            let attempt = match f(tx.clone(), MaybeCommitted(maybe_committed)).await {
+            let attempt = match f(tx.for_attempt(), MaybeCommitted(maybe_committed)).await {
                 Ok(value) => tx.commit().await.map(|_| value),
                 Err(e) => Err(e),
             };
@@ -426,11 +432,15 @@ impl<R: Runtime> Database<R> {
                 Ok(value) => return Ok(value),
                 Err(e) => e,
             };
-            let this_maybe_committed = error.is_maybe_committed();
-            match tx.on_error(error).await {
-                Ok(()) => maybe_committed |= this_maybe_committed,
-                Err(e) if maybe_committed => return Err(e.into_maybe_committed()),
-                Err(e) => return Err(e),
+            // Before `on_error`, which may return another error (a timeout, the retry
+            // limit's): whatever `run` returns from now on may hide a commit.
+            maybe_committed |= error.is_maybe_committed();
+            if let Err(e) = tx.on_error(error).await {
+                return Err(if maybe_committed {
+                    e.into_maybe_committed()
+                } else {
+                    e
+                });
             }
         }
     }

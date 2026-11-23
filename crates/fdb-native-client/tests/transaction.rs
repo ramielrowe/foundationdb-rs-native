@@ -5,6 +5,8 @@
 //! `used_during_commit`, and the `run` retry loop. Reads from storage servers are covered by
 //! the docker tests.
 
+#![cfg(feature = "tokio")]
+
 mod support;
 
 use std::sync::Arc;
@@ -500,21 +502,57 @@ async fn concurrent_reads_of_the_read_version_share_one_request() {
     assert!(env.grv.try_next().is_none(), "one request");
     assert_eq!(tx.get_read_version().await.unwrap(), 42);
 
-    // An abandoned request lets the next reader ask again.
+    // The request does not depend on the reader that started it: one that is dropped, or
+    // parked without being polled, leaves it to the others.
     let tx = env.db.create_transaction();
     let first = spawn({
         let tx = tx.clone();
         async move { tx.get_read_version().await }
     });
-    let _unanswered = env.grv.next().await;
+    let request = env.grv.next().await;
     first.abort();
     let _ = first.await;
     let second = spawn({
         let tx = tx.clone();
         async move { tx.get_read_version().await }
     });
-    env.grv.next().await.reply_grv(43);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    request.reply_grv(43);
     assert_eq!(done(second).await.unwrap(), 43);
+    assert!(env.grv.try_next().is_none(), "one request");
+
+    // (Review finding f2.) A reader polled once and then parked.
+    let tx = env.db.create_transaction();
+    let mut parked = Box::pin(tx.get_read_version());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut parked)
+            .await
+            .is_err()
+    );
+    env.grv.next().await.reply_grv(44);
+    let second = tokio::time::timeout(Duration::from_secs(30), tx.get_read_version()).await;
+    assert_eq!(second.expect("not stranded").unwrap(), 44);
+    drop(parked);
+
+    // The write-only commit's read version too.
+    let tx = env.db.create_transaction();
+    tx.set(b"k", b"v");
+    let mut parked = Box::pin(tx.get_read_version());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut parked)
+            .await
+            .is_err()
+    );
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    env.grv.next().await.reply_grv(45);
+    let call = env.commit.next().await;
+    assert_eq!(call.commit().0.read_snapshot, 45);
+    call.reply_commit(committed(46, 0));
+    assert_eq!(done(handle).await.unwrap().committed_version(), 46);
+    drop(parked);
 }
 
 #[tokio::test(start_paused = true)]
@@ -637,5 +675,445 @@ async fn open_errors() {
             .unwrap_err()
             .code(),
         codes::TLS_ERROR
+    );
+}
+
+// ---- review regressions (let.6) -------------------------------------------------------------
+
+/// (f1) `run` with a commit that times out after it was sent: the error may hide a commit.
+#[tokio::test(start_paused = true)]
+async fn run_with_a_timeout_during_the_commit_is_maybe_committed() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let handle = spawn({
+        let db = env.db.clone();
+        async move {
+            db.run(|tx, _| async move {
+                tx.set_option(TransactionOption::Timeout(Duration::from_secs(1)))?;
+                tx.set(b"k", b"v");
+                Ok(())
+            })
+            .await
+        }
+    });
+    env.grv.next().await.reply_grv(5);
+    let _unanswered = env.commit.next().await;
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    assert!(e.is_maybe_committed(), "{e:?}");
+}
+
+/// (f1b) `commit_unknown_result`, then the timeout ends the backoff: still maybe committed,
+/// from `on_error` itself and from `run`.
+#[tokio::test(start_paused = true)]
+async fn a_timeout_during_the_backoff_after_an_unknown_result_is_maybe_committed() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let handle = spawn({
+        let db = env.db.clone();
+        async move {
+            db.run(|tx, _| async move {
+                tx.set_option(TransactionOption::Timeout(Duration::from_millis(500)))?;
+                tx.set_option(TransactionOption::CausalWriteRisky)?;
+                tx.set(b"k", b"v");
+                Ok(())
+            })
+            .await
+        }
+    });
+    env.grv.next().await.reply_grv(5);
+    let call = env.commit.next().await;
+    tokio::time::sleep(Duration::from_millis(499)).await;
+    call.reply_commit(Err(codes::COMMIT_UNKNOWN_RESULT));
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT, "{e:?}");
+    assert!(e.is_maybe_committed(), "{e:?}");
+
+    // `on_error` alone: a long backoff interrupted by the timeout.
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(30)))
+        .unwrap();
+    let mut last = None;
+    for _ in 0..20 {
+        if let Err(e) = tx.on_error(Error::new(codes::COMMIT_UNKNOWN_RESULT)).await {
+            last = Some(e);
+            break;
+        }
+    }
+    let e = last.expect("timed out");
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    assert!(e.is_maybe_committed());
+    // A dead transaction given a maybe-committed error says so too.
+    let e = tx
+        .on_error(Error::new(codes::COMMIT_UNKNOWN_RESULT))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    assert!(e.is_maybe_committed());
+    // An error that is not maybe committed is not marked.
+    let e = tx
+        .on_error(Error::new(codes::NOT_COMMITTED))
+        .await
+        .unwrap_err();
+    assert!(!e.is_maybe_committed());
+}
+
+/// (f3) A timeout set while an operation is in progress applies to it.
+#[tokio::test(start_paused = true)]
+async fn a_timeout_set_during_an_operation_interrupts_it() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let start = Instant::now();
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.get_read_version().await }
+    });
+    let _unanswered = env.grv.next().await;
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(100)))
+        .unwrap();
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(102), "{elapsed:?}");
+
+    // A deadline that has already passed fails it at once; a longer one is still waited
+    // for.
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_secs(100)))
+        .unwrap();
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.get_read_version().await }
+    });
+    let _unanswered = env.grv.next().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.set_option(TransactionOption::Timeout(Duration::from_secs(200)))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handle.is_finished());
+    let before = Instant::now();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(10)))
+        .unwrap();
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    assert!(before.elapsed() < Duration::from_millis(2));
+}
+
+/// (f4) Shutting the database down ends the operations in progress; a commit that was
+/// sent may have committed.
+#[tokio::test(start_paused = true)]
+async fn shutdown_ends_the_operations_in_progress() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    let grv = spawn({
+        let tx = tx.clone();
+        async move { tx.get_read_version().await }
+    });
+    let _g = env.grv.next().await;
+    let tx2 = env.db.create_transaction();
+    tx2.set_read_version(9);
+    tx2.set(b"k", b"v");
+    let commit = spawn({
+        let tx2 = tx2.clone();
+        async move { tx2.commit().await }
+    });
+    let _c = env.commit.next().await;
+    env.db.shutdown().await;
+    let e = done(grv).await.unwrap_err();
+    assert_eq!(e.code(), codes::OPERATION_CANCELLED, "{e:?}");
+    let e = done(commit).await.unwrap_err();
+    assert!(e.is_maybe_committed(), "{e:?}");
+}
+
+/// (f5) A closure that commits itself: `run`'s own commit is `used_during_commit`, which may
+/// not be mistaken for a commit that did not happen.
+#[tokio::test(start_paused = true)]
+async fn a_second_commit_after_a_sent_one_is_maybe_committed() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let handle = spawn({
+        let db = env.db.clone();
+        async move {
+            db.run(|tx, _| async move {
+                tx.set_read_version(3);
+                tx.set(b"k", b"v");
+                let result = tx.commit().await?;
+                assert_eq!(tx.committed_version(), result.committed_version());
+                assert_eq!(tx.versionstamp(), result.versionstamp());
+                Ok(())
+            })
+            .await
+        }
+    });
+    env.commit.next().await.reply_commit(committed(10, 2));
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed(), "{e:?}");
+
+    // The accessors.
+    let tx = env.db.create_transaction();
+    assert_eq!(tx.committed_version(), -1);
+    assert_eq!(tx.versionstamp(), None);
+    tx.set_read_version(3);
+    tx.set(b"k", b"v");
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    env.commit.next().await.reply_commit(committed(11, 1));
+    done(handle).await.unwrap();
+    assert_eq!(tx.committed_version(), 11);
+    assert_eq!(tx.versionstamp(), Some([0, 0, 0, 0, 0, 0, 0, 11, 0, 1]));
+    // After a successful commit, any use is `used_during_commit` (maybe committed: it did).
+    let e = tx.get(b"k").await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed());
+    tx.reset();
+    assert_eq!(tx.committed_version(), -1);
+
+    // A commit that failed before anything was sent: a second commit is not maybe
+    // committed.
+    let tx = env.db.create_transaction();
+    tx.set(&[b'k'; 20_000], b"v");
+    assert_eq!(tx.commit().await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    let e = tx.commit().await.unwrap_err();
+    assert_eq!(
+        e.code(),
+        codes::KEY_TOO_LARGE,
+        "the deferred error comes first"
+    );
+}
+
+/// A read started during a commit is `used_during_commit`; it interrupts the commit, which
+/// may have been sent.
+#[tokio::test(start_paused = true)]
+async fn a_read_during_the_commit_is_used_during_commit() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    tx.set_read_version(5);
+    tx.set(b"k", b"v");
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let _unanswered = env.commit.next().await;
+    let e = tx.get(b"k").await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed());
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed());
+    assert_eq!(
+        tx.get_read_version().await.unwrap_err().code(),
+        codes::USED_DURING_COMMIT
+    );
+
+    // Before the request may have left (waiting for its read version), it is not.
+    let tx = env.db.create_transaction();
+    tx.set(b"k", b"v");
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let _unanswered = env.grv.next().await;
+    let e = tx.get_read_version().await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(!e.is_maybe_committed());
+    assert!(!done(handle).await.unwrap_err().is_maybe_committed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_resource_constrained_backoff_grows_to_30_seconds() {
+    let env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let mut cap = Duration::from_millis(10);
+    let mut longest = Duration::ZERO;
+    for i in 0..20 {
+        let waited = timed_on_error(&tx, codes::COMMIT_PROXY_MEMORY_LIMIT_EXCEEDED)
+            .await
+            .unwrap();
+        assert!(
+            waited <= cap + Duration::from_millis(1),
+            "retry {i}: {waited:?} > {cap:?}"
+        );
+        longest = longest.max(waited);
+        cap = (cap * 2).min(Duration::from_secs(30));
+    }
+    assert!(
+        longest > Duration::from_secs(1),
+        "past MAX_RETRY_DELAY: {longest:?}"
+    );
+    // The next ordinary error caps the backoff back at the max retry delay, after one more
+    // wait of up to the backoff reached.
+    timed_on_error(&tx, codes::NOT_COMMITTED).await.unwrap();
+    for _ in 0..5 {
+        let waited = timed_on_error(&tx, codes::NOT_COMMITTED).await.unwrap();
+        assert!(waited <= Duration::from_millis(1001), "{waited:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_system_key_boundaries() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let legality = |tx: &Transaction<MemRuntime>| {
+        let tx = tx.clone();
+        async move {
+            match tx.commit().await {
+                Err(e) if e.code() == codes::KEY_OUTSIDE_LEGAL_RANGE => Err(e),
+                _ => Ok(()),
+            }
+        }
+    };
+    // ReadSystemKeys: reads (and read conflict ranges) up to `\xff\xff`, writes below `\xff`.
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+    assert_eq!(
+        tx.get(b"\xff\xff").await.unwrap_err().code(),
+        codes::KEY_OUTSIDE_LEGAL_RANGE
+    );
+    let read = spawn({
+        let tx = tx.clone();
+        async move { tx.get(b"\xff\xfe").await }
+    });
+    let _unanswered = env.grv.next().await;
+    read.abort();
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+    tx.add_read_conflict_range(b"a", b"\xff\xff");
+    tx.set_read_version(1);
+    tx.set(b"k", b"v");
+    let committing = spawn(legality(&tx));
+    env.commit.next().await.reply_commit(committed(2, 0));
+    assert!(done(committing).await.is_ok());
+    for write in [
+        |tx: &Transaction<MemRuntime>| tx.set(b"\xff", b""),
+        |tx: &Transaction<MemRuntime>| tx.clear_range(b"a", b"\xff\x00"),
+        |tx: &Transaction<MemRuntime>| tx.add_write_conflict_range(b"a", b"\xff\x00"),
+    ] {
+        let tx = env.db.create_transaction();
+        tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        write(&tx);
+        assert!(legality(&tx).await.is_err());
+    }
+    // AccessSystemKeys: writes up to `\xff\xff` (a range may end there), not past it.
+    for (write, legal) in [
+        (
+            (|tx: &Transaction<MemRuntime>| tx.set(b"\xff\xfe", b"")) as fn(&_),
+            true,
+        ),
+        (
+            |tx: &Transaction<MemRuntime>| tx.clear_range(b"\xff", b"\xff\xff"),
+            true,
+        ),
+        (
+            |tx: &Transaction<MemRuntime>| tx.set(b"\xff\xff", b""),
+            false,
+        ),
+        (|tx: &Transaction<MemRuntime>| tx.clear(b"\xff\xff"), false),
+        (
+            |tx: &Transaction<MemRuntime>| tx.clear_range(b"\xff", b"\xff\xff\x00"),
+            false,
+        ),
+        (
+            |tx: &Transaction<MemRuntime>| tx.add_read_conflict_range(b"\xff", b"\xff\xff\x00"),
+            false,
+        ),
+    ] {
+        let tx = env.db.create_transaction();
+        tx.set_option(TransactionOption::AccessSystemKeys).unwrap();
+        tx.set_read_version(1);
+        write(&tx);
+        let committing = spawn(legality(&tx));
+        if legal {
+            env.commit.next().await.reply_commit(committed(3, 0));
+        }
+        assert_eq!(done(committing).await.is_ok(), legal);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_size_limit_is_not_persistent() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::SizeLimit(100)).unwrap();
+    tx.set_read_version(1);
+    tx.set(b"k", &[0; 200]);
+    let e = tx.commit().await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TOO_LARGE);
+    // TRANSACTION_TOO_LARGE is not retried; a conflict resets the options.
+    tx.reset();
+    tx.set_option(TransactionOption::SizeLimit(100)).unwrap();
+    tx.on_error(Error::new(codes::NOT_COMMITTED)).await.unwrap();
+    tx.set_read_version(1);
+    tx.set(b"k", &[0; 200]);
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    env.commit.next().await.reply_commit(committed(2, 0));
+    done(handle).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_deferred_error_comes_before_the_cancellation() {
+    let env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    tx.set(&[b'k'; 20_000], b"v");
+    tx.cancel();
+    assert_eq!(tx.get(b"k").await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    assert_eq!(
+        tx.get_read_version().await.unwrap_err().code(),
+        codes::KEY_TOO_LARGE
+    );
+}
+
+/// A handle of an earlier `run` attempt cannot reach the attempt in progress.
+#[tokio::test(start_paused = true)]
+async fn a_stale_run_handle_cannot_touch_the_next_attempt() {
+    let mut env = env(SchemaVersion::V7_4).await;
+    let stale = Arc::new(std::sync::Mutex::new(None::<Transaction<MemRuntime>>));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handle = spawn({
+        let db = env.db.clone();
+        let (stale, attempts) = (stale.clone(), attempts.clone());
+        async move {
+            db.run(|tx, _| {
+                let (stale, attempts) = (stale.clone(), attempts.clone());
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    tx.set_read_version(5);
+                    tx.set(b"k", b"v");
+                    match attempt {
+                        0 => *stale.lock().unwrap() = Some(tx),
+                        1 => {
+                            let old = stale.lock().unwrap().clone().unwrap();
+                            assert_eq!(
+                                old.get(b"x").await.unwrap_err().code(),
+                                codes::TRANSACTION_CANCELLED
+                            );
+                            assert!(old.set_option(TransactionOption::LockAware).is_err());
+                            old.cancel();
+                            old.reset();
+                            // Not cancelled or reset by the stale handle: this attempt goes
+                            // on, until the stale write.
+                            assert_eq!(tx.get_read_version().await.unwrap(), 5);
+                            old.set(b"leak", b"!");
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        }
+    });
+    env.commit
+        .next()
+        .await
+        .reply_commit(Err(codes::NOT_COMMITTED));
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_CANCELLED, "{e:?}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        env.commit.try_next().is_none(),
+        "the second attempt sent nothing"
     );
 }
