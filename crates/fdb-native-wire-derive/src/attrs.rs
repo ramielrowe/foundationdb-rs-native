@@ -12,6 +12,8 @@ pub(crate) struct ContainerAttrs {
     pub(crate) file_identifier: Option<(Span, Expr)>,
     /// `struct`: an inline struct rather than a table.
     pub(crate) inline_struct: Option<Span>,
+    /// `absent = "default"`, with the span of `absent`: `absent()` is `Default::default()`.
+    pub(crate) absent_default: Option<Span>,
 }
 
 /// What a field (or variant field) is on the wire.
@@ -48,6 +50,7 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
         krate: None,
         file_identifier: None,
         inline_struct: None,
+        absent_default: None,
     };
     for attr in attrs.iter().filter(|a| is_fdb(a)) {
         attr.parse_nested_meta(|meta| {
@@ -78,6 +81,23 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
                     return Err(duplicate(span, "struct"));
                 }
                 out.inline_struct = Some(span);
+            } else if meta.path.is_ident("absent") {
+                if out.absent_default.is_some() {
+                    return Err(duplicate(span, "absent"));
+                }
+                let value: LitStr = meta
+                    .value()?
+                    .parse()
+                    .map_err(|e| Error::new(e.span(), "expected `absent = \"default\"`"))?;
+                if value.value() != "default" {
+                    return Err(Error::new(
+                        value.span(),
+                        "the only supported value is `absent = \"default\"` (`absent()` is \
+                         `Default::default()`, which you implement to match the C++ default \
+                         constructor)",
+                    ));
+                }
+                out.absent_default = Some(span);
             } else if meta.path.is_ident("skip")
                 || meta.path.is_ident("arena")
                 || meta.path.is_ident("skip_slots")
@@ -85,8 +105,8 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
                 return Err(meta.error("this is a field attribute; put it on a field"));
             } else {
                 return Err(meta.error(
-                    "unknown fdb attribute; expected `file_identifier = N`, `struct` or \
-                     `crate = \"path\"`",
+                    "unknown fdb attribute; expected `file_identifier = N`, `struct`, \
+                     `absent = \"default\"` or `crate = \"path\"`",
                 ));
             }
             Ok(())
@@ -135,6 +155,7 @@ pub(crate) fn field(attrs: &[Attribute]) -> Result<FieldAttrs> {
                 FieldKind::SkipSlots(slots)
             } else if meta.path.is_ident("file_identifier")
                 || meta.path.is_ident("struct")
+                || meta.path.is_ident("absent")
                 || meta.path.is_ident("crate")
             {
                 return Err(meta.error("this is a container attribute; put it on the type"));

@@ -60,6 +60,8 @@ pub enum CdcConsumeRequest {}
 
 /// `CDCProxyInterface` (`serializer(ar, processId, consume, supportsOrderedStreams)`; its
 /// other streams are adjusted endpoints 1 to 9 of `consume`).
+///
+/// Absent: no constructor, `supportsOrderedStreams = false`: zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 6689609)]
 pub struct CdcProxyInterface<'a> {
@@ -74,6 +76,9 @@ pub struct CdcProxyInterface<'a> {
 /// `ClientDBInfo` on 8.0 (the flatbuffers branch: `serializer(ar, grvProxies, commitProxies,
 /// id, forward, history, clusterId, clusterType, nativeCdcEnabled, nativeCdcTagCount,
 /// cdcProxies, streamToCDCProxyId)`), the reply to [`OpenDatabaseCoordRequest`].
+///
+/// Absent: `ClientDBInfo() = default` with `clusterType = STANDALONE` (0), `nativeCdcEnabled =
+/// false`, `nativeCdcTagCount = 0`: zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 5355080)]
 pub struct ClientDBInfo<'a> {
@@ -144,8 +149,11 @@ impl<'a> From<&'a domain::ClientDbInfo> for ClientDBInfo<'a> {
 
 /// `GetReadVersionRequest` on 8.0 (`serializer(ar, transactionCount, flags, tags, debugID,
 /// reply, spanContext, maxVersion, maxGrvQueueDelayMS)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 838566)]
+///
+/// Absent: `GetReadVersionRequest() : transactionCount(1), flags(0), maxVersion(invalidVersion)`,
+/// so `transaction_count` is 1 and `max_version` -1. [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 838566, absent = "default")]
 pub struct GetReadVersionRequest<'a> {
     /// `transactionCount`.
     pub transaction_count: u32,
@@ -163,6 +171,22 @@ pub struct GetReadVersionRequest<'a> {
     pub max_version: i64,
     /// `maxGrvQueueDelayMS`.
     pub max_grv_queue_delay_ms: Option<i64>,
+}
+
+impl Default for GetReadVersionRequest<'_> {
+    /// `GetReadVersionRequest()`: one transaction, `maxVersion = invalidVersion`.
+    fn default() -> Self {
+        GetReadVersionRequest {
+            transaction_count: 1,
+            flags: 0,
+            tags: BTreeMap::new(),
+            debug_id: None,
+            reply: ReplyPromise::default(),
+            span_context: SpanContext::default(),
+            max_version: domain::INVALID_VERSION,
+            max_grv_queue_delay_ms: None,
+        }
+    }
 }
 
 impl<'a> GetReadVersionRequest<'a> {
@@ -198,8 +222,12 @@ impl From<GetReadVersionRequest<'_>> for domain::GetReadVersion {
 /// `GetReadVersionReply` on 8.0 (`serializer(ar, BasicLoadBalancedReply::processBusyTime,
 /// version, locked, metadataVersion, tagThrottleInfo, midShardSize, rkDefaultThrottled,
 /// rkBatchThrottled, ssVersionVectorDelta, proxyId)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq)]
-#[fdb(file_identifier = 15709388)]
+///
+/// Absent: `GetReadVersionReply() : version(invalidVersion), locked(false)`, so `version` is
+/// -1 (and `ss_version_vector_delta.max_version`, a `VersionVector()`, is -1 too).
+/// [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq)]
+#[fdb(file_identifier = 15709388, absent = "default")]
 pub struct GetReadVersionReply<'a> {
     /// `processBusyTime`.
     pub process_busy_time: i32,
@@ -221,6 +249,24 @@ pub struct GetReadVersionReply<'a> {
     pub ss_version_vector_delta: VersionVector,
     /// `proxyId`.
     pub proxy_id: Uid,
+}
+
+impl Default for GetReadVersionReply<'_> {
+    /// `GetReadVersionReply()`: `version = invalidVersion`.
+    fn default() -> Self {
+        GetReadVersionReply {
+            process_busy_time: 0,
+            version: domain::INVALID_VERSION,
+            locked: false,
+            metadata_version: None,
+            tag_throttle_info: BTreeMap::new(),
+            mid_shard_size: 0,
+            rk_default_throttled: false,
+            rk_batch_throttled: false,
+            ss_version_vector_delta: VersionVector::default(),
+            proxy_id: Uid::default(),
+        }
+    }
 }
 
 impl<'a> GetReadVersionReply<'a> {
@@ -273,8 +319,11 @@ impl<'a> GetReadVersionReply<'a> {
 
 /// `GetKeyServerLocationsRequest` on 8.0 (`serializer(ar, begin, end, limit, reverse, reply,
 /// spanContext, legacyVersion, arena)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 9144680)]
+///
+/// Absent: `GetKeyServerLocationsRequest() : limit(0), reverse(false),
+/// legacyVersion(latestVersion)`, so `legacy_version` is -2. [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 9144680, absent = "default")]
 pub struct GetKeyServerLocationsRequest<'a> {
     /// `begin`.
     pub begin: &'a [u8],
@@ -293,6 +342,22 @@ pub struct GetKeyServerLocationsRequest<'a> {
     /// `arena`.
     #[fdb(arena)]
     pub arena: (),
+}
+
+impl Default for GetKeyServerLocationsRequest<'_> {
+    /// `GetKeyServerLocationsRequest()`: `legacyVersion = latestVersion` (-2).
+    fn default() -> Self {
+        GetKeyServerLocationsRequest {
+            begin: b"",
+            end: None,
+            limit: 0,
+            reverse: false,
+            reply: ReplyPromise::default(),
+            span_context: SpanContext::default(),
+            legacy_version: domain::LATEST_VERSION,
+            arena: (),
+        }
+    }
 }
 
 impl<'a> GetKeyServerLocationsRequest<'a> {
@@ -329,7 +394,11 @@ impl From<GetKeyServerLocationsRequest<'_>> for domain::GetKeyServerLocations {
 
 /// `ReadOptions` on 8.0 (`serializer(ar, type, cacheResult, debugID,
 /// consistencyCheckStartVersion, lockAware)`); `type` is a `uint32_t` enum.
-#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Absent: `ReadOptions()` (every constructor argument defaulted): `read_type` is `NORMAL` (3)
+/// and `cache_result` `true`. [`Default`] is that too.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+#[fdb(absent = "default")]
 pub struct ReadOptions {
     /// `type` (`ReadType`).
     pub read_type: u32,
@@ -341,6 +410,19 @@ pub struct ReadOptions {
     pub consistency_check_start_version: Option<i64>,
     /// `lockAware`.
     pub lock_aware: bool,
+}
+
+impl Default for ReadOptions {
+    /// `ReadOptions()`: `ReadType::NORMAL`, `CacheResult::True`.
+    fn default() -> Self {
+        ReadOptions {
+            read_type: domain::ReadOptions::NORMAL,
+            cache_result: true,
+            debug_id: None,
+            consistency_check_start_version: None,
+            lock_aware: false,
+        }
+    }
 }
 
 impl From<&domain::ReadOptions> for ReadOptions {
@@ -369,6 +451,10 @@ impl From<ReadOptions> for domain::ReadOptions {
 
 /// `GetValueRequest` on 8.0 (`serializer(ar, key, version, tags, reply, spanContext,
 /// options, ssLatestCommitVersions)`).
+///
+/// Absent: `GetValueRequest() = default`: zero except
+/// `ss_latest_commit_versions.max_version`, which is -1 (`VersionVector()`, `VersionVector.h`,
+/// via `VersionVector::absent()`).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8454530)]
 pub struct GetValueRequest<'a> {
@@ -421,6 +507,8 @@ impl From<GetValueRequest<'_>> for domain::GetValue {
 
 /// `CommitTransactionRequest` on 8.0 (`serializer(ar, transaction, reply, flags, debugID,
 /// commitCostEstimation, tagSet, spanContext, idempotencyId, arena)`).
+///
+/// Absent: `CommitTransactionRequest() : flags(0)`: zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 93948)]
 pub struct CommitTransactionRequest<'a> {

@@ -519,6 +519,11 @@ pub struct ReadOptions {
     pub lock_aware: bool,
 }
 
+impl ReadOptions {
+    /// `ReadType::NORMAL`, the type of a default-constructed `ReadOptions()`.
+    pub const NORMAL: u32 = 3;
+}
+
 /// `GetValueRequest`, sent to a storage server's `getValue`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetValue {

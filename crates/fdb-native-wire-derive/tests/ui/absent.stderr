@@ -1,0 +1,29 @@
+error: `absent = "default"` applies to tables and `#[fdb(struct)]`s; a union's absent value is its first alternative's (C++ `std::variant{}` default-constructs it), so put `absent = "default"` on that alternative
+ --> tests/ui/absent.rs:5:7
+  |
+5 | #[fdb(absent = "default")]
+  |       ^^^^^^
+
+error: the only supported value is `absent = "default"` (`absent()` is `Default::default()`, which you implement to match the C++ default constructor)
+  --> tests/ui/absent.rs:13:16
+   |
+13 | #[fdb(absent = "zero")]
+   |                ^^^^^^
+
+error: expected `absent = "default"`
+  --> tests/ui/absent.rs:20:16
+   |
+20 | #[fdb(absent = default)]
+   |                ^^^^^^^
+
+error: this is a container attribute; put it on the type
+  --> tests/ui/absent.rs:28:11
+   |
+28 |     #[fdb(absent = "default")]
+   |           ^^^^^^
+
+error: duplicate `absent` attribute
+  --> tests/ui/absent.rs:33:27
+   |
+33 | #[fdb(absent = "default", absent = "default")]
+   |                           ^^^^^^

@@ -151,6 +151,13 @@ pub trait Encode: Wire {
 pub trait Decode<'de>: Wire + Sized {
     /// The value of a field whose slot is absent: what C++ default-constructs (0, false,
     /// empty, an absent `Optional`, a table of absent fields, ...).
+    ///
+    /// For a table this is the C++ *constructor's* result, including its non-zero member
+    /// initializers (`LoadBalancedReply`'s `penalty = 1.0`, `NetworkAddress`'s
+    /// `FLAG_PRIVATE`): C++'s `LoadMember` assigns `T{}` to a table-typed member whose slot
+    /// is absent. It is not what a *present* table reads for a scalar slot its vtable does
+    /// not reach (that is 0, the scalar's own `absent()`). A derived type gets it from
+    /// `#[fdb(absent = "default")]` and a hand-written `Default`; see the derive's docs.
     fn absent() -> Self;
 
     /// Parses an inline value from exactly `size` bytes of its [`Shape::Inline`].

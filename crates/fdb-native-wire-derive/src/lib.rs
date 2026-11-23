@@ -152,6 +152,7 @@ use proc_macro::TokenStream;
 /// | --- | --- |
 /// | `#[fdb(file_identifier = N)]` | tables only (a C++ `std::variant` or `std::tuple` has none). Implements `FileIdentified` with `FileIdentifier::new(N)`. `N` is an integer literal or a constant expression below 2^24 (larger fails to compile). Wrappers compose it automatically: `ErrorOr<EnsureTable<T>>`, `Option<T>`, `Vec<T>`, ... |
 /// | `#[fdb(struct)]` | an inline struct (`std::tuple`) instead of a table. Structs only. |
+/// | `#[fdb(absent = "default")]` | tables and `#[fdb(struct)]`s. `Decode::absent()` is `<Self as Default>::default()` instead of every field's own absent value. Write the `Default` impl to match the C++ default constructor; see [Absent tables](#absent-tables-and-c-default-constructors). A union takes it on its first alternative. |
 /// | `#[fdb(crate = "path")]` | the path of the wire crate in the generated code (default `::fdb_native_wire`); for code that renames the crate or re-exports it. |
 ///
 /// ```compile_fail,E0080
@@ -216,6 +217,58 @@ use proc_macro::TokenStream;
 /// assert_eq!(fdb_native_wire::decode::<GetThing>(&bytes)?, request);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// # Absent tables and C++ default constructors
+///
+/// FDB's reader default-constructs a table-typed member whose slot is absent
+/// (`member = std::decay_t<decltype(member)>{}` in `LoadMember`, `flow/flat_buffers.h`), so
+/// the type's C++ constructor and member initializers apply: `LoadBalancedReply` has
+/// `penalty = 1.0`, `TenantInfo()` has `tenantId = -1`, `NetworkAddress()` has
+/// `FLAG_PRIVATE`. A derived `absent()` is field-wise, every field's own absent value,
+/// which is zero for numbers. For a type whose C++ default is not that, give the type a
+/// `Default` impl that matches the C++ constructor and add `#[fdb(absent = "default")]`:
+/// `absent()` is then `Default::default()`.
+///
+/// This changes only what an *absent table* reads as. A table that is present but whose
+/// vtable does not reach a scalar slot (a shorter table from an older writer) still reads
+/// zero for that field, because `LoadMember` assigns `T{}` of the *scalar* there, not the
+/// member initializer. The derived `decode_object` of the table itself is unchanged; only
+/// the `absent()` that a containing table (or a vector of unions, or a union tag past the
+/// last alternative) uses for the type differs.
+///
+/// ```
+/// use fdb_native_wire::{Decode, Wire};
+///
+/// // struct LoadBalancedReply { double penalty; Optional<Error> error;
+/// //     LoadBalancedReply() : penalty(1.0) {}  serializer(ar, penalty, error, value) };
+/// #[derive(Wire, Debug, PartialEq)]
+/// #[fdb(file_identifier = 0x000fdb44, absent = "default")]
+/// struct Reply {
+///     penalty: f64,
+///     error: Option<u16>,
+///     value: u32,
+/// }
+///
+/// impl Default for Reply {
+///     fn default() -> Self {
+///         Reply { penalty: 1.0, error: None, value: 0 }
+///     }
+/// }
+///
+/// // The table that holds one: with the slot absent, C++ reads `Reply()`.
+/// #[derive(Wire, Debug, PartialEq)]
+/// struct Holder {
+///     reply: Reply,
+/// }
+/// assert_eq!(Holder::absent(), Holder { reply: Reply { penalty: 1.0, error: None, value: 0 } });
+///
+/// // Without the attribute it would be all zeros: `penalty: 0.0`.
+/// ```
+///
+/// A union (`std::variant{}` default-constructs its first alternative) needs no attribute
+/// of its own: its `absent()` is the first alternative's, which follows that type's
+/// attribute. The attribute on a union is a compile error. A type that cannot be derived
+/// (a codec) writes `absent()` by hand.
 ///
 /// # Protocol versions
 ///
@@ -292,6 +345,9 @@ use proc_macro::TokenStream;
 /// }
 /// const _: FileIdentifier = FileIdentifier::new(1039114);
 /// ```
+///
+/// With `#[fdb(absent = "default")]`, `absent()` is `<Self as Default>::default()` and the
+/// rest is the same.
 ///
 /// Types the derive does not cover (blob codecs, types whose file identifier composes
 /// another type's like `ReplyPromise<T>`) implement the traits by hand; the wire crate's
