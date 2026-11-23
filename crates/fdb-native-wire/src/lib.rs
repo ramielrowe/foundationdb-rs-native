@@ -147,6 +147,7 @@
 #![warn(missing_docs)]
 
 mod codec;
+pub mod codecs;
 mod error;
 mod file_identifier;
 mod protocol_version;
@@ -156,6 +157,11 @@ mod types;
 mod writer;
 
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
+pub use codecs::{
+    INVALID_VERSION, IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId, KeyValue, KeyValueIter,
+    KeyValueRef, KeyValueVector, KeyValueVectorBuf, TAG_LOCALITY_INVALID, Tag, TagSet, Version,
+    VersionVector,
+};
 pub use error::{DecodeError, EncodeError, StrictCheck};
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
