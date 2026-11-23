@@ -226,6 +226,17 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// The container came back with another bridge IP after a stop or restart, so the cluster
+    /// file and every address derived from it are stale.
+    #[error("container {container} came back at {after} instead of {before}")]
+    AddressChanged {
+        /// The container ID.
+        container: String,
+        /// The address before.
+        before: IpAddr,
+        /// The address after.
+        after: IpAddr,
+    },
 }
 
 /// Result alias for this crate.
@@ -748,6 +759,76 @@ impl FdbContainer {
     /// The image the container was started from.
     pub fn image(&self) -> &str {
         &self.image
+    }
+
+    /// Restarts the container (`docker restart` by exact ID, with a 1 s grace period): the
+    /// server process dies, every TCP connection to it is reset, and the call returns once the
+    /// database is available again at the same address. Blocking.
+    ///
+    /// The data directory is a volume, so an in-memory database recovers its data. Fails with
+    /// [`Error::AddressChanged`] if Docker gave the container another IP address (the handle's
+    /// [`address`](Self::address) and cluster file would then be stale; nothing here rewrites
+    /// them).
+    pub fn restart(&self) -> Result<()> {
+        docker(&["restart", "-t", "1", &self.guard.id], DOCKER_TIMEOUT)?;
+        self.wait_back()
+    }
+
+    /// Stops the container (`docker stop` by exact ID, with a 1 s grace period) and leaves it
+    /// stopped: connecting to [`address`](Self::address) then fails (no route to host, or a
+    /// timeout) until [`start_stopped`](Self::start_stopped). Blocking.
+    pub fn stop(&self) -> Result<()> {
+        docker(&["stop", "-t", "1", &self.guard.id], DOCKER_TIMEOUT).map(drop)
+    }
+
+    /// Starts a container stopped with [`stop`](Self::stop) (`docker start` by exact ID) and
+    /// returns once the database is available again at the same address, as for
+    /// [`restart`](Self::restart). Blocking.
+    pub fn start_stopped(&self) -> Result<()> {
+        docker(&["start", &self.guard.id], DOCKER_TIMEOUT)?;
+        self.wait_back()
+    }
+
+    /// Freezes every process in the container (`docker pause` by exact ID, the cgroup
+    /// freezer): the server stops answering but its sockets stay open, so a client sees a
+    /// stalled peer (no replies, no pings) instead of a closed one. Undo with
+    /// [`unpause`](Self::unpause). Blocking.
+    pub fn pause(&self) -> Result<()> {
+        docker(&["pause", &self.guard.id], DOCKER_TIMEOUT).map(drop)
+    }
+
+    /// Thaws a container frozen with [`pause`](Self::pause) (`docker unpause` by exact ID).
+    /// Blocking.
+    pub fn unpause(&self) -> Result<()> {
+        docker(&["unpause", &self.guard.id], DOCKER_TIMEOUT).map(drop)
+    }
+
+    /// Waits until a started container serves the database at its recorded address again.
+    fn wait_back(&self) -> Result<()> {
+        let ip_out = docker(
+            &["inspect", "-f", INSPECT_IP_TEMPLATE, &self.guard.id],
+            DOCKER_TIMEOUT,
+        )?;
+        let after = parse_inspect_ip(&ip_out).ok_or_else(|| {
+            Error::Parse(format!(
+                "no container IP address in inspect output {ip_out:?}"
+            ))
+        })?;
+        if after != self.address.ip() {
+            return Err(Error::AddressChanged {
+                container: self.guard.id.clone(),
+                before: self.address.ip(),
+                after,
+            });
+        }
+        wait_ready(
+            &self.guard.id,
+            self.address,
+            &self.cluster_string,
+            DEFAULT_STARTUP_TIMEOUT,
+            Instant::now() + DEFAULT_STARTUP_TIMEOUT,
+        )
+        .map(drop)
     }
 
     /// Runs `fdbcli --exec <command>` inside the container and returns its stdout.

@@ -11,6 +11,12 @@ fail-fast = true
 filter = 'binary(docker) | test(/(^|::)docker_/)'
 test-group = 'docker'
 
+# Tests that stop or restart their container run alone: Docker hands a stopped container's bridge
+# IP to the next container that starts, and the cluster file (and the test) would then be stale.
+[[profile.default.overrides]]
+filter = 'binary(integration_docker) & test(/docker_(server_restart|vanished_server)/)'
+threads-required = "num-test-threads"
+
 [profile.ci]
 fail-fast = false
 retries = 0
@@ -18,6 +24,10 @@ retries = 0
 [[profile.ci.overrides]]
 filter = 'binary(docker) | test(/(^|::)docker_/)'
 test-group = 'docker'
+
+[[profile.ci.overrides]]
+filter = 'binary(integration_docker) & test(/docker_(server_restart|vanished_server)/)'
+threads-required = "num-test-threads"
 
 [profile.ci.junit]
 path = "junit.xml"
