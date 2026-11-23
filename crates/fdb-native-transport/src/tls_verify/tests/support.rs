@@ -124,3 +124,56 @@ impl Pki {
         }
     }
 }
+
+impl Ca {
+    /// A self-signed certificate from arbitrary parameters.
+    pub(super) fn self_signed(params: CertificateParams) -> Ca {
+        let key = new_key();
+        let cert = params.self_signed(&key).unwrap();
+        Ca { params, key, cert }
+    }
+}
+
+/// Decodes the certificates of a PEM file.
+pub(super) fn pem_certs(pem: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    let mut out = Vec::new();
+    let mut b64 = String::new();
+    let mut inside = false;
+    for line in pem.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE") {
+            inside = true;
+            b64.clear();
+        } else if line.starts_with("-----END CERTIFICATE") {
+            inside = false;
+            out.push(rustls::pki_types::CertificateDer::from(base64(&b64)));
+        } else if inside {
+            b64.push_str(line.trim());
+        }
+    }
+    out
+}
+
+fn base64(s: &str) -> Vec<u8> {
+    let value = |c: u8| -> u32 {
+        match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("bad base64"),
+        }
+    };
+    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=').collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let mut v = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            v |= value(c) << (18 - 6 * i);
+        }
+        for i in 0..chunk.len() * 6 / 8 {
+            out.push((v >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}

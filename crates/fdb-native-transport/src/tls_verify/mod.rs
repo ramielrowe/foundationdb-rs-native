@@ -103,13 +103,24 @@
 //!   port splits correctly there.
 //! * **Rule parse positions.** FDB only reports `tls_error`; [`ParseError`] adds a kind and
 //!   offset.
-//! * **Chain validation** is webpki's rather than OpenSSL's: roughly the same (trust anchors,
-//!   intermediates, validity, `basicConstraints`, `serverAuth` usage), but webpki is stricter
-//!   about malformed certificates and does not support some legacy algorithms or v1 CA
-//!   certificates. A peer that is itself a configured, self-signed, in-date root is accepted
-//!   as OpenSSL does (webpki alone would reject a `CA:TRUE` certificate as an end entity).
-//!   Revocation is not checked, as in FDB.
-//! * [`VerifyPeersVerifier::check_valid_zero_skips_chain_validation`] is an opt-in extension.
+//! * **Chain validation** is webpki's, shaped to follow OpenSSL's use of its trust store
+//!   (see [`VerifyPeersVerifier`]): only a *self-signed*, CA-capable certificate of the CA file
+//!   is a trust anchor and its validity period is checked; the other CA-file certificates
+//!   (intermediates) only complete chains; `R.` criteria see the self-signed root. The peer's
+//!   certificate must also be valid for TLS server use (`keyUsage` and `extendedKeyUsage`, as
+//!   OpenSSL's `ssl_server` purpose). A peer that is itself a configured, self-signed,
+//!   in-date root is accepted as OpenSSL does (webpki alone would reject a `CA:TRUE`
+//!   certificate as an end entity). Revocation is not checked, as in FDB.
+//! * **Certificates webpki is stricter about** than OpenSSL are refused, with errors that say
+//!   what to change ([`CertificateRejected`]): an end-entity certificate with `CA:TRUE`
+//!   issued by another CA, and X.509 version 1 end-entity or intermediate certificates (a
+//!   self-signed v1 root in the CA file is fine). Also unsupported by the underlying
+//!   libraries: RSA keys under 2048 bits, SHA-1 signatures, DSA, Ed448, and (with the `ring`
+//!   provider) P-521.
+//! * **Name matching of malformed certificates.** A subjectAltName with any undecodable name
+//!   is treated as absent (OpenSSL fails to decode the extension), and a name attribute whose
+//!   value is not a universal primitive string never matches.
+//! * There is no option to skip chain validation for `Check.Valid=0`: FDB does not skip it.
 //!
 //! # Differences between 7.4 and 8.0
 //!
@@ -124,6 +135,7 @@
 mod cert;
 mod eval;
 mod rules;
+mod selfsig;
 mod verifier;
 
 pub use cert::{AltName, AsnString, CertParseError, NameEntry, PeerCert};
@@ -131,7 +143,7 @@ pub use eval::{AcceptReason, RuleFailure, Verdict};
 pub use rules::{
     Criterion, Field, Location, MatchType, ParseError, ParseErrorKind, Rule, Scope, VerifyPeers,
 };
-pub use verifier::{PeerRejected, RootError, VerifyPeersVerifier};
+pub use verifier::{CertificateRejected, PeerRejected, RootError, VerifyPeersVerifier};
 
 #[cfg(test)]
 mod tests;

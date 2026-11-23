@@ -128,15 +128,143 @@ fn chain_must_reach_a_configured_root() {
         ),
         "{err:?}"
     );
-    // No roots at all.
-    let v = verifier("Check.Valid=1", &[]);
-    assert!(verify(&v, &pki.leaf, &[&pki.intermediate.cert]).is_err());
-    // An intermediate configured as the root also works: a trust anchor can be any CA.
-    let v = verifier("Check.Valid=1", &[&pki.intermediate.cert]);
-    verify(&v, &pki.leaf, &[]).unwrap();
     // Several roots, one of them right.
     let v = verifier("R.CN=Test Root", &[&other.root, &pki.root]);
     verify(&v, &pki.leaf, &[&pki.intermediate.cert]).unwrap();
+}
+
+/// A CA file with no self-signed certificate has nothing to anchor a chain: an intermediate
+/// alone is not a trust anchor (OpenSSL: "unable to get issuer certificate"), and an empty
+/// file is no better.
+#[test]
+fn ca_files_without_a_self_signed_root_are_refused() {
+    let pki = Pki::new();
+    let err = VerifyPeersVerifier::new(
+        VerifyPeers::default(),
+        [der(&pki.intermediate.cert)],
+        &provider(),
+    )
+    .unwrap_err();
+    assert_eq!(err, RootError::NoAnchors { provided: 1 });
+    assert!(err.to_string().contains("include the root"), "{err}");
+    let err = VerifyPeersVerifier::new(VerifyPeers::default(), [], &provider()).unwrap_err();
+    assert_eq!(err, RootError::NoAnchors { provided: 0 });
+    // A leaf alone likewise.
+    assert!(
+        VerifyPeersVerifier::new(VerifyPeers::default(), [der(&pki.leaf)], &provider()).is_err()
+    );
+    // A certificate that claims to be self-signed (subject == issuer) but is signed by
+    // another key is not one.
+    let params = ca_params(&[("CN", "liar")]);
+    let forged = params
+        .signed_by(&new_key(), &rcgen::Issuer::from_params(&params, new_key()))
+        .unwrap();
+    assert!(
+        PeerCert::from_der(forged.der()).unwrap().is_self_signed(),
+        "same subject and issuer names"
+    );
+    let err =
+        VerifyPeersVerifier::new(VerifyPeers::default(), [der(&forged)], &provider()).unwrap_err();
+    assert_eq!(err, RootError::NoAnchors { provided: 1 });
+}
+
+/// The probe cases of the review, against what `openssl verify -purpose sslserver` does.
+#[test]
+fn anchors_follow_openssl() {
+    let pki = Pki::new();
+
+    // An expired root is not trusted, even though the leaf is in date.
+    let mut p = ca_params(&[("CN", "Expired Root")]);
+    p.not_before = date_time_ymd(2000, 1, 1);
+    p.not_after = date_time_ymd(2001, 1, 1);
+    let old_root = Ca::self_signed(p);
+    let (leaf, _) = old_root.issue(params(&[("CN", "under-old-root")], &[]));
+    let v = verifier("Check.Valid=1", &[&old_root.cert]);
+    let err = verify(&v, &leaf, &[]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidCertificate(CertificateError::ExpiredContext { .. })
+        ),
+        "{err:?}"
+    );
+    // The same for a root that is not valid yet.
+    let mut p = ca_params(&[("CN", "Future Root")]);
+    p.not_before = date_time_ymd(3000, 1, 1);
+    let future_root = Ca::self_signed(p);
+    let (leaf, _) = future_root.issue(params(&[("CN", "under-future-root")], &[]));
+    let v = verifier("Check.Valid=1", &[&future_root.cert]);
+    assert!(matches!(
+        verify(&v, &leaf, &[]).unwrap_err(),
+        Error::InvalidCertificate(CertificateError::NotValidYetContext { .. })
+    ));
+    // An expired root does not hide a valid one with the same name and key.
+    let good = Ca::root(&[("CN", "Dup Root")]);
+    let mut p = good.params.clone();
+    p.not_after = date_time_ymd(2001, 1, 1);
+    p.not_before = date_time_ymd(2000, 1, 1);
+    let stale = p.self_signed(&good.key).unwrap();
+    let (leaf, _) = good.issue(params(&[("CN", "dup")], &[]));
+    let v = verifier("Check.Valid=1", &[&stale, &good.cert]);
+    verify(&v, &leaf, &[]).unwrap();
+
+    // A CA:FALSE self-signed certificate does not issue anything...
+    let mut p = params(&[("CN", "NoCaRoot")], &[]);
+    p.is_ca = IsCa::ExplicitNoCa;
+    let no_ca = Ca::self_signed(p);
+    let (leaf, _) = no_ca.issue(params(&[("CN", "under-nocaroot")], &[]));
+    let v = verifier("Check.Valid=1", &[&no_ca.cert]);
+    let err = verify(&v, &leaf, &[]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ),
+        "{err:?}"
+    );
+    // ...nor does a CA whose keyUsage lacks keyCertSign.
+    let mut p = ca_params(&[("CN", "SignsNothing")]);
+    p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    let no_sign = Ca::self_signed(p);
+    let (leaf, _) = no_sign.issue(params(&[("CN", "under-nosign")], &[]));
+    let v = verifier("Check.Valid=1", &[&no_sign.cert]);
+    assert!(verify(&v, &leaf, &[]).is_err());
+
+    // A node certificate in the CA file does not become an anchor: it cannot vouch for a
+    // certificate it signed.
+    let (node, node_key) = pki.intermediate.issue(params(&[("CN", "a-node")], &[]));
+    let node_ca = Ca {
+        params: params(&[("CN", "a-node")], &[]),
+        key: node_key,
+        cert: node.clone(),
+    };
+    let child_key = new_key();
+    let child = node_ca.sign(&params(&[("CN", "child-of-node")], &[]), &child_key);
+    let v = verifier("Check.Valid=1", &[&pki.root, &node]);
+    assert!(verify(&v, &child, &[&node]).is_err());
+    // ...although the node itself is fine, via the chain to the root, wherever its
+    // intermediate comes from.
+    verify(&v, &node, &[&pki.intermediate.cert]).unwrap();
+
+    // A Root+Intermediate bundle: the intermediate completes the chain, so the peer need not
+    // send it, and R.* is the self-signed root, not the intermediate.
+    for bundle in [
+        [&pki.root, &pki.intermediate.cert],
+        [&pki.intermediate.cert, &pki.root],
+    ] {
+        let v = verifier("R.CN=Test Root", &bundle);
+        verify(&v, &pki.leaf, &[]).unwrap();
+        let v = verifier("R.CN=Test Intermediate", &bundle);
+        let err = verify(&v, &pki.leaf, &[]).unwrap_err();
+        assert!(
+            peer_rejected(&err).failures[0].reason.contains(
+                "RootCert.Subject.Name.NameMismatch[Name=C = US, O = Root Org, CN = Test Root]"
+            ),
+            "{err:?}"
+        );
+        let v = verifier("R.CN=Test Root,I.CN=Test Intermediate,S.CN=node-1", &bundle);
+        verify(&v, &pki.leaf, &[&pki.intermediate.cert]).unwrap();
+    }
 }
 
 #[test]
@@ -176,8 +304,7 @@ fn expired_and_not_yet_valid_are_rejected() {
     verify(&v, &pki.leaf, &[&pki.intermediate.cert]).unwrap();
 
     // An expired intermediate fails the chain too.
-    let old_ca = pki.root_ca.intermediate(&[("CN", "Old CA")]);
-    let mut p = ca_params(&[("CN", "Old CA 2")]);
+    let mut p = ca_params(&[("CN", "Old Intermediate")]);
     p.not_before = date_time_ymd(2000, 1, 1);
     p.not_after = date_time_ymd(2001, 1, 1);
     let key = new_key();
@@ -190,7 +317,6 @@ fn expired_and_not_yet_valid_are_rejected() {
     let (leaf, _) = old.issue(params(&[("CN", "under-old")], &[]));
     let v = verifier("Check.Valid=1", &[&pki.root]);
     assert!(verify(&v, &leaf, &[&old.cert]).is_err());
-    drop(old_ca);
 }
 
 #[test]
@@ -213,13 +339,193 @@ fn wrong_extended_key_usage_is_rejected() {
     );
 }
 
+/// The peer certificate is a CA certificate issued by another CA, such as the intermediate
+/// itself or an `openssl req -x509 -CA ...` certificate with CA:TRUE. OpenSSL accepts these;
+/// webpki refuses a CA certificate as an end entity, and the error says how to fix it.
 #[test]
-fn a_ca_certificate_cannot_be_the_peer_unless_it_is_a_root() {
+fn a_ca_certificate_issued_by_a_ca_is_refused_with_advice() {
     let pki = Pki::new();
     let v = verifier("Check.Valid=1", &[&pki.root]);
-    // The intermediate as the peer certificate, signed by the root: webpki rejects a CA used
-    // as an end entity.
-    assert!(verify(&v, &pki.intermediate.cert, &[]).is_err());
+    // The intermediate itself as the peer certificate.
+    let err = verify(&v, &pki.intermediate.cert, &[]).unwrap_err();
+    assert_eq!(rejected_cert(&err), &CertificateRejected::CaUsedAsEndEntity);
+    // A CA:TRUE certificate with TLS key usages (the shape `openssl req -x509 -CA` makes).
+    let mut p = params(&[("CN", "ca-true-leaf")], &["x.example.com"]);
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    p.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+        rcgen::KeyUsagePurpose::KeyCertSign,
+    ];
+    let key = new_key();
+    let cert = pki.intermediate.sign(&p, &key);
+    let err = verify(&v, &cert, &[&pki.intermediate.cert]).unwrap_err();
+    assert_eq!(rejected_cert(&err), &CertificateRejected::CaUsedAsEndEntity);
+    let text = CertificateRejected::CaUsedAsEndEntity.to_string();
+    assert!(
+        text.contains("CA:FALSE") && text.contains("Reissue"),
+        "{text}"
+    );
+    // Only a self-signed certificate that is in the CA file is exempt.
+    let v = verifier("Check.Valid=1", &[&pki.root, &cert]);
+    assert!(verify(&v, &cert, &[&pki.intermediate.cert]).is_err());
+}
+
+/// What `openssl verify -purpose sslserver` says about OpenSSL-generated certificates.
+mod openssl_fixtures {
+    use super::*;
+
+    fn pem(text: &str) -> CertificateDer<'static> {
+        pem_certs(text).remove(0)
+    }
+
+    fn root() -> CertificateDer<'static> {
+        pem(include_str!("fixtures/openssl_root.pem"))
+    }
+
+    /// A time inside every fixture's validity, an hour after they were made.
+    fn now() -> UnixTime {
+        let cert =
+            PeerCert::from_der(pem(include_str!("fixtures/openssl_leaf_v1.pem")).as_ref()).unwrap();
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            u64::try_from(cert.not_before()).unwrap() + 3600,
+        ))
+    }
+
+    fn check(
+        spec: &str,
+        roots: Vec<CertificateDer<'static>>,
+        peer: &CertificateDer<'static>,
+    ) -> Result<(), Error> {
+        let v = VerifyPeersVerifier::new(VerifyPeers::parse(spec).unwrap(), roots, &provider())
+            .unwrap();
+        v.verify_server_cert(
+            peer,
+            &[],
+            &ServerName::try_from("x.invalid").unwrap(),
+            &[],
+            now(),
+        )
+        .map(|_| ())
+    }
+
+    /// OpenSSL 3 writes version 3 even for a certificate with no extensions, which is what
+    /// its `-extfile`-less signing produces; that is fine here too.
+    #[test]
+    fn a_certificate_without_extensions_is_accepted() {
+        check(
+            "S.CN=node-1,R.CN=Root",
+            vec![root()],
+            &pem(include_str!("fixtures/openssl_leaf_v1.pem")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_ca_true_leaf_issued_by_a_ca_is_refused_with_advice() {
+        let err = check(
+            "Check.Valid=1",
+            vec![root()],
+            &pem(include_str!("fixtures/openssl_leaf_isca.pem")),
+        )
+        .unwrap_err();
+        assert_eq!(rejected_cert(&err), &CertificateRejected::CaUsedAsEndEntity);
+    }
+
+    #[test]
+    fn a_key_cert_sign_only_leaf_is_not_a_server_certificate() {
+        let err = check(
+            "Check.Valid=1",
+            vec![root()],
+            &pem(include_str!("fixtures/openssl_leaf_kucertsign.pem")),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(rejected_cert(&err), CertificateRejected::Purpose(_)),
+            "{err:?}"
+        );
+    }
+
+    /// `openssl req -x509` (CA:TRUE, no key usage) as its own CA file, which FDB's own
+    /// tests rely on.
+    #[test]
+    fn req_x509_as_its_own_ca_file() {
+        let doc = pem(include_str!("fixtures/openssl_req_x509.pem"));
+        check("R.CN=doc,S.O=FDB,I.C=US", vec![doc.clone()], &doc).unwrap();
+        // Another CA file does not vouch for it.
+        assert!(check("Check.Valid=1", vec![root()], &doc).is_err());
+    }
+
+    /// A self-signed certificate in the CA file still has to be valid for a TLS server.
+    #[test]
+    fn self_signed_peers_need_a_server_purpose() {
+        // CA root with keyUsage keyCertSign,cRLSign only: no digitalSignature/keyEncipherment.
+        let r = root();
+        let err = check("Check.Valid=1", vec![r.clone()], &r).unwrap_err();
+        assert!(matches!(
+            rejected_cert(&err),
+            CertificateRejected::Purpose(_)
+        ));
+        // Extended key usage of clientAuth only.
+        let c = pem(include_str!("fixtures/openssl_ss_clientauth.pem"));
+        let err = check("Check.Valid=1", vec![c.clone()], &c).unwrap_err();
+        assert!(matches!(
+            rejected_cert(&err),
+            CertificateRejected::Purpose(_)
+        ));
+        // A self-signed certificate that is not a CA: digitalSignature is enough, and as
+        // OpenSSL does it is accepted as its own trust, though it cannot issue anything.
+        let n = pem(include_str!("fixtures/openssl_ss_digsig_only.pem"));
+        check("S.CN=ssnocs,R.CN=ssnocs", vec![n.clone()], &n).unwrap();
+        assert!(check("Check.Valid=1", vec![root()], &n).is_err());
+    }
+}
+
+fn rejected_cert(err: &Error) -> &CertificateRejected {
+    match err {
+        Error::InvalidCertificate(CertificateError::Other(OtherError(e))) => e
+            .downcast_ref::<CertificateRejected>()
+            .unwrap_or_else(|| panic!("not a CertificateRejected: {e}")),
+        other => panic!("expected a CertificateRejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn key_usage_must_allow_a_tls_server() {
+    let pki = Pki::new();
+    let v = verifier("Check.Valid=1", &[&pki.root]);
+    let sign = |usages: Vec<rcgen::KeyUsagePurpose>| {
+        let mut p = params(&[("CN", "ku")], &[]);
+        // rcgen writes extensions only if there is some other reason to.
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = usages;
+        let key = new_key();
+        pki.intermediate.sign(&p, &key)
+    };
+    use rcgen::KeyUsagePurpose as Ku;
+    let inter = [&pki.intermediate.cert];
+    for ok in [
+        vec![],
+        vec![Ku::DigitalSignature],
+        vec![Ku::KeyEncipherment],
+        vec![Ku::KeyAgreement],
+        vec![Ku::KeyCertSign, Ku::DigitalSignature],
+    ] {
+        verify(&v, &sign(ok.clone()), &inter).unwrap_or_else(|e| panic!("{ok:?}: {e:?}"));
+    }
+    for bad in [
+        vec![Ku::KeyCertSign],
+        vec![Ku::CrlSign],
+        vec![Ku::ContentCommitment],
+        vec![Ku::DataEncipherment],
+    ] {
+        let r = verify(&v, &sign(bad.clone()), &inter);
+        let err = r.unwrap_err();
+        assert!(
+            matches!(rejected_cert(&err), CertificateRejected::Purpose(_)),
+            "{bad:?}: {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -316,35 +622,14 @@ fn check_valid_zero_still_needs_a_valid_chain_as_in_fdb() {
     assert!(verify(&v, &selfsigned, &[]).is_err());
 }
 
-#[test]
-fn check_valid_zero_can_skip_chain_validation() {
-    let pki = Pki::new();
-    let key = new_key();
-    let selfsigned = params(&[("CN", "self")], &[]).self_signed(&key).unwrap();
-    let mut old = params(&[("CN", "old")], &[]);
-    old.not_after = date_time_ymd(2001, 1, 1);
-    let (expired, _) = pki.intermediate.issue(old);
-
-    let v = verifier("Check.Valid=0", &[&pki.root]).check_valid_zero_skips_chain_validation(true);
-    verify(&v, &selfsigned, &[]).unwrap();
-    verify(&v, &expired, &[]).unwrap();
-    verify(&v, &pki.leaf, &[]).unwrap();
-    // Any rule with Check.Valid=0 counts, as in FDB.
-    let v = verifier("S.CN=x|Check.Valid=0", &[&pki.root])
-        .check_valid_zero_skips_chain_validation(true);
-    verify(&v, &selfsigned, &[]).unwrap();
-    // Without the setting, or without Check.Valid=0, the chain is validated.
-    let v = verifier("Check.Valid=1", &[&pki.root]).check_valid_zero_skips_chain_validation(true);
-    assert!(verify(&v, &selfsigned, &[]).is_err());
-    let v = verifier("Check.Valid=0", &[&pki.root]).check_valid_zero_skips_chain_validation(false);
-    assert!(verify(&v, &selfsigned, &[]).is_err());
-}
-
 /// The way FDB's own single-certificate setups work (`openssl req -x509` and
 /// `--tls_ca_file` pointing at the same file): the peer's certificate is itself the root.
 #[test]
 fn self_signed_certificate_that_is_its_own_root() {
-    let ca = Ca::root(&[("CN", "networktest-smoke")]);
+    // CA:TRUE and no keyUsage, as `openssl req -x509` makes.
+    let mut p = params(&[("CN", "networktest-smoke")], &[]);
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = Ca::self_signed(p);
     let v = verifier("Root.CN=networktest-smoke", &[&ca.cert]);
     verify(&v, &ca.cert, &[]).unwrap();
     let v = verifier("Root.CN=dummy-ca", &[&ca.cert]);
@@ -363,12 +648,21 @@ fn self_signed_certificate_that_is_its_own_root() {
     let other = Ca::root(&[("CN", "other")]);
     let v = verifier("Check.Valid=1", &[&other.cert]);
     assert!(verify(&v, &ca.cert, &[]).is_err());
+    // With a keyUsage of keyCertSign only, as many CA tools make, it is not a server
+    // certificate: OpenSSL's ssl_server purpose refuses it.
+    let v = verifier("Check.Valid=1", &[&other.cert]);
+    let err = verify(&v, &other.cert, &[]).unwrap_err();
+    assert!(matches!(
+        rejected_cert(&err),
+        CertificateRejected::Purpose(_)
+    ));
     let v = verifier("Check.Valid=0", &[&other.cert]);
     assert!(verify(&v, &ca.cert, &[]).is_err());
 
     // Expired and not-yet-valid trusted self-signed certificates are still refused.
     for (nb, na) in [((2000, 1, 1), (2001, 1, 1)), ((3000, 1, 1), (3001, 1, 1))] {
-        let mut p = ca_params(&[("CN", "dated")]);
+        let mut p = params(&[("CN", "dated")], &[]);
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         p.not_before = date_time_ymd(nb.0, nb.1, nb.2);
         p.not_after = date_time_ymd(na.0, na.1, na.2);
         let key = new_key();
@@ -379,18 +673,19 @@ fn self_signed_certificate_that_is_its_own_root() {
             matches!(
                 err,
                 Error::InvalidCertificate(
-                    CertificateError::Expired | CertificateError::NotValidYet
+                    CertificateError::ExpiredContext { .. }
+                        | CertificateError::NotValidYetContext { .. }
                 )
             ),
             "{err:?}"
         );
     }
 
-    // A self-signed leaf that is not a CA, trusted directly.
+    // A self-signed leaf that is not a CA, trusted directly (it cannot issue anything).
     let key = new_key();
-    let leaf = params(&[("CN", "leaf-root")], &["x.example.com"])
-        .self_signed(&key)
-        .unwrap();
+    let mut p = params(&[("CN", "leaf-root")], &["x.example.com"]);
+    p.is_ca = IsCa::ExplicitNoCa;
+    let leaf = p.self_signed(&key).unwrap();
     let v = verifier(
         "R.CN=leaf-root,S.subjectAltName=DNS:x.example.com",
         &[&leaf],
@@ -406,7 +701,10 @@ fn invalid_roots_are_reported() {
         &provider(),
     )
     .unwrap_err();
-    assert_eq!(err.index, 0);
+    assert!(
+        matches!(err, RootError::Invalid { index: 0, .. }),
+        "{err:?}"
+    );
     let pki = Pki::new();
     let err = VerifyPeersVerifier::new(
         VerifyPeers::default(),
@@ -414,7 +712,10 @@ fn invalid_roots_are_reported() {
         &provider(),
     )
     .unwrap_err();
-    assert_eq!(err.index, 1);
+    assert!(
+        matches!(err, RootError::Invalid { index: 1, .. }),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("root certificate 1"), "{err}");
 }
 

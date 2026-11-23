@@ -1,11 +1,15 @@
 //! The certificate fields `verify_peers` rules look at, extracted from a DER certificate.
 
+use x509_parser::asn1_rs::Class;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::FromDer;
-use x509_parser::x509::X509Name;
+use x509_parser::x509::{X509Name, X509Version};
 
 use super::rules::{Field, MatchType};
+
+/// The [`AsnString::tag`] of a value that is not a universal, primitive ASN.1 type.
+pub(super) const NOT_A_STRING: u32 = u32::MAX;
 
 /// An ASN.1 string value as it appears in a certificate: its tag and raw content bytes.
 ///
@@ -132,6 +136,46 @@ pub enum AltName {
     Other,
 }
 
+/// An extension of a certificate, as far as policy checks care.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ext<T> {
+    Absent,
+    Present(T),
+    /// Present but unparseable, or duplicated.
+    Invalid,
+}
+
+/// The keyUsage bits TLS cares about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyUsageBits {
+    digital_signature: bool,
+    key_encipherment: bool,
+    key_agreement: bool,
+    key_cert_sign: bool,
+}
+
+/// What OpenSSL's `X509_check_purpose` looks at, extracted once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Profile {
+    v1: bool,
+    /// basicConstraints `cA`.
+    ca: Ext<bool>,
+    key_usage: Ext<KeyUsageBits>,
+    /// Whether the extendedKeyUsage allows a TLS server: it lists `serverAuth`,
+    /// `anyExtendedKeyUsage` or one of the legacy server-gated-crypto OIDs.
+    eku_allows_server: Ext<bool>,
+}
+
+impl Profile {
+    #[cfg(test)]
+    const ABSENT: Profile = Profile {
+        v1: false,
+        ca: Ext::Absent,
+        key_usage: Ext::Absent,
+        eku_allows_server: Ext::Absent,
+    };
+}
+
 /// The parts of a certificate that rules can examine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerCert {
@@ -144,6 +188,7 @@ pub struct PeerCert {
     not_before: i64,
     not_after: i64,
     self_signed: bool,
+    profile: Profile,
 }
 
 /// A certificate that could not be parsed.
@@ -163,14 +208,25 @@ impl PeerCert {
     }
 
     pub(super) fn from_x509(cert: &X509Certificate<'_>) -> PeerCert {
+        // An entry x509-parser cannot decode (a malformed or unknown general name) makes the
+        // whole extension unparseable, as OpenSSL's `X509_get_ext_d2i` would fail: the
+        // extension then counts as absent and every `subjectAltName` criterion fails.
         let alt_names = match cert.subject_alternative_name() {
-            Ok(Some(ext)) => Some(
-                ext.value
+            Ok(Some(ext))
+                if !ext
+                    .value
                     .general_names
                     .iter()
-                    .map(alt_name)
-                    .collect::<Vec<_>>(),
-            ),
+                    .any(|n| matches!(n, GeneralName::Invalid(..))) =>
+            {
+                Some(
+                    ext.value
+                        .general_names
+                        .iter()
+                        .map(alt_name)
+                        .collect::<Vec<_>>(),
+                )
+            }
             _ => None,
         };
         PeerCert {
@@ -182,6 +238,56 @@ impl PeerCert {
             not_before: cert.validity().not_before.timestamp(),
             not_after: cert.validity().not_after.timestamp(),
             self_signed: cert.subject().as_raw() == cert.issuer().as_raw(),
+            profile: profile(cert),
+        }
+    }
+
+    /// Whether OpenSSL's `check_ca` would call this a CA certificate: a keyUsage extension,
+    /// if present, must include `keyCertSign`; then `cA` from basicConstraints, or, without
+    /// basicConstraints, a self-signed v1 certificate or one whose keyUsage has `keyCertSign`.
+    pub(super) fn is_ca_capable(&self) -> bool {
+        let p = &self.profile;
+        match p.key_usage {
+            Ext::Invalid => return false,
+            Ext::Present(ku) if !ku.key_cert_sign => return false,
+            _ => {}
+        }
+        match p.ca {
+            Ext::Present(ca) => ca,
+            Ext::Invalid => false,
+            Ext::Absent => (p.v1 && self.self_signed) || matches!(p.key_usage, Ext::Present(_)),
+        }
+    }
+
+    /// Whether this certificate can be a trust anchor under OpenSSL's rules: self-signed (by
+    /// name) and [CA-capable](Self::is_ca_capable).
+    pub(super) fn can_be_anchor(&self) -> bool {
+        self.self_signed && self.is_ca_capable()
+    }
+
+    /// OpenSSL's `ssl_server` purpose for an end-entity certificate
+    /// (`check_purpose_ssl_server`): the extendedKeyUsage, if present, must allow a TLS
+    /// server, and the keyUsage, if present, must include `digitalSignature`,
+    /// `keyEncipherment` or `keyAgreement`. Returns what is wrong.
+    pub(super) fn tls_server_purpose_problem(&self) -> Option<&'static str> {
+        match self.profile.eku_allows_server {
+            Ext::Invalid => return Some("its extendedKeyUsage extension is malformed"),
+            Ext::Present(false) => {
+                return Some("its extendedKeyUsage does not include serverAuth");
+            }
+            _ => {}
+        }
+        match self.profile.key_usage {
+            Ext::Invalid => Some("its keyUsage extension is malformed"),
+            Ext::Present(ku)
+                if !(ku.digital_signature || ku.key_encipherment || ku.key_agreement) =>
+            {
+                Some(
+                    "its keyUsage allows none of digitalSignature, keyEncipherment and \
+                     keyAgreement, which a TLS server certificate needs",
+                )
+            }
+            _ => None,
         }
     }
 
@@ -215,6 +321,7 @@ impl PeerCert {
             not_before: 0,
             not_after: i64::MAX,
             self_signed: false,
+            profile: Profile::ABSENT,
         }
     }
 
@@ -257,6 +364,43 @@ impl PeerCert {
     }
 }
 
+fn profile(cert: &X509Certificate<'_>) -> Profile {
+    let ca = match cert.basic_constraints() {
+        Ok(Some(bc)) => Ext::Present(bc.value.ca),
+        Ok(None) => Ext::Absent,
+        Err(_) => Ext::Invalid,
+    };
+    let key_usage = match cert.key_usage() {
+        Ok(Some(ku)) => Ext::Present(KeyUsageBits {
+            digital_signature: ku.value.digital_signature(),
+            key_encipherment: ku.value.key_encipherment(),
+            key_agreement: ku.value.key_agreement(),
+            key_cert_sign: ku.value.key_cert_sign(),
+        }),
+        Ok(None) => Ext::Absent,
+        Err(_) => Ext::Invalid,
+    };
+    // nsSGC and msSGC: the "server gated crypto" OIDs OpenSSL still honours.
+    let eku_allows_server = match cert.extended_key_usage() {
+        Ok(Some(eku)) => Ext::Present(
+            eku.value.any
+                || eku.value.server_auth
+                || eku.value.other.iter().any(|oid| {
+                    let id = oid.to_id_string();
+                    id == "2.16.840.1.113730.4.1" || id == "1.3.6.1.4.1.311.10.3.3"
+                }),
+        ),
+        Ok(None) => Ext::Absent,
+        Err(_) => Ext::Invalid,
+    };
+    Profile {
+        v1: cert.version() == X509Version::V1,
+        ca,
+        key_usage,
+        eku_allows_server,
+    }
+}
+
 fn name_entries(name: &X509Name<'_>) -> Vec<NameEntry> {
     const FIELDS: [Field; 8] = [
         Field::Cn,
@@ -273,10 +417,17 @@ fn name_entries(name: &X509Name<'_>) -> Vec<NameEntry> {
             let oid = attr.attr_type().to_id_string();
             let field = FIELDS.into_iter().find(|f| f.oid() == oid)?;
             let any = attr.attr_value();
+            // Only a universal, primitive string converts; anything else is an attribute
+            // whose value can never match.
+            let tag = if any.class() == Class::Universal && !any.header.is_constructed() {
+                any.tag().0
+            } else {
+                NOT_A_STRING
+            };
             Some(NameEntry {
                 field,
                 value: AsnString {
-                    tag: any.tag().0,
+                    tag,
                     bytes: any.data.to_vec(),
                 },
             })
@@ -289,10 +440,6 @@ fn alt_name(name: &GeneralName<'_>) -> AltName {
         tag: 22,
         bytes: s.as_bytes().to_vec(),
     };
-    let ia5_raw = |bytes: &[u8]| AsnString {
-        tag: 22,
-        bytes: bytes.to_vec(),
-    };
     match name {
         GeneralName::RFC822Name(s) => AltName::Email(ia5(s)),
         GeneralName::DNSName(s) => AltName::Dns(ia5(s)),
@@ -303,14 +450,8 @@ fn alt_name(name: &GeneralName<'_>) -> AltName {
         GeneralName::DirectoryName(_) => AltName::Unsupported("GEN_DIRNAME"),
         GeneralName::EDIPartyName(_) => AltName::Unsupported("GEN_EDIPARTY"),
         GeneralName::RegisteredID(_) => AltName::Unsupported("GEN_RID"),
-        // An IA5String entry that is not UTF-8, which x509-parser does not decode.
-        GeneralName::Invalid(tag, data) => match tag.0 {
-            1 => AltName::Email(ia5_raw(data)),
-            2 => AltName::Dns(ia5_raw(data)),
-            6 => AltName::Uri(ia5_raw(data)),
-            7 => AltName::Ip(data.to_vec()),
-            _ => AltName::Other,
-        },
+        // Filtered out by the caller: an undecodable entry voids the extension.
+        GeneralName::Invalid(..) => AltName::Other,
     }
 }
 

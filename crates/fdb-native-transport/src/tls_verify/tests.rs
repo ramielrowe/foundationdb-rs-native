@@ -950,6 +950,71 @@ mod eval {
         assert!(!accepts("subjectAltName=IP:10.1.2.3", &cert, None));
     }
 
+    /// Replaces every occurrence of `from` in `der` with `to` (same length); a self-signed
+    /// certificate repeats its subject as the issuer.
+    fn patch(der: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        assert_eq!(from.len(), to.len());
+        let mut out = der.to_vec();
+        let mut found = false;
+        for at in 0..der.len().saturating_sub(from.len() - 1) {
+            if &der[at..at + from.len()] == from {
+                out[at..at + to.len()].copy_from_slice(to);
+                found = true;
+            }
+        }
+        assert!(found, "pattern in certificate");
+        out
+    }
+
+    /// OpenSSL fails to decode the whole subjectAltName extension if one name is malformed,
+    /// so every `subjectAltName` criterion then fails, even one that names a good entry.
+    #[test]
+    fn an_undecodable_alt_name_voids_the_extension() {
+        let key = new_key();
+        let p = params(&[("CN", "sans")], &["good.example.com", "bad.example.com"]);
+        let der = p.self_signed(&key).unwrap().der().to_vec();
+        let good = PeerCert::from_der(&der).unwrap();
+        assert_eq!(good.alt_names().unwrap().len(), 2);
+        assert!(accepts("subjectAltName=DNS:good.example.com", &good, None));
+
+        // A dNSName that is not valid text.
+        let bad =
+            PeerCert::from_der(&patch(&der, b"bad.example.com", b"\xffad.example.com")).unwrap();
+        assert!(bad.alt_names().is_none());
+        assert!(!accepts("subjectAltName=DNS:good.example.com", &bad, None));
+        assert!(reason("subjectAltName=DNS:good.example.com", &bad, None).contains("EmptySans"));
+    }
+
+    /// A name attribute value must be a universal, primitive string to be comparable.
+    #[test]
+    fn attribute_values_must_be_universal_primitive_strings() {
+        let key = new_key();
+        let der = params(&[("CN", "tagged-value")], &[])
+            .self_signed(&key)
+            .unwrap()
+            .der()
+            .to_vec();
+        let ok = PeerCert::from_der(&der).unwrap();
+        assert!(accepts("CN=tagged-value", &ok, None));
+        // The UTF8String tag (0x0c) sits just before the length and the text; make the
+        // value context-specific (0x8c) and then constructed universal (0x2c).
+        let mut pattern = vec![0x0c, "tagged-value".len() as u8];
+        pattern.extend_from_slice(b"tagged-value");
+        for tag in [0x8c, 0xcc, 0x4c] {
+            let mut replacement = pattern.clone();
+            replacement[0] = tag;
+            let cert = PeerCert::from_der(&patch(&der, &pattern, &replacement)).unwrap();
+            assert_eq!(cert.subject().len(), 1);
+            assert!(!accepts("CN=tagged-value", &cert, None), "tag {tag:#x}");
+        }
+        // Constructed universal.
+        let mut replacement = pattern.clone();
+        replacement[0] = 0x2c;
+        if let Ok(cert) = PeerCert::from_der(&patch(&der, &pattern, &replacement)) {
+            assert!(!accepts("CN=tagged-value", &cert, None));
+        }
+    }
+
     #[test]
     fn certificate_without_alt_names_or_with_bad_der() {
         let key = new_key();
@@ -976,6 +1041,51 @@ mod props {
     /// A criterion's value with every byte written as a `\XX` escape.
     fn hex_escape(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("\\{b:02X}")).collect()
+    }
+
+    /// A real certificate to mutate.
+    fn base_cert() -> &'static Vec<u8> {
+        static CERT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        CERT.get_or_init(|| {
+            let pki = super::support::Pki::new();
+            pki.leaf.der().to_vec()
+        })
+    }
+
+    fn arb_asn_string() -> impl Strategy<Value = AsnString> {
+        (
+            prop::sample::select(vec![0u32, 4, 12, 18, 19, 20, 22, 26, 28, 30, 31, u32::MAX]),
+            prop::collection::vec(any::<u8>(), 0..10),
+        )
+            .prop_map(|(tag, bytes)| AsnString { tag, bytes })
+    }
+
+    fn arb_name() -> impl Strategy<Value = Vec<NameEntry>> {
+        prop::collection::vec(
+            (arb_field(), arb_asn_string()).prop_map(|(field, value)| NameEntry { field, value }),
+            0..6,
+        )
+    }
+
+    fn arb_alt_name() -> impl Strategy<Value = AltName> {
+        prop_oneof![
+            arb_asn_string().prop_map(AltName::Dns),
+            arb_asn_string().prop_map(AltName::Email),
+            arb_asn_string().prop_map(AltName::Uri),
+            prop::collection::vec(any::<u8>(), 0..17).prop_map(AltName::Ip),
+            prop::sample::select(vec!["GEN_OTHERNAME", "GEN_X400", "GEN_RID"])
+                .prop_map(AltName::Unsupported),
+            Just(AltName::Other),
+        ]
+    }
+
+    fn arb_peer_cert() -> impl Strategy<Value = PeerCert> {
+        (
+            arb_name(),
+            arb_name(),
+            prop::option::of(prop::collection::vec(arb_alt_name(), 0..5)),
+        )
+            .prop_map(|(subject, issuer, sans)| PeerCert::from_parts(subject, issuer, sans))
     }
 
     fn arb_field() -> impl Strategy<Value = Field> {
@@ -1144,16 +1254,63 @@ mod props {
 
         /// Evaluation is total over arbitrary parsed rules and certificates.
         #[test]
-        fn evaluate_never_panics(s in arb_fragmenty()) {
+        fn evaluate_never_panics(s in arb_fragmenty(), leaf in arb_peer_cert(), root in arb_peer_cert()) {
             if let Ok(vp) = VerifyPeers::parse(&s) {
-                let cert = PeerCert::from_parts(
-                    vec![NameEntry { field: Field::Cn, value: AsnString { tag: 12, bytes: b"a".to_vec() } }],
-                    vec![],
-                    Some(vec![AltName::Dns(AsnString { tag: 22, bytes: b"a".to_vec() })]),
-                );
-                let _ = vp.evaluate(&cert, Some(&cert));
-                let _ = vp.evaluate(&cert, None);
+                let _ = vp.evaluate(&leaf, Some(&root));
+                let _ = vp.evaluate(&leaf, None);
             }
+        }
+
+        /// Whatever the rules, a certificate matches the rule built from its own fields, and
+        /// evaluating twice agrees.
+        #[test]
+        fn a_certificate_matches_its_own_exact_fields(leaf in arb_peer_cert()) {
+            let mut items = Vec::new();
+            for field in [Field::Cn, Field::O, Field::Ou, Field::L, Field::St, Field::C] {
+                let mut entries = leaf.subject().iter().filter(|e| e.field == field);
+                if let (Some(e), None) = (entries.next(), entries.next()) {
+                    // Criteria are Latin-1 bytes; compare against the UTF-8 conversion when it
+                    // is plain ASCII.
+                    if let Some(text) = e.value.to_utf8().filter(|t| t.is_ascii()) {
+                        items.push(format!("{field}={}", hex_escape(&text)));
+                    }
+                }
+            }
+            let spec = items.join(",");
+            let vp = VerifyPeers::parse(&spec).unwrap();
+            prop_assert!(vp.evaluate(&leaf, None).is_accepted(), "{spec}");
+            prop_assert_eq!(vp.evaluate(&leaf, None), vp.evaluate(&leaf, None));
+        }
+
+        /// Parsing certificates is total: a certificate with bytes flipped, inserted or
+        /// removed is an error or some certificate, never a panic.
+        #[test]
+        fn from_der_never_panics_on_mutated_certificates(
+            flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..8),
+            cut in prop::option::of(any::<prop::sample::Index>()),
+            insert in prop::option::of((any::<prop::sample::Index>(), any::<u8>())),
+        ) {
+            let mut der = base_cert().clone();
+            for (i, b) in flips {
+                let at = i.index(der.len());
+                der[at] = b;
+            }
+            if let Some((i, b)) = insert {
+                der.insert(i.index(der.len() + 1), b);
+            }
+            if let Some(i) = cut {
+                der.truncate(i.index(der.len() + 1));
+            }
+            if let Ok(cert) = PeerCert::from_der(&der) {
+                let vp = VerifyPeers::parse("CN=a,S.subjectAltName>=DNS:a,I.O<=b,R.OU=c").unwrap();
+                let _ = vp.evaluate(&cert, Some(&cert));
+                let _ = cert.is_self_signed();
+            }
+        }
+
+        #[test]
+        fn from_der_never_panics_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = PeerCert::from_der(&bytes);
         }
     }
 }
