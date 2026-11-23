@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use fdb_native_schema::domain::{
-    ClientDbInfo, ClientVersion, Commit, CommitCostEstimation, CommitId, CommitProxy,
-    GetKeyServerLocations, GetReadVersion, GetValue, GetValueReply, GrvProxy, Hostname,
-    InvalidValue, KeyRange, KeyServerLocations, LATEST_VERSION, Mutation, MutationType,
-    OpenDatabaseCoord, ReadOptions, ReadVersion, StorageServer, TagThrottleLimits, TenantMode,
-    VersionHistory,
+    ClientDbInfo, ClientVersion, Commit, CommitCostEstimation, CommitId, CommitProxy, GetKey,
+    GetKeyReply, GetKeyServerLocations, GetKeyValues, GetKeyValuesReply, GetReadVersion, GetValue,
+    GetValueReply, GrvProxy, Hostname, INVALID_VERSION, InvalidValue, KeyRange, KeySelector,
+    KeyServerLocations, LATEST_VERSION, Mutation, MutationType, OpenDatabaseCoord, ReadOptions,
+    ReadVersion, StorageServer, TagThrottleLimits, TenantMode, VersionHistory, WatchValue,
+    WatchValueReply,
 };
 use fdb_native_schema::streams::{GRV_PROXY_STREAMS, STORAGE_SERVER_STREAMS};
 use fdb_native_schema::{
@@ -22,8 +23,8 @@ use fdb_native_schema::{
 };
 use fdb_native_wire::{
     Decode, DecodeError, EncodeError, Endpoint, EnsureTable, ErrorOr, FdbError, IdempotencyId,
-    IpAddress, NetworkAddress, NetworkAddressList, ProtocolVersion, Tag, TagSet, Uid,
-    VersionVector, decode, encode,
+    IpAddress, KeyValueRef, KeyValueVector, KeyValueVectorRef, NetworkAddress, NetworkAddressList,
+    ProtocolVersion, Tag, TagSet, Uid, VersionVector, decode, encode,
 };
 use support::*;
 
@@ -177,6 +178,66 @@ fn get_value() -> GetValue {
     }
 }
 
+fn read_options() -> ReadOptions {
+    ReadOptions {
+        read_type: 3,
+        cache_result: true,
+        debug_id: Some(Uid::new(3, 4)),
+        consistency_check_start_version: Some(40),
+        lock_aware: true,
+    }
+}
+
+fn get_key() -> GetKey {
+    GetKey {
+        sel: KeySelector::new(b"sel/key".to_vec(), true, -4),
+        version: 42,
+        tags: Some(tags()),
+        span_context: span(),
+        options: Some(read_options()),
+        ss_latest_commit_versions: version_vector(),
+    }
+}
+
+fn get_key_values(schema: SchemaVersion) -> GetKeyValues {
+    GetKeyValues {
+        begin: KeySelector::first_greater_or_equal(b"range/a".to_vec()),
+        end: KeySelector::last_less_or_equal(b"range/z".to_vec()),
+        version: 42,
+        limit: -100,
+        limit_bytes: 80_000,
+        tags: Some(tags()),
+        span_context: span(),
+        options: Some(read_options()),
+        ss_latest_commit_versions: version_vector(),
+        // Only 8.0 has it.
+        task_id: (schema == SchemaVersion::V8_0).then_some(2500),
+    }
+}
+
+fn watch_value() -> WatchValue {
+    WatchValue {
+        key: b"watched".to_vec(),
+        value: Some(b"old".to_vec()),
+        version: 42,
+        tags: Some(tags()),
+        debug_id: Some(Uid::new(5, 6)),
+        span_context: span(),
+    }
+}
+
+/// Rows of a `GetKeyValuesReply`: empty keys and values, binary bytes, and a long value.
+fn kv_vector() -> KeyValueVector {
+    KeyValueVector::from_pairs([
+        KeyValueRef::new(b"range/b", b"value-b"),
+        KeyValueRef::new(b"range/c", b""),
+        KeyValueRef::new(b"", b"empty key"),
+        KeyValueRef::new(b"range/d\xff", &[0, 1, 0xff]),
+        KeyValueRef::new(b"range/e", &[7; 300]),
+    ])
+    .unwrap()
+}
+
 fn get_key_server_locations() -> GetKeyServerLocations {
     GetKeyServerLocations {
         begin: b"loc/a".to_vec(),
@@ -326,6 +387,60 @@ fn domain_messages_round_trip_through_each_schema_set() {
         );
         round_trip(
             version,
+            &get_key(),
+            &Ok(GetKeyReply {
+                penalty: 2.5,
+                error: None,
+                sel: KeySelector::new(b"sel/result".to_vec(), false, 1).borrowed(),
+                cached: true,
+            }),
+        );
+        round_trip(
+            version,
+            &get_key(),
+            &Ok(GetKeyReply {
+                error: Some(FdbError::new(1037)),
+                ..GetKeyReply::default()
+            }),
+        );
+        let rows = kv_vector();
+        round_trip(
+            version,
+            &get_key_values(version),
+            &Ok(GetKeyValuesReply {
+                penalty: 1.25,
+                error: None,
+                data: rows.borrowed(),
+                version: 1234,
+                more: true,
+                cached: true,
+            }),
+        );
+        round_trip(
+            version,
+            &get_key_values(version),
+            &Ok(GetKeyValuesReply::default()),
+        );
+        round_trip(
+            version,
+            &watch_value(),
+            &Ok(WatchValueReply {
+                version: 5678,
+                cached: true,
+            }),
+        );
+        round_trip(
+            version,
+            &WatchValue {
+                value: None,
+                tags: None,
+                debug_id: None,
+                ..watch_value()
+            },
+            &Ok(WatchValueReply::default()),
+        );
+        round_trip(
+            version,
             &commit(),
             &Ok(CommitId {
                 version: 1234,
@@ -389,6 +504,18 @@ fn a_7_4_request_carries_the_default_tenant() {
     let wire: v7_4::GetKeyServerLocationsRequest = decode(&bytes).unwrap();
     assert_eq!(wire.tenant, v7_4::TenantInfo::NONE);
     assert_eq!(wire.min_tenant_version, LATEST_VERSION);
+
+    let bytes = get_key().encode_request(v, TOKEN).unwrap();
+    let wire: v7_4::GetKeyRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
+
+    let bytes = get_key_values(v).encode_request(v, TOKEN).unwrap();
+    let wire: v7_4::GetKeyValuesRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
+
+    let bytes = watch_value().encode_request(v, TOKEN).unwrap();
+    let wire: v7_4::WatchValueRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
 }
 
 /// C++'s `LoadMember` default-constructs an absent table member, and `TenantInfo()` has
@@ -536,6 +663,19 @@ fn version_specific_fields() {
         .unwrap()
         .unwrap();
     assert_eq!(back.tenant_mode, Some(TenantMode::DISABLED));
+    // 8.0's taskID on GetKeyValues is not sent to 7.4.
+    let request = get_key_values(SchemaVersion::V8_0);
+    assert_eq!(request.task_id, Some(2500));
+    assert_eq!(request_round_trip(SchemaVersion::V8_0, &request), request);
+    let back = request_round_trip(SchemaVersion::V7_4, &request);
+    assert_eq!(back.task_id, None);
+    assert_eq!(
+        back,
+        GetKeyValues {
+            task_id: None,
+            ..request
+        }
+    );
     // ReadOptions::type is i32 on 7.4 and u32 on 8.0: the bits are kept.
     let mut request = get_value();
     request.options.as_mut().unwrap().read_type = u32::MAX;
@@ -566,6 +706,115 @@ fn defaults_match_cpp() {
     // LoadBalancedReply() has penalty 1.0.
     assert_eq!(GetValueReply::default().penalty, 1.0);
     assert_eq!(v7_4::GetValueReply::default().penalty, 1.0);
+    assert_eq!(GetKeyReply::default().penalty, 1.0);
+    assert_eq!(v7_4::GetKeyReply::default().penalty, 1.0);
+    assert_eq!(GetKeyValuesReply::default().penalty, 1.0);
+    assert_eq!(v7_4::GetKeyValuesReply::default().penalty, 1.0);
+    // GetKeyValuesReply() : version(invalidVersion)
+    assert_eq!(GetKeyValuesReply::default().version, INVALID_VERSION);
+    assert_eq!(v8_0::GetKeyValuesReply::default().version, INVALID_VERSION);
+    assert!(GetKeyValuesReply::default().data.is_empty());
+    // WatchValueReply() = default: zero.
+    assert_eq!(
+        WatchValueReply::default(),
+        WatchValueReply {
+            version: 0,
+            cached: false
+        }
+    );
+    // KeySelector(): the empty key, orEqual false, offset 0.
+    assert_eq!(
+        KeySelector::default(),
+        KeySelector::new(b"".to_vec(), false, 0)
+    );
+}
+
+/// The four standard selectors are `(key, orEqual, offset)` as C++'s `lastLessThan` and so on
+/// build them (`FDBTypes.h`).
+#[test]
+fn key_selector_constructors() {
+    let k = || b"k".to_vec();
+    assert_eq!(
+        KeySelector::last_less_than(k()),
+        KeySelector::new(k(), false, 0)
+    );
+    assert_eq!(
+        KeySelector::last_less_or_equal(k()),
+        KeySelector::new(k(), true, 0)
+    );
+    assert_eq!(
+        KeySelector::first_greater_than(k()),
+        KeySelector::new(k(), true, 1)
+    );
+    assert_eq!(
+        KeySelector::first_greater_or_equal(k()),
+        KeySelector::new(k(), false, 1)
+    );
+    let sel = KeySelector::new(k(), true, -2);
+    assert_eq!(sel.borrowed().into_owned(), sel);
+}
+
+/// A `GetKeyValuesReply` is read in place: the rows are a view of the received message's
+/// blob, with no copy, and `more` and `version` come with it.
+#[test]
+fn get_key_values_reply_is_read_in_place() {
+    for (release, schema) in [
+        ("release-7.4", SchemaVersion::V7_4),
+        ("release-8.0", SchemaVersion::V8_0),
+    ] {
+        let bytes = record_bytes(&fixture(release, "get_key_values_reply_envelope"));
+        let reply = GetKeyValues::decode_reply(schema, &bytes).unwrap().unwrap();
+        assert_eq!(reply.penalty, 2.0);
+        assert_eq!(reply.error, None);
+        assert_eq!(reply.version, 2_000_000_000_001);
+        assert!(reply.more);
+        assert!(!reply.cached);
+        assert_eq!(reply.data.len(), 3);
+        let rows: Vec<_> = reply.data.iter().collect();
+        assert_eq!(
+            rows,
+            [
+                KeyValueRef::new(b"range/b", b"value-b"),
+                KeyValueRef::new(b"range/c", b""),
+                KeyValueRef::new(b"range/d\xff", &[0, 1]),
+            ]
+        );
+        // Zero-copy: the payload and the rows lie inside the message buffer.
+        let message = bytes.as_ptr_range();
+        for slice in [
+            reply.data.payload(),
+            rows[0].key,
+            rows[0].value,
+            rows[2].key,
+        ] {
+            let range = slice.as_ptr_range();
+            assert!(
+                message.start <= range.start && range.end <= message.end,
+                "{release}"
+            );
+        }
+        // The empty reply is a four-byte blob holding a zero count.
+        let bytes = record_bytes(&fixture(release, "get_key_values_reply_empty"));
+        let reply = GetKeyValues::decode_reply(schema, &bytes).unwrap().unwrap();
+        assert!(reply.data.is_empty());
+        assert_eq!(reply.data, KeyValueVectorRef::EMPTY);
+        assert_eq!(reply.version, 5);
+        assert!(!reply.more);
+    }
+}
+
+/// A `GetKeyValuesReply` whose blob does not add up is a decode error, not a panic.
+#[test]
+fn a_malformed_get_key_values_blob_is_an_error() {
+    let bytes = record_bytes(&fixture("release-8.0", "get_key_values_reply_envelope"));
+    let reply = GetKeyValues::decode_reply(SchemaVersion::V8_0, &bytes)
+        .unwrap()
+        .unwrap();
+    // Corrupt the first item's key length (the payload is the count, then that length).
+    let at = reply.data.payload().as_ptr() as usize - bytes.as_ptr() as usize;
+    let mut bad = bytes.clone();
+    bad[at + 4..at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(GetKeyValues::decode_reply(SchemaVersion::V8_0, &bad).is_err());
 }
 
 #[test]

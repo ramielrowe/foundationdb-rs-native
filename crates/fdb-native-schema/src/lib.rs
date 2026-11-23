@@ -33,13 +33,15 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! The vertical slice covers `OpenDatabaseCoordRequest` → `ClientDBInfo` (with
+//! The messages covered are `OpenDatabaseCoordRequest` → `ClientDBInfo` (with
 //! `GrvProxyInterface` and `CommitProxyInterface`), `GetReadVersionRequest` →
 //! `GetReadVersionReply`, `GetKeyServerLocationsRequest` → `GetKeyServerLocationsReply`
-//! (with `StorageServerInterface`), `GetValueRequest` → `GetValueReply` and
-//! `CommitTransactionRequest` → `CommitID`. Interfaces carry one endpoint each; the others
-//! are adjusted endpoints whose indices are in [`streams`] (the domain interfaces'
-//! `endpoints()` computes them).
+//! (with `StorageServerInterface`), `GetValueRequest` → `GetValueReply`, `GetKeyRequest` →
+//! `GetKeyReply` (with `KeySelectorRef`), `GetKeyValuesRequest` → `GetKeyValuesReply` (whose
+//! rows stay in the message's pre-serialized blob and are read in place),
+//! `WatchValueRequest` → `WatchValueReply` and `CommitTransactionRequest` → `CommitID`.
+//! Interfaces carry one endpoint each; the others are adjusted endpoints whose indices are in
+//! [`streams`] (the domain interfaces' `endpoints()` computes them).
 //!
 //! Wire quirks handled here: single-key compression of `KeyRangeRef` and `MutationRef`, and
 //! the refusal to encode the inverted ranges and clears C++ cannot serialize
@@ -56,8 +58,9 @@
 //! constructor sets non-zero values, `Default` now matches it: `ReadOptions` (`NORMAL`, cache
 //! on), `GetReadVersionRequest` (one transaction, `maxVersion` -1), `GetReadVersionReply`
 //! (`version` -1), `GetKeyServerLocationsRequest` (`minTenantVersion`/`legacyVersion` -2),
-//! `CommitID` (`version` -1), `OpenDatabaseCoordRequest` (`internal` true) and
-//! `ClientVersionRef` (`"Unknown"`), in both schema sets, as `GetValueReply` (`penalty` 1.0)
+//! `CommitID` (`version` -1), `OpenDatabaseCoordRequest` (`internal` true),
+//! `ClientVersionRef` (`"Unknown"`), `GetKeyReply` (`penalty` 1.0) and `GetKeyValuesReply`
+//! (`penalty` 1.0, `version` -1), in both schema sets, as `GetValueReply` (`penalty` 1.0)
 //! and `TenantInfo` already did. A *present* table whose vtable lacks a scalar slot still
 //! reads zero for it. Each type's docs say what its absent value is.
 //!

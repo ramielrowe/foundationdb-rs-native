@@ -19,9 +19,10 @@ use fdb_native_wire::{Decode, Uid, Wire, decode, encode};
 // Shared by both releases; both schema sets re-export them.
 use v7_4::{
     ClientTagThrottleLimits, ClientTrCommitCostEstimation, ClientVersionRef, CommitID,
-    CommitProxyInterface, CommitTransactionRef, GetKeyServerLocationsReply, GetValueReply,
-    GrvProxyInterface, Hostname, KeyRangeRef, LocalityData, MutationRef, OpenDatabaseCoordRequest,
-    StorageServerInterface, VersionHistory,
+    CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyServerLocationsReply,
+    GetKeyValuesReply, GetValueReply, GrvProxyInterface, Hostname, KeyRangeRef, KeySelectorRef,
+    LocalityData, MutationRef, OpenDatabaseCoordRequest, StorageServerInterface, VersionHistory,
+    WatchValueReply,
 };
 
 /// A table with `value` first, as the reader sees it: `serializer(ar, value, tail)`.
@@ -106,6 +107,65 @@ fn get_value_reply() {
     assert_eq!(reply.error, None);
     assert_eq!(reply.value, None);
     assert!(!reply.cached);
+}
+
+#[test]
+fn get_key_reply() {
+    // LoadBalancedReply() : penalty(1.0); GetKeyReply() : cached(false), a KeySelector()
+    let reply = absent_in_message!(GetKeyReply);
+    assert_eq!(reply, GetKeyReply::default());
+    assert_eq!(reply.penalty, 1.0);
+    assert_eq!(reply.sel, KeySelectorRef::default());
+    assert_eq!(<GetKeyReply as Decode>::absent(), reply);
+
+    // Present, without a `penalty` slot: a scalar, zero.
+    let reply = empty_in_message!(GetKeyReply);
+    assert_eq!(reply.penalty, 0.0);
+    assert_eq!(reply.error, None);
+    assert_eq!(reply.sel, KeySelectorRef::default());
+    assert!(!reply.cached);
+}
+
+#[test]
+fn get_key_values_reply() {
+    // LoadBalancedReply() : penalty(1.0); GetKeyValuesReply() : version(invalidVersion),
+    // more(false), cached(false)
+    let reply = absent_in_message!(GetKeyValuesReply);
+    assert_eq!(reply, GetKeyValuesReply::default());
+    assert_eq!(reply.penalty, 1.0);
+    assert_eq!(reply.version, INVALID_VERSION);
+    assert!(reply.data.is_empty());
+    assert!(!reply.more && !reply.cached);
+    assert_eq!(<GetKeyValuesReply as Decode>::absent(), reply);
+
+    // Present, with no slots: scalars are zero, and an absent blob is the empty vector.
+    let reply = empty_in_message!(GetKeyValuesReply);
+    assert_eq!((reply.penalty, reply.version), (0.0, 0));
+    assert!(reply.data.is_empty());
+}
+
+#[test]
+fn watch_value_reply() {
+    // WatchValueReply() = default, `cached = false`: zero.
+    assert_eq!(
+        absent_in_message!(WatchValueReply),
+        WatchValueReply::default()
+    );
+    assert_eq!(
+        empty_in_message!(WatchValueReply),
+        WatchValueReply::default()
+    );
+    assert_eq!(WatchValueReply::default().version, 0);
+}
+
+#[test]
+fn key_selector_ref() {
+    // KeySelectorRef() : orEqual(false), offset(0)
+    assert_eq!(
+        absent_in_message!(KeySelectorRef),
+        KeySelectorRef::default()
+    );
+    assert_eq!(empty_in_message!(KeySelectorRef), KeySelectorRef::default());
 }
 
 #[test]
@@ -266,6 +326,35 @@ fn v7_4_read_options() {
 /// each field's, so `TenantInfo()` shows through.
 #[test]
 fn v7_4_requests_compose_nested_defaults() {
+    let request = absent_in_message!(v7_4::GetKeyRequest);
+    assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(request.sel, KeySelectorRef::default());
+    assert_eq!(
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
+    );
+    assert_eq!(request, v7_4::GetKeyRequest::default());
+
+    let request = absent_in_message!(v7_4::GetKeyValuesRequest);
+    assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(
+        (request.limit, request.limit_bytes, request.version),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
+    );
+    assert_eq!(request, v7_4::GetKeyValuesRequest::default());
+
+    let request = absent_in_message!(v7_4::WatchValueRequest);
+    assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(request, v7_4::WatchValueRequest::default());
+    assert_eq!(
+        empty_in_message!(v7_4::WatchValueRequest).tenant_info,
+        v7_4::TenantInfo::NONE
+    );
+
     let request = absent_in_message!(v7_4::GetValueRequest);
     assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
     assert_eq!(request.version, 0);
@@ -364,6 +453,24 @@ fn v8_0_zero_default_types() {
     assert_eq!(
         absent_in_message!(v8_0::CommitTransactionRequest),
         v8_0::CommitTransactionRequest::default()
+    );
+    // `VersionVector()`: `maxVersion = invalidVersion`; every other field is zero.
+    let request = absent_in_message!(v8_0::GetKeyRequest);
+    assert_eq!(request, v8_0::GetKeyRequest::default());
+    assert_eq!(
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
+    );
+    let request = absent_in_message!(v8_0::GetKeyValuesRequest);
+    assert_eq!(request, v8_0::GetKeyValuesRequest::default());
+    assert_eq!(
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
+    );
+    assert_eq!(request.task_id, None);
+    assert_eq!(
+        absent_in_message!(v8_0::WatchValueRequest),
+        v8_0::WatchValueRequest::default()
     );
 }
 

@@ -1,7 +1,7 @@
 //! The 7.4 and 8.0 schema sets against the message fixtures each release's own C++ wrote
 //! (`tools/golden-vectors/fixtures/release-7.4` and `release-8.0`).
 //!
-//! Every fixture of the vertical slice decodes into its version's Rust type, whose dump
+//! Every fixture of the slice decodes into its version's Rust type, whose dump
 //! matches the fixture's `root` field for field; the value re-encodes and decodes to the
 //! same dump. The domain layer decodes and re-encodes each request and reply envelope
 //! through [`Request`]. With the release decoders built, the ignored
@@ -11,7 +11,8 @@
 mod support;
 
 use fdb_native_schema::domain::{
-    Commit, GetKeyServerLocations, GetReadVersion, GetValue, OpenDatabaseCoord,
+    Commit, GetKey, GetKeyServerLocations, GetKeyValues, GetReadVersion, GetValue,
+    OpenDatabaseCoord, WatchValue,
 };
 use fdb_native_schema::{Request, SchemaVersion, v7_4, v8_0};
 use fdb_native_wire::{DecodeError, EnsureTable, ErrorOr, FileIdentified, decode, encode};
@@ -121,6 +122,9 @@ fn dropped_by_the_domain(release: &str, name: &str) -> &'static [&'static str] {
         // The tenant of a 7.4 request (the domain is tenant-less; it writes TenantInfo::NONE).
         ("release-7.4", "get_value_request") => &["/0/tenantInfo/"],
         ("release-7.4", "get_key_server_locations_request") => &["/0/tenant/"],
+        ("release-7.4", "get_key_request" | "get_key_values_request" | "watch_value_request") => {
+            &["/0/tenantInfo/"]
+        }
         // tenantIds is set by the commit proxy; the 7.4 fixture also has a tenant.
         ("release-7.4", "commit_transaction_request") => {
             &["/0/tenantInfo/", "/0/transaction/tenantIds"]
@@ -280,6 +284,75 @@ fn release_7_4() -> Vec<Outcome> {
             "ErrorOr<EnsureTable<GetValueReply>>"
         ),
         check_request!(
+            GetKeyRequest,
+            GetKey,
+            V,
+            "release-7.4",
+            "get_key_request",
+            "GetKeyRequest"
+        ),
+        check!(GetKeyReply, "release-7.4", "get_key_reply", "GetKeyReply"),
+        check_reply!(
+            GetKeyReply,
+            GetKey,
+            V,
+            "release-7.4",
+            "get_key_reply_envelope",
+            "ErrorOr<EnsureTable<GetKeyReply>>"
+        ),
+        check_request!(
+            GetKeyValuesRequest,
+            GetKeyValues,
+            V,
+            "release-7.4",
+            "get_key_values_request",
+            "GetKeyValuesRequest"
+        ),
+        check!(
+            GetKeyValuesReply,
+            "release-7.4",
+            "get_key_values_reply",
+            "GetKeyValuesReply"
+        ),
+        check_reply!(
+            GetKeyValuesReply,
+            GetKeyValues,
+            V,
+            "release-7.4",
+            "get_key_values_reply_envelope",
+            "ErrorOr<EnsureTable<GetKeyValuesReply>>"
+        ),
+        check_reply!(
+            GetKeyValuesReply,
+            GetKeyValues,
+            V,
+            "release-7.4",
+            "get_key_values_reply_empty",
+            "ErrorOr<EnsureTable<GetKeyValuesReply>>"
+        ),
+        check_request!(
+            WatchValueRequest,
+            WatchValue,
+            V,
+            "release-7.4",
+            "watch_value_request",
+            "WatchValueRequest"
+        ),
+        check!(
+            WatchValueReply,
+            "release-7.4",
+            "watch_value_reply",
+            "WatchValueReply"
+        ),
+        check_reply!(
+            WatchValueReply,
+            WatchValue,
+            V,
+            "release-7.4",
+            "watch_value_reply_envelope",
+            "ErrorOr<EnsureTable<WatchValueReply>>"
+        ),
+        check_request!(
             CommitTransactionRequest,
             Commit,
             V,
@@ -432,6 +505,75 @@ fn release_8_0() -> Vec<Outcome> {
             "ErrorOr<EnsureTable<GetValueReply>>"
         ),
         check_request!(
+            GetKeyRequest,
+            GetKey,
+            V,
+            "release-8.0",
+            "get_key_request",
+            "GetKeyRequest"
+        ),
+        check!(GetKeyReply, "release-8.0", "get_key_reply", "GetKeyReply"),
+        check_reply!(
+            GetKeyReply,
+            GetKey,
+            V,
+            "release-8.0",
+            "get_key_reply_envelope",
+            "ErrorOr<EnsureTable<GetKeyReply>>"
+        ),
+        check_request!(
+            GetKeyValuesRequest,
+            GetKeyValues,
+            V,
+            "release-8.0",
+            "get_key_values_request",
+            "GetKeyValuesRequest"
+        ),
+        check!(
+            GetKeyValuesReply,
+            "release-8.0",
+            "get_key_values_reply",
+            "GetKeyValuesReply"
+        ),
+        check_reply!(
+            GetKeyValuesReply,
+            GetKeyValues,
+            V,
+            "release-8.0",
+            "get_key_values_reply_envelope",
+            "ErrorOr<EnsureTable<GetKeyValuesReply>>"
+        ),
+        check_reply!(
+            GetKeyValuesReply,
+            GetKeyValues,
+            V,
+            "release-8.0",
+            "get_key_values_reply_empty",
+            "ErrorOr<EnsureTable<GetKeyValuesReply>>"
+        ),
+        check_request!(
+            WatchValueRequest,
+            WatchValue,
+            V,
+            "release-8.0",
+            "watch_value_request",
+            "WatchValueRequest"
+        ),
+        check!(
+            WatchValueReply,
+            "release-8.0",
+            "watch_value_reply",
+            "WatchValueReply"
+        ),
+        check_reply!(
+            WatchValueReply,
+            WatchValue,
+            V,
+            "release-8.0",
+            "watch_value_reply_envelope",
+            "ErrorOr<EnsureTable<WatchValueReply>>"
+        ),
+        check_request!(
             CommitTransactionRequest,
             Commit,
             V,
@@ -467,23 +609,8 @@ fn release_8_0() -> Vec<Outcome> {
     ]
 }
 
-/// Fixtures of messages outside the vertical slice (range reads, `getKey`, watches) and of
-/// the transport layer.
-const NOT_IN_THE_SLICE: [&str; 13] = [
-    "get_key_values_request",
-    "get_key_values_reply",
-    "get_key_values_reply_envelope",
-    "get_key_values_reply_empty",
-    "get_key_request",
-    "get_key_reply",
-    "get_key_reply_envelope",
-    "watch_value_request",
-    "watch_value_reply",
-    "watch_value_reply_envelope",
-    "ping_request",
-    "ping_reply",
-    "endpoint_not_found",
-];
+/// Fixtures of messages outside the slice: the transport layer's.
+const NOT_IN_THE_SLICE: [&str; 3] = ["ping_request", "ping_reply", "endpoint_not_found"];
 
 fn report(outcomes: &[Outcome]) {
     let identical = outcomes.iter().filter(|o| o.identical).count();
