@@ -6,6 +6,13 @@
 // It assumes nothing about the bytes: every read is bounds-checked, and
 // anything out of bounds is reported as "out_of_bounds" (which only happens on
 // paths the C++ reader does not follow, since it accepted the buffer).
+//
+// It also counts the "work" of one decode from the root, as README.md ("Corpus
+// accept classes", `work_limit`) and fdb-native-wire's Reader define it, and
+// reports "work_limit" when the count exceeds 4 * buffer length + 1024. The walk
+// ends at that point (an aliasing bomb would otherwise take millions of steps),
+// so violations that lie after it are not listed; a decoder that enforces the
+// limit stops there as well.
 #pragma once
 
 #include <climits>
@@ -19,9 +26,13 @@
 
 class StrictWalker {
 public:
-	StrictWalker(const uint8_t* b, size_t n) : b(b), n(n) {}
+	StrictWalker(const uint8_t* b, size_t n) : b(b), n(n), budget(4 * n + 1024) {}
 
 	std::set<std::string> violations;
+
+	// Units of work charged so far, and the limit they are checked against.
+	size_t work() const { return spent; }
+	size_t workLimit() const { return budget; }
 
 	template <class... Ts>
 	void root() {
@@ -44,8 +55,22 @@ private:
 	size_t n;
 	int depth = 0;
 	long steps = 0;
+	size_t budget; // the work limit: 4 * n + 1024 units
+	size_t spent = 0;
+	bool over = false; // the work limit was exceeded: the walk is over
 
 	void flag(const char* v) { violations.insert(v); }
+	// Charges |units| of work. Past the budget it flags work_limit and ends the walk.
+	void charge(size_t units) {
+		if (over) {
+			return;
+		}
+		spent += units;
+		if (spent > budget) {
+			over = true;
+			flag("work_limit");
+		}
+	}
 	bool inb(size_t p, size_t len) const { return p != npos && p <= n && len <= n - p; }
 	uint32_t r32(size_t p) const {
 		uint32_t x;
@@ -102,11 +127,15 @@ private:
 
 	template <class T>
 	void walkTable(T& obj, size_t t) {
-		if (t == npos) {
+		if (t == npos || over) {
 			return;
 		}
 		if (++steps > 1000000 || depth > 64) {
 			flag("too_deep");
+			return;
+		}
+		charge(4); // a table, or a zero-field table
+		if (over) {
 			return;
 		}
 		++depth;
@@ -189,6 +218,9 @@ private:
 
 	template <class M>
 	void memberOfType(Ctx& c) {
+		if (over) {
+			return;
+		}
 		if constexpr (detail::is_vector_of_union_like<M>) {
 			size_t e1 = entry(c, c.i, 4), e2 = entry(c, c.i + 1, 4);
 			c.i += 2;
@@ -205,7 +237,8 @@ private:
 				flag("union_vector_count_mismatch");
 			}
 			using U = typename vector_like_traits<M>::value_type;
-			for (uint32_t k = 0; k < oc; ++k) {
+			charge(5 * size_t(oc)); // a vector of unions
+			for (uint32_t k = 0; k < oc && !over; ++k) {
 				if (!inb(tv + 4 + k, 1) || !inb(ov + 4 + 4 * size_t(k), 4)) {
 					flag("out_of_bounds");
 					return;
@@ -266,6 +299,7 @@ private:
 					if (!inb(p, detail::fb_size<A>)) {
 						flag("out_of_bounds");
 					} else {
+						charge(detail::fb_size<A>); // an out-of-line scalar or struct
 						value<A>(p);
 					}
 				}
@@ -285,6 +319,9 @@ private:
 	// structs, a uoffset for everything else.
 	template <class T>
 	void value(size_t pos) {
+		if (over) {
+			return;
+		}
 		if constexpr (!std::is_same_v<T, gv_unwrap_t<T>>) {
 			value<gv_unwrap_t<T>>(pos); // e.g. Standalone<T> is serialized as T
 		} else if constexpr (detail::is_scalar<T>) {
@@ -308,6 +345,8 @@ private:
 			size_t p = follow(pos);
 			if (!inb(p, 4) || !inb(p + 4, r32(p))) {
 				flag("out_of_bounds");
+			} else {
+				charge(4 + size_t(r32(p))); // a string or blob
 			}
 		} else if constexpr (detail::is_vector_like<T>) {
 			using E = typename vector_like_traits<T>::value_type;
@@ -321,12 +360,13 @@ private:
 				flag("out_of_bounds");
 				return;
 			}
+			charge(4 + count * size_t(detail::fb_size<E>)); // a vector
 			if constexpr (std::is_same_v<T, std::vector<bool>>) {
 				return; // vector<bool> treats any nonzero byte as true
 			} else if constexpr (detail::is_scalar<E> && !std::is_same_v<E, bool>) {
 				return;
 			} else {
-				for (size_t k = 0; k < count; ++k) {
+				for (size_t k = 0; k < count && !over; ++k) {
 					value<E>(p + 4 + k * detail::fb_size<E>);
 				}
 			}
