@@ -644,9 +644,10 @@ For each branch the script:
 
 1. exports the branch with `git archive` into `build/msg/src-<release>/` (only when the
    commit changed; the FDB checkout is only read, with `git --no-optional-locks`);
-2. starts a disposable build container (`docker run --rm`, also removed by ID on exit or
-   interrupt) from the pinned image, with the source mounted read-only, the build tree in
-   `build/msg/build-<release>/` and a ccache in `build/msg/ccache/` (all gitignored);
+2. starts a disposable build container (`docker run --rm --init`, also removed by ID on
+   exit, error or Ctrl-C) from the pinned image, with this tool directory and the source
+   mounted read-only; it writes only into the build tree `build/msg/build-<release>/` and a
+   ccache in `build/msg/ccache/` (all gitignored);
 3. configures FDB with CMake (`-G Ninja`, clang; Java, Go, Ruby, docs, gRPC, RocksDB and
    AWS off) and injects this tool's target with
    `-DCMAKE_PROJECT_foundationdb_INCLUDE=messages/project_include.cmake`, which defers an
@@ -654,17 +655,25 @@ For each branch the script:
    exported tree is not modified;
 4. builds `golden_vectors_messages` (FDB's generated headers, the actor compiler output,
    `flow`, `fdbrpc` and `fdbclient`, then `messages/message_vectors.cpp` and `src/main.cpp`);
-5. writes `fixtures/<release>/` and feeds every fixture back through that build's `decode`
-   command (`check_fixtures.py roundtrip`);
-6. with `--check`, generates again and requires byte-identical output.
+5. generates into `build/msg/build-<release>/out/` and feeds every fixture back through that
+   build's `decode` command (`check_fixtures.py roundtrip`);
+6. with `--check`, generates a second time with the same binary and requires byte-identical
+   output;
+7. only if all of that succeeded, replaces `fixtures/<release>/` with the new output. A
+   failed or interrupted run leaves the checked-in fixtures untouched.
+
+`--check` does not compare with the committed fixtures: after a run, `git status` (or
+`git diff tools/golden-vectors/fixtures`) shows whether the output changed. A clean tree means
+the regeneration reproduced the committed fixtures byte for byte.
 
 The build image is pinned by tag and digest in `regen_messages.sh` (`BUILD_IMAGE`):
 `foundationdb/build:rockylinux9-20261120210123-c79f7cf1aa@sha256:eabf6edbff5f6e864a574814db0a10eb63f804a6a8856f801f942a0b4be715e1`,
 a dated build of the `rockylinux9` image that FDB's CI uses
 (`foundationdb/build:rockylinux9-latest` in release-8.0's `.github/workflows/tidy.yml`; both
 branches' `cmake/ConfigureCompiler.cmake` describe its toolchain, and both build with it
-unchanged). It has clang 19 with libc++, CMake 3.31, Ninja and mono. Each fixture directory's `index.json` records the branch commit (`fdb_source`),
-the FDB version and the image.
+unchanged). It has clang 19 with libc++, CMake 3.31, Ninja and mono. Each fixture
+directory's `index.json` records the branch commit (`fdb_source`), the FDB version and the
+image.
 
 Cost on a 32-core host: a cold build of one branch (configure plus `fdbclient`, 200 to 350
 Ninja steps) takes about 2.5 minutes, and a rebuild after editing the generator about 45
@@ -695,7 +704,19 @@ positive records only (no `negative/` or `corpus/`), plus `index.json` and `sche
 `cpp_type` is the C++ type name (`GetValueRequest`, `ErrorOr<EnsureTable<CommitID>>`,
 `UID`). Field names are the `serializer()` argument names in the branch's headers: the last
 identifier of each argument (`LoadBalancedReply::penalty` is `penalty`,
-`const_cast<KeyRef&>(begin)` is `begin`).
+`const_cast<KeyRef&>(begin)` is `begin`). Usually that is the C++ data member, but not
+always:
+
+- `WipedString.ws` is a local in `WipedString::serialize()` (a wrapper around the string).
+  On 7.4, `TenantInfo.token` is therefore `optional<table<WipedString>>`: a union whose
+  payload is a table with one `bytes` field, `ws` (plus an `arena`, which takes no slot).
+- `ClientTagThrottleLimits.duration` is a local computed from the `expiration` member (see
+  the wire notes).
+- `LocalityData._data` is the C++ member name, underscore included (a
+  `std::map<key, Optional<value>>`, dumped as a vector of `pair` tables).
+- `table<request_stream>.endpoint` and `table<reply_promise>.token` are this tool's labels
+  for the single argument of `serializable_traits<RequestStream<T>>` (a local `ep`) and
+  `serializable_traits<ReplyPromise<T>>` (the endpoint's token).
 
 Additions to the [node types](#nodes):
 
@@ -720,7 +741,9 @@ share a dump name only if their fields are identical (`reply_promise`, `request_
 little-endian, `size_t` is 8 bytes): u64 count of distinct tag localities; per locality run,
 in `Tag` order, i8 locality and u16 run length; if there is at least one entry, u8 tag-id
 width (1 if every id is at most 255, else 2), u8 version-delta width (1, 2, 4 or 8: the
-smallest that holds max version minus min version), i64 min version, u64 entry count, then
+smallest that holds the largest minus the smallest entry version; the minimum and maximum are
+taken over the entries only, not over the trailing `maxVersion` field), i64 min version (the
+smallest entry version), u64 entry count, then
 per entry the tag id and (version minus min version) in those widths; finally i64
 `maxVersion`. The vectors cover the empty form and the width pairs 1/1, 1/2, 1/4 and 2/8.
 
@@ -740,8 +763,9 @@ per entry the tag id and (version minus min version) in those widths; finally i6
   serializes packets), is decoded by the branch's `ArenaObjectReader` to the same field dump
   as the value it was built from, and passes the permitted
   [strict checks](#corpus-accept-classes).
-- **Determinism**: the output is a function of the source and the compiler. `--check`, two
-  full runs, and a run from an empty `build/msg/` give byte-identical fixtures. The values
+- **Determinism**: the output is a function of the source and the compiler. `--check` (two
+  runs of one binary), a second full run and a run from an empty `build/msg/` all reproduce
+  the committed fixtures byte for byte (a clean `git status`). The values
   avoid the nondeterministic parts: `std::unordered_map` fields (`TransactionTagMap`) hold
   one entry, and `ClientTagThrottleLimits` serializes `expiration - now()` (the network clock
   does not advance in the generator, so `duration` is exactly 30.0).
@@ -757,10 +781,22 @@ per entry the tag id and (version minus min version) in those widths; finally i6
   (begin = k\x00, end = "") and a `ClearRange` `MutationRef` over [k, k\x00) as (type,
   param1 = k\x00, param2 = ""); the reader restores [k, k\x00). The fixtures' `root` shows
   the wire form (`commit_transaction_request*`), because the dumper runs the writer side of
-  `serialize()`. A Rust encoder must compress the same way, and its decoder must expand.
+  `serialize()`. A Rust encoder must compress the same way, and its decoder must expand,
+  with exactly the C++ reader's trigger conditions:
+  - `KeyRangeRef`: expand when `end` is empty and `begin` is not: end = begin, begin = begin
+    without its last byte. C++ `ASSERT`s that the last byte of `begin` is `\x00` (the
+    process dies otherwise).
+  - `MutationRef`: expand only when `type` is `ClearRange` (1), `param2` is empty and
+    `param1` is not: param2 = param1, param1 = param1 without its last byte. If the last
+    byte is not `\x00`, C++ logs a `SevError` and marks the mutation corrupted but keeps it.
+  - In both cases the Rust decoder should reject a compressed value whose last byte is not
+    `\x00` (a correct writer never produces one). An empty `begin` / `param1` with an empty
+    `end` / `param2` is not compressed and decodes as two empty strings.
   `MutationRef` also has checksum forms (a flag bit in the type, a suffix on param2) that are
   only written when the `ENABLE_MUTATION_CHECKSUM` client knob is set; no vector covers them.
-- **`ClientTagThrottleLimits`** is written as (tpsRate, duration = expiration - now()).
+- **`ClientTagThrottleLimits`** is written as (tpsRate, duration = expiration - now()) and
+  read back as expiration = now() + duration, both with the local clock (so the expiration
+  is relative and clock skew between processes does not matter).
 - **`Endpoint`** is (addresses, token); `NetworkAddressList` is (address, secondaryAddress);
   `NetworkAddress` is (ip, port, flags, fromHostname) with flags bit 0 = private and bit 1 =
   TLS; `IPAddress` is a one-slot table holding `variant<u32, array<u8,16>>` (tag 1 IPv4, tag

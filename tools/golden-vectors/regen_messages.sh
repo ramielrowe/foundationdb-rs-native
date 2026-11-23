@@ -16,10 +16,13 @@
 # messages/targets.cmake injected through CMAKE_PROJECT_foundationdb_INCLUDE), build the
 # golden_vectors_messages target (which links fdbclient, flow and fdbrpc), write the fixtures,
 # and check that every fixture round-trips through that build's decoder. The build trees and a
-# ccache live in build/msg/ (gitignored), so a second run only rebuilds what changed.
+# ccache live in build/msg/ (gitignored), so a second run only rebuilds what changed. The tool
+# directory is mounted read-only: the container writes only into build/msg/, and the result
+# replaces fixtures/<release>/ only after every check for that release passed.
 #
-#   --check   Also regenerate each branch a second time into build/msg/ and require
-#             byte-identical output (determinism).
+#   --check   Also regenerate each branch a second time with the same binary and require
+#             byte-identical output. (Whether the output matches the committed fixtures is
+#             what `git status` shows afterwards.)
 set -euo pipefail
 
 TOOL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -49,15 +52,15 @@ if [[ ${1:-} == --in-container ]]; then
 	}
 	bin=$(find /build -name golden_vectors_messages -type f -perm -u+x | head -n 1)
 	echo "== [$name] built in $(($(date +%s) - start))s: ${bin#/build/}"
-	rm -rf "/gv/fixtures/$name"
-	"$bin" generate --out /gv/fixtures --fdb-rev "$name@$rev"
+	# Output goes to /build/out; the host copies it into fixtures/ if this script succeeds.
+	rm -rf /build/out /build/check
+	"$bin" generate --out /build/out --fdb-rev "$name@$rev"
 	echo "== [$name] round trip through the $name decoder"
-	python3 /gv/check_fixtures.py roundtrip "/gv/fixtures/$name" "$bin"
+	python3 /gv/check_fixtures.py roundtrip "/build/out/$name" "$bin"
 	if [[ $check == 1 ]]; then
-		echo "== [$name] determinism: regenerate and compare"
-		rm -rf /build/check
+		echo "== [$name] determinism: regenerate with the same binary and compare"
 		"$bin" generate --out /build/check --fdb-rev "$name@$rev"
-		diff -r "/gv/fixtures/$name" "/build/check/$name"
+		diff -r "/build/out/$name" "/build/check/$name"
 		echo "identical"
 	fi
 	exit 0
@@ -73,13 +76,14 @@ MSG_BRANCHES=${MSG_BRANCHES:-"origin/release-7.4 origin/release-8.0"}
 BUILD_IMAGE=${BUILD_IMAGE:-foundationdb/build:rockylinux9-20261120210123-c79f7cf1aa@sha256:eabf6edbff5f6e864a574814db0a10eb63f804a6a8856f801f942a0b4be715e1}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 8)}
 MSG_DIR=$TOOL_DIR/build/msg
+FIXTURES=$TOOL_DIR/fixtures
 
 check=0
 for arg in "$@"; do
 	case $arg in
 	--check) check=1 ;;
 	*)
-		sed -n '2,22p' "$0" >&2
+		sed -n '2,25p' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -97,17 +101,28 @@ command -v docker >/dev/null || {
 	exit 1
 }
 
-cidfile=""
+cidfile="" container="" docker_pid=""
 cleanup() {
-	# Remove the build container by ID if it is still there (e.g. after Ctrl-C).
+	# Remove the build container if it is still there (e.g. after Ctrl-C): by the ID in the
+	# cidfile, or by its unique name if the cidfile was not written yet.
+	if [[ -n $docker_pid ]]; then
+		kill "$docker_pid" 2>/dev/null || true
+	fi
 	if [[ -n $cidfile && -s $cidfile ]]; then
 		docker rm -f "$(cat "$cidfile")" >/dev/null 2>&1 || true
+	elif [[ -n $container ]]; then
+		docker rm -f "$container" >/dev/null 2>&1 || true
 	fi
 	if [[ -n $cidfile ]]; then
 		rm -f "$cidfile"
 	fi
+	if [[ -n $docker_pid ]]; then
+		wait "$docker_pid" 2>/dev/null || true
+	fi
+	cidfile="" container="" docker_pid=""
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 mkdir -p "$MSG_DIR/ccache"
 for ref in $MSG_BRANCHES; do
@@ -124,13 +139,31 @@ for ref in $MSG_BRANCHES; do
 		fdb_git archive "$rev" | tar -x -C "$src"
 		echo "$rev" >"$src/.gv-rev"
 	fi
-	mkdir -p "$MSG_DIR/build-$name"
+	build=$MSG_DIR/build-$name
+	mkdir -p "$build"
 	cidfile=$(mktemp -u "$MSG_DIR/cid.XXXXXX")
-	docker run --rm --cidfile "$cidfile" --name "gv-msg-$name-$$" \
+	container="gv-msg-$name-$$"
+	# --init: the in-container bash is not PID 1, and tini passes signals to its whole process
+	# group. docker runs in the background so that the INT/TERM trap fires at once (bash runs
+	# traps only between commands) and removes the container.
+	docker run --rm --init -e TINI_KILL_PROCESS_GROUP=1 --cidfile "$cidfile" --name "$container" \
 		--user "$(id -u):$(id -g)" -e HOME=/tmp -e CCACHE_DIR=/ccache -e GV_BUILD_IMAGE="$BUILD_IMAGE" \
-		-v "$TOOL_DIR:/gv" -v "$src:/src:ro" -v "$MSG_DIR/build-$name:/build" -v "$MSG_DIR/ccache:/ccache" \
-		"$BUILD_IMAGE" bash /gv/regen_messages.sh --in-container "$name" "${rev:0:12}" "$JOBS" "$check"
+		-v "$TOOL_DIR:/gv:ro" -v "$src:/src:ro" -v "$build:/build" -v "$MSG_DIR/ccache:/ccache" \
+		"$BUILD_IMAGE" bash /gv/regen_messages.sh --in-container "$name" "${rev:0:12}" "$JOBS" "$check" </dev/null &
+	docker_pid=$!
+	status=0
+	wait "$docker_pid" || status=$?
+	docker_pid=""
 	cleanup
-	cidfile=""
+	if [[ $status != 0 ]]; then
+		echo "== [$name] failed (exit $status); fixtures/$name left unchanged" >&2
+		exit "$status"
+	fi
+	# Every check passed: replace the checked-in fixtures.
+	rm -rf "$FIXTURES/$name.new"
+	cp -r "$build/out/$name" "$FIXTURES/$name.new"
+	rm -rf "$FIXTURES/$name"
+	mv "$FIXTURES/$name.new" "$FIXTURES/$name"
+	echo "== [$name] fixtures/$name updated"
 done
 echo "== all message fixtures regenerated"
