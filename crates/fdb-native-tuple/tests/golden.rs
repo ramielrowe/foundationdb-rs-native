@@ -207,38 +207,108 @@ fn golden_entries_with_non_utf8_strings() {
     );
 }
 
+// Go's math/rand stream (seeded with 1) is not reproducible from Rust, so the
+// values below were decoded once from the fixture with the Python binding's
+// tuple.py, an independent implementation. Integers are the
+// rand.NewSource(1).Int63() sequence; floats are exact IEEE bit patterns.
+const GO_INTEGERS: [i64; 20] = [
+    5577006791947779410,
+    8674665223082153551,
+    6129484611666145821,
+    4037200794235010051,
+    3916589616287113937,
+    6334824724549167320,
+    605394647632969758,
+    1443635317331776148,
+    894385949183117216,
+    2775422040480279449,
+    4751997750760398084,
+    7504504064263669287,
+    1976235410884491574,
+    3510942875414458836,
+    2933568871211445515,
+    4324745483838182873,
+    2610529275472644968,
+    2703387474910584091,
+    6263450610539110790,
+    2015796113853353331,
+];
+const GO_FLOATS: [u32; 20] = [
+    0x3edcf198, 0x3f7fe77f, 0xbfc3115f, 0xbea2112b, 0x3ff1d9f7, 0x3f8ce4b2, 0xbf7e246b, 0x3f7d5da9,
+    0xbf1d7f49, 0xbfb7af9e, 0xc009b123, 0x3e0ca594, 0x3ee2b9a6, 0xbf5899a4, 0xbda99071, 0x3e1fdfa0,
+    0xbfb9ae06, 0x3e8f3a92, 0xbfde947c, 0x3f33e771,
+];
+const GO_DOUBLES: [u64; 20] = [
+    0x3fd62723c1b6f6dd,
+    0xbff11cdba3cb181a,
+    0xbfeaa9ffe8699578,
+    0x3fd52376175b0736,
+    0x3ffbee8ee1d3faa0,
+    0xbff1ee71e66d68b5,
+    0x3fe837b2346c3b49,
+    0x3fedac6dd7b20068,
+    0xbff749c0762e56f1,
+    0x3fef2318fffccd44,
+    0xbfd2e4c7cf20d402,
+    0x3fe052df057667ba,
+    0xbfde377d4dee9078,
+    0x3fd0193b69b7949a,
+    0xbfb4f9daa88db968,
+    0x3fc5561f19268128,
+    0x3fd74c83e596dc08,
+    0xbffa37dfb4f468c2,
+    0x3feabdcb90f74ea6,
+    0x3ff277babaceb8a4,
+];
+const GO_NESTED_INTS: [i64; 4] = [
+    8603989663476771718,
+    6842348953158377901,
+    7388428680384065704,
+    6735196588112087610,
+];
+const GO_NESTED_DOUBLES: [u64; 4] = [
+    0x3fe580903870639c,
+    0x3ff6b976fe5e3384,
+    0xbfd79a10f91843dc,
+    0xbfd526341ee49c36,
+];
+
+fn ints(values: &[i64]) -> Tuple {
+    values.iter().map(|&v| Element::Int(v)).collect()
+}
+
+fn floats(bits: &[u32]) -> Tuple {
+    bits.iter()
+        .map(|&b| Element::Float(f32::from_bits(b)))
+        .collect()
+}
+
+fn doubles(bits: &[u64]) -> Tuple {
+    bits.iter()
+        .map(|&b| Element::Double(f64::from_bits(b)))
+        .collect()
+}
+
 #[test]
-fn golden_random_entries_round_trip() {
+fn golden_random_entries_pack_identically() {
     let golden = load_golden();
-
-    let ints = unpack(&golden["Integers"]).unwrap();
-    assert_eq!(ints.len(), 20);
-    assert!(ints.iter().all(|e| matches!(e, Element::Int(v) if *v >= 0)));
-    assert_eq!(&pack(&ints).unwrap(), &golden["Integers"]);
-
-    let floats = unpack(&golden["Floats"]).unwrap();
-    assert_eq!(floats.len(), 20);
-    assert!(floats.iter().all(|e| matches!(e, Element::Float(_))));
-    assert_eq!(&pack(&floats).unwrap(), &golden["Floats"]);
-
-    let doubles = unpack(&golden["Doubles"]).unwrap();
-    assert_eq!(doubles.len(), 20);
-    assert!(doubles.iter().all(|e| matches!(e, Element::Double(_))));
-    assert_eq!(&pack(&doubles).unwrap(), &golden["Doubles"]);
-
-    let nested = unpack(&golden["Nested"]).unwrap();
-    assert_eq!(nested.len(), 7);
-    assert_eq!(nested[0], Element::Uuid(TEST_UUID));
-    assert!(nested[2].is_null() && nested[4].is_null() && nested[6].is_null());
-    let ints = nested[1].as_tuple().unwrap();
-    assert_eq!(ints.len(), 4);
-    assert!(ints.iter().all(|e| matches!(e, Element::Int(_))));
-    assert_eq!(
-        nested[3],
-        Element::Tuple(repeat(Element::Bytes(b"namespace".to_vec()), 4))
-    );
-    let doubles = nested[5].as_tuple().unwrap();
-    assert_eq!(doubles.len(), 4);
-    assert!(doubles.iter().all(|e| matches!(e, Element::Double(_))));
-    assert_eq!(&pack(&nested).unwrap(), &golden["Nested"]);
+    let nested = tuple![
+        TEST_UUID,
+        ints(&GO_NESTED_INTS),
+        Element::Null,
+        repeat(Element::Bytes(b"namespace".to_vec()), 4),
+        Element::Null,
+        doubles(&GO_NESTED_DOUBLES),
+        Element::Null
+    ];
+    let cases = [
+        ("Integers", ints(&GO_INTEGERS)),
+        ("Floats", floats(&GO_FLOATS)),
+        ("Doubles", doubles(&GO_DOUBLES)),
+        ("Nested", nested),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(&pack(&expected).unwrap(), &golden[name], "pack {name}");
+        assert_eq!(unpack(&golden[name]).unwrap(), expected, "unpack {name}");
+    }
 }

@@ -57,8 +57,19 @@ fn small_integers() {
 
 #[test]
 fn integers_around_64_bit_boundaries() {
-    // u64::MAX still uses the 8-byte code and decodes to a BigInt.
+    // u64::MAX and -(2^64 - 1) use the 8-byte codes (`1c ff*8` / `0c 00*8`), as the
+    // specification, Java and Go do. The Python binding instead emits the long
+    // forms `1d 08 ff*8` / `0b f7 00*8` for exactly these two values; that is a
+    // known divergence we deliberately do not copy. Decoding accepts both.
     let umax = tuple![u64::MAX];
+    assert_eq!(
+        unpack(b"\x1d\x08\xff\xff\xff\xff\xff\xff\xff\xff").unwrap()[0],
+        Element::BigInt(BigInt::from(u64::MAX))
+    );
+    assert_eq!(
+        unpack(b"\x0b\xf7\x00\x00\x00\x00\x00\x00\x00\x00").unwrap()[0],
+        Element::BigInt(-BigInt::from(u64::MAX))
+    );
     assert_eq!(p(umax.clone()), b"\x1c\xff\xff\xff\xff\xff\xff\xff\xff");
     assert_eq!(
         unpack(&p(umax)).unwrap()[0],
@@ -252,13 +263,47 @@ fn versionstamps() {
 }
 
 #[test]
+fn versionstamp_unset_tr_version_is_incomplete() {
+    // The bindingtester feeds exactly these bytes to TUPLE_PACK_WITH_VERSIONSTAMP.
+    let bytes = b"\x02a\x00\x33\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x05";
+    let t = unpack(bytes).unwrap();
+    assert_eq!(t[1], Element::Versionstamp(Versionstamp::incomplete(5)));
+    assert!(t.has_incomplete_versionstamp());
+    let key = pack_with_versionstamp(&t).unwrap();
+    assert_eq!(&key[..bytes.len()], bytes);
+    assert_eq!(&key[bytes.len()..], &4u32.to_le_bytes());
+
+    // Stripping the offset suffix from pack_with_versionstamp output round-trips.
+    let t = tuple![
+        "x",
+        Tuple::new().with(1).with(Versionstamp::incomplete(0x0102)),
+        2
+    ];
+    let key = pack_with_versionstamp(&t).unwrap();
+    assert_eq!(unpack(&key[..key.len() - 4]).unwrap(), t);
+
+    // Plain pack refuses a transaction version of all 0xff, however it was built.
+    assert_eq!(
+        pack(&(Versionstamp::complete([0xff; 10], 0),)),
+        Err(Error::IncompleteVersionstamp)
+    );
+}
+
+#[test]
 fn versionstamp_ordering() {
     let a = Versionstamp::complete([0; 10], 5);
     let b = Versionstamp::complete([0; 10], 6);
     let inc = Versionstamp::incomplete(0);
     assert!(a < b && b < inc);
     assert_eq!(a, a);
-    assert_ne!(inc, Versionstamp::complete([0xff; 10], 0));
+    // All-0xff transaction version is the incomplete marker, as in the other bindings.
+    assert_eq!(inc, Versionstamp::complete([0xff; 10], 0));
+    assert!(!Versionstamp::complete([0xff; 10], 3).is_complete());
+    assert_eq!(Versionstamp::complete([0xff; 10], 3).tr_version(), None);
+    let mut almost = [0xff; 10];
+    almost[9] = 0xfe;
+    assert!(Versionstamp::complete(almost, 0).is_complete());
+    assert!(b < inc);
     assert!(a.is_complete() && !inc.is_complete());
     assert_eq!(Versionstamp::from_bytes(a.to_bytes()), a);
 }

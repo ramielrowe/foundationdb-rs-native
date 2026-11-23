@@ -41,25 +41,32 @@ impl From<[u8; 16]> for Uuid {
 /// A 96-bit versionstamp: a 10-byte transaction version followed by a 2-byte
 /// user version.
 ///
-/// A versionstamp is *incomplete* until the database fills in the 10-byte
-/// transaction version at commit. Incomplete versionstamps can only be packed
-/// with [`pack_with_versionstamp`](crate::pack_with_versionstamp).
+/// A versionstamp whose transaction version is ten `0xff` bytes is
+/// *incomplete*: it is a placeholder that the database fills in at commit.
+/// This is the convention of the other bindings, so [`Versionstamp::incomplete`]
+/// and `Versionstamp::complete([0xff; 10], u)` are the same value, and the
+/// bytes `33 ff*10 uu uu` always unpack to an incomplete versionstamp.
+/// Incomplete versionstamps can only be packed with
+/// [`pack_with_versionstamp`](crate::pack_with_versionstamp).
 ///
-/// Ordering follows the packed form, in which an incomplete versionstamp has
-/// an all-`0xff` transaction version. When a complete versionstamp has that
-/// same transaction version, the incomplete one sorts after it so that `Ord`
-/// stays consistent with `Eq`.
-#[derive(Debug, Clone, Copy)]
+/// Ordering is the packed byte order: transaction version, then user version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Versionstamp {
-    tr_version: Option<[u8; 10]>,
+    tr_version: [u8; 10],
     user_version: u16,
 }
 
+/// Transaction version marking an incomplete versionstamp.
+const UNSET_TR_VERSION: [u8; 10] = [0xff; 10];
+
 impl Versionstamp {
-    /// Creates a complete versionstamp.
+    /// Creates a versionstamp from a transaction version and user version.
+    ///
+    /// A transaction version of ten `0xff` bytes yields an incomplete
+    /// versionstamp, identical to [`Versionstamp::incomplete`].
     pub const fn complete(tr_version: [u8; 10], user_version: u16) -> Self {
         Self {
-            tr_version: Some(tr_version),
+            tr_version,
             user_version,
         }
     }
@@ -67,19 +74,20 @@ impl Versionstamp {
     /// Creates an incomplete versionstamp with the given user version.
     pub const fn incomplete(user_version: u16) -> Self {
         Self {
-            tr_version: None,
+            tr_version: UNSET_TR_VERSION,
             user_version,
         }
     }
 
-    /// Returns `true` if the transaction version is known.
-    pub const fn is_complete(&self) -> bool {
-        self.tr_version.is_some()
+    /// Returns `true` if the transaction version is known, that is, it is not
+    /// ten `0xff` bytes.
+    pub fn is_complete(&self) -> bool {
+        self.tr_version != UNSET_TR_VERSION
     }
 
     /// Returns the transaction version, or `None` if incomplete.
-    pub const fn tr_version(&self) -> Option<&[u8; 10]> {
-        self.tr_version.as_ref()
+    pub fn tr_version(&self) -> Option<&[u8; 10]> {
+        self.is_complete().then_some(&self.tr_version)
     }
 
     /// Returns the user version.
@@ -90,53 +98,18 @@ impl Versionstamp {
     /// Returns the 12-byte packed form. An incomplete versionstamp has ten
     /// `0xff` bytes in place of the transaction version.
     pub fn to_bytes(&self) -> [u8; 12] {
-        let mut out = [0xff; 12];
-        if let Some(tr) = &self.tr_version {
-            out[..10].copy_from_slice(tr);
-        }
+        let mut out = [0; 12];
+        out[..10].copy_from_slice(&self.tr_version);
         out[10..].copy_from_slice(&self.user_version.to_be_bytes());
         out
     }
 
-    /// Creates a complete versionstamp from its 12-byte packed form.
+    /// Creates a versionstamp from its 12-byte packed form. A transaction
+    /// version of ten `0xff` bytes gives an incomplete versionstamp.
     pub fn from_bytes(bytes: [u8; 12]) -> Self {
         let mut tr = [0; 10];
         tr.copy_from_slice(&bytes[..10]);
         Self::complete(tr, u16::from_be_bytes([bytes[10], bytes[11]]))
-    }
-
-    fn sort_key(&self) -> ([u8; 10], u16, bool) {
-        (
-            self.tr_version.unwrap_or([0xff; 10]),
-            self.user_version,
-            self.tr_version.is_none(),
-        )
-    }
-}
-
-impl PartialEq for Versionstamp {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort_key() == other.sort_key()
-    }
-}
-
-impl Eq for Versionstamp {}
-
-impl PartialOrd for Versionstamp {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Versionstamp {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.sort_key().cmp(&other.sort_key())
-    }
-}
-
-impl Hash for Versionstamp {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.sort_key().hash(state);
     }
 }
 

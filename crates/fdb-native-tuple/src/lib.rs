@@ -74,10 +74,19 @@
 //!
 //! # Versionstamps
 //!
-//! A tuple with exactly one incomplete [`Versionstamp`] can be packed with
+//! A [`Versionstamp`] whose 10-byte transaction version is all `0xff` is
+//! *incomplete*, exactly as in the Python, Java and Go bindings. A tuple with
+//! exactly one incomplete versionstamp can be packed with
 //! [`pack_with_versionstamp`]; the result ends with a 4-byte little-endian
-//! offset of the stamp (API version 520 and later), ready for
-//! `SET_VERSIONSTAMPED_KEY`.
+//! offset of the stamp, ready for `SET_VERSIONSTAMPED_KEY`. Plain [`pack`]
+//! rejects incomplete versionstamps, and [`unpack`] returns bytes containing
+//! an all-`0xff` transaction version as an incomplete versionstamp, so the
+//! output of `pack_with_versionstamp` minus its 4-byte suffix unpacks to the
+//! original tuple.
+//!
+//! Only the 4-byte offset used from API version 520 is supported; the 2-byte
+//! offset of older API versions is not. A client built on this crate (for
+//! example the stack tester) must therefore use a minimum API version of 520.
 //!
 //! ```
 //! use fdb_native_tuple::{pack_with_versionstamp, Versionstamp};
@@ -104,13 +113,25 @@
 //! assert!(begin < key && key < end);
 //! ```
 //!
-//! # Errors
+//! # Errors and strictness
 //!
 //! [`unpack`] is strict and returns [`Error`] on truncated or malformed input;
-//! no function in this crate panics on any input. Integer decoding is lenient
-//! about non-minimal encodings (as the other bindings are) and normalises the
-//! value. Nesting deeper than [`MAX_DEPTH`] is rejected on both pack and
-//! unpack.
+//! no function in this crate panics on any input. Unterminated strings, byte
+//! strings and nested tuples are errors, which matches the Java binding; the
+//! Python binding is more lenient and treats end of input as the terminator.
+//! Strings must be valid UTF-8 (Python also decodes strictly). Integer
+//! decoding accepts non-minimal encodings and normalises the value.
+//!
+//! # Differences from other bindings
+//!
+//! * `u64::MAX` and `-(2^64 - 1)` are packed with the 8-byte integer codes
+//!   (`1c ff*8` and `0c 00*8`), as the specification, Java and Go do. Python
+//!   packs exactly these two values with the long forms `1d 08 ff*8` and
+//!   `0b f7 00*8`. Decoding accepts both.
+//! * Nesting is limited to [`MAX_DEPTH`] (128) levels on both pack and unpack
+//!   to keep recursion bounded; Python can nest deeper.
+//! * Only the API version 520 and later versionstamp offset is supported (see
+//!   above).
 
 mod decode;
 mod element;
@@ -124,7 +145,10 @@ pub use error::{Error, Result};
 pub use subspace::Subspace;
 pub use tuple::{Tuple, TuplePack};
 
-/// Maximum nesting depth of tuples within tuples, for both pack and unpack.
+/// Maximum nesting depth of tuples within tuples (128), for both pack and unpack.
+///
+/// This is a deliberate limit that bounds recursion; the Python binding can
+/// nest deeper.
 pub const MAX_DEPTH: usize = 128;
 
 /// Packs a tuple into a key.
