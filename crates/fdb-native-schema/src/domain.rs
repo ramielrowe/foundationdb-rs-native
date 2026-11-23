@@ -7,8 +7,9 @@
 //! documented as such; a field the domain does not carry is written as the C++ default (on 7.4,
 //! the tenant-less `TenantInfo`). Request types own their data (a commit's mutations can
 //! be moved in from the transaction's buffer and are encoded without a copy); the reply to the
-//! hottest request, [`GetValueReply`], borrows its value from the received message. A
-//! request's reply token is not part of it: it is given to
+//! hottest request, [`GetValueReply`], borrows its value from the received message, as
+//! [`GetKeyReply`] borrows its key and [`GetKeyValuesReply`] views its rows in the message's
+//! blob. A request's reply token is not part of it: it is given to
 //! [`Request::encode_request`](crate::Request::encode_request), so the same request can be
 //! sent again with a new token.
 
@@ -16,7 +17,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use fdb_native_wire::{
-    Endpoint, FdbError, IdempotencyId, NetworkAddress, Tag, TagSet, Uid, VersionVector,
+    Endpoint, FdbError, IdempotencyId, KeyValueVectorRef, NetworkAddress, Tag, TagSet, Uid,
+    VersionVector,
 };
 
 use crate::SchemaVersion;
@@ -566,6 +568,235 @@ impl Default for GetValueReply<'_> {
             cached: false,
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Storage server: GetKeyRequest -> GetKeyReply.
+
+/// A key selector (`KeySelector`): the first key at an offset from an anchor. It resolves to
+/// the `offset`-th key after the last key less than `key` (`or_equal` false) or less than or
+/// equal to `key` (`or_equal` true); an offset of 0 or less moves backward.
+///
+/// The usual four are [`last_less_than`](KeySelector::last_less_than),
+/// [`last_less_or_equal`](KeySelector::last_less_or_equal),
+/// [`first_greater_than`](KeySelector::first_greater_than) and
+/// [`first_greater_or_equal`](KeySelector::first_greater_or_equal). [`Default`] is
+/// `KeySelector()`: the empty key, `or_equal` false, offset 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct KeySelector {
+    /// `key`: the anchor.
+    pub key: Vec<u8>,
+    /// `orEqual`: whether the anchor itself counts as "less than or equal".
+    pub or_equal: bool,
+    /// `offset`: how many keys to move from the anchor's position.
+    pub offset: i32,
+}
+
+impl KeySelector {
+    /// A selector.
+    pub fn new(key: impl Into<Vec<u8>>, or_equal: bool, offset: i32) -> KeySelector {
+        KeySelector {
+            key: key.into(),
+            or_equal,
+            offset,
+        }
+    }
+
+    /// `lastLessThan(key)`: the last key before `key`.
+    pub fn last_less_than(key: impl Into<Vec<u8>>) -> KeySelector {
+        KeySelector::new(key, false, 0)
+    }
+
+    /// `lastLessOrEqual(key)`: `key` if it is set, else the last key before it.
+    pub fn last_less_or_equal(key: impl Into<Vec<u8>>) -> KeySelector {
+        KeySelector::new(key, true, 0)
+    }
+
+    /// `firstGreaterThan(key)`: the first key after `key`.
+    pub fn first_greater_than(key: impl Into<Vec<u8>>) -> KeySelector {
+        KeySelector::new(key, true, 1)
+    }
+
+    /// `firstGreaterOrEqual(key)`: `key` if it is set, else the first key after it.
+    pub fn first_greater_or_equal(key: impl Into<Vec<u8>>) -> KeySelector {
+        KeySelector::new(key, false, 1)
+    }
+
+    /// Borrows the selector.
+    pub fn borrowed(&self) -> KeySelectorRef<'_> {
+        KeySelectorRef {
+            key: &self.key,
+            or_equal: self.or_equal,
+            offset: self.offset,
+        }
+    }
+}
+
+/// A key selector (`KeySelectorRef`) that borrows its key: how a reply to
+/// [`GetKey`] carries the selector from the message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct KeySelectorRef<'a> {
+    /// `key`: the anchor.
+    pub key: &'a [u8],
+    /// `orEqual`.
+    pub or_equal: bool,
+    /// `offset`.
+    pub offset: i32,
+}
+
+impl KeySelectorRef<'_> {
+    /// Copies the key ([`KeySelector`] owns its).
+    pub fn into_owned(self) -> KeySelector {
+        KeySelector {
+            key: self.key.to_vec(),
+            or_equal: self.or_equal,
+            offset: self.offset,
+        }
+    }
+}
+
+/// `GetKeyRequest`, sent to a storage server's `getKey`: resolve `sel` at `version`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GetKey {
+    /// `sel`.
+    pub sel: KeySelector,
+    /// `version`: the read version.
+    pub version: i64,
+    /// `tags`: the transaction's tags.
+    pub tags: Option<TagSet>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+    /// `options`.
+    pub options: Option<ReadOptions>,
+    /// `ssLatestCommitVersions`: see [`GetValue::ss_latest_commit_versions`].
+    pub ss_latest_commit_versions: VersionVector,
+}
+
+/// `GetKeyReply`: the resolved selector. Borrows its key from the reply message. [`Default`]
+/// is `GetKeyReply()`: penalty 1.0 (`LoadBalancedReply()`), no error, a default selector.
+///
+/// The server resolves the selector as far as its own shard allows: `sel` is the result, and
+/// when it is not fully resolved (its offset is not yet 0 or 1 at a key in the shard) the client
+/// continues with it on the neighbouring shard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GetKeyReply<'a> {
+    /// `penalty` (`LoadBalancedReply`): the server's load, for load balancing.
+    pub penalty: f64,
+    /// `error` (`LoadBalancedReply`): set when the server could not serve the read.
+    pub error: Option<FdbError>,
+    /// `sel`: the resolved (or partly resolved) selector.
+    pub sel: KeySelectorRef<'a>,
+    /// `cached`.
+    pub cached: bool,
+}
+
+impl Default for GetKeyReply<'_> {
+    fn default() -> Self {
+        GetKeyReply {
+            penalty: 1.0,
+            error: None,
+            sel: KeySelectorRef::default(),
+            cached: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Storage server: GetKeyValuesRequest -> GetKeyValuesReply.
+
+/// `GetKeyValuesRequest`, sent to a storage server's `getKeyValues`: the rows from the key
+/// `begin` resolves to up to the key `end` resolves to, at most `limit` rows and about
+/// `limit_bytes` bytes (a negative `limit` reads backward from `end`).
+///
+/// The C++ struct's `mapper` is a dummy that is never serialized, and is not modelled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GetKeyValues {
+    /// `begin`.
+    pub begin: KeySelector,
+    /// `end`.
+    pub end: KeySelector,
+    /// `version`: the read version.
+    pub version: i64,
+    /// `limit`: the most rows to return; negative to read in reverse.
+    pub limit: i32,
+    /// `limitBytes`: about how many bytes of rows to return.
+    pub limit_bytes: i32,
+    /// `tags`: the transaction's tags.
+    pub tags: Option<TagSet>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+    /// `options`.
+    pub options: Option<ReadOptions>,
+    /// `ssLatestCommitVersions`: see [`GetValue::ss_latest_commit_versions`].
+    pub ss_latest_commit_versions: VersionVector,
+    /// `taskID` (8.0 only; not sent to 7.4): the `TaskPriority` the server runs the read at,
+    /// which says what the read is for.
+    pub task_id: Option<i32>,
+}
+
+/// `GetKeyValuesReply`. The rows are the reply message's pre-serialized blob, read in place:
+/// [`data`](GetKeyValuesReply::data) borrows from the message and its
+/// [`iter`](fdb_native_wire::KeyValueVectorRef::iter) yields `KeyValueRef`s of borrowed keys
+/// and values, without copying them. [`Default`] is `GetKeyValuesReply()`: penalty 1.0
+/// (`LoadBalancedReply()`), no error, no rows, `version` [`INVALID_VERSION`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GetKeyValuesReply<'a> {
+    /// `penalty` (`LoadBalancedReply`): the server's load, for load balancing.
+    pub penalty: f64,
+    /// `error` (`LoadBalancedReply`): set when the server could not serve the read.
+    pub error: Option<FdbError>,
+    /// `data`: the rows.
+    pub data: KeyValueVectorRef<'a>,
+    /// `version`: the version the server read at (useful when `latestVersion` was
+    /// requested).
+    pub version: i64,
+    /// `more`: whether the range has more rows beyond these.
+    pub more: bool,
+    /// `cached`.
+    pub cached: bool,
+}
+
+impl Default for GetKeyValuesReply<'_> {
+    fn default() -> Self {
+        GetKeyValuesReply {
+            penalty: 1.0,
+            error: None,
+            data: KeyValueVectorRef::EMPTY,
+            version: INVALID_VERSION,
+            more: false,
+            cached: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Storage server: WatchValueRequest -> WatchValueReply.
+
+/// `WatchValueRequest`, sent to a storage server's `watchValue`: reply when `key`'s value
+/// is no longer `value` (`None`: not set), as of a version at or after `version`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchValue {
+    /// `key`.
+    pub key: Vec<u8>,
+    /// `value`: the value being watched (`None`: the key not being set).
+    pub value: Option<Vec<u8>>,
+    /// `version`: the version at which the client read `value`.
+    pub version: i64,
+    /// `tags`: the transaction's tags.
+    pub tags: Option<TagSet>,
+    /// `debugID`.
+    pub debug_id: Option<Uid>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+}
+
+/// `WatchValueReply`: the watch fired.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WatchValueReply {
+    /// `version`: the version at which the key's value was seen to differ.
+    pub version: i64,
+    /// `cached`.
+    pub cached: bool,
 }
 
 // ---------------------------------------------------------------------------------------

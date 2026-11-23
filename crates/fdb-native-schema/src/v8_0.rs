@@ -8,6 +8,9 @@
 //! | type | 8.0 |
 //! | --- | --- |
 //! | [`GetValueRequest`] | no `tenantInfo`: `options` and `ssLatestCommitVersions` move down a slot |
+//! | [`GetKeyRequest`] | no `tenantInfo`: `options` and `ssLatestCommitVersions` move down a slot |
+//! | [`GetKeyValuesRequest`] | no `tenantInfo`; `taskID` appended after `ssLatestCommitVersions` |
+//! | [`WatchValueRequest`] | no `tenantInfo` |
 //! | [`CommitTransactionRequest`] | no `tenantInfo`: `idempotencyId` moves down a slot |
 //! | [`GetKeyServerLocationsRequest`] | no `tenant`; `minTenantVersion` renamed `legacyVersion` |
 //! | [`GetReadVersionRequest`] | `maxGrvQueueDelayMS` appended |
@@ -24,10 +27,10 @@ use fdb_native_wire::{
 
 pub use crate::common::{
     ClientTagThrottleLimits, ClientTrCommitCostEstimation, ClientVersionRef, CommitID,
-    CommitProxyInterface, CommitTransactionRef, GetKeyServerLocationsReply, GetValueReply,
-    GrvProxyInterface, Hostname, KeyRangeRef, KeyServerLocation, LocalityData, MutationRef,
-    OpenDatabaseCoordRequest, Pair, SpanContext, StorageServerInterface, TraceFlags,
-    VersionHistory,
+    CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyServerLocationsReply,
+    GetKeyValuesReply, GetValueReply, GrvProxyInterface, Hostname, KeyRangeRef, KeySelectorRef,
+    KeyServerLocation, LocalityData, MutationRef, OpenDatabaseCoordRequest, Pair, SpanContext,
+    StorageServerInterface, TraceFlags, VersionHistory, WatchValueReply,
 };
 use crate::streams::CommitProxyStreams;
 use crate::{SchemaVersion, domain};
@@ -498,6 +501,188 @@ impl From<GetValueRequest<'_>> for domain::GetValue {
             span_context: r.span_context,
             options: r.options.map(Into::into),
             ss_latest_commit_versions: r.ss_latest_commit_versions,
+        }
+    }
+}
+
+/// `GetKeyRequest` on 8.0 (`serializer(ar, sel, version, tags, reply, spanContext, options,
+/// ssLatestCommitVersions, arena)`).
+///
+/// Absent: `GetKeyRequest() = default`: zero except what the fields' own absent values give:
+/// `sel` is a `KeySelectorRef()` (zero) and `ss_latest_commit_versions.max_version` is -1
+/// (`VersionVector()`).
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 10457870)]
+pub struct GetKeyRequest<'a> {
+    /// `sel`.
+    pub sel: KeySelectorRef<'a>,
+    /// `version`.
+    pub version: i64,
+    /// `tags`.
+    pub tags: Option<TagSetRef<'a>>,
+    /// `reply`.
+    pub reply: ReplyPromise<domain::GetKeyReply<'static>>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+    /// `options`.
+    pub options: Option<ReadOptions>,
+    /// `ssLatestCommitVersions`.
+    pub ss_latest_commit_versions: VersionVector,
+    /// `arena`.
+    #[fdb(arena)]
+    pub arena: (),
+}
+
+impl<'a> GetKeyRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::GetKey, reply: Uid) -> Self {
+        GetKeyRequest {
+            sel: KeySelectorRef::from(&r.sel),
+            version: r.version,
+            tags: r.tags.as_ref().map(TagSet::borrowed),
+            reply: ReplyPromise::new(reply),
+            span_context: r.span_context,
+            options: r.options.as_ref().map(ReadOptions::from),
+            ss_latest_commit_versions: r.ss_latest_commit_versions.clone(),
+            arena: (),
+        }
+    }
+}
+
+impl From<GetKeyRequest<'_>> for domain::GetKey {
+    fn from(r: GetKeyRequest<'_>) -> Self {
+        domain::GetKey {
+            sel: r.sel.into(),
+            version: r.version,
+            tags: r.tags.map(TagSetRef::into_owned),
+            span_context: r.span_context,
+            options: r.options.map(Into::into),
+            ss_latest_commit_versions: r.ss_latest_commit_versions,
+        }
+    }
+}
+
+/// `GetKeyValuesRequest` on 8.0 (`serializer(ar, begin, end, version, limit, limitBytes,
+/// tags, reply, spanContext, options, ssLatestCommitVersions, taskID, arena)`). The C++
+/// struct's `mapper` is not serialized.
+///
+/// Absent: `GetKeyValuesRequest() = default`: zero except what the fields' own absent values
+/// give: `begin` and `end` are `KeySelectorRef()`s (zero) and
+/// `ss_latest_commit_versions.max_version` is -1.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 6795746)]
+pub struct GetKeyValuesRequest<'a> {
+    /// `begin`.
+    pub begin: KeySelectorRef<'a>,
+    /// `end`.
+    pub end: KeySelectorRef<'a>,
+    /// `version`.
+    pub version: i64,
+    /// `limit`.
+    pub limit: i32,
+    /// `limitBytes`.
+    pub limit_bytes: i32,
+    /// `tags`.
+    pub tags: Option<TagSetRef<'a>>,
+    /// `reply`.
+    pub reply: ReplyPromise<domain::GetKeyValuesReply<'static>>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+    /// `options`.
+    pub options: Option<ReadOptions>,
+    /// `ssLatestCommitVersions`.
+    pub ss_latest_commit_versions: VersionVector,
+    /// `taskID` (`Optional<TaskPriority>`, an `int` enum).
+    pub task_id: Option<i32>,
+    /// `arena`.
+    #[fdb(arena)]
+    pub arena: (),
+}
+
+impl<'a> GetKeyValuesRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::GetKeyValues, reply: Uid) -> Self {
+        GetKeyValuesRequest {
+            begin: KeySelectorRef::from(&r.begin),
+            end: KeySelectorRef::from(&r.end),
+            version: r.version,
+            limit: r.limit,
+            limit_bytes: r.limit_bytes,
+            tags: r.tags.as_ref().map(TagSet::borrowed),
+            reply: ReplyPromise::new(reply),
+            span_context: r.span_context,
+            options: r.options.as_ref().map(ReadOptions::from),
+            ss_latest_commit_versions: r.ss_latest_commit_versions.clone(),
+            task_id: r.task_id,
+            arena: (),
+        }
+    }
+}
+
+impl From<GetKeyValuesRequest<'_>> for domain::GetKeyValues {
+    fn from(r: GetKeyValuesRequest<'_>) -> Self {
+        domain::GetKeyValues {
+            begin: r.begin.into(),
+            end: r.end.into(),
+            version: r.version,
+            limit: r.limit,
+            limit_bytes: r.limit_bytes,
+            tags: r.tags.map(TagSetRef::into_owned),
+            span_context: r.span_context,
+            options: r.options.map(Into::into),
+            ss_latest_commit_versions: r.ss_latest_commit_versions,
+            task_id: r.task_id,
+        }
+    }
+}
+
+/// `WatchValueRequest` on 8.0 (`serializer(ar, key, value, version, tags, debugID, reply,
+/// spanContext)`).
+///
+/// Absent: `WatchValueRequest() = default`: zero.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 14747733)]
+pub struct WatchValueRequest<'a> {
+    /// `key`.
+    pub key: &'a [u8],
+    /// `value`.
+    pub value: Option<&'a [u8]>,
+    /// `version`.
+    pub version: i64,
+    /// `tags`.
+    pub tags: Option<TagSetRef<'a>>,
+    /// `debugID`.
+    pub debug_id: Option<Uid>,
+    /// `reply`.
+    pub reply: ReplyPromise<domain::WatchValueReply>,
+    /// `spanContext`.
+    pub span_context: SpanContext,
+}
+
+impl<'a> WatchValueRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::WatchValue, reply: Uid) -> Self {
+        WatchValueRequest {
+            key: &r.key,
+            value: r.value.as_deref(),
+            version: r.version,
+            tags: r.tags.as_ref().map(TagSet::borrowed),
+            debug_id: r.debug_id,
+            reply: ReplyPromise::new(reply),
+            span_context: r.span_context,
+        }
+    }
+}
+
+impl From<WatchValueRequest<'_>> for domain::WatchValue {
+    fn from(r: WatchValueRequest<'_>) -> Self {
+        domain::WatchValue {
+            key: r.key.to_vec(),
+            value: r.value.map(<[u8]>::to_vec),
+            version: r.version,
+            tags: r.tags.map(TagSetRef::into_owned),
+            debug_id: r.debug_id,
+            span_context: r.span_context,
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Encoding and decoding the vertical-slice messages for a [`SchemaVersion`].
+//! Encoding and decoding the client's messages for a [`SchemaVersion`].
 
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, FileIdentified, Uid, Writer,
@@ -7,7 +7,7 @@ use fdb_native_wire::{
 
 use crate::{SchemaVersion, common, domain, v7_4, v8_0};
 
-/// A request a client sends, with its reply: the message pairs of the vertical slice, as
+/// A request a client sends, with its reply: the message pairs this crate covers, as
 /// [`domain`](crate::domain) types, encoded and decoded with the schema set of a
 /// [`SchemaVersion`].
 ///
@@ -30,6 +30,9 @@ use crate::{SchemaVersion, common, domain, v7_4, v8_0};
 /// | [`GetReadVersion`](domain::GetReadVersion) | a GRV proxy, `getConsistentReadVersion` | [`ReadVersion`](domain::ReadVersion) |
 /// | [`GetKeyServerLocations`](domain::GetKeyServerLocations) | a commit proxy, `getKeyServersLocations` | [`KeyServerLocations`](domain::KeyServerLocations) |
 /// | [`GetValue`](domain::GetValue) | a storage server, `getValue` | [`GetValueReply`](domain::GetValueReply) (borrows the value) |
+/// | [`GetKey`](domain::GetKey) | a storage server, `getKey` | [`GetKeyReply`](domain::GetKeyReply) (borrows the selector's key) |
+/// | [`GetKeyValues`](domain::GetKeyValues) | a storage server, `getKeyValues` | [`GetKeyValuesReply`](domain::GetKeyValuesReply) (reads the rows in place) |
+/// | [`WatchValue`](domain::WatchValue) | a storage server, `watchValue` | [`WatchValueReply`](domain::WatchValueReply) |
 /// | [`Commit`](domain::Commit) | a commit proxy, `commit` | [`CommitId`](domain::CommitId) |
 ///
 /// ```
@@ -368,6 +371,141 @@ impl Request for domain::GetValue {
         bytes: &[u8],
     ) -> Result<ErrorOr<domain::GetValueReply<'_>>, DecodeError> {
         decode_envelope(bytes, |r: common::GetValueReply| Ok(r.into()))
+    }
+}
+
+impl Request for domain::GetKey {
+    type Reply<'de> = domain::GetKeyReply<'de>;
+
+    fn encode_request_into(
+        &self,
+        version: SchemaVersion,
+        reply: Uid,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        match version {
+            SchemaVersion::V7_4 => encode_into(&v7_4::GetKeyRequest::from_domain(self, reply), out),
+            SchemaVersion::V8_0 => encode_into(&v8_0::GetKeyRequest::from_domain(self, reply), out),
+        }
+    }
+
+    fn decode_request(version: SchemaVersion, bytes: &[u8]) -> Result<(Self, Uid), DecodeError> {
+        match version {
+            SchemaVersion::V7_4 => decode_request(bytes, |r: &v7_4::GetKeyRequest| r.reply.token()),
+            SchemaVersion::V8_0 => decode_request(bytes, |r: &v8_0::GetKeyRequest| r.reply.token()),
+        }
+    }
+
+    /// The same on both versions.
+    fn encode_reply(
+        _: SchemaVersion,
+        reply: &ErrorOr<domain::GetKeyReply<'_>>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_envelope(reply, common::GetKeyReply::from)
+    }
+
+    /// The same on both versions; the selector's key borrows from `bytes`.
+    fn decode_reply(
+        _: SchemaVersion,
+        bytes: &[u8],
+    ) -> Result<ErrorOr<domain::GetKeyReply<'_>>, DecodeError> {
+        decode_envelope(bytes, |r: common::GetKeyReply| Ok(r.into()))
+    }
+}
+
+impl Request for domain::GetKeyValues {
+    type Reply<'de> = domain::GetKeyValuesReply<'de>;
+
+    /// 8.0's `taskID` is not sent to 7.4.
+    fn encode_request_into(
+        &self,
+        version: SchemaVersion,
+        reply: Uid,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                encode_into(&v7_4::GetKeyValuesRequest::from_domain(self, reply), out)
+            }
+            SchemaVersion::V8_0 => {
+                encode_into(&v8_0::GetKeyValuesRequest::from_domain(self, reply), out)
+            }
+        }
+    }
+
+    fn decode_request(version: SchemaVersion, bytes: &[u8]) -> Result<(Self, Uid), DecodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                decode_request(bytes, |r: &v7_4::GetKeyValuesRequest| r.reply.token())
+            }
+            SchemaVersion::V8_0 => {
+                decode_request(bytes, |r: &v8_0::GetKeyValuesRequest| r.reply.token())
+            }
+        }
+    }
+
+    /// The same on both versions.
+    fn encode_reply(
+        _: SchemaVersion,
+        reply: &ErrorOr<domain::GetKeyValuesReply<'_>>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_envelope(reply, common::GetKeyValuesReply::from)
+    }
+
+    /// The same on both versions. The rows are not copied or parsed into a vector: the
+    /// reply's `data` is validated and then views the pre-serialized blob in `bytes`.
+    fn decode_reply(
+        _: SchemaVersion,
+        bytes: &[u8],
+    ) -> Result<ErrorOr<domain::GetKeyValuesReply<'_>>, DecodeError> {
+        decode_envelope(bytes, |r: common::GetKeyValuesReply| Ok(r.into()))
+    }
+}
+
+impl Request for domain::WatchValue {
+    type Reply<'de> = domain::WatchValueReply;
+
+    fn encode_request_into(
+        &self,
+        version: SchemaVersion,
+        reply: Uid,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                encode_into(&v7_4::WatchValueRequest::from_domain(self, reply), out)
+            }
+            SchemaVersion::V8_0 => {
+                encode_into(&v8_0::WatchValueRequest::from_domain(self, reply), out)
+            }
+        }
+    }
+
+    fn decode_request(version: SchemaVersion, bytes: &[u8]) -> Result<(Self, Uid), DecodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                decode_request(bytes, |r: &v7_4::WatchValueRequest| r.reply.token())
+            }
+            SchemaVersion::V8_0 => {
+                decode_request(bytes, |r: &v8_0::WatchValueRequest| r.reply.token())
+            }
+        }
+    }
+
+    /// The same on both versions.
+    fn encode_reply(
+        _: SchemaVersion,
+        reply: &ErrorOr<domain::WatchValueReply>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_envelope(reply, common::WatchValueReply::from)
+    }
+
+    /// The same on both versions.
+    fn decode_reply(
+        _: SchemaVersion,
+        bytes: &[u8],
+    ) -> Result<ErrorOr<domain::WatchValueReply>, DecodeError> {
+        decode_envelope(bytes, |r: common::WatchValueReply| Ok(r.into()))
     }
 }
 
