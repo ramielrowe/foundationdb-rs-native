@@ -7,5 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+
 [lints]
 workspace = true
