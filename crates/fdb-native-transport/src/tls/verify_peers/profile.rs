@@ -11,30 +11,29 @@
 //! `crypto/x509/v3_purp.c`, `crypto/x509/v3_ncons.c`), checked against 3.5.5 with
 //! `openssl verify -purpose sslserver`.
 
-use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::{GeneralName, ParsedExtension, X509Extension};
-
 use super::cert::{AltName, AsnString, Ext, PeerCert};
+use super::exts::{self, AuthorityKeyId};
 use super::rules::Field;
-use super::selfsig::tlv;
 
-/// OpenSSL's `X509_supported_extension` list (`crypto/x509/v3_purp.c`, `supported_nids`): the
-/// extensions its verifier "uses", so that a *critical* one is not an "unhandled critical
-/// extension" (error 34, `X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION`). Every other critical
-/// extension makes a certificate unusable, whatever its role in the chain: this includes
-/// `subjectKeyIdentifier`, `authorityKeyIdentifier`, `cRLDistributionPoints`,
-/// `authorityInfoAccess` and `freshestCRL`, which are normally not critical.
+/// OpenSSL's `X509_supported_extension` list (`crypto/x509/v3_purp.c`, `supported_nids`, as
+/// of 3.5): the extensions its verifier "uses", so that a *critical* one is not an "unhandled
+/// critical extension" (error 34, `X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION`). Every other
+/// critical extension makes a certificate unusable, whatever its role in the chain: this
+/// includes `subjectKeyIdentifier`, `authorityKeyIdentifier`, `authorityInfoAccess`,
+/// `subjectInfoAccess`, `freshestCRL` and `issuerAltName`, which are normally not critical.
 ///
 /// The two RFC 3779 entries are compiled in unless OpenSSL is built with `no-rfc3779`.
-const SUPPORTED_EXTENSIONS: [&str; 13] = [
+const SUPPORTED_EXTENSIONS: [&str; 15] = [
     "2.16.840.1.113730.1.1", // nsCertType
     "2.5.29.15",             // keyUsage
     "2.5.29.17",             // subjectAltName
     "2.5.29.19",             // basicConstraints
     "2.5.29.32",             // certificatePolicies
+    "2.5.29.31",             // cRLDistributionPoints
     "2.5.29.37",             // extendedKeyUsage
     "1.3.6.1.5.5.7.1.7",     // sbgp-ipAddrBlock (RFC 3779)
     "1.3.6.1.5.5.7.1.8",     // sbgp-autonomousSysNum (RFC 3779)
+    "1.3.6.1.5.5.7.48.1.5",  // id-pkix-ocsp-nocheck
     "2.5.29.36",             // policyConstraints
     "1.3.6.1.5.5.7.1.14",    // proxyCertInfo
     "2.5.29.30",             // nameConstraints
@@ -47,88 +46,27 @@ pub(super) fn is_supported_extension(oid: &str) -> bool {
     SUPPORTED_EXTENSIONS.contains(&oid)
 }
 
-/// The content octets of an `INTEGER` without leading zero octets (a positive serial number
-/// compared as a number, as `ASN1_INTEGER_cmp` does).
-pub(super) fn trim_leading_zeros(mut bytes: &[u8]) -> &[u8] {
-    while let [0, rest @ ..] = bytes {
-        bytes = rest;
-    }
-    bytes
-}
-
-/// The one extension of the certificate with this OID: none, one, or a duplicate (invalid).
-fn find<'c, 'a>(cert: &'c X509Certificate<'a>, oid: &str) -> Ext<&'c X509Extension<'a>> {
-    let mut found = cert
-        .extensions()
-        .iter()
-        .filter(|ext| ext.oid.to_id_string() == oid);
-    match (found.next(), found.next()) {
-        (None, _) => Ext::Absent,
-        (Some(ext), None) => Ext::Present(ext),
-        (Some(_), Some(_)) => Ext::Invalid,
-    }
-}
-
-/// An authorityKeyIdentifier, reduced to what `X509_check_akid` compares.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Akid {
-    key_id: Option<Vec<u8>>,
-    /// The DER of the first `directoryName` of `authorityCertIssuer`. OpenSSL compares it to
-    /// the *issuer* name of the issuing certificate (not its subject).
-    issuer: Option<Vec<u8>>,
-    /// `authorityCertSerialNumber`, leading zero octets removed.
-    serial: Option<Vec<u8>>,
-}
-
-pub(super) fn authority_key_identifier(cert: &X509Certificate<'_>) -> Ext<Akid> {
-    match find(cert, "2.5.29.35") {
-        Ext::Absent => Ext::Absent,
-        Ext::Present(ext) => match ext.parsed_extension() {
-            ParsedExtension::AuthorityKeyIdentifier(akid) => Ext::Present(Akid {
-                key_id: akid.key_identifier.as_ref().map(|k| k.0.to_vec()),
-                issuer: akid.authority_cert_issuer.as_ref().and_then(|names| {
-                    names.iter().find_map(|name| match name {
-                        GeneralName::DirectoryName(dn) => Some(dn.as_raw().to_vec()),
-                        _ => None,
-                    })
-                }),
-                serial: akid
-                    .authority_cert_serial
-                    .map(|s| trim_leading_zeros(s).to_vec()),
-            }),
-            _ => Ext::Invalid,
-        },
-        Ext::Invalid => Ext::Invalid,
-    }
-}
-
-pub(super) fn subject_key_identifier(cert: &X509Certificate<'_>) -> Ext<Vec<u8>> {
-    match find(cert, "2.5.29.14") {
-        Ext::Absent => Ext::Absent,
-        Ext::Present(ext) => match ext.parsed_extension() {
-            ParsedExtension::SubjectKeyIdentifier(id) => Ext::Present(id.0.to_vec()),
-            _ => Ext::Invalid,
-        },
-        Ext::Invalid => Ext::Invalid,
-    }
-}
-
-/// OpenSSL's `X509_check_akid(issuer, akid)`: does a certificate whose authority key
-/// identifier is `akid` plausibly come from `issuer`? `Absent` always does.
+/// OpenSSL's `X509_check_akid(issuer, akid)`, as `ossl_x509_likely_issued` uses it: could a
+/// certificate whose authority key identifier is `akid` come from `issuer`? An issuer whose
+/// own subject key identifier is malformed never can (OpenSSL fails to cache its extensions,
+/// whatever the child has); otherwise an `Absent` identifier always fits.
 ///
 /// A key identifier that differs from the issuer's subject key identifier (when it has one),
-/// a serial number that is not the issuer's, and an issuer name that is not the *issuer's
-/// issuer* all say no.
-pub(super) fn akid_allows(akid: &Ext<Akid>, issuer: &PeerCert) -> bool {
+/// a serial number whose content octets are not the issuer's, and an issuer name that is not
+/// the *issuer's issuer* (compared canonically, as `X509_NAME_cmp` does) all say no.
+pub(super) fn akid_allows(akid: &Ext<AuthorityKeyId>, issuer: &PeerCert) -> bool {
+    if matches!(issuer.subject_key_identifier(), Ext::Invalid) {
+        return false;
+    }
     let akid = match akid {
         Ext::Absent => return true,
         Ext::Invalid => return false,
         Ext::Present(akid) => akid,
     };
-    match (&akid.key_id, issuer.subject_key_identifier()) {
-        (_, Ext::Invalid) => return false,
-        (Some(key_id), Ext::Present(skid)) if key_id != skid => return false,
-        _ => {}
+    if let (Some(key_id), Ext::Present(skid)) = (&akid.key_id, issuer.subject_key_identifier()) {
+        if key_id != skid {
+            return false;
+        }
     }
     if akid
         .serial
@@ -137,39 +75,22 @@ pub(super) fn akid_allows(akid: &Ext<Akid>, issuer: &PeerCert) -> bool {
     {
         return false;
     }
-    if akid
-        .issuer
-        .as_deref()
-        .is_some_and(|name| name != issuer.issuer_raw())
-    {
-        return false;
+    if let Some(name) = &akid.issuer {
+        if issuer.issuer_canonical() != Some(name.as_slice()) {
+            return false;
+        }
     }
     true
 }
 
-/// Whether the Netscape certificate type has the `sslServer` bit (`NS_SSL_SERVER`, `0x40`, the
-/// second bit of the first octet), as OpenSSL reads it: only the first octet counts, and an
-/// empty bit string is type 0.
-pub(super) fn ns_cert_type_ssl_server(cert: &X509Certificate<'_>) -> Ext<bool> {
-    match find(cert, "2.16.840.1.113730.1.1") {
-        Ext::Absent => Ext::Absent,
-        Ext::Invalid => Ext::Invalid,
-        Ext::Present(ext) => match tlv(ext.value) {
-            // BIT STRING: the first content octet counts the unused bits.
-            Some(bits) if bits.tag == 0x03 && bits.rest.is_empty() && !bits.content.is_empty() => {
-                Ext::Present(bits.content.get(1).is_some_and(|b| b & 0x40 != 0))
-            }
-            _ => Ext::Invalid,
-        },
-    }
-}
-
-/// The `dNSName` and `rfc822Name` subtrees of a certificate's `nameConstraints`; the other
-/// kinds are webpki's business.
+/// The `dNSName` and `rfc822Name` subtrees of a certificate's `nameConstraints` (the other
+/// kinds are webpki's business), and how many subtrees it has in all.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct NameConstraintsInfo {
     dns: Subtrees,
     email: Subtrees,
+    /// Permitted plus excluded subtrees of every name type (`NAME_CHECK_MAX`).
+    count: usize,
 }
 
 /// The subtrees of one name type: the `base` of each (an IA5String).
@@ -182,72 +103,36 @@ struct Subtrees {
     bad_range: bool,
 }
 
-pub(super) fn name_constraints(cert: &X509Certificate<'_>) -> Ext<NameConstraintsInfo> {
-    match find(cert, "2.5.29.30") {
-        Ext::Absent => Ext::Absent,
-        Ext::Invalid => Ext::Invalid,
-        Ext::Present(ext) => parse_name_constraints(ext.value).map_or(Ext::Invalid, Ext::Present),
+impl Subtrees {
+    fn is_empty(&self) -> bool {
+        self.permitted.is_empty() && self.excluded.is_empty()
     }
 }
 
-/// `NameConstraints ::= SEQUENCE { permittedSubtrees [0] GeneralSubtrees OPTIONAL,
-/// excludedSubtrees [1] GeneralSubtrees OPTIONAL }`. `GeneralSubtree ::= SEQUENCE { base
-/// GeneralName, minimum [0] BaseDistance DEFAULT 0, maximum [1] BaseDistance OPTIONAL }`.
-///
-/// Parsed here because x509-parser drops `minimum` and `maximum`.
-fn parse_name_constraints(value: &[u8]) -> Option<NameConstraintsInfo> {
-    let seq = tlv(value)?;
-    if seq.tag != 0x30 || !seq.rest.is_empty() {
-        return None;
-    }
-    let mut info = NameConstraintsInfo::default();
-    let mut rest = seq.content;
-    while !rest.is_empty() {
-        let group = tlv(rest)?;
-        rest = group.rest;
-        let permitted = match group.tag {
-            0xA0 => true,
-            0xA1 => false,
-            _ => return None,
+impl NameConstraintsInfo {
+    /// From a decoded `nameConstraints` ([`exts::name_constraints`]).
+    pub(super) fn new((permitted, excluded): &exts::Subtrees<'_>) -> NameConstraintsInfo {
+        let mut info = NameConstraintsInfo {
+            count: permitted.len() + excluded.len(),
+            ..NameConstraintsInfo::default()
         };
-        let mut subtrees = group.content;
-        if subtrees.is_empty() {
-            return None;
-        }
-        while !subtrees.is_empty() {
-            let subtree = tlv(subtrees)?;
-            subtrees = subtree.rest;
-            if subtree.tag != 0x30 {
-                return None;
-            }
-            let base = tlv(subtree.content)?;
-            let mut bad_range = false;
-            let mut tail = base.rest;
-            while !tail.is_empty() {
-                let field = tlv(tail)?;
-                tail = field.rest;
-                match field.tag {
-                    // minimum: only 0 is acceptable
-                    0x80 => bad_range |= field.content.iter().any(|&b| b != 0),
-                    // maximum: any value is
-                    0x81 => bad_range = true,
-                    _ => return None,
+        for (list, is_permitted) in [(permitted, true), (excluded, false)] {
+            for subtree in list {
+                let (target, base) = match subtree.base {
+                    exts::GeneralName::Dns(base) => (&mut info.dns, base),
+                    exts::GeneralName::Rfc822(base) => (&mut info.email, base),
+                    _ => continue,
+                };
+                target.bad_range |= subtree.bad_range;
+                if is_permitted {
+                    target.permitted.push(base.to_vec());
+                } else {
+                    target.excluded.push(base.to_vec());
                 }
             }
-            let target = match base.tag {
-                0x82 => &mut info.dns,
-                0x81 => &mut info.email,
-                _ => continue,
-            };
-            target.bad_range |= bad_range;
-            if permitted {
-                target.permitted.push(base.content.to_vec());
-            } else {
-                target.excluded.push(base.content.to_vec());
-            }
         }
+        info
     }
-    Some(info)
 }
 
 /// What one subtree comparison says, as OpenSSL's `nc_dns` and `nc_email` return it.
@@ -361,20 +246,20 @@ impl Subtrees {
 }
 
 /// What `cn2dnsid` makes of a `commonName`: the value as a DNS name if it looks like one, or
-/// `None` if it does not. `Err` if the value cannot be converted to UTF-8 at all.
+/// `None` if it does not. `Err` if OpenSSL refuses the name: it cannot be converted to UTF-8,
+/// or it has a NUL that is not trailing (`X509_V_ERR_UNSUPPORTED_NAME_SYNTAX`).
 ///
 /// A name "looks like a host name" if it has at least two labels of letters, digits,
 /// underscores and interior hyphens (`a.b`; not `localhost`, not `a..b`, not `-a.b`), after
-/// trailing NULs are dropped; an embedded NUL disqualifies it. This is deliberately the
-/// legacy syntax: OpenSSL checks a CN against DNS constraints only when it would pass for a
-/// host name.
+/// trailing NULs are dropped. This is deliberately the legacy syntax: OpenSSL checks a CN
+/// against DNS constraints only when it would pass for a host name.
 fn cn_as_dns_id(cn: &AsnString) -> Result<Option<Vec<u8>>, ()> {
     let mut value = cn.to_utf8_allowing_empty().ok_or(())?;
     while value.last() == Some(&0) {
         value.pop();
     }
     if value.contains(&0) {
-        return Ok(None);
+        return Err(());
     }
     let n = value.len();
     let mut is_dns_name = false;
@@ -400,15 +285,27 @@ fn cn_as_dns_id(cn: &AsnString) -> Result<Option<Vec<u8>>, ()> {
     Ok(is_dns_name.then_some(value))
 }
 
+/// OpenSSL's `NAME_CHECK_MAX`: `NAME_CONSTRAINTS_check` refuses a certificate when its names
+/// (subject attributes plus alternative names) times the constraint holder's subtrees (of
+/// every type) exceed this.
+const NAME_CHECK_MAX: usize = 1 << 20;
+
 /// `NAME_CONSTRAINTS_check` (the parts webpki does not do) and `NAME_CONSTRAINTS_check_CN` for
 /// `cert` against `nc`: the subject's `emailAddress` attributes, the DNS and e-mail
 /// alternative names, and, for the end-entity certificate with no `dNSName` alternative name,
 /// each host-name-looking `commonName` as a DNS name.
+///
+/// An `id-on-SmtpUTF8Mailbox` alternative name under `rfc822Name` subtrees is refused outright:
+/// OpenSSL compares it (`nc_email_eai`, with an A-label to U-label conversion of the
+/// constraint) and webpki ignores it, so rather than emulate that comparison this is stricter.
 fn check_names(
     cert: &PeerCert,
     nc: &NameConstraintsInfo,
     end_entity: bool,
 ) -> Result<(), NameProblem> {
+    if cert.has_smtp_utf8_mailbox() && !nc.email.is_empty() {
+        return Err(NameProblem::Unsupported);
+    }
     for email in cert.subject_emails() {
         // OpenSSL refuses the whole certificate for an emailAddress that is not an IA5String,
         // whether or not the constraints mention e-mail.
@@ -443,6 +340,17 @@ fn check_names(
 /// Why a candidate path is not acceptable to OpenSSL although webpki accepted it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PathProblem {
+    /// A certificate of the path has a duplicated or malformed extension of the kinds OpenSSL
+    /// decodes for every certificate, a negative `pathLenConstraint`, or an empty `keyUsage`
+    /// (`EXFLAG_INVALID`; OpenSSL then finds no issuer, error 20).
+    InvalidCertificate,
+    /// A certificate of the path is a proxy certificate (`proxyCertInfo`; error 40, or 20
+    /// when the extension also makes it invalid).
+    ProxyCertificate,
+    /// An intermediate is self-signed by OpenSSL's reckoning (`EXFLAG_SS`) and is not in the
+    /// CA file: OpenSSL stops building there and fails with error 19, "self-signed
+    /// certificate in certificate chain".
+    SelfSignedIntermediate,
     /// An intermediate is not a CA by OpenSSL's `check_ca`: without `keyCertSign` in a
     /// `keyUsage` extension (`X509_V_ERR_INVALID_CA`, error 79).
     IntermediateNotCa,
@@ -454,6 +362,9 @@ pub(super) enum PathProblem {
     PathLenExceeded,
     /// A certificate in the path has a `nameConstraints` extension that does not parse.
     MalformedNameConstraints,
+    /// A certificate has too many names for the subtrees of a constraint holder above it
+    /// (`NAME_CHECK_MAX`; error 1, unspecified).
+    TooManyNameChecks,
     /// A name violates the `nameConstraints` of a certificate above it (error 47 or 48).
     NameConstraints(NameProblem),
 }
@@ -462,11 +373,18 @@ impl PathProblem {
     /// The webpki error to hand back, so that webpki abandons this path and tries others.
     pub(super) fn to_webpki(self) -> webpki::Error {
         match self {
+            PathProblem::InvalidCertificate => webpki::Error::MalformedExtensions,
+            PathProblem::ProxyCertificate => webpki::Error::ExtensionValueInvalid,
+            PathProblem::SelfSignedIntermediate | PathProblem::AuthorityKeyMismatch => {
+                webpki::Error::UnknownIssuer
+            }
             PathProblem::IntermediateNotCa => webpki::Error::EndEntityUsedAsCa,
-            PathProblem::AuthorityKeyMismatch => webpki::Error::UnknownIssuer,
             PathProblem::PathLenExceeded => webpki::Error::PathLenConstraintViolated,
             PathProblem::MalformedNameConstraints => webpki::Error::MalformedNameConstraint,
-            PathProblem::NameConstraints(_) => webpki::Error::NameConstraintViolation,
+            // webpki's own budget error would not be reported: it ranks with "unknown issuer".
+            PathProblem::TooManyNameChecks | PathProblem::NameConstraints(_) => {
+                webpki::Error::NameConstraintViolation
+            }
         }
     }
 }
@@ -474,27 +392,48 @@ impl PathProblem {
 /// The checks OpenSSL makes on a path webpki has already validated (signatures, validity,
 /// `basicConstraints`, `extendedKeyUsage`, the end-entity's names against name constraints,
 /// intermediates' `pathLenConstraint`). `intermediates` are in path order, from the
-/// end-entity's issuer up; `anchor` is the self-signed trust anchor the path ends at.
+/// end-entity's issuer up, and `in_ca_file` says, for each, whether it is byte-identical to a
+/// certificate of the CA file; `anchor` is the self-signed trust anchor the path ends at.
 ///
+/// * no certificate of the path is invalid ([`PeerCert::is_invalid`]) or a proxy
+///   certificate;
+/// * no intermediate is self-signed ([`PeerCert::is_self_signed`]) unless it is in the CA file
+///   (OpenSSL would take that one as the trust anchor and stop there, which only means fewer
+///   checks than this path gets);
 /// * every intermediate is CA-capable ([`PeerCert::is_ca_capable`]): `check_ca` rejects a
 ///   `keyUsage` without `keyCertSign` (webpki only asks for `CA:TRUE`);
 /// * each certificate's authority key identifier fits its issuer (`X509_check_akid`);
 /// * the anchor's `pathLenConstraint` (webpki's `TrustAnchor` has none) bounds the number of
 ///   intermediates that are not self-issued, as in `check_chain_extensions`;
 /// * name constraints from the intermediates and the anchor, applied as `check_name_constraints`
-///   does, to the names webpki does not look at: see [`check_names`].
+///   does, to the names webpki does not look at (see [`check_names`]), after OpenSSL's bound
+///   on the work (`NAME_CHECK_MAX`).
 pub(super) fn check_path(
     end_entity: &PeerCert,
     intermediates: &[PeerCert],
+    in_ca_file: &[bool],
     anchor: &PeerCert,
 ) -> Result<(), PathProblem> {
-    if intermediates.iter().any(|c| !c.is_ca_capable()) {
-        return Err(PathProblem::IntermediateNotCa);
-    }
     let chain: Vec<&PeerCert> = std::iter::once(end_entity)
         .chain(intermediates)
         .chain(std::iter::once(anchor))
         .collect();
+    if chain.iter().any(|c| c.is_invalid()) {
+        return Err(PathProblem::InvalidCertificate);
+    }
+    if chain.iter().any(|c| c.is_proxy()) {
+        return Err(PathProblem::ProxyCertificate);
+    }
+    if intermediates
+        .iter()
+        .zip(in_ca_file.iter().chain(std::iter::repeat(&false)))
+        .any(|(c, &trusted)| c.is_self_signed() && !trusted)
+    {
+        return Err(PathProblem::SelfSignedIntermediate);
+    }
+    if intermediates.iter().any(|c| !c.is_ca_capable()) {
+        return Err(PathProblem::IntermediateNotCa);
+    }
     for pair in chain.windows(2) {
         if !akid_allows(pair[0].authority_key_identifier(), pair[1]) {
             return Err(PathProblem::AuthorityKeyMismatch);
@@ -502,7 +441,7 @@ pub(super) fn check_path(
     }
     if let Some(limit) = anchor.path_len() {
         let below = intermediates.iter().filter(|c| !c.is_self_issued()).count();
-        if below > usize::try_from(limit).unwrap_or(usize::MAX) {
+        if u64::try_from(below).unwrap_or(u64::MAX) > limit {
             return Err(PathProblem::PathLenExceeded);
         }
     }
@@ -517,6 +456,10 @@ pub(super) fn check_path(
                 Ext::Absent => {}
                 Ext::Invalid => return Err(PathProblem::MalformedNameConstraints),
                 Ext::Present(nc) => {
+                    let names = cert.name_count();
+                    if names > 0 && nc.count > NAME_CHECK_MAX / names {
+                        return Err(PathProblem::TooManyNameChecks);
+                    }
                     check_names(cert, nc, i == 0).map_err(PathProblem::NameConstraints)?;
                 }
             }
@@ -575,7 +518,9 @@ mod tests {
         assert_eq!(id("evil.-org"), None);
         assert_eq!(id("evil.org."), None); // trailing dot
         assert_eq!(id("Evil Corp.org"), None);
-        assert_eq!(id("e\0vil.org"), None);
+        // An embedded NUL is an error (unsupported name syntax), not "not a host name".
+        assert!(cn_as_dns_id(&cn("e\0vil.org")).is_err());
+        assert!(cn_as_dns_id(&cn("evil.org\0x")).is_err());
         assert_eq!(id(""), None);
         // A value with no UTF-8 conversion at all is an error, not "not a host name".
         let octets = AsnString {
@@ -594,14 +539,37 @@ mod tests {
             b'e', b'.', b'c', b'o', b'm', 0xA1, 0x0D, 0x30, 0x0B, 0x81, 0x03, b'a', b'@', b'b',
             0x80, 0x01, 0x01, 0x81, 0x01, 0x05,
         ];
-        let info = parse_name_constraints(&der).unwrap();
+        let parse = |der: &[u8]| exts::name_constraints(der).map(|s| NameConstraintsInfo::new(&s));
+        let info = parse(&der).unwrap();
         assert_eq!(info.dns.permitted, [b"example.com".to_vec()]);
         assert!(!info.dns.bad_range);
         assert_eq!(info.email.excluded, [b"a@b".to_vec()]);
         assert!(info.email.bad_range);
-        assert!(parse_name_constraints(&der[..10]).is_none());
-        assert!(parse_name_constraints(&[0x30, 0x00]).is_some());
-        assert!(parse_name_constraints(&[0x31, 0x00]).is_none());
+        assert_eq!(info.count, 2);
+        assert!(parse(&der[..10]).is_none());
+        assert!(parse(&[0x30, 0x00]).is_some());
+        assert!(parse(&[0x31, 0x00]).is_none());
+        // As OpenSSL decodes it: an empty list is fine, excluded before permitted or a repeated
+        // list is not, and an explicit `minimum 0` is no range.
+        assert!(parse(&[0x30, 0x02, 0xA0, 0x00]).is_some());
+        let reversed = [
+            0x30, 0x0C, 0xA1, 0x04, 0x30, 0x02, 0x82, 0x00, 0xA0, 0x04, 0x30, 0x02, 0x82, 0x00,
+        ];
+        assert!(parse(&reversed).is_none());
+        let twice = [
+            0x30, 0x0C, 0xA0, 0x04, 0x30, 0x02, 0x82, 0x00, 0xA0, 0x04, 0x30, 0x02, 0x82, 0x00,
+        ];
+        assert!(parse(&twice).is_none());
+        let zero_min = [
+            0x30, 0x09, 0xA0, 0x07, 0x30, 0x05, 0x82, 0x00, 0x80, 0x01, 0x00,
+        ];
+        assert!(!parse(&zero_min).unwrap().dns.bad_range);
+        // Subtrees of other types count towards NAME_CHECK_MAX.
+        let ip = [
+            0x30, 0x0C, 0xA0, 0x0A, 0x30, 0x08, 0x87, 0x06, 10, 0, 0, 0, 255, 0,
+        ];
+        let info = parse(&ip).unwrap();
+        assert_eq!((info.count, info.dns.permitted.len()), (1, 0));
     }
 
     #[test]
@@ -609,22 +577,20 @@ mod tests {
         for oid in SUPPORTED_EXTENSIONS {
             assert!(is_supported_extension(oid));
         }
-        // subjectKeyIdentifier, authorityKeyIdentifier, cRLDistributionPoints, freshestCRL.
+        // OpenSSL 3.5 added cRLDistributionPoints and id-pkix-ocsp-nocheck.
+        assert!(is_supported_extension("2.5.29.31"));
+        assert!(is_supported_extension("1.3.6.1.5.5.7.48.1.5"));
+        // subjectKeyIdentifier, authorityKeyIdentifier, freshestCRL, authorityInfoAccess,
+        // TLS feature.
         for oid in [
             "2.5.29.14",
             "2.5.29.35",
-            "2.5.29.31",
             "2.5.29.46",
+            "1.3.6.1.5.5.7.1.1",
+            "1.3.6.1.5.5.7.1.24",
             "1.2.3.4.5",
         ] {
             assert!(!is_supported_extension(oid), "{oid}");
         }
-    }
-
-    #[test]
-    fn leading_zeros_are_trimmed() {
-        assert_eq!(trim_leading_zeros(&[0, 0, 1, 0]), &[1, 0]);
-        assert_eq!(trim_leading_zeros(&[0]), &[] as &[u8]);
-        assert_eq!(trim_leading_zeros(&[]), &[] as &[u8]);
     }
 }
