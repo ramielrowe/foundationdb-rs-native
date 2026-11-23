@@ -1,0 +1,29 @@
+error: unknown fdb attribute; expected `file_identifier = N`, `struct` or `crate = "path"`
+ --> tests/ui/unknown_attributes.rs:4:7
+  |
+4 | #[fdb(ensure_table)]
+  |       ^^^^^^^^^^^^
+
+error: unknown fdb field attribute; expected `skip`, `arena` or `skip_slots = N`
+  --> tests/ui/unknown_attributes.rs:11:11
+   |
+11 |     #[fdb(rename = "x")]
+   |           ^^^^^^
+
+error: this is a field attribute; put it on a field
+  --> tests/ui/unknown_attributes.rs:16:7
+   |
+16 | #[fdb(skip)]
+   |       ^^^^
+
+error: this is a container attribute; put it on the type
+  --> tests/ui/unknown_attributes.rs:23:11
+   |
+23 |     #[fdb(file_identifier = 1)]
+   |           ^^^^^^^^^^^^^^^
+
+error: duplicate `file_identifier` attribute
+  --> tests/ui/unknown_attributes.rs:28:28
+   |
+28 | #[fdb(file_identifier = 1, file_identifier = 2)]
+   |                            ^^^^^^^^^^^^^^^

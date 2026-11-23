@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 fdb-native-wire = { version = "0.0.0", path = "crates/fdb-native-wire" }
+fdb-native-wire-derive = { version = "0.0.0", path = "crates/fdb-native-wire-derive" }
 fdb-native-schema = { version = "0.0.0", path = "crates/fdb-native-schema" }
 fdb-native-transport = { version = "0.0.0", path = "crates/fdb-native-transport" }
 

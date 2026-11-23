@@ -15,6 +15,7 @@ FoundationDB 7.4 and 8.0.
 | Crate | Purpose |
 | --- | --- |
 | `fdb-native-wire` | Sans-IO codec for FDB's flatbuffers dialect and the legacy binary format |
+| `fdb-native-wire-derive` | `#[derive(Wire)]`, re-exported by `wire` (its default `derive` feature). It dev-depends on `wire` while `wire` depends on it, so publish it first (see its crate docs) |
 | `fdb-native-schema` | Per-protocol-version message schemas (7.4, 8.0); depends on `wire` |
 | `fdb-native-transport` | Runtime-agnostic connection layer; depends on `wire` |
 | `fdb-native-client` | Public client API; depends on `schema` and `transport` |
@@ -42,7 +43,7 @@ Requires [cargo-nextest](https://nexte.st/).
 cargo nextest run --workspace
 
 # Integration tests that need a live FoundationDB (requires Docker)
-cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
+cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
 
 # fdb-native-wire's encoder against FDB's C++ readers (requires tools/golden-vectors to be built)
 FDB_GOLDEN_VECTORS_BIN=$PWD/tools/golden-vectors/build/golden-vectors \
@@ -55,7 +56,7 @@ The `FDB_IMAGE` environment variable selects the server image
 
 ```bash
 FDB_IMAGE=foundationdb/foundationdb:8.0.1 cargo nextest run --workspace --run-ignored only \
-  -E 'not binary(cpp_crosscheck)'
+  -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
 ```
 
 Tests must only target disposable containers started by `fdb-native-testkit`, never a

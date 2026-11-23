@@ -167,8 +167,9 @@ The reader must reject `bytes`. `reason` is the C++ reader's message, for inform
 the Rust error need not match it. `mutation` says how the bytes were derived from a valid
 message: `overwrite_u32` / `overwrite_u16` / `overwrite_u8` (little-endian value at byte
 `pos`), `set_bytes` (a list of `{pos, value}` byte writes applied in order), `truncate`
-(first `len` bytes kept), `file_identifier` (written with that identifier instead), or
-`schema_mismatch` (written as `writer_cpp_type`).
+(first `len` bytes kept), `file_identifier` (written with that identifier instead),
+`schema_mismatch` (written as `writer_cpp_type`), or `hand_built` (no source message: the
+bytes were assembled by hand, corpus entries only).
 
 ### Corpus line
 
@@ -303,7 +304,8 @@ Each accepted corpus entry is classified by the generator:
    bounds or loop forever, on any input.
 2. Every `data` accept must be accepted, with a `root` identical to the recorded one.
 3. `structural` accepts may be rejected, but only by one of the permitted checks named in
-   that entry's `violations`. If the Rust decoder accepts it, the `root` must be identical.
+   that entry's `violations` (`work_limit` included). If the decoder accepts it, the `root`
+   must be identical.
 4. `padding` accepts should be accepted with an identical `root`. A decoder may reject them
    only by validating bytes the decoded value does not depend on (e.g. requiring zero
    padding, or an exact vtable table-size field).
@@ -329,9 +331,15 @@ Permitted strict checks (the `violations` vocabulary, implemented in `src/strict
 
 `work_limit` bounds the work of decoding messages whose offsets reference the same objects
 many times over (an aliasing bomb: N offsets to one large string cost N times its length).
-`src/strict.h` does not compute it, so it never appears in `violations`; no current corpus
-entry reaches it, and a decoder that implements it may reject any accepted entry that does.
-A decode starts from the root table and is charged, every time it reaches an object:
+`src/strict.h` computes it with the accounting below and lists it in `violations`, so an
+aliasing bomb is a `structural` accept and a decoder that implements the limit may reject it.
+Only the entries of `corpus/aliasing_bombs.jsonl` reach the limit (`check_fixtures.py`
+checks that no other record lists it), and every positive vector stays far below it. The
+tool keeps counting past the limit, so its total is the full cost of one decode (up to
+2^24 units, beyond which the walk gives up), but `violations` lists only the other checks
+that fail before the limit is exceeded, not those after it, as a decoder that stops at the
+limit would see them. A decode starts from the root table and is
+charged, every time it reaches an object:
 
 | object reached | units |
 | --- | --- |
@@ -343,7 +351,25 @@ A decode starts from the root table and is charged, every time it reaches an obj
 | an out-of-line union scalar or struct | its size |
 
 Every object the C++ writer emits is referenced once, except the shared empty blob, so its
-messages cost at most about 2 units per byte and never reach the limit.
+messages cost at most about 2 units per byte and never reach the limit. Measured with the
+tool over the 54 positive vectors and the 1,511 entries of the corpora other than
+`aliasing_bombs` that the C++ reader accepts (1,565 messages), the most any costs is
+186 units for 224 bytes, 0.83 units per byte; a decoder that rejects some of the
+`structural` ones sees a smaller maximum. The limit is reached only by aliasing: the 824-byte `untrusted_alias_20x600` below (20 offsets to one
+600-byte string) costs 12,207 units against a limit of 4,320.
+
+A decoder that reads vectors lazily (the Rust `VectorView`) charges each element when it is
+read, not when the vector is decoded, so two things differ from a decode that finishes
+before returning:
+
+- Re-reading counts. Every read of an element charges its objects again, so a valid message
+  whose elements are read enough times (five full passes over a vector of a thousand small
+  tables measured) reaches `work_limit`. Reads of the same message share one budget.
+- Unread elements are never checked. A lazy decoder may accept a message that an eager
+  decoder rejects (including by one of the permitted checks above, or a negative vector's
+  out-of-bounds offset) when the only fault is in an element that is never read; reading
+  that element gives the error an eager decoder would have given. The vector's own header
+  (offset, count, and that `count` elements fit) is always checked when it is decoded.
 
 No other check is permitted: in particular not object overlap or aliasing (the C++ writer
 itself points every empty string/vector at one shared blob), not alignment of tables,
@@ -358,6 +384,40 @@ Current corpora (`fixtures/engine/corpus/`):
 | `untrusted_word_overwrites.jsonl`: every aligned u32 set to 0, 1, 0xffffffff, 0x7ffffff0, 0x80000000, 0xfffffff0, 0x10000 (no-op overwrites omitted) | 382 | 170 | 157 | 6 | 49 |
 | `untrusted_random_flips.jsonl`: the `RejectsMalformedBuffers` random-damage loop, 500 iterations with a fixed seed (splitmix64, seed 0x0fdb5eed), 1–3 random bytes each (no-ops omitted) | 499 | 354 | 100 | 19 | 26 |
 | `untrusted_targeted.jsonl`: `Optional` union tag set to 2 and to 255 | 2 | 0 | 0 | 0 | 2 |
+| `aliasing_bombs.jsonl`: hand-built messages that reference objects many times, see below | 5 | 0 | 2 | 0 | 3 |
+| `void_mutations.jsonl`: the three generators below applied to `void_root` (`Void`) | 387 | 232 | 0 | 54 | 101 |
+| `error_or_void_mutations.jsonl`: `ErrorOr<Void>`, `error_or_plain_void_success` and `_error` | 662 | 413 | 14 | 122 | 113 |
+| `error_or_ensure_table_void_mutations.jsonl`: `ErrorOr<EnsureTable<Void>>`, `error_or_void_success` and `error_or_void_broken_promise` | 661 | 419 | 19 | 112 | 111 |
+| `error_or_payload_mutations.jsonl`: `ErrorOr<EnsureTable<Payload>>`, `error_or_success` and `error_or_error`, plus `ErrorOr<Payload>` (random damage only) | 673 | 416 | 123 | 66 | 68 |
+| `ensure_table_mutations.jsonl`: `EnsureTables`, `ensure_table` (`EnsureTable` around a scalar, table, string, vector and inside a variant) | 521 | 383 | 78 | 6 | 54 |
+| `error_or_ensure_table_optional_mutations.jsonl`: `ErrorOr<EnsureTable<Optional<Inner>>>`, `fid_error_or_ensure_table_optional` (`EnsureTable` around a union) | 366 | 256 | 23 | 48 | 39 |
+
+The policy corpora (everything after `untrusted_targeted.jsonl` except `aliasing_bombs`)
+apply the generators of the `untrusted_*` corpora to the messages named in the table, each
+source with its own random seed (`0x0fdb5eed` plus a per-file offset plus the source's
+index): every truncation, the seven hostile words at every aligned position (no-ops omitted),
+and 60 to 300 iterations of 1-3 random byte writes (the `ErrorOr<Payload>` source has no
+truncations or word overwrites: its bytes equal `ErrorOr<EnsureTable<Payload>>`'s). The
+entry names are `<source>/truncate_N`, `<source>/word_POS_VALUE` and `<source>/flip_N`, and
+each entry has the `cpp_type` of its source, so a Rust test decodes it with the matching
+type. `Void` is a zero-field table: the C++ reader never follows its offset, so most
+mutations of `void_root` are accepted (`padding`) or caught only by `table_size`,
+`out_of_bounds` and `empty_table_offset`.
+
+`aliasing_bombs.jsonl` entries have `"mutation": {"op": "hand_built"}`: the C++ writer never
+aliases, so they are assembled byte by byte (`src/engine_vectors_policy.cpp`). All are
+accepted by the C++ reader.
+
+| entry | type | class | what it is |
+| --- | --- | --- | --- |
+| `untrusted_alias_20x600` | `Untrusted` | `structural` (`work_limit`) | 824 bytes: `strs` holds 20 offsets to one 600-byte string |
+| `untrusted_alias_11x235_at_limit` | `Untrusted` | `data` | the same shape with 11 offsets to a 235-byte string, sized so that one decode charges exactly 4 × length + 1024 units (a decoder must accept exactly this much work) |
+| `untrusted_alias_11x236_over_limit` | `Untrusted` | `structural` (`work_limit`) | one more byte of string: a few units over |
+| `root_alias_3x2x16` | `Root` | `data` | `b` holds 3 offsets to one `Nested2` table whose `b` holds 2 offsets to one 16-byte string: well under the limit |
+| `root_alias_40x40x16` | `Root` | `structural` (`work_limit`) | the same with 40 and 40: 1,600 visits of the string and 40 of the table from 396 bytes (38,892 units against a limit of 2,608) |
+
+The decoded `root` of a bomb is as large as the work it implies, so the committed bombs are
+sized to keep the file small; the generator's constants make bigger ones.
 
 ## Vector catalog
 
@@ -370,7 +430,7 @@ Positive vectors (`fixtures/engine/*.json`), by group:
 | vectors | `vectors`, `containers`, `root_vector_bool`, `vector_bool_nonzero` | vectors of u8/u16/i32/u64/f64/strings/tables, empty vectors of each kind, `vector<bool>`, `array<u8,16>`, `std::map`, `std::set`, vector of vectors; `vector<bool>` element bytes 02, ff, 80 read as true |
 | nested | `nested_root`, `root_multiple_members`, `structs`, `root_vector_of_structs` | the unit-test `Root`/`Nested`/`Nested2` tables, a three-member root, structs inline in tables and in vectors |
 | unions | `optionals`, `variant_i32`, `variant_f64`, `variant_table`, `variant_blob`, `variant_u8`, `root_variant_i32`, `root_variant_f64`, `root_variant_table` | `Optional` present/absent of scalar, string, table, f64, UID; vector of `Optional` (union vector); `std::variant` holding each of i32, f64, table, string blob, u8; a variant as the root member |
-| error_or | `error_or_success`, `error_or_error`, `error_or_void_success`, `error_or_void_broken_promise`, `error_or_without_ensure_table`, `ensure_table` | replies as sent (`ErrorOr<EnsureTable<T>>`), errors, `Void` replies, `EnsureTable` around scalar/table/string/vector and inside a variant |
+| error_or | `error_or_success`, `error_or_error`, `error_or_void_success`, `error_or_void_broken_promise`, `error_or_without_ensure_table`, `ensure_table`, `void_root`, `error_or_plain_void_success`, `error_or_plain_void_error` | replies as sent (`ErrorOr<EnsureTable<T>>`), errors, `Void` replies, `EnsureTable` around scalar/table/string/vector and inside a variant; a bare `Void`, and `ErrorOr<Void>` without `EnsureTable` (the same wire form as with it) |
 | file_identifier | `fid_plain`, `fid_reply_promise`, `fid_error_or`, `fid_vectorref`, `fid_optional`, `fid_std_vector`, `fid_error_or_ensure_table_optional`, `request_like` | each composition wrapper, a two-level composition, a request-shaped message with `ReplyPromise` and `Arena` |
 | layout | `serializer_order`, `arena_refs`, `root_vectorref_stringref`, `preserialized_kv_vector`, `vtable_dedup` | slot order ≠ declaration order, `VectorRef`/`StringRef` + `Arena`, pre-serialized KV vector, one vtable shared by four types |
 | tolerance | `tolerance_old_writer_new_reader`, `tolerance_new_writer_old_reader`, `schema_v2`, `nested_compat_y1_as_y2`, `nested_compat_y2_as_y1`, `handbuilt_alternate_layout`, `truncated_vtable` | missing trailing slots read as defaults; unknown trailing slots ignored; a hand-built layout C++ never writes (vtables after tables, negative soffset, declaration-order fields, no sharing); a shortened vtable |
@@ -741,8 +801,9 @@ share a dump name only if their fields are identical (`reply_promise`, `request_
 little-endian, `size_t` is 8 bytes): u64 count of distinct tag localities; per locality run,
 in `Tag` order, i8 locality and u16 run length; if there is at least one entry, u8 tag-id
 width (1 if every id is at most 255, else 2), u8 version-delta width (1, 2, 4 or 8: the
-smallest that holds the largest minus the smallest entry version; the minimum and maximum are
-taken over the entries only, not over the trailing `maxVersion` field), i64 min version (the
+smallest that holds the largest minus the smallest entry version; the minimum is taken over the
+entries only, not over the trailing `maxVersion` field, and the maximum starts at -1, so it is the
+largest entry version or -1 if every entry is below -1), i64 min version (the
 smallest entry version), u64 entry count, then
 per entry the tag id and (version minus min version) in those widths; finally i64
 `maxVersion`. The vectors cover the empty form and the width pairs 1/1, 1/2, 1/4 and 2/8.
@@ -913,12 +974,14 @@ and metacluster requests. (FDB's binary, non-flatbuffers serializer has its own 
 | `src/codec.h` | encode (`save_members`, run twice with different fill bytes to catch uninitialized output), decode (`load_members` with a context that mirrors `ArenaObjectReader` on `main`), and the type registry |
 | `src/dump.h`, `src/json.h` | the field dumper and a small ordered JSON printer |
 | `src/schema.h` | the schema lister behind `schemas.json` |
-| `src/strict.h` | the permitted strict checks used to classify corpus accepts; every positive vector must pass them |
+| `src/strict.h` | the permitted strict checks and the work accounting (`work_limit`) used to classify corpus accepts; every positive vector must pass them |
 | `src/fixtures.h` | record builders; every positive vector is decoded again and must equal the dump of its input |
 | `src/engine_vectors.cpp` | test types (modelled on the `flow/flat_buffers.cpp` unit tests) and the catalog |
+| `src/engine_vectors_policy.cpp` | the `void_root` and `ErrorOr<Void>` positives, the aliasing bombs and the Void / ErrorOr / EnsureTable mutation corpora. A separate translation unit, linked after `engine_vectors.cpp` (the Makefile makes sure), because the C++ writer orders vtables by the addresses of per-shape statics, which depend on instantiation order: instantiating more types in `engine_vectors.cpp` changes the bytes of existing vectors. It works from the bytes of the vectors the catalog already produced |
+| `src/mutation.h` | byte-patching helpers, the PRNG and the mutation records shared by the two |
 | `src/main.cpp` | CLI (shared by both generators) |
 | `src/hooks.h`, `src/gv_types.h` | customization points (`gv_unwrap`, `gv_leaf`, `gv_table_info`) and the switch between `stubs.h` and the real FDB types |
-| `check_fixtures.py` | round-trip and tree-compare checks used by `regen.sh --check` and `regen_messages.sh` |
+| `check_fixtures.py` | round-trip, corpus lint (record shape, class and `violations` vocabulary, entry counts, `work_limit` only in `aliasing_bombs`) and tree-compare checks used by `regen.sh --check` and `regen_messages.sh` |
 | `ubsan.supp` | the single UBSan suppression (FDB reader alignment UB on hostile input) |
 | `regen_messages.sh` | message vectors: exports each release branch, builds and runs the generator in the FDB build image |
 | `messages/project_include.cmake`, `messages/targets.cmake` | inject the `golden_vectors_messages` target into FDB's CMake build |
@@ -934,7 +997,9 @@ one of the stubbed trait specializations, update `src/stubs.h` to match.
 
 To add a vector, add a type with `TABLE(Name, fid(n))` and `FIELDS(...)` to
 `src/engine_vectors.cpp`, call `positive(...)` (or `negative(...)`) in the catalog, and run
-`./regen.sh --check`.
+`./regen.sh --check`. Check `git status` afterwards: if unrelated existing fixtures changed,
+the new instantiations reordered the vtables; put the new vectors in
+`src/engine_vectors_policy.cpp` instead.
 
 To add a message vector, build the value in `messages/message_vectors.cpp` and call
 `message(...)`. If it reaches a table type that is not listed yet, add the type to `TABLES` in

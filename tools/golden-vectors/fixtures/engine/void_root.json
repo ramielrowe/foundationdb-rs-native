@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "void_root",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "A bare Void as the root member: root slot 0 holds an offset to a zero-field table (just its 4-byte soffset), which the reader never follows. File identifier 2010442.",
+  "cpp_type": "Void",
+  "file_identifier": 2010442,
+  "file_identifier_hex": "0x001ead4a",
+  "size": 32,
+  "bytes": "140000004aad1e00000004000400060008000400060000000400000012000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Void>",
+        "value": []
+      }
+    ]
+  }
+}

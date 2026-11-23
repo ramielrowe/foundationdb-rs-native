@@ -206,7 +206,6 @@ fn corpus_obeys_policy() {
                 "{name}: C++ rejects ({}), accepted as {root}",
                 line["reason"]
             ),
-            (_, Err(DecodeError::WorkLimit)) => panic!("{name}: rejected only by the work limit"),
             ("reject", Err(_)) => counts.1 += 1,
             ("data" | "padding", Err(e)) => panic!("{name}: {class} accept rejected: {e}"),
             ("structural", Err(e)) => {
@@ -226,7 +225,15 @@ fn corpus_obeys_policy() {
                 *structural_rejections.entry(check.to_string()).or_default() += 1;
                 counts.1 += 1;
             }
-            (_, Ok(root)) => {
+            (class, Ok(root)) => {
+                // This crate implements the work limit, so an entry whose only violation is
+                // `work_limit` (an aliasing bomb) must not be accepted.
+                if class == "structural"
+                    && line["violations"].as_array().map(Vec::as_slice)
+                        == Some(&[Value::from("work_limit")])
+                {
+                    panic!("{name}: accepted, but exceeds the work limit");
+                }
                 assert_json_eq(&name, &line["root"], &root);
                 counts.0 += 1;
             }
@@ -238,6 +245,15 @@ fn corpus_obeys_policy() {
         println!("  {file:40} {class:10} accepted {accepted:4} rejected {rejected:4}");
     }
     println!("structural entries rejected, by check: {structural_rejections:?}");
+    // The aliasing bombs must keep exercising the work limit.
+    assert!(
+        structural_rejections
+            .get("work_limit")
+            .copied()
+            .unwrap_or(0)
+            >= 3,
+        "work_limit path lost coverage: {structural_rejections:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
