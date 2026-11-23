@@ -101,7 +101,8 @@ struct DecodableType {
 	std::function<std::set<std::string>(const uint8_t*, size_t)> strict;
 	// The members of the root table; registers every reachable table in the collector.
 	std::function<Json(SchemaCollector&)> schema;
-	// The work units one decode charges and the limit, as counted by strict.h (for sizing aliasing bombs).
+	// The work units one decode charges (the full total, up to StrictWalker::kCountCap) and the limit, as counted by
+	// strict.h (for sizing aliasing bombs).
 	std::function<size_t(const uint8_t*, size_t, size_t*)> work;
 };
 

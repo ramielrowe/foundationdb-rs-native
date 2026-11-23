@@ -245,6 +245,15 @@ fn corpus_obeys_policy() {
         println!("  {file:40} {class:10} accepted {accepted:4} rejected {rejected:4}");
     }
     println!("structural entries rejected, by check: {structural_rejections:?}");
+    // The aliasing bombs must keep exercising the work limit.
+    assert!(
+        structural_rejections
+            .get("work_limit")
+            .copied()
+            .unwrap_or(0)
+            >= 3,
+        "work_limit path lost coverage: {structural_rejections:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

@@ -9,10 +9,11 @@
 //
 // It also counts the "work" of one decode from the root, as README.md ("Corpus
 // accept classes", `work_limit`) and fdb-native-wire's Reader define it, and
-// reports "work_limit" when the count exceeds 4 * buffer length + 1024. The walk
-// ends at that point (an aliasing bomb would otherwise take millions of steps),
-// so violations that lie after it are not listed; a decoder that enforces the
-// limit stops there as well.
+// reports "work_limit" when the count exceeds 4 * buffer length + 1024. Violations
+// that lie after that point are not listed (a decoder that enforces the limit stops
+// there as well), but the walk goes on counting, so work() is the full total of one
+// decode; only past kCountCap units (an aliasing bomb can take millions of steps) does
+// it stop, and work() is then "at least kCountCap".
 #pragma once
 
 #include <climits>
@@ -30,7 +31,8 @@ public:
 
 	std::set<std::string> violations;
 
-	// Units of work charged so far, and the limit they are checked against.
+	// Units of work one decode charges (uncapped up to kCountCap), and the limit they are checked against.
+	static constexpr size_t kCountCap = size_t(1) << 24;
 	size_t work() const { return spent; }
 	size_t workLimit() const { return budget; }
 
@@ -57,18 +59,26 @@ private:
 	long steps = 0;
 	size_t budget; // the work limit: 4 * n + 1024 units
 	size_t spent = 0;
-	bool over = false; // the work limit was exceeded: the walk is over
+	bool over = false; // the work limit was exceeded: later violations are not listed
+	bool stop = false; // more than kCountCap units: the walk is over
 
-	void flag(const char* v) { violations.insert(v); }
-	// Charges |units| of work. Past the budget it flags work_limit and ends the walk.
+	void flag(const char* v) {
+		if (!over) {
+			violations.insert(v);
+		}
+	}
+	// Charges |units| of work. Past the budget it flags work_limit (and nothing after it).
 	void charge(size_t units) {
-		if (over) {
+		if (stop) {
 			return;
 		}
 		spent += units;
-		if (spent > budget) {
-			over = true;
+		if (spent > budget && !over) {
 			flag("work_limit");
+			over = true;
+		}
+		if (spent > kCountCap) {
+			stop = true;
 		}
 	}
 	bool inb(size_t p, size_t len) const { return p != npos && p <= n && len <= n - p; }
@@ -127,7 +137,7 @@ private:
 
 	template <class T>
 	void walkTable(T& obj, size_t t) {
-		if (t == npos || over) {
+		if (t == npos || stop) {
 			return;
 		}
 		if (++steps > 1000000 || depth > 64) {
@@ -135,7 +145,7 @@ private:
 			return;
 		}
 		charge(4); // a table, or a zero-field table
-		if (over) {
+		if (stop) {
 			return;
 		}
 		++depth;
@@ -218,7 +228,7 @@ private:
 
 	template <class M>
 	void memberOfType(Ctx& c) {
-		if (over) {
+		if (stop) {
 			return;
 		}
 		if constexpr (detail::is_vector_of_union_like<M>) {
@@ -237,8 +247,12 @@ private:
 				flag("union_vector_count_mismatch");
 			}
 			using U = typename vector_like_traits<M>::value_type;
-			charge(5 * size_t(oc)); // a vector of unions
-			for (uint32_t k = 0; k < oc && !over; ++k) {
+			if (!inb(tv + 4, oc) || !inb(ov + 4, 4 * size_t(oc))) {
+				flag("out_of_bounds");
+				return;
+			}
+			charge(5 * size_t(oc)); // a vector of unions, after the bounds checks (as Reader::union_vector)
+			for (uint32_t k = 0; k < oc && !stop; ++k) {
 				if (!inb(tv + 4 + k, 1) || !inb(ov + 4 + 4 * size_t(k), 4)) {
 					flag("out_of_bounds");
 					return;
@@ -319,7 +333,7 @@ private:
 	// structs, a uoffset for everything else.
 	template <class T>
 	void value(size_t pos) {
-		if (over) {
+		if (stop) {
 			return;
 		}
 		if constexpr (!std::is_same_v<T, gv_unwrap_t<T>>) {
@@ -366,7 +380,7 @@ private:
 			} else if constexpr (detail::is_scalar<E> && !std::is_same_v<E, bool>) {
 				return;
 			} else {
-				for (size_t k = 0; k < count && !over; ++k) {
+				for (size_t k = 0; k < count && !stop; ++k) {
 					value<E>(p + 4 + k * detail::fb_size<E>);
 				}
 			}

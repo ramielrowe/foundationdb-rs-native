@@ -335,8 +335,10 @@ many times over (an aliasing bomb: N offsets to one large string cost N times it
 aliasing bomb is a `structural` accept and a decoder that implements the limit may reject it.
 Only the entries of `corpus/aliasing_bombs.jsonl` reach the limit (`check_fixtures.py`
 checks that no other record lists it), and every positive vector stays far below it. The
-walk stops as soon as the limit is exceeded, so `violations` lists the other checks that
-fail before that point, not those after it. A decode starts from the root table and is
+tool keeps counting past the limit, so its total is the full cost of one decode (up to
+2^24 units, beyond which the walk gives up), but `violations` lists only the other checks
+that fail before the limit is exceeded, not those after it, as a decoder that stops at the
+limit would see them. A decode starts from the root table and is
 charged, every time it reaches an object:
 
 | object reached | units |
@@ -349,9 +351,11 @@ charged, every time it reaches an object:
 | an out-of-line union scalar or struct | its size |
 
 Every object the C++ writer emits is referenced once, except the shared empty blob, so its
-messages cost at most about 2 units per byte and never reach the limit (the most any
-positive vector or accepted corpus entry costs is 0.83 units per byte). The limit is
-reached only by aliasing: the 824-byte `untrusted_alias_20x600` below (20 offsets to one
+messages cost at most about 2 units per byte and never reach the limit. Measured with the
+tool over the 54 positive vectors and the 1,511 entries of the corpora other than
+`aliasing_bombs` that the C++ reader accepts (1,565 messages), the most any costs is
+186 units for 224 bytes, 0.83 units per byte; a decoder that rejects some of the
+`structural` ones sees a smaller maximum. The limit is reached only by aliasing: the 824-byte `untrusted_alias_20x600` below (20 offsets to one
 600-byte string) costs 12,207 units against a limit of 4,320.
 
 A decoder that reads vectors lazily (the Rust `VectorView`) charges each element when it is
