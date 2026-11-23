@@ -11,11 +11,13 @@
 //! See the [module documentation](super) for the FoundationDB behaviour this
 //! mirrors.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use zeroize::Zeroizing;
 
 use super::error::TlsError;
 use super::pem;
@@ -86,7 +88,7 @@ fn default_config_dir_impl() -> Option<PathBuf> {
 #[derive(Clone, PartialEq, Eq)]
 enum Source {
     Path(PathBuf),
-    Bytes(Vec<u8>),
+    Bytes(Zeroizing<Vec<u8>>),
 }
 
 /// TLS settings as a program sets them, before the environment and default
@@ -130,7 +132,7 @@ pub struct TlsConfig {
     cert: Option<Source>,
     key: Option<Source>,
     ca: Option<Source>,
-    password: Option<String>,
+    password: Option<Zeroizing<Vec<u8>>>,
     verify_peers: Vec<String>,
     disable_plaintext: bool,
 }
@@ -148,14 +150,16 @@ impl TlsConfig {
     /// It is rarely needed, since [`load`](Self::load) already consults the
     /// environment. See [`from_env_with`](Self::from_env_with).
     pub fn from_env() -> Self {
-        Self::from_env_with(|name| std::env::var(name).ok())
+        Self::from_env_with(|name| std::env::var_os(name))
     }
 
     /// Like [`from_env`](Self::from_env) with an injected variable lookup,
     /// so callers and tests need not touch the process environment.
     ///
-    /// A variable that is set but empty counts as unset here.
-    pub fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Self {
+    /// A variable that is set but empty counts as unset here. Values are
+    /// `OsString`s because FoundationDB's are byte strings: a path or password
+    /// that is not valid UTF-8 must not be dropped.
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<OsString>) -> Self {
         let get = |name: &str| lookup(name).filter(|v| !v.is_empty());
         let mut config = Self::new();
         if let Some(path) = get(ENV_CERTIFICATE_FILE) {
@@ -168,10 +172,10 @@ impl TlsConfig {
             config = config.ca_path(path);
         }
         if let Some(password) = get(ENV_PASSWORD) {
-            config = config.password(password);
+            config = config.password(os_to_bytes(password));
         }
         if let Some(rules) = get(ENV_VERIFY_PEERS) {
-            config = config.verify_peers(rules);
+            config = config.verify_peers(rules.to_string_lossy());
         }
         if let Some(flag) = lookup(ENV_DISABLE_PLAINTEXT_CONNECTION).and_then(parse_bool) {
             config = config.disable_plaintext_connection(flag);
@@ -192,7 +196,7 @@ impl TlsConfig {
     /// Uses PEM bytes as the certificate chain (`TLS_cert_bytes`).
     #[must_use]
     pub fn cert_bytes(mut self, pem: impl Into<Vec<u8>>) -> Self {
-        self.cert = Some(Source::Bytes(pem.into()));
+        self.cert = Some(Source::Bytes(Zeroizing::new(pem.into())));
         self
     }
 
@@ -206,7 +210,7 @@ impl TlsConfig {
     /// Uses PEM bytes as the private key (`TLS_key_bytes`).
     #[must_use]
     pub fn key_bytes(mut self, pem: impl Into<Vec<u8>>) -> Self {
-        self.key = Some(Source::Bytes(pem.into()));
+        self.key = Some(Source::Bytes(Zeroizing::new(pem.into())));
         self
     }
 
@@ -221,14 +225,17 @@ impl TlsConfig {
     /// Uses PEM bytes as the CA bundle (`TLS_ca_bytes`).
     #[must_use]
     pub fn ca_bytes(mut self, pem: impl Into<Vec<u8>>) -> Self {
-        self.ca = Some(Source::Bytes(pem.into()));
+        self.ca = Some(Source::Bytes(Zeroizing::new(pem.into())));
         self
     }
 
     /// Sets the passphrase for an encrypted private key (`TLS_password`).
+    ///
+    /// A byte string, as in FoundationDB: a `&str` or `String` works, and so
+    /// does non-UTF-8 data.
     #[must_use]
-    pub fn password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(password.into());
+    pub fn password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(Zeroizing::new(password.into()));
         self
     }
 
@@ -268,7 +275,7 @@ impl TlsConfig {
     /// task.
     pub fn load(&self) -> Result<LoadedTlsConfig, TlsError> {
         self.load_with(
-            |name| std::env::var(name).ok(),
+            |name| std::env::var_os(name),
             default_config_dir().as_deref(),
         )
     }
@@ -298,7 +305,7 @@ impl TlsConfig {
     /// setting.
     pub fn load_with(
         &self,
-        lookup: impl Fn(&str) -> Option<String>,
+        lookup: impl Fn(&str) -> Option<OsString>,
         default_dir: Option<&Path>,
     ) -> Result<LoadedTlsConfig, TlsError> {
         let cert = resolve_material(
@@ -315,15 +322,15 @@ impl TlsConfig {
         )?;
         let ca = resolve_material("CA", self.ca.as_ref(), &lookup(ENV_CA_FILE), None)?;
 
-        let password = self
-            .password
-            .clone()
-            .filter(|p| !p.is_empty())
-            .or_else(|| lookup(ENV_PASSWORD).filter(|p| !p.is_empty()));
+        let password = self.password.clone().filter(|p| !p.is_empty()).or_else(|| {
+            lookup(ENV_PASSWORD)
+                .filter(|p| !p.is_empty())
+                .map(|p| Zeroizing::new(os_to_bytes(p)))
+        });
 
         let verify_peers = if self.verify_peers.is_empty() {
             match lookup(ENV_VERIFY_PEERS) {
-                Some(rules) => vec![rules],
+                Some(rules) => vec![rules.to_string_lossy().into_owned()],
                 None => vec![DEFAULT_VERIFY_PEERS.to_owned()],
             }
         } else {
@@ -336,7 +343,7 @@ impl TlsConfig {
 
         Ok(LoadedTlsConfig {
             cert,
-            key,
+            key: key.map(Zeroizing::new),
             ca,
             password,
             verify_peers,
@@ -369,18 +376,30 @@ impl fmt::Debug for Source {
 }
 
 /// `boost::lexical_cast<bool>`: only `0` and `1`.
-fn parse_bool(value: String) -> Option<bool> {
-    match value.as_str() {
-        "0" => Some(false),
-        "1" => Some(true),
+fn parse_bool(value: OsString) -> Option<bool> {
+    match value.to_str() {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
         _ => None,
+    }
+}
+
+/// The bytes of an environment value: exact on Unix, lossy UTF-8 elsewhere.
+fn os_to_bytes(value: OsString) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        std::os::unix::ffi::OsStringExt::into_vec(value)
+    }
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().into_owned().into_bytes()
     }
 }
 
 fn resolve_material(
     what: &'static str,
     explicit: Option<&Source>,
-    env_path: &Option<String>,
+    env_path: &Option<OsString>,
     default_file: Option<PathBuf>,
 ) -> Result<Option<Vec<u8>>, TlsError> {
     let explicit_path = match explicit {
@@ -396,7 +415,7 @@ fn resolve_material(
         return read_limited(what, path).map(Some);
     }
     Ok(match explicit {
-        Some(Source::Bytes(bytes)) if !bytes.is_empty() => Some(bytes.clone()),
+        Some(Source::Bytes(bytes)) if !bytes.is_empty() => Some(bytes.to_vec()),
         _ => None,
     })
 }
@@ -433,9 +452,9 @@ fn read_limited(what: &'static str, path: PathBuf) -> Result<Vec<u8>, TlsError> 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoadedTlsConfig {
     cert: Option<Vec<u8>>,
-    key: Option<Vec<u8>>,
+    key: Option<Zeroizing<Vec<u8>>>,
     ca: Option<Vec<u8>>,
-    password: Option<String>,
+    password: Option<Zeroizing<Vec<u8>>>,
     verify_peers: Vec<String>,
     disable_plaintext_connection: bool,
 }
@@ -448,7 +467,7 @@ impl LoadedTlsConfig {
 
     /// PEM of the client private key, if one is configured.
     pub fn key_pem(&self) -> Option<&[u8]> {
-        self.key.as_deref()
+        self.key.as_ref().map(|k| k.as_slice())
     }
 
     /// PEM of the CA bundle, if one is configured.
@@ -457,8 +476,8 @@ impl LoadedTlsConfig {
     }
 
     /// The passphrase for an encrypted key, if one is configured.
-    pub fn password(&self) -> Option<&str> {
-        self.password.as_deref()
+    pub fn password(&self) -> Option<&[u8]> {
+        self.password.as_ref().map(|p| p.as_slice())
     }
 
     /// The resolved verify-peers rule strings: the explicit ones, else
@@ -507,11 +526,14 @@ impl LoadedTlsConfig {
 
 impl fmt::Debug for LoadedTlsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let len = |m: &Option<Vec<u8>>| m.as_ref().map(|b| format!("{} bytes", b.len()));
+        let len = |n: Option<usize>| n.map(|n| format!("{n} bytes"));
         f.debug_struct("LoadedTlsConfig")
-            .field("certificate", &len(&self.cert))
-            .field("key", &len(&self.key).map(|_| "<redacted>"))
-            .field("ca", &len(&self.ca))
+            .field("certificate", &len(self.cert.as_ref().map(|c| c.len())))
+            .field(
+                "key",
+                &len(self.key.as_ref().map(|k| k.len())).map(|_| "<redacted>"),
+            )
+            .field("ca", &len(self.ca.as_ref().map(|c| c.len())))
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("verify_peers", &self.verify_peers)
             .field(
@@ -528,15 +550,15 @@ mod tests {
 
     use super::*;
 
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let map: HashMap<String, OsString> = pairs
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
             .collect();
         move |name| map.get(name).cloned()
     }
 
-    fn no_env(_: &str) -> Option<String> {
+    fn no_env(_: &str) -> Option<OsString> {
         None
     }
 
@@ -579,7 +601,7 @@ mod tests {
         assert_eq!(loaded.certificate_pem(), Some(&b"CERT"[..]));
         assert_eq!(loaded.key_pem(), Some(&b"KEY"[..]));
         assert_eq!(loaded.ca_pem(), Some(&b"CA"[..]));
-        assert_eq!(loaded.password(), Some("pw"));
+        assert_eq!(loaded.password(), Some(&b"pw"[..]));
     }
 
     #[test]
@@ -718,17 +740,17 @@ mod tests {
     fn password_precedence() {
         let vars = [(ENV_PASSWORD, "from-env")];
         let loaded = TlsConfig::new().load_with(env(&vars), None).unwrap();
-        assert_eq!(loaded.password(), Some("from-env"));
+        assert_eq!(loaded.password(), Some(&b"from-env"[..]));
         let loaded = TlsConfig::new()
             .password("explicit")
             .load_with(env(&vars), None)
             .unwrap();
-        assert_eq!(loaded.password(), Some("explicit"));
+        assert_eq!(loaded.password(), Some(&b"explicit"[..]));
         let loaded = TlsConfig::new()
             .password("")
             .load_with(env(&vars), None)
             .unwrap();
-        assert_eq!(loaded.password(), Some("from-env"));
+        assert_eq!(loaded.password(), Some(&b"from-env"[..]));
     }
 
     #[test]
@@ -787,7 +809,10 @@ mod tests {
         assert_eq!(config.cert, Some(Source::Path("/c.pem".into())));
         assert_eq!(config.key, Some(Source::Path("/k.pem".into())));
         assert_eq!(config.ca, Some(Source::Path("/ca.pem".into())));
-        assert_eq!(config.password.as_deref(), Some("pw"));
+        assert_eq!(
+            config.password.as_ref().map(|p| p.as_slice()),
+            Some(&b"pw"[..])
+        );
         assert_eq!(config.verify_peers, ["S.O=x"]);
         assert!(config.disable_plaintext);
 

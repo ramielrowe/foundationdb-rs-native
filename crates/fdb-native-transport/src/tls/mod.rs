@@ -42,7 +42,17 @@
 //! provider instead ([`crypto_provider`]); `ring` stays compiled in because
 //! cargo features are additive. `aws-lc-rs` needs a C toolchain (and CMake on
 //! some targets), which is why `ring` is the default. Neither provider changes
-//! behaviour described below.
+//! behaviour described below, with one exception: ECDSA P-521 is not supported
+//! by `ring` (see "Differences from OpenSSL").
+//!
+//! **Process-wide default provider.** This module never relies on rustls'
+//! process default: every config is built with `builder_with_provider`. But if
+//! an application enables `tls-aws-lc-rs` (or any other crate enables rustls'
+//! `aws_lc_rs` feature) alongside `ring`, rustls sees two providers and
+//! cannot pick one, so *other* code that calls `ClientConfig::builder()` or
+//! `ServerConfig::builder()` panics unless the application first calls
+//! `CryptoProvider::install_default`. Install one at start-up if you mix this
+//! crate with such code.
 //!
 //! # Why `tls` is off by default
 //!
@@ -145,11 +155,23 @@
 //!   returns `LoadedTLSConfig::getPassword()` (explicit option, else
 //!   `FDB_TLS_PASSWORD`, else empty), line 131 / 130. OpenSSL calls it only for an
 //!   encrypted key. Pure-Rust support exists (the `pkcs8` crate), so
-//!   encrypted keys work here when they are PKCS#8 with PBES2 (PBKDF2 and
-//!   AES-CBC; what `openssl pkcs8 -topk8` and `openssl genpkey -aes256`
-//!   write). PBES1 / PKCS#12-style schemes and OpenSSL's legacy
-//!   `Proc-Type: 4,ENCRYPTED` PEM encryption are not supported and give
-//!   [`TlsError::KeyDecrypt`] / [`TlsError::LegacyEncryptedKey`].
+//!   encrypted keys work here when they are PKCS#8 with PBES2 (PBKDF2 with
+//!   HMAC-SHA1 or SHA-2, and AES-CBC or 3DES-CBC; what `openssl pkcs8 -topk8`
+//!   and `openssl genpkey -aes256` write). The scheme is identified before
+//!   decryption, so the error says which problem it is: a wrong password is
+//!   [`TlsError::KeyDecrypt`]; PBES1 and PKCS#12-style schemes (written by
+//!   `openssl pkcs8 -v1`), scrypt and unknown ciphers are
+//!   [`TlsError::UnsupportedKeyEncryption`]; OpenSSL's legacy
+//!   `Proc-Type: 4,ENCRYPTED` PEM encryption is
+//!   [`TlsError::LegacyEncryptedKey`]. Passwords are byte strings, as in
+//!   FoundationDB.
+//! * **Secrets in memory.** The private key PEM and the password are held in
+//!   `zeroize::Zeroizing` buffers and wiped on drop, as are the decrypted
+//!   intermediates. The DER copy handed to rustls, and rustls' own signing key,
+//!   are outside this crate's control and are not wiped.
+//! * Environment values are read as OS strings, so a non-UTF-8 path or
+//!   password is used as is rather than ignored (verify-peers strings are
+//!   converted lossily).
 //! * Files are read whole and limited by the `CERT_FILE_MAX_SIZE` knob, 5 MiB
 //!   (`flow/Knobs.cpp` 228 / 226); a larger file is an error
 //!   ([`TlsError::FileTooLarge`]).
@@ -244,7 +266,32 @@
 //!   (`basicConstraints CA:TRUE`), and a present `extendedKeyUsage` must
 //!   include `serverAuth`;
 //! * a self-signed server certificate is accepted only if it is itself in the
-//!   CA bundle (it then acts as its own trust anchor).
+//!   CA bundle (it then acts as its own trust anchor), and only if it is not
+//!   flagged `CA:TRUE`: the self-signed example in FoundationDB's `tls.rst`
+//!   (`openssl req -x509`) is flagged `CA:TRUE` and is rejected as
+//!   `CaUsedAsEndEntity`. Fixing this is planned together with the verify-peers
+//!   verifier (an ignored test records the case);
+//! * **ECDSA P-521 is not supported with the default `ring` provider**, for
+//!   either a server certificate signature or a client private key
+//!   ([`TlsError::InvalidKey`] for the latter). It works with the
+//!   `tls-aws-lc-rs` feature. P-256 and P-384 work with both.
+//!
+//! # Closing, truncation and flushing
+//!
+//! FoundationDB never sends a TLS `close_notify`: `SSLConnection::closeSocket`
+//! closes the TCP socket first and only then calls `ssl_sock.shutdown`, which
+//! has nothing left to send on (`flow/Net2.actor.cpp` 1424-1434 on 7.4;
+//! `flow/Net2.cpp` 1307-1314 on 8.0).
+//! So every close initiated by a server looks to rustls like a truncation, and
+//! reading yields an [`io::ErrorKind::UnexpectedEof`](std::io::ErrorKind)
+//! error rather than `Ok(0)`. **The transport must treat `UnexpectedEof` from
+//! a [`TlsStream`] as "peer closed".** (A peer that does send `close_notify`
+//! gives `Ok(0)`.)
+//!
+//! `futures-rustls` buffers encrypted output: a successful `poll_write` does
+//! not mean the bytes reached the socket. **The transport must `poll_flush`
+//! after writing** (and before waiting for a reply); `poll_close` flushes and
+//! sends `close_notify` before closing the underlying stream.
 //!
 //! Where FoundationDB tolerates a client certificate configured without a key
 //! (it silently sends none), this module reports an error instead

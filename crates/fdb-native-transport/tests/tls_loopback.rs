@@ -795,3 +795,213 @@ async fn a_self_signed_server_certificate_is_accepted_only_when_it_is_the_trust_
     let not_trusting = TlsConnector::new(&loaded(ca_config(&other_ca))).unwrap();
     assert!(connect(&not_trusting, server.addr).await.is_err());
 }
+
+#[tokio::test]
+async fn a_server_certificate_for_client_auth_only_is_rejected() {
+    let ca = new_ca("Test CA");
+    // extendedKeyUsage lists clientAuth but not serverAuth.
+    let leaf = leaf_with(
+        &ca,
+        KeyPair::generate().unwrap(),
+        &["server.example"],
+        ExtendedKeyUsagePurpose::ClientAuth,
+        |_| {},
+    );
+    let server = Server::start(ServerOptions::new(&leaf, &[])).await;
+
+    let connector = TlsConnector::new(&loaded(ca_config(&ca))).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    assert!(
+        matches!(
+            rustls_error(&error),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. }
+            ))
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "TODO(vdb.2 unification): the default verifier uses rustls-webpki, which rejects a \
+            CA:TRUE end-entity certificate (what FDB's tls.rst `openssl req -x509` example \
+            produces). Enable when ChainVerifier is unified with the verify_peers verifier."]
+async fn a_self_signed_ca_flagged_server_certificate_is_accepted_when_trusted() {
+    let key = KeyPair::generate().unwrap();
+    let mut params = ca_params("self-signed-ca-server");
+    params.subject_alt_names = vec![rcgen::SanType::DnsName(
+        "server.example".try_into().unwrap(),
+    )];
+    let cert = params.self_signed(&key).unwrap();
+    let server = Server::start(ServerOptions {
+        chain: vec![cert.der().clone()],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        client_ca: None,
+        allow_anonymous: false,
+        versions: rustls::DEFAULT_VERSIONS,
+        alpn: Vec::new(),
+    })
+    .await;
+    let connector = TlsConnector::new(&loaded(TlsConfig::new().ca_bytes(cert.pem()))).unwrap();
+    connect(&connector, server.addr).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_that_closes_without_close_notify_is_a_truncation() {
+    // FoundationDB closes the TCP connection without sending close_notify
+    // (SSLConnection::closeSocket), so every server-initiated close looks
+    // like this: data, then FIN.
+    let ca = new_ca("Test CA");
+    let leaf = server_leaf(&ca, &["server.example"]);
+    let config = ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.cert.clone()], leaf.key_der())
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        tls.write_all(b"last words").await.unwrap();
+        tls.flush().await.unwrap();
+        // Drop the socket without tls.shutdown(): no close_notify.
+        let (tcp, _connection) = tls.into_inner();
+        drop(tcp);
+    });
+
+    let connector = TlsConnector::new(&loaded(ca_config(&ca))).unwrap();
+    let mut stream = connect(&connector, addr).await.unwrap();
+    let mut data = [0u8; 10];
+    stream.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"last words");
+    let mut more = [0u8; 1];
+    let error = stream.read(&mut more).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error:?}");
+}
+
+// ---- ClientHello inspection -------------------------------------------
+
+/// The extension types of the ClientHello at the start of `bytes` (one TLS
+/// record).
+fn client_hello_extensions(bytes: &[u8]) -> Vec<u16> {
+    fn take<'a>(bytes: &mut &'a [u8], n: usize) -> &'a [u8] {
+        let (head, tail) = bytes.split_at(n);
+        *bytes = tail;
+        head
+    }
+    fn take_u8(bytes: &mut &[u8]) -> usize {
+        usize::from(take(bytes, 1)[0])
+    }
+    fn take_u16(bytes: &mut &[u8]) -> usize {
+        let b = take(bytes, 2);
+        usize::from(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    let mut rest = bytes;
+    assert_eq!(take(&mut rest, 1), [0x16], "not a handshake record");
+    take(&mut rest, 2); // record version
+    let record_len = take_u16(&mut rest);
+    let mut rest = &rest[..record_len];
+    assert_eq!(take(&mut rest, 1), [0x01], "not a ClientHello");
+    take(&mut rest, 3); // handshake length
+    take(&mut rest, 2 + 32); // version, random
+    let n = take_u8(&mut rest);
+    take(&mut rest, n); // session id
+    let n = take_u16(&mut rest);
+    take(&mut rest, n); // cipher suites
+    let n = take_u8(&mut rest);
+    take(&mut rest, n); // compression methods
+    let ext_len = take_u16(&mut rest);
+    let mut exts = &rest[..ext_len];
+    let mut types = Vec::new();
+    while !exts.is_empty() {
+        types.push(take_u16(&mut exts) as u16);
+        let n = take_u16(&mut exts);
+        take(&mut exts, n);
+    }
+    types
+}
+
+const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_ALPN: u16 = 0x0010;
+
+#[test]
+fn the_hello_parser_sees_sni_when_a_dns_name_is_used() {
+    // Control for the test below: a stock rustls client with a DNS name.
+    let config = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .unwrap()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let name = ServerName::try_from("example.com").unwrap();
+    let mut connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut hello = Vec::new();
+    connection.write_tls(&mut hello).unwrap();
+    let extensions = client_hello_extensions(&hello);
+    assert!(extensions.contains(&EXT_SERVER_NAME), "{extensions:?}");
+}
+
+#[tokio::test]
+async fn the_client_hello_has_no_sni_and_no_alpn() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hello = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut have = 0;
+        loop {
+            have += tcp.read(&mut buf[have..]).await.unwrap();
+            // Whole first record received?
+            if have >= 5 && have >= 5 + usize::from(u16::from_be_bytes([buf[3], buf[4]])) {
+                break;
+            }
+        }
+        buf.truncate(have);
+        // Keep the socket open until the test is done with the bytes.
+        (buf, tcp)
+    });
+    let ca = new_ca("Test CA");
+    let connector = TlsConnector::new(&loaded(ca_config(&ca))).unwrap();
+    let tcp = TokioRuntime::new().connect(addr).await.unwrap();
+    // The handshake cannot finish; the client has sent its hello by now.
+    let attempt = tokio::spawn(async move { connector.connect(tcp).await.map(|_| ()) });
+    let (bytes, _tcp) = hello.await.unwrap();
+    attempt.abort();
+    let extensions = client_hello_extensions(&bytes);
+    assert!(
+        !extensions.contains(&EXT_SERVER_NAME),
+        "ClientHello carries SNI: {extensions:?}"
+    );
+    assert!(
+        !extensions.contains(&EXT_ALPN),
+        "ClientHello carries ALPN: {extensions:?}"
+    );
+    assert!(!extensions.is_empty(), "no extensions parsed");
+}
+
+#[test]
+fn an_ecdsa_p521_client_key_needs_the_aws_lc_provider() {
+    let cert = include_str!("fixtures/p521_cert.pem");
+    let key = include_str!("fixtures/p521_key.pem");
+    let config = TlsConfig::new()
+        .ca_bytes(cert)
+        .cert_bytes(cert)
+        .key_bytes(key);
+    let result = TlsConnector::new(&loaded(config));
+    if cfg!(feature = "tls-aws-lc-rs") {
+        result.unwrap();
+    } else {
+        match result {
+            Err(error @ TlsError::InvalidKey(_)) => {
+                assert!(
+                    error.to_string().contains("tls-aws-lc-rs"),
+                    "the error should point at the aws-lc-rs feature: {error}"
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+}

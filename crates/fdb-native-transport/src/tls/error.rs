@@ -77,10 +77,27 @@ pub enum TlsError {
          supported; convert it with `openssl pkcs8 -topk8`"
     )]
     LegacyEncryptedKey,
-    /// The encrypted PKCS#8 key could not be decrypted: wrong password, or an
-    /// encryption scheme other than PBES2 with AES-CBC.
-    #[error("cannot decrypt the TLS private key (wrong password, or unsupported scheme): {0}")]
+    /// The encrypted PKCS#8 key is in a supported scheme but did not decrypt:
+    /// wrong password or a corrupt key.
+    #[error("cannot decrypt the TLS private key: {0}")]
     KeyDecrypt(String),
+    /// The encrypted PKCS#8 key uses a scheme this crate cannot decrypt (PBES1,
+    /// scrypt, or an unknown cipher). The message names it.
+    ///
+    /// Supported: PBES2 with PBKDF2 (HMAC-SHA1 or SHA-2) and AES-CBC or
+    /// 3DES-CBC.
+    #[error("unsupported TLS private key encryption: {0}")]
+    UnsupportedKeyEncryption(String),
+    /// rustls could not load the private key as a signing key.
+    ///
+    /// The key parsed as PEM/DER but is of a type the crypto provider does not
+    /// support. With the default `ring` provider that includes ECDSA P-521
+    /// keys (and P-521 certificate signatures); build with the
+    /// `tls-aws-lc-rs` feature to use them.
+    #[error(
+        "the TLS private key is not usable: {0} (ECDSA P-521 needs the `tls-aws-lc-rs` feature)"
+    )]
+    InvalidKey(String),
     /// No CA certificates were configured, so there is nothing to validate a
     /// server chain against.
     ///

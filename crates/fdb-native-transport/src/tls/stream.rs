@@ -66,7 +66,17 @@ impl TlsConnector {
             .with_custom_certificate_verifier(verifier);
         let client_certificate = identity.is_some();
         let mut client_config = match identity {
-            Some((chain, key)) => builder.with_client_auth_cert(chain, key)?,
+            Some((chain, key)) => {
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .map_err(|error| match error {
+                        // The provider could not load the key (for example
+                        // ECDSA P-521 under ring). Mismatches between key and
+                        // certificate are other variants.
+                        rustls::Error::General(message) => TlsError::InvalidKey(message),
+                        other => TlsError::Rustls(other),
+                    })?
+            }
             None => builder.with_no_client_auth(),
         };
         // FoundationDB sets no SNI, no ALPN, and never reuses a session.
