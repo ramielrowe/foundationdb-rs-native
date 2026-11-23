@@ -1,8 +1,18 @@
 //! Public API of the pure-Rust native FoundationDB client.
 //!
 //! Built on `fdb-native-schema` and `fdb-native-transport`.
+//!
+//! * [`cluster_file`]: cluster files and connection strings.
+//! * [`cluster`]: the coordinator connection, [`ClusterMonitor`], which keeps the client's
+//!   `ClientDBInfo` (its GRV and commit proxies) current.
 
+pub mod cluster;
 pub mod cluster_file;
+
+pub use cluster::{
+    ClusterInfo, ClusterInfoWatch, ClusterMonitor, ClusterMonitorConfig, CommitProxyEndpoints,
+    ConnectionRecord, GrvProxyEndpoints, MonitorClosed, MonitorError, MonitorStatus,
+};
 
 pub use cluster_file::{
     ClusterConnectionString, ClusterFile, ClusterFileError, ClusterFileLocation, ClusterFileSource,

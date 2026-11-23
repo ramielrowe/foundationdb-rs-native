@@ -385,11 +385,15 @@ name = "fdb-native-client"
 version = "0.0.0"
 dependencies = [
  "fdb-native-schema",
+ "fdb-native-testkit",
  "fdb-native-transport",
+ "fdb-native-wire",
+ "futures-io",
  "proptest",
  "regex",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

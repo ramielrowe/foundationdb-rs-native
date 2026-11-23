@@ -13,9 +13,14 @@ workspace = true
 [dependencies]
 fdb-native-schema.workspace = true
 fdb-native-transport.workspace = true
+fdb-native-wire.workspace = true
 thiserror = "2.0.21"
 
 [dev-dependencies]
+fdb-native-testkit = { path = "../fdb-native-testkit" }
+fdb-native-transport = { workspace = true, features = ["tokio"] }
+futures-io = "0.3.34"
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util", "sync", "time"] }
 proptest = "1.11.0"
 regex = { version = "1.11", default-features = false, features = ["std", "perf"] }
 tempfile = "3.27.0"
