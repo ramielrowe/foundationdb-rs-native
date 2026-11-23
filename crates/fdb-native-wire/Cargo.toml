@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["derive"]
+# `#[derive(Wire)]`, re-exported as `fdb_native_wire::Wire`.
+derive = ["dep:fdb-native-wire-derive"]
+
 [dependencies]
+fdb-native-wire-derive = { workspace = true, optional = true }
 thiserror = "2.0.21"
 
 [dev-dependencies]

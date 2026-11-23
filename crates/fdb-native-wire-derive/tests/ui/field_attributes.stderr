@@ -1,0 +1,29 @@
+error: a field takes at most one of `skip`, `arena` and `skip_slots`
+ --> tests/ui/field_attributes.rs:6:17
+  |
+6 |     #[fdb(skip, arena)]
+  |                 ^^^^^
+
+error: `skip_slots` must be at least 1
+  --> tests/ui/field_attributes.rs:13:24
+   |
+13 |     #[fdb(skip_slots = 0)]
+   |                        ^
+
+error: an `#[fdb(arena)]` field must come after every serialized field: C++ requires the Arena to be the last serializer argument, and field order is argument order
+  --> tests/ui/field_attributes.rs:19:11
+   |
+19 |     #[fdb(arena)]
+   |           ^^^^^
+
+error: a table takes at most one `#[fdb(arena)]` field (C++ allows one Arena serializer argument, the last)
+  --> tests/ui/field_attributes.rs:29:11
+   |
+29 |     #[fdb(arena)]
+   |           ^^^^^
+
+error: `arena` and `skip_slots` apply to table fields; an `#[fdb(struct)]` has no slots (use `skip` for a field that is not on the wire)
+  --> tests/ui/field_attributes.rs:37:11
+   |
+37 |     #[fdb(arena)]
+   |           ^^^^^

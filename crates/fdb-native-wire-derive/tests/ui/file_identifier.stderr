@@ -1,0 +1,11 @@
+error: a file identifier must be below 2^24 (0x1000000); wrapper codes in the top byte are composed automatically
+ --> tests/ui/file_identifier.rs:5:25
+  |
+5 | #[fdb(file_identifier = 0x01000000)]
+  |                         ^^^^^^^^^^
+
+error: expected `=`
+  --> tests/ui/file_identifier.rs:11:22
+   |
+11 | #[fdb(file_identifier)]
+   |                      ^
