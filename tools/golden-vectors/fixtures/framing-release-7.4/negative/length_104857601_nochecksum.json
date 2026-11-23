@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "name": "length_104857601_nochecksum",
+  "group": "negative",
+  "kind": "negative",
+  "description": "A frame whose length (104857601) is above PACKET_LIMIT (104857600); the body is not read.",
+  "checksum_enabled": false,
+  "size": 36,
+  "bytes": "010040061111111111111111111111111111111111111111111111111111111111111111",
+  "length": 104857601,
+  "error": "oversize",
+  "packet_limit": 104857600
+}

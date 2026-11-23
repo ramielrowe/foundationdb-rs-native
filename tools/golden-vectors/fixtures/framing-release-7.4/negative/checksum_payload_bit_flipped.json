@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "name": "checksum_payload_bit_flipped",
+  "group": "negative",
+  "kind": "negative",
+  "description": "A valid 64-byte frame with one payload bit flipped.",
+  "checksum_enabled": true,
+  "size": 92,
+  "bytes": "50000000d64435958c164531efcdab89674523011032547698badcfe0726456483a2c1e0ff1e395c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8",
+  "length": 80,
+  "error": "checksum_mismatch",
+  "packet_limit": 104857600
+}

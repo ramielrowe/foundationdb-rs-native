@@ -8,7 +8,7 @@ can be checked against the C++ reader.
 Nothing in the Rust workspace builds or runs this tool. The fixtures it writes are checked
 in under [`fixtures/`](fixtures/), and Rust tests read them as plain files.
 
-There are two kinds of fixtures:
+There are four kinds of fixtures:
 
 - `fixtures/engine/`: engine-level vectors (test types modelled on FDB's flatbuffers unit
   tests, compiled against stand-ins for the flow types), built on the host by `regen.sh`.
@@ -16,6 +16,10 @@ There are two kinds of fixtures:
   `GetValueRequest`, `CommitTransactionRequest`, `ClientDBInfo`, ...) serialized by each
   release branch's own code, built inside the official FDB build image by
   `regen_messages.sh`. See [Message-level vectors](#message-level-vectors).
+- `fixtures/binary-release-7.4/` and `fixtures/binary-release-8.0/`: legacy `BinaryWriter` vectors,
+  from the same run. See [Binary-format vectors](#binary-format-vectors).
+- `fixtures/framing-release-7.4/` and `fixtures/framing-release-8.0/`: FlowTransport packet framing
+  (length, checksum, token, payload), from the same run. See [Framing vectors](#framing-vectors).
 
 - [Build and regenerate](#build-and-regenerate)
 - [Decode mode](#decode-mode)
@@ -26,6 +30,8 @@ There are two kinds of fixtures:
 - [Types not covered](#types-not-covered)
 - [Message-level vectors](#message-level-vectors)
 - [How the tool is put together](#how-the-tool-is-put-together)
+- [Binary-format vectors](#binary-format-vectors)
+- [Framing vectors](#framing-vectors)
 
 ## Build and regenerate
 
@@ -1063,3 +1069,67 @@ vectors follow FDB: 0 for a plain client, 1 for fdbserver and the simulator, a r
 for the multi-version client API.
 FDB's headers cannot write `std::tuple`, `float` or `Void` or read a `std::deque`, and
 `ErrorOr<T>` does not round-trip, so there are no vectors for them.
+
+## Framing vectors
+
+`fixtures/framing-release-7.4/` and `fixtures/framing-release-8.0/` hold FlowTransport's packet
+framing: `[u32 length][u64 XXH3-64 checksum, non-TLS only][16-byte token][payload]`, for the Rust
+`fdb-native-transport` framing codec. They come from the same `regen_messages.sh` run as the other
+message fixtures, from the `golden_vectors_framing` target (`messages/framing_vectors.cpp`).
+
+**How the bytes are made.** `sendPacket()` is a `static` function of `FlowTransport.actor.cpp` /
+`FlowTransport.cpp` that needs a whole transport, so it cannot be called. The generator instead runs
+the framing core of `sendPacket()` verbatim (the regions marked `MIRROR A` and `MIRROR B`:
+`PacketWriter` construction, `writeAhead` for the length and checksum, `<< token`, the payload,
+`finish()`, then the XXH3 one-shot or streaming checksum over the buffer chain, and the
+`SplitBuffer::write` of the length and checksum; `MIRROR C` is `PACKET_LEN_WIDTH`) over the release's real `PacketBuffer`,
+`PacketWriter`, `SplitBuffer` and `flow/xxhash.h`. `check_mirrors.py` compares both regions with the
+branch's source (ignoring comments and whitespace) and fails the build if they differ; it also
+fingerprints `sendPacket`, `scanPackets`, `getNewBufferSize` (and 8.0's limit helpers), `PACKET_LEN_WIDTH`
+and the `connectionReader` block that dispatches what follows the handshake, so that a
+change to the code the Rust codec follows is noticed. The payloads are either raw bytes written the
+way a payload is written (one `writeBytes` allocation, which is how the `ObjectWriter` writes a
+flatbuffers message, or `serializeBytes` pieces) or real flatbuffers messages made by
+`SerializeSource<T>` (`StringRef`, `UID`).
+
+Every frame is read back by a mirror of `scanPackets()`'s checks (length against the limit, the
+`XXH3_64bits` check, `ArenaReader >> UID`), and every negative vector must be refused by them, or
+the generator fails.
+
+**Files.** `index.json` lists `positive` and `negative` records, and carries `packet_limit`,
+`packet_warning`, `min_packet_buffer_bytes` (the knobs of this release) and
+`packet_buffer_capacity` (16336: a `PacketBuffer` is 16384 bytes with 48 of header). A positive record:
+
+```jsonc
+{
+  "format_version": 1, "name": "...", "group": "raw|flatbuffer|boundary|stream", "kind": "positive",
+  "description": "...",
+  "checksum_enabled": true,      // false: a TLS connection
+  "start_offset": 0,             // bytes of the first PacketBuffer that precede the first frame
+  "segments": [16336, 7],        // how the written bytes were split across PacketBuffers
+  "size": 16343, "bytes": "...", // the stream: every frame, back to back (hex)
+  "frames": [{
+    "offset": 0, "length": 16324,        // the length field: token plus payload
+    "checksum": 123,                     // u64, or null without a checksum
+    "token": {"first": 1, "second": 2},  // the UID halves, as u64
+    "payload_len": 16308,
+    "payload_hex": "..."                 // or: "payload_pattern": {"mul": 29, "add": 3}
+  }]
+}
+```
+
+`payload_pattern` stands for byte `i` = `(i as u8) * mul + add` (wrapping, as `uint8_t`). A negative
+record has `bytes`, `checksum_enabled`, `length` (the length field), `packet_limit` and `error`
+(`checksum_mismatch`, `too_short` or `oversize`).
+
+**Groups.** `raw`: empty, 1, 100 and 40000-byte payloads (the large ones in one buffer and spread over
+three), and the well-known ping token `(-1, 1)`. `flatbuffer`: real `ObjectWriter` payloads. `boundary`:
+frames that end 1 byte before, at, and 1 byte after the end of a `PacketBuffer`, and 100-byte frames
+that start `k` bytes before its end (the length, the checksum or the token straddles the boundary).
+`stream`: six frames back to back in one buffer chain. Every case exists with and without a checksum
+(`*_checksum`, `*_nochecksum`). Frames are canonical: the Rust encoder must produce `bytes` exactly.
+There is no vector at the 100 MiB limit; the limit is tested with a smaller configured one.
+
+The framing is the same on both releases; the differences (8.0 clamps the limit and discards an
+oversize packet on send, 7.4 sends it anyway) do not show in the bytes, so the two releases'
+fixtures are identical apart from `index.json`.

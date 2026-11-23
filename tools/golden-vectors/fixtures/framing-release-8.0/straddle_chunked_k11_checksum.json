@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "straddle_chunked_k11_checksum",
+  "group": "boundary",
+  "kind": "positive",
+  "description": "A 100-byte frame that starts 11 bytes before the end of a 16336-byte PacketBuffer (the output starts at the frame). Payload written in 7-byte pieces.",
+  "checksum_enabled": true,
+  "start_offset": 16325,
+  "segments": [11, 117],
+  "size": 128,
+  "bytes": "740000005c4bf5b43f5a1549efcdab89674523011032547698badcfe05162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0e1f2031425364758697a8b9cadbecfe0f102132435465768798a9bacbdcedff00112233445566778899aabbccddeef00112233445566778899aabbccddeeff102132435465768798",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 116,
+      "checksum": 5266214568945077084,
+      "token": {
+        "first": 81985529216486895,
+        "second": 18364758544493064720
+      },
+      "payload_len": 100,
+      "payload_pattern": {
+        "mul": 17,
+        "add": 5
+      }
+    }
+  ]
+}

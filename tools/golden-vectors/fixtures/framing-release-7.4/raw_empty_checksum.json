@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "raw_empty_checksum",
+  "group": "raw",
+  "kind": "positive",
+  "description": "A frame whose payload is empty (length 16: just the token).",
+  "checksum_enabled": true,
+  "start_offset": 0,
+  "segments": [28],
+  "size": 28,
+  "bytes": "100000004420c9b4fe91fdb5efcdab89674523011032547698badcfe",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 16,
+      "checksum": 13113798213113552964,
+      "token": {
+        "first": 81985529216486895,
+        "second": 18364758544493064720
+      },
+      "payload_len": 0,
+      "payload_pattern": {
+        "mul": 31,
+        "add": 7
+      }
+    }
+  ]
+}

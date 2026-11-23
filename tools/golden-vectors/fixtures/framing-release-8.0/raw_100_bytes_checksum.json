@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "raw_100_bytes_checksum",
+  "group": "raw",
+  "kind": "positive",
+  "description": "A 100-byte payload.",
+  "checksum_enabled": true,
+  "start_offset": 0,
+  "segments": [128],
+  "size": 128,
+  "bytes": "7400000022eda77e3151d0d0efcdab89674523011032547698badcfe0726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8c7e60524436281a0bfdefd1c3b5a7998b7d6f51433527190afceed0c2b4a6988a7c6e504",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 116,
+      "checksum": 15046615628065008930,
+      "token": {
+        "first": 81985529216486895,
+        "second": 18364758544493064720
+      },
+      "payload_len": 100,
+      "payload_pattern": {
+        "mul": 31,
+        "add": 7
+      }
+    }
+  ]
+}
