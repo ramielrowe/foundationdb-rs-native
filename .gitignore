@@ -10,3 +10,4 @@
 
 # Agent worktrees
 .claude/worktrees/
+.claude/scratch/
