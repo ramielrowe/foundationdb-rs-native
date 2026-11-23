@@ -107,9 +107,16 @@
 //!   failed one is probed until it comes back.
 //! * **Bound.** Before an insert, while the cache holds `LOCATION_CACHE_EVICTION_SIZE`
 //!   ranges ([`ReadConfig::location_cache_size`], 600 000; ClientKnobs 7.4:99,
-//!   8.0:209), a random range is evicted (at most 100 per insert, as C++). Unlike C++, whose
-//!   `KeyRangeMap` keeps the boundaries of evicted and invalidated ranges, adjacent unknown
-//!   ranges are merged, so the map itself stays within twice the bound.
+//!   8.0:209), a random range is evicted (at most 100 per insert, as C++). C++'s cache is a
+//!   `CoalescedKeyRangeMap` (`DatabaseContext.h` 7.4:546), so an eviction or a range
+//!   invalidation (both `insert` an empty value) merges the range with unknown neighbours,
+//!   as here; only `invalidateCache(key)`, which assigns the value in place, keeps the
+//!   boundaries in C++. Here that merges too, so the map stays within about twice the bound.
+//! * **Interfaces.** A location reply that lists a known server (by id) with new endpoints
+//!   and the same locality updates its cached entry in place, so every cached range uses the
+//!   new endpoints (`getInterface`, 7.4:405-433); a different locality makes a new entry.
+//!   Server entries no range uses any more, their queue model data and their endpoint
+//!   failure records are pruned once they could outnumber the live ones.
 //! * **Not ported:** the TSS mapping (`resultsTssMapping` is ignored: testing storage
 //!   servers only shadow reads for comparison), the tag mapping (version vectors), the
 //!   periodic peer evictor (`LOCATION_CACHE_PEER_EVICTOR_*`, off on 7.4), and tenants.
@@ -123,7 +130,11 @@
 //!   [`ReadConfig::wrong_shard_server_delay`]) and start again; any other error is returned:
 //!   `future_version` (1009) and `transaction_too_old` (1007) go to the transaction, which
 //!   retries with a new read version. A version of 0 or less is refused with
-//!   `client_invalid_operation` (`validateVersion` throws it for 0 and asserts for the rest).
+//!   `client_invalid_operation` (`validateVersion` throws it for 0 and asserts for the rest),
+//!   including `latestVersion` (-2), which C++ only lets the cluster's own processes use.
+//!   Key locations are asked with the read version, and of provisional commit proxies only
+//!   if the transaction uses them (`trState->useProvisionalProxies`, 7.4:3294;
+//!   [`Reader::get_with`], [`Reader::snapshot_with`]).
 //! * **`loadBalance`** (LB 7.4:686-1022, 8.0:307-620), with the `QueueModel`
 //!   (`fdbrpc/QueueModel.cpp`; C++ clients enable it, `EnableLocalityLoadBalance::True`):
 //!   - The replicas are ordered by distance (`loadBalanceDistance`: the same `dcid` as
@@ -141,6 +152,10 @@
 //!     request that may have been delivered is simply sent again) try the next replica,
 //!     with the same backoff as above once all were tried; `process_behind` too, until all
 //!     were tried, then it is returned; any other error a replica answers is returned.
+//!     **With a single replica** (as in a single-process cluster) "all tried" is never
+//!     reached (`triedAllOptions` is set when the walk wraps around to its start, which one
+//!     alternative never does), so, as in C++, `process_behind` is retried with the backoff
+//!     (up to 5 s apart) until the server catches up or the read is abandoned.
 //!   - When every replica is failed, `allAlternativesFailedDelay` (`fdbrpc/LoadBalance.cpp`
 //!     8.0:29-53) waits for one to come back for 50 ms, growing to 1 s (and, after minutes,
 //!     30 s) while failures continue, jittered, then fails with `all_alternatives_failed`.
@@ -161,11 +176,15 @@
 //!   (`enableReplicaConsistencyCheck`), `connectionFileChanged` (a `switchConnectionRecord`
 //!   makes C++ fail reads with `transaction_too_old`), debug ids and metrics, and the
 //!   `LoadBalanceTooLong` trace.
-//! * **Shutdown.** Once the [`PeerManager`] is shut down, requests fail with
-//!   `operation_cancelled` (1101) instead of being retried; once the monitor is shut down,
-//!   a wait for proxies fails the same way.
+//! * **Shutdown.** Once the [`PeerManager`] is shut down or the [`ClusterMonitor`] closed,
+//!   the reader fails with `operation_cancelled` (1101) where it would otherwise wait for
+//!   something that cannot happen any more: a wait for proxies (when there are none), a
+//!   load balancer waiting for a failed alternative to come back, and the retry loops
+//!   (checked before each attempt). The peer manager has no shutdown notification, so a
+//!   parked wait notices its shutdown within a second. A request already sent is not
+//!   interrupted: the transport ends it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -194,6 +213,9 @@ pub use location::KEY_SPACE_END;
 use grv::Batcher;
 use location::{Location, LocationCache};
 use util::{Either, Rng, never, now_secs, race};
+
+/// How often a parked wait checks whether the peer manager was shut down.
+const SHUTDOWN_POLL: Duration = Duration::from_secs(1);
 
 /// `LOCATION_CACHE_ENDPOINT_FAILURE_GRACE_PERIOD` (60 s; ClientKnobs 7.4:101, 8.0:211).
 const ENDPOINT_FAILURE_GRACE_PERIOD: f64 = 60.0;
@@ -428,8 +450,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 
     /// A [`ReadSnapshot`] at a new read version.
     pub async fn snapshot(&self) -> Result<ReadSnapshot<R, W>, ClientError> {
-        let version = self.get_read_version().await?;
-        Ok(self.snapshot_at(version))
+        self.snapshot_with(ReadVersionOptions::default()).await
+    }
+
+    /// A [`ReadSnapshot`] at a new read version requested with `options`; its reads use
+    /// provisional commit proxies if `options.use_provisional_proxies`.
+    pub async fn snapshot_with(
+        &self,
+        options: ReadVersionOptions,
+    ) -> Result<ReadSnapshot<R, W>, ClientError> {
+        let version = self.get_read_version_with(options).await?;
+        Ok(ReadSnapshot {
+            reader: self.clone(),
+            version,
+            use_provisional_proxies: options.use_provisional_proxies,
+        })
     }
 
     /// A [`ReadSnapshot`] at `version`.
@@ -437,13 +472,28 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         ReadSnapshot {
             reader: self.clone(),
             version,
+            use_provisional_proxies: false,
         }
     }
 
-    /// The value of `key` at `version` (`getValue`), `None` if the key is not set. `key` must
-    /// be below [`KEY_SPACE_END`] (`key_outside_legal_range`); reading the system keys
-    /// (`\xff...`) is not checked here (that is a transaction option).
+    /// The value of `key` at `version` (`getValue`), `None` if the key is not set.
+    ///
+    /// `version` must be a read version (positive): 0 and `LATEST_VERSION` (-2) are refused
+    /// with `client_invalid_operation`. `key` must be below [`KEY_SPACE_END`]
+    /// (`key_outside_legal_range`); reading the system keys (`\xff...`) is not checked here
+    /// (that is a transaction option).
     pub async fn get(&self, key: &[u8], version: i64) -> Result<Option<Vec<u8>>, ClientError> {
+        self.get_with(key, version, false).await
+    }
+
+    /// [`get`](Self::get), locating the key with provisional commit proxies too if
+    /// `use_provisional_proxies` (the transaction option `USE_PROVISIONAL_PROXIES`).
+    pub async fn get_with(
+        &self,
+        key: &[u8],
+        version: i64,
+        use_provisional_proxies: bool,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
         if version <= 0 {
             return Err(ClientError::new(CLIENT_INVALID_OPERATION));
         }
@@ -456,7 +506,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         // (and their probes) through an invalidation.
         let mut _previous: Option<Arc<Location>> = None;
         loop {
-            let (_, location) = shared.key_location(key, version).await?;
+            let (_, location) = shared
+                .key_location(key, version, use_provisional_proxies)
+                .await?;
             _previous = Some(location.clone());
             let request = GetValue {
                 key: key.to_vec(),
@@ -486,7 +538,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if key >= KEY_SPACE_END {
             return Err(ClientError::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
-        let (range, location) = self.inner.shared.key_location(key, LATEST_VERSION).await?;
+        let (range, location) = self
+            .inner
+            .shared
+            .key_location(key, LATEST_VERSION, false)
+            .await?;
         Ok(KeyLocation {
             range,
             servers: location.storage_servers(),
@@ -522,6 +578,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 pub struct ReadSnapshot<R: Runtime, W = NoTls> {
     reader: Reader<R, W>,
     version: i64,
+    use_provisional_proxies: bool,
 }
 
 impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
@@ -529,6 +586,7 @@ impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
         ReadSnapshot {
             reader: self.reader.clone(),
             version: self.version,
+            use_provisional_proxies: self.use_provisional_proxies,
         }
     }
 }
@@ -552,9 +610,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
         &self.reader
     }
 
-    /// The value of `key` at the snapshot's version ([`Reader::get`]).
+    /// The value of `key` at the snapshot's version ([`Reader::get_with`]).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClientError> {
-        self.reader.get(key, self.version).await
+        self.reader
+            .get_with(key, self.version, self.use_provisional_proxies)
+            .await
     }
 }
 
@@ -582,12 +642,14 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         key: &[u8],
         version: i64,
+        use_provisional: bool,
     ) -> Result<(KeyRange, Arc<Location>), ClientError> {
         let cached = lock(&self.locations).get(key);
         if let Some((range, location)) = cached {
             let mut refresh = false;
             for server in &location.servers {
-                if self.check_only_endpoint_failed(server.address, server.get_value.token) {
+                let (address, token) = server.target();
+                if self.check_only_endpoint_failed(address, token) {
                     refresh = true;
                 }
             }
@@ -596,7 +658,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             }
             lock(&self.locations).invalidate_key(key);
         }
-        self.fetch_key_location(key, version).await
+        self.fetch_key_location(key, version, use_provisional).await
     }
 
     /// `checkOnlyEndpointFailed` (NativeAPI 7.4:3329-3355, 8.0:1315-1341).
@@ -632,20 +694,22 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         key: &[u8],
         version: i64,
+        use_provisional: bool,
     ) -> Result<(KeyRange, Arc<Location>), ClientError> {
         loop {
+            self.check_open()?;
             let backoff = lock(&self.state).location_backoff;
             if backoff > 0.0 {
                 self.rt.sleep(util::secs(backoff)).await;
             }
             let info = self
                 .monitor
-                .commit_proxies(false)
+                .commit_proxies(use_provisional)
                 .await
                 .map_err(|_| ClientError::new(OPERATION_CANCELLED))?;
             self.hold_proxy_references(&info);
             let alternatives: Vec<Endpoint> = info
-                .available_commit_proxies(false)
+                .available_commit_proxies(use_provisional)
                 .unwrap_or_default()
                 .iter()
                 .map(|p| p.streams.get_key_servers_locations)
@@ -723,6 +787,49 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let mut rng = lock(&self.rng);
         let location = Arc::new(Location::new(infos, &mut rng));
         cache.insert(range, location.clone(), &mut rng);
+        drop(rng);
+        drop(cache);
+        self.prune();
         location
+    }
+
+    /// Drops the queue model data and endpoint failure records of servers no cached range
+    /// (or read in progress) uses any more, once they could outnumber the live servers.
+    fn prune(&self) {
+        let bound = 2 * lock(&self.locations).server_entries() + 64;
+        let endpoints = lock(&self.state).failed_endpoints.len();
+        let model = lock(&self.model).len();
+        if endpoints <= bound && model <= bound {
+            return;
+        }
+        let live = lock(&self.locations).live_targets();
+        lock(&self.state)
+            .failed_endpoints
+            .retain(|target, _| live.contains(target));
+        let ids: HashSet<u64> = live.iter().map(|(_, token)| token.first).collect();
+        lock(&self.model).retain(|id| ids.contains(&id));
+    }
+
+    /// `operation_cancelled` once the peer manager is shut down or the monitor closed.
+    pub(crate) fn check_open(&self) -> Result<(), ClientError> {
+        if self.peers.is_shut_down() || self.monitor.is_closed() {
+            Err(ClientError::new(OPERATION_CANCELLED))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Resolves once the peer manager is shut down or the monitor closed (the former is
+    /// polled every [`SHUTDOWN_POLL`]).
+    pub(crate) async fn closed(&self) {
+        loop {
+            if self.check_open().is_err() {
+                return;
+            }
+            let monitor_closed = self.monitor.wait_for(|_| None::<()>);
+            if let Either::Left(_) = race(monitor_closed, self.rt.sleep(SHUTDOWN_POLL)).await {
+                return;
+            }
+        }
     }
 }

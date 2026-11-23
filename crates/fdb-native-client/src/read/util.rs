@@ -102,12 +102,10 @@ pub(crate) async fn any_available(failures: &FailureMonitor, endpoints: &[(Netwo
     let mut waits: Vec<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = endpoints
         .iter()
         .map(|(address, token)| {
-            let wait = async move {
-                while failures.endpoint_status(address, *token).is_failed() {
-                    failures.on_state_changed(address, *token).await;
-                }
-            };
-            Box::pin(wait) as Pin<Box<dyn Future<Output = ()> + Send + '_>>
+            // One check-and-wait under the monitor's lock: no transition can slip between
+            // a check and the wait.
+            Box::pin(failures.wait_endpoint_available(address, *token))
+                as Pin<Box<dyn Future<Output = ()> + Send + '_>>
         })
         .collect();
     if waits.is_empty() {
@@ -177,6 +175,34 @@ pub(crate) fn try_get_reply_code(error: &RequestError) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_available_sees_every_transition() {
+        use fdb_native_wire::IpAddress;
+        use std::task::{Context, Waker};
+
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let fm = FailureMonitor::new();
+        let a = NetworkAddress::new(IpAddress::V4(0x0a00_0001), 4500, true, false);
+        let b = NetworkAddress::new(IpAddress::V4(0x0a00_0002), 4500, true, false);
+        let (ta, tb) = (Uid::new(1, 1), Uid::new(2, 2));
+        fm.endpoint_not_found(&a, ta);
+        fm.endpoint_not_found(&b, tb);
+        let targets = [(a, ta), (b, tb)];
+
+        // Pending while both are failed; a transition of either, before the first poll or
+        // between polls, ends it.
+        let mut wait = Box::pin(any_available(&fm, &targets));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        fm.forget_endpoint(&b, tb);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+
+        fm.endpoint_not_found(&b, tb);
+        let mut wait = Box::pin(any_available(&fm, &targets));
+        fm.forget_endpoint(&a, ta);
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
+    }
 
     #[test]
     fn rng_ranges() {

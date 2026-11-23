@@ -287,6 +287,23 @@ impl FailureMonitor {
         .await
     }
 
+    /// Resolves once the endpoint `token` at `address` is not failed (neither the endpoint
+    /// itself nor its address): at once if it is not. This is
+    /// `IFailureMonitor::onStateEqual(endpoint, FailureStatus(false))`, which the load
+    /// balancers wait on when every alternative is failed: the state is checked and the wait
+    /// registered under one lock, so a change between a check and the wait cannot be missed
+    /// (as it could be by checking [`endpoint_status`](Self::endpoint_status), then calling
+    /// [`on_state_changed`](Self::on_state_changed)). An endpoint that has failed itself
+    /// stays failed, so this resolves for one only once it is
+    /// [forgotten](Self::forget_endpoint).
+    pub async fn wait_endpoint_available(&self, address: &NetworkAddress, token: Uid) {
+        let key = PeerKey::new(address);
+        self.wait(key, |s| {
+            (!s.endpoint(&key, token).is_failed()).then_some(())
+        })
+        .await
+    }
+
     /// Resolves with the endpoint's new state when it differs from what it is now
     /// (`IFailureMonitor::onStateChanged`). An endpoint that has failed itself never changes
     /// again, so this never resolves for one.
@@ -486,6 +503,51 @@ mod tests {
             assert_eq!(changed.await, EndpointStatus::AddressFailed);
         });
         assert_eq!(fm.waiting(&a), 0, "finished waits give their slots back");
+    }
+
+    #[test]
+    fn waiting_for_an_endpoint_to_be_available() {
+        let fm = FailureMonitor::new();
+        let a = addr(1);
+        let token = Uid::new(8, 9);
+        block_on(async {
+            // Available: at once.
+            assert!(
+                poll_once(Box::pin(fm.wait_endpoint_available(&a, token)))
+                    .await
+                    .is_some()
+            );
+        });
+
+        // The address fails, then comes back.
+        fm.set_address_failed(&a, true, t(1));
+        let mut wait = Box::pin(fm.wait_endpoint_available(&a, token));
+        block_on(async { assert!(poll_once(&mut wait).await.is_none()) });
+        // A change that leaves it failed does not end the wait.
+        fm.notify_disconnect(&a);
+        block_on(async { assert!(poll_once(&mut wait).await.is_none()) });
+        fm.set_address_failed(&a, false, t(2));
+        block_on(async { assert!(poll_once(&mut wait).await.is_some()) });
+
+        // A transition that happens between creating the wait and polling it (or between two
+        // polls) is seen: the predicate is evaluated on the state, not compared with a
+        // snapshot taken earlier.
+        fm.set_address_failed(&a, true, t(3));
+        let mut wait = Box::pin(fm.wait_endpoint_available(&a, token));
+        fm.set_address_failed(&a, false, t(4));
+        block_on(async { assert!(poll_once(&mut wait).await.is_some()) });
+
+        // An endpoint that failed itself: only when it is forgotten, whatever the address.
+        assert!(fm.endpoint_not_found(&a, token));
+        let mut wait = Box::pin(fm.wait_endpoint_available(&a, token));
+        block_on(async { assert!(poll_once(&mut wait).await.is_none()) });
+        fm.set_address_failed(&a, true, t(5));
+        fm.set_address_failed(&a, false, t(6));
+        block_on(async { assert!(poll_once(&mut wait).await.is_none()) });
+        assert!(fm.forget_endpoint(&a, token));
+        block_on(async { assert!(poll_once(&mut wait).await.is_some()) });
+        drop(wait);
+        assert_eq!(fm.waiting(&a), 0);
     }
 
     struct Counting(AtomicUsize);

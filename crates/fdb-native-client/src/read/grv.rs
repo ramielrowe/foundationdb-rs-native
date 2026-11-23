@@ -87,6 +87,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     ) -> Result<ReadVersion, ClientError> {
         let use_provisional = flags & GetReadVersion::FLAG_USE_PROVISIONAL_PROXIES != 0;
         loop {
+            self.check_open()?;
             let info = self
                 .monitor
                 .grv_proxies(use_provisional)

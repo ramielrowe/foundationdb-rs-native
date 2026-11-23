@@ -1,9 +1,9 @@
 //! The key location cache: C++'s `DatabaseContext::locationCache`, a range map from key
 //! ranges (shards) to the storage servers that hold them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use fdb_native_schema::domain::{KeyRange, StorageServer};
 use fdb_native_transport::peer::PeerRef;
@@ -41,15 +41,42 @@ pub(crate) fn distance(client_dc_id: Option<&[u8]>, server: &StorageServer) -> D
 /// `ReferencedInterface<StorageServerInterface>`): shared by every cached range it serves,
 /// with a reference to its peer, so the connection is kept and a failed address is probed
 /// (and found again) while any cached range points at the server.
+///
+/// The interface can change in place: when a server restarts its storage role with new
+/// endpoints but the same id and locality, the next location reply that lists it updates
+/// this entry, so every cached range sees the new endpoints (`getInterface` assigns `interf`,
+/// NativeAPI 7.4:405-433). A read already in progress keeps the endpoints it started with.
 #[derive(Debug)]
 pub(crate) struct ServerInfo {
-    pub(crate) server: StorageServer,
-    /// The `getValue` endpoint (the base endpoint).
-    pub(crate) get_value: Endpoint,
-    /// The address the client connects to (`choosePrimaryAddress`).
-    pub(crate) address: NetworkAddress,
     pub(crate) distance: Distance,
+    interface: Mutex<Interface>,
+}
+
+#[derive(Debug)]
+struct Interface {
+    server: StorageServer,
+    /// The address the client connects to (`choosePrimaryAddress`).
+    address: NetworkAddress,
     _peer: PeerRef,
+}
+
+impl ServerInfo {
+    fn interface(&self) -> MutexGuard<'_, Interface> {
+        self.interface
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Where to send a `GetValueRequest`: the address and the `getValue` (base) token.
+    pub(crate) fn target(&self) -> (NetworkAddress, Uid) {
+        let interface = self.interface();
+        (interface.address, interface.server.base.token)
+    }
+
+    /// The interface.
+    pub(crate) fn server(&self) -> StorageServer {
+        self.interface().server.clone()
+    }
 }
 
 /// The replicas of one shard (C++'s `LocationInfo`, a
@@ -77,7 +104,7 @@ impl Location {
 
     /// The servers' interfaces.
     pub(crate) fn storage_servers(&self) -> Vec<StorageServer> {
-        self.servers.iter().map(|s| s.server.clone()).collect()
+        self.servers.iter().map(|s| s.server()).collect()
     }
 }
 
@@ -104,6 +131,8 @@ pub(crate) struct LocationCache {
     capacity: usize,
     /// `DatabaseContext::server_interf`: one [`ServerInfo`] per storage server id.
     servers: HashMap<Uid, Weak<ServerInfo>>,
+    /// The size of `servers` after its last pruning of dead entries.
+    servers_after_prune: usize,
 }
 
 impl LocationCache {
@@ -117,6 +146,7 @@ impl LocationCache {
             next_generation: 0,
             capacity: capacity.max(1),
             servers: HashMap::new(),
+            servers_after_prune: 0,
         }
     }
 
@@ -161,9 +191,10 @@ impl LocationCache {
             .map_or_else(|| KEY_SPACE_END.to_vec(), |(k, _)| k.clone())
     }
 
-    /// The interned [`ServerInfo`] for `server`, made with `make` (which gives the primary
-    /// address and a peer reference) if the cache has none for its id, or has one with
-    /// another interface.
+    /// The interned [`ServerInfo`] for `server` (`StorageServerInfo::getInterface`): the
+    /// cache's entry for its id if it has the same `getValue` token; the entry updated in
+    /// place if only the endpoints changed (same locality); otherwise a new entry. `make`
+    /// gives the primary address and a peer reference for an interface.
     pub(crate) fn server_info(
         &mut self,
         server: &StorageServer,
@@ -171,23 +202,54 @@ impl LocationCache {
         make: impl FnOnce(&Endpoint) -> (NetworkAddress, PeerRef),
     ) -> Arc<ServerInfo> {
         if let Some(info) = self.servers.get(&server.id).and_then(Weak::upgrade) {
-            if info.server == *server {
+            let mut interface = info.interface();
+            if interface.server.base.token == server.base.token {
+                drop(interface);
+                return info;
+            }
+            if interface.server.locality == server.locality {
+                let (address, peer) = make(&server.base);
+                *interface = Interface {
+                    server: server.clone(),
+                    address,
+                    _peer: peer,
+                };
+                drop(interface);
                 return info;
             }
         }
         let (address, peer) = make(&server.base);
         let info = Arc::new(ServerInfo {
-            server: server.clone(),
-            get_value: server.base,
-            address,
             distance: distance(client_dc_id, server),
-            _peer: peer,
+            interface: Mutex::new(Interface {
+                server: server.clone(),
+                address,
+                _peer: peer,
+            }),
         });
-        if self.servers.len() >= 1024 && self.servers.len() >= 2 * self.cached {
+        // Dead entries (servers no cached range uses any more) are dropped once they could
+        // outnumber the live ones.
+        if self.servers.len() >= 2 * self.servers_after_prune + 64 {
             self.servers.retain(|_, w| w.strong_count() > 0);
+            self.servers_after_prune = self.servers.len();
         }
         self.servers.insert(server.id, Arc::downgrade(&info));
         info
+    }
+
+    /// The `getValue` targets of the servers that cached ranges (or reads in progress)
+    /// still use.
+    pub(crate) fn live_targets(&self) -> HashSet<(NetworkAddress, Uid)> {
+        self.servers
+            .values()
+            .filter_map(Weak::upgrade)
+            .map(|s| s.target())
+            .collect()
+    }
+
+    /// How many server entries the cache has, dead or alive.
+    pub(crate) fn server_entries(&self) -> usize {
+        self.servers.len()
     }
 
     /// `setCachedLocation`: caches `location` for `range`, overwriting what overlaps it,
@@ -376,6 +438,82 @@ mod tests {
         assert_eq!(cache.ranges(), 1, "everything unknown is one range");
         cache.invalidate_key(b"zz");
         assert_eq!(cache.ranges(), 1);
+    }
+
+    fn storage_server(id: u64, token: u64, dc: &[u8]) -> StorageServer {
+        use fdb_native_wire::{IpAddress, NetworkAddressList};
+        let mut locality = std::collections::BTreeMap::new();
+        locality.insert(b"dcid".to_vec(), Some(dc.to_vec()));
+        StorageServer {
+            id: Uid::new(0x55, id),
+            locality,
+            base: Endpoint::new(
+                NetworkAddressList {
+                    address: NetworkAddress::new(
+                        IpAddress::V4(0x0a00_0000 + id as u32),
+                        4500,
+                        true,
+                        false,
+                    ),
+                    secondary_address: None,
+                },
+                Uid::new(token, 1),
+            ),
+            tss_pair_id: None,
+            accepting_requests: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_entries_are_interned_updated_and_pruned() {
+        use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
+        use fdb_native_transport::runtime::TokioRuntime;
+
+        let peers = PeerManager::new(
+            TokioRuntime::new(),
+            PeerManagerConfig::default(),
+            DiscardEvents,
+        );
+        let make = |e: &Endpoint| {
+            (
+                e.addresses.address,
+                peers.peer(&e.addresses.address).reference(),
+            )
+        };
+        let mut rng = Rng::new(Some(5));
+        let mut cache = LocationCache::new(10);
+
+        // The same interface: the same entry.
+        let a = cache.server_info(&storage_server(1, 100, b"dc1"), Some(b"dc1"), make);
+        let again = cache.server_info(&storage_server(1, 100, b"dc1"), Some(b"dc1"), make);
+        assert!(Arc::ptr_eq(&a, &again));
+        assert_eq!(a.distance, Distance::SameDc);
+        // New endpoints, same locality: updated in place.
+        let moved = cache.server_info(&storage_server(1, 200, b"dc1"), Some(b"dc1"), make);
+        assert!(Arc::ptr_eq(&a, &moved));
+        assert_eq!(a.target().1, Uid::new(200, 1));
+        // Another locality: a new entry.
+        let other = cache.server_info(&storage_server(1, 300, b"dc2"), Some(b"dc1"), make);
+        assert!(!Arc::ptr_eq(&a, &other));
+        assert_eq!(other.distance, Distance::Distant);
+        drop((a, again, moved, other));
+
+        // Many servers come and go through a small cache: dead entries are pruned.
+        for i in 0..1000u64 {
+            let info = cache.server_info(&storage_server(10 + i, 1000 + i, b"dc1"), None, make);
+            let location = Arc::new(Location::new(vec![info], &mut rng));
+            let begin = i.to_be_bytes();
+            let end = (i + 1).to_be_bytes();
+            cache.insert(&range(&begin, &end), location, &mut rng);
+            let live = cache.live_targets().len();
+            assert!(live <= 10, "{live}");
+            assert!(
+                cache.server_entries() <= 2 * 10 + 64 + 1,
+                "{}",
+                cache.server_entries()
+            );
+        }
+        peers.shutdown().await;
     }
 
     #[test]

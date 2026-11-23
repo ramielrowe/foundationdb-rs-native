@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,12 +66,15 @@ struct StorageBehaviour {
     owns: Option<KeyRange>,
     /// The requests received.
     requests: Vec<GetValue>,
+    /// The token each request was sent to.
+    tokens: Vec<Uid>,
 }
 
 struct FakeStorage {
     process: FakeProcess,
     server: StorageServer,
     behaviour: Arc<Mutex<StorageBehaviour>>,
+    handler: Arc<dyn Fn(Incoming) -> Action + Send + Sync>,
 }
 
 impl FakeStorage {
@@ -81,6 +84,26 @@ impl FakeStorage {
 
     fn served(&self) -> usize {
         self.behaviour.lock().unwrap().requests.len()
+    }
+
+    /// The server restarts its storage role: new endpoints, same id and locality. Its old
+    /// `getValue` endpoint answers `wrong_shard_server` from now on.
+    fn move_to(&mut self, token: Uid) {
+        let handler = self.handler.clone();
+        self.process
+            .handle(token, move |incoming| handler(incoming));
+        self.process
+            .handle(self.server.base.token, |incoming: Incoming| {
+                let (_, reply) =
+                    GetValue::decode_request(incoming.schema, &incoming.payload).unwrap();
+                let answer = GetValueReply {
+                    error: Some(FdbError::new(codes::WRONG_SHARD_SERVER)),
+                    ..GetValueReply::default()
+                };
+                let payload = GetValue::encode_reply(incoming.schema, &Ok(answer)).unwrap();
+                Action::reply(reply, payload)
+            });
+        self.server.base = self.process.endpoint(token);
     }
 }
 
@@ -97,6 +120,8 @@ struct FakeCommit {
     process: FakeProcess,
     proxy: CommitProxy,
     requests: Arc<Mutex<Vec<GetKeyServerLocations>>>,
+    /// Errors to answer the next requests with, in order.
+    errors: Arc<Mutex<VecDeque<u16>>>,
 }
 
 /// A whole fake cluster.
@@ -198,10 +223,27 @@ impl Cluster {
 
     /// Publishes a new info with these proxies.
     fn publish(&self, grv: &[&FakeGrv], commit: &[&FakeCommit]) {
+        self.publish_with(grv, commit, false);
+    }
+
+    /// Publishes a new info with these proxies, provisional (a recovery in progress) or not.
+    fn publish_with(&self, grv: &[&FakeGrv], commit: &[&FakeCommit], provisional: bool) {
         let mut info = self.info.lock().unwrap();
         info.id = Uid::new(0xdb, info.id.second + 1);
-        info.grv_proxies = grv.iter().map(|g| g.proxy.clone()).collect();
-        info.commit_proxies = commit.iter().map(|c| c.proxy.clone()).collect();
+        info.grv_proxies = grv
+            .iter()
+            .map(|g| GrvProxy {
+                provisional,
+                ..g.proxy.clone()
+            })
+            .collect();
+        info.commit_proxies = commit
+            .iter()
+            .map(|c| CommitProxy {
+                provisional,
+                ..c.proxy.clone()
+            })
+            .collect();
         let current = info.clone();
         drop(info);
         for call in self.pending.lock().unwrap().drain(..) {
@@ -260,15 +302,25 @@ impl Cluster {
         };
         let token = proxy.endpoints().get_key_servers_locations.token;
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(VecDeque::new()));
         {
             let requests = requests.clone();
             let shards = self.shards.clone();
+            let errors = errors.clone();
             process.handle(token, move |incoming: Incoming| {
                 let (request, reply) =
                     GetKeyServerLocations::decode_request(incoming.schema, &incoming.payload)
                         .unwrap();
                 let key = request.begin.clone();
                 requests.lock().unwrap().push(request);
+                if let Some(code) = errors.lock().unwrap().pop_front() {
+                    let payload = GetKeyServerLocations::encode_reply(
+                        incoming.schema,
+                        &Err(FdbError::new(code)),
+                    )
+                    .unwrap();
+                    return Action::reply(reply, payload);
+                }
                 let shards = shards.lock().unwrap();
                 let shard = shards
                     .iter()
@@ -289,6 +341,7 @@ impl Cluster {
             process,
             proxy,
             requests,
+            errors,
         }
     }
 
@@ -318,6 +371,10 @@ impl Cluster {
     fn reader(&self) -> Reader<MemRuntime> {
         let mut config = ReadConfig::default();
         config.seed = Some(11);
+        self.reader_with(config)
+    }
+
+    fn reader_with(&self, config: ReadConfig) -> Reader<MemRuntime> {
         Reader::new(
             self.rt.clone(),
             self.peers.clone(),
@@ -369,13 +426,14 @@ impl FakeStorage {
             accepting_requests: true,
         };
         let behaviour = Arc::new(Mutex::new(StorageBehaviour::default()));
-        {
+        let handler: Arc<dyn Fn(Incoming) -> Action + Send + Sync> = {
             let behaviour = behaviour.clone();
-            process.handle(token, move |incoming: Incoming| {
+            Arc::new(move |incoming: Incoming| {
                 let (request, reply) =
                     GetValue::decode_request(incoming.schema, &incoming.payload).unwrap();
                 let mut b = behaviour.lock().unwrap();
                 b.requests.push(request.clone());
+                b.tokens.push(incoming.token);
                 if b.close {
                     return Action::Close;
                 }
@@ -406,12 +464,17 @@ impl FakeStorage {
                     payload,
                     delay: b.delay,
                 }
-            });
+            })
+        };
+        {
+            let handler = handler.clone();
+            process.handle(token, move |incoming| handler(incoming));
         }
         FakeStorage {
             process,
             server,
             behaviour,
+            handler,
         }
     }
 }
@@ -477,6 +540,8 @@ async fn grv_fails_over_between_proxies() {
         assert!(v >= 1000);
     }
     assert_eq!(b.requests.lock().unwrap().len(), 10);
+    let tried_a = a.process.requests();
+    assert!(tried_a >= 1, "A was tried (and hung up)");
 
     // A is down altogether: still B.
     a.process.stop();
@@ -484,6 +549,7 @@ async fn grv_fails_over_between_proxies() {
         within("GRV", reader.get_read_version()).await.unwrap();
     }
     assert_eq!(b.requests.lock().unwrap().len(), 15);
+    assert_eq!(a.process.requests(), tried_a);
 }
 
 #[tokio::test(start_paused = true)]
@@ -641,13 +707,17 @@ async fn location_requests_fail_over_between_commit_proxies() {
         assert_eq!(value.is_some(), key == b"k");
     }
     assert_eq!(b.requests.lock().unwrap().len(), 3);
+    assert!(
+        cluster.net.connects(a.process.addr) >= 1,
+        "the stopped proxy was tried"
+    );
 }
 
 // ---- GetValue ----------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
 async fn get_value_fails_over_between_replicas() {
-    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 3).await;
+    let (cluster, _grv, commit) = Cluster::ready(SchemaVersion::V7_4, 3).await;
     cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1, 2])]);
     cluster.set(b"k", b"v");
     let reader = cluster.reader();
@@ -669,6 +739,7 @@ async fn get_value_fails_over_between_replicas() {
     assert!(cluster.storage[2].served() >= 20);
     // The location was never invalidated: failover is within the shard's replicas.
     assert_eq!(reader.cached_locations(), 1);
+    assert_eq!(commit.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -784,4 +855,301 @@ async fn snapshot_reads_at_its_version() {
     assert_eq!(requests[0].key, b"k");
     assert_eq!(requests[0].tags, None);
     assert_eq!(requests[0].options, None);
+}
+
+// ---- review additions -------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn grv_batches_are_capped_and_errors_reach_every_waiter() {
+    let (cluster, grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    let mut config = ReadConfig::default();
+    config.seed = Some(11);
+    config.max_batch_size = 4;
+    let reader = cluster.reader_with(config);
+    let reads: Vec<_> = (0..10)
+        .map(|_| {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.get_read_version().await })
+        })
+        .collect();
+    for read in reads {
+        within("GRV", read).await.unwrap().unwrap();
+    }
+    {
+        let requests = grv.requests.lock().unwrap();
+        let counts: Vec<u32> = requests.iter().map(|r| r.transaction_count).collect();
+        assert!(counts.iter().all(|&c| c <= 4), "{counts:?}");
+        assert_eq!(counts.iter().sum::<u32>(), 10);
+        assert!(counts.len() >= 3, "{counts:?}");
+    }
+
+    // A batch that fails fails for each of its transactions.
+    *grv.answer.lock().unwrap() = Err(Some(codes::BATCH_TRANSACTION_THROTTLED));
+    let before = grv.requests.lock().unwrap().len();
+    let reads: Vec<_> = (0..4)
+        .map(|_| {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.get_read_version().await })
+        })
+        .collect();
+    for read in reads {
+        let e = within("GRV", read).await.unwrap().unwrap_err();
+        assert_eq!(e.code(), codes::BATCH_TRANSACTION_THROTTLED);
+    }
+    let requests = grv.requests.lock().unwrap();
+    assert_eq!(requests.len(), before + 1, "one batch");
+    assert_eq!(requests[before].transaction_count, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn location_requests_back_off_while_commit_proxies_are_out_of_memory() {
+    let (cluster, _grv, commit) = Cluster::ready(SchemaVersion::V8_0, 1).await;
+    cluster.set(b"k", b"v");
+    let reader = cluster.reader();
+    let v = within("GRV", reader.get_read_version()).await.unwrap();
+    commit
+        .errors
+        .lock()
+        .unwrap()
+        .extend([codes::COMMIT_PROXY_MEMORY_LIMIT_EXCEEDED; 3]);
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        within("get", reader.get(b"k", v)).await.unwrap(),
+        Some(b"v".to_vec())
+    );
+    // Three failures, then success: waits of 10, 20 and 40 ms before the retries.
+    assert_eq!(commit.requests.lock().unwrap().len(), 4);
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(70), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+
+    // The backoff halves on success (to 20 ms) and is waited before the next request.
+    reader.invalidate_location(b"k");
+    let start = tokio::time::Instant::now();
+    within("get", reader.get(b"k", v)).await.unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+    assert_eq!(commit.requests.lock().unwrap().len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_endpoint_failed_on_a_healthy_server_refreshes_the_location() {
+    let (cluster, _grv, commit) = Cluster::ready(SchemaVersion::V7_4, 2).await;
+    cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+    cluster.set(b"k", b"v");
+    let reader = cluster.reader();
+    let v = within("GRV", reader.get_read_version()).await.unwrap();
+    within("get", reader.get(b"k", v)).await.unwrap();
+    within("get", reader.get(b"k", v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 1, "cached");
+
+    // Server 0's getValue endpoint is gone while its process is fine (its storage role
+    // restarted): the cached location is refreshed on every read during the grace period
+    // (60 s), and the reads go to server 1.
+    let server = &cluster.storage[0].server;
+    let address = cluster.peers.primary_address(&server.base.addresses);
+    cluster
+        .peers
+        .failure_monitor()
+        .endpoint_not_found(&address, server.base.token);
+    let served = cluster.storage[0].served();
+    within("get", reader.get(b"k", v)).await.unwrap();
+    within("get", reader.get(b"k", v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        cluster.storage[0].served(),
+        served,
+        "the failed endpoint is skipped"
+    );
+
+    // After the grace period, once per 60 s.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    within("get", reader.get(b"k", v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 4);
+    for _ in 0..3 {
+        within("get", reader.get(b"k", v)).await.unwrap();
+    }
+    assert_eq!(commit.requests.lock().unwrap().len(), 4);
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    within("get", reader.get(b"k", v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 5);
+
+    // The endpoint is announced again: no more refreshes.
+    cluster
+        .peers
+        .failure_monitor()
+        .forget_endpoint(&address, server.base.token);
+    for _ in 0..3 {
+        within("get", reader.get(b"k", v)).await.unwrap();
+    }
+    assert_eq!(commit.requests.lock().unwrap().len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_location_cache_is_bounded() {
+    let (cluster, _grv, commit) = Cluster::ready(SchemaVersion::V8_0, 2).await;
+    let bounds: Vec<Vec<u8>> = (0..=10u8).map(|i| vec![b'a' + i]).collect();
+    let mut shards: Vec<(&[u8], &[u8], &[usize])> = Vec::new();
+    shards.push((b"", &bounds[0], &[0]));
+    for w in bounds.windows(2) {
+        shards.push((&w[0], &w[1], &[1]));
+    }
+    shards.push((&bounds[10], KEY_SPACE_END, &[0]));
+    cluster.set_shards(&shards);
+    let mut config = ReadConfig::default();
+    config.seed = Some(11);
+    config.location_cache_size = 3;
+    let reader = cluster.reader_with(config);
+    let v = within("GRV", reader.get_read_version()).await.unwrap();
+    for b in &bounds {
+        within("get", reader.get(b, v)).await.unwrap();
+        assert!(
+            reader.cached_locations() <= 3,
+            "{}",
+            reader.cached_locations()
+        );
+        assert!(reader.cached_location(b).is_some(), "the latest stays");
+    }
+    assert_eq!(reader.cached_locations(), 3);
+    assert_eq!(commit.requests.lock().unwrap().len(), 11);
+    // An evicted shard is located again.
+    let evicted = bounds
+        .iter()
+        .find(|b| reader.cached_location(b).is_none())
+        .unwrap();
+    within("get", reader.get(evicted, v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 12);
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_endpoints_of_a_server_reach_every_cached_shard() {
+    let (mut cluster, _grv, commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    cluster.set_shards(&[(b"", b"m", &[0]), (b"m", KEY_SPACE_END, &[0])]);
+    cluster.set(b"a", b"1");
+    cluster.set(b"x", b"2");
+    let reader = cluster.reader();
+    let v = within("GRV", reader.get_read_version()).await.unwrap();
+    within("get", reader.get(b"a", v)).await.unwrap();
+    within("get", reader.get(b"x", v)).await.unwrap();
+    assert_eq!(commit.requests.lock().unwrap().len(), 2);
+
+    // Server 0 restarts its storage role: same id and locality, new getValue endpoint.
+    let old = cluster.storage[0].server.base.token;
+    let new = Uid::new(0x5599, 0x31);
+    cluster.storage[0].move_to(new);
+    cluster.set_shards(&[(b"", b"m", &[0]), (b"m", KEY_SPACE_END, &[0])]);
+
+    // The first shard's read gets `wrong_shard_server` at the old endpoint and is located
+    // again; the reply's interface updates the server's entry in place...
+    assert_eq!(
+        within("get", reader.get(b"a", v)).await.unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(commit.requests.lock().unwrap().len(), 3);
+    // ... so the other cached shard uses the new endpoint without being located again.
+    assert_eq!(
+        reader.cached_location(b"x").unwrap().servers[0].base.token,
+        new
+    );
+    assert_eq!(
+        within("get", reader.get(b"x", v)).await.unwrap(),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(commit.requests.lock().unwrap().len(), 3);
+    let tokens = cluster.storage[0].behaviour.lock().unwrap().tokens.clone();
+    // (The old endpoint's `wrong_shard_server` answer is not the server's handler: two reads
+    // before the move, two after.)
+    assert_eq!(tokens, vec![old, old, new, new]);
+    assert_eq!(cluster.storage[0].process.requests(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn provisional_proxies_only_when_asked() {
+    let mut cluster = Cluster::new(SchemaVersion::V8_0, 1).await;
+    let grv = cluster.grv_proxy(10);
+    let commit = cluster.commit_proxy(20, 1);
+    cluster.publish_with(&[&grv], &[&commit], true);
+    cluster.set(b"k", b"v");
+    let reader = cluster.reader();
+
+    // A default read version waits for the recovery to finish.
+    let waiting = tokio::spawn({
+        let reader = reader.clone();
+        async move { reader.get_read_version().await }
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!waiting.is_finished());
+
+    // With USE_PROVISIONAL_PROXIES, the provisional proxies serve the read version and the
+    // key location.
+    let mut options = ReadVersionOptions::default();
+    options.use_provisional_proxies = true;
+    let snapshot = within("snapshot", reader.snapshot_with(options))
+        .await
+        .unwrap();
+    assert_eq!(
+        within("get", snapshot.get(b"k")).await.unwrap(),
+        Some(b"v".to_vec())
+    );
+    assert_eq!(
+        grv.requests.lock().unwrap()[0].flags,
+        GetReadVersion::PRIORITY_DEFAULT | GetReadVersion::FLAG_USE_PROVISIONAL_PROXIES
+    );
+    assert_eq!(commit.requests.lock().unwrap().len(), 1);
+
+    // A plain read does not use them.
+    reader.invalidate_location(b"k");
+    let plain = tokio::spawn({
+        let reader = reader.clone();
+        let version = snapshot.version();
+        async move { reader.get(b"k", version).await }
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!plain.is_finished());
+    assert_eq!(commit.requests.lock().unwrap().len(), 1);
+
+    // The recovery completes.
+    cluster.publish(&[&grv], &[&commit]);
+    within("plain get", plain).await.unwrap().unwrap();
+    within("default GRV", waiting).await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_ends_parked_requests() {
+    let (cluster, grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    let reader = cluster.reader();
+    within("GRV", reader.get_read_version()).await.unwrap();
+
+    // The only GRV proxy is down: once it is marked failed, a read version request waits
+    // for it to come back.
+    grv.process.stop();
+    let parked = tokio::spawn({
+        let reader = reader.clone();
+        async move { reader.get_read_version().await }
+    });
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(!parked.is_finished());
+
+    cluster.peers.shutdown().await;
+    let e = within("parked GRV", parked).await.unwrap().unwrap_err();
+    assert_eq!(e.code(), codes::OPERATION_CANCELLED);
+    let e = within("GRV", reader.get_read_version()).await.unwrap_err();
+    assert_eq!(e.code(), codes::OPERATION_CANCELLED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn monitor_shutdown_ends_parked_location_requests() {
+    let (cluster, _grv, commit) = Cluster::ready(SchemaVersion::V8_0, 1).await;
+    let reader = cluster.reader();
+    let v = within("GRV", reader.get_read_version()).await.unwrap();
+    commit.process.stop();
+    let parked = tokio::spawn({
+        let reader = reader.clone();
+        async move { reader.get(b"k", v).await }
+    });
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(!parked.is_finished());
+    cluster.monitor.shutdown().await;
+    let e = within("parked get", parked).await.unwrap().unwrap_err();
+    assert_eq!(e.code(), codes::OPERATION_CANCELLED);
 }

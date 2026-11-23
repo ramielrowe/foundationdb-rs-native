@@ -1,6 +1,7 @@
 //! FDB's error codes, names and descriptions: `flow/include/flow/error_definitions.h` of
 //! `release-7.4` and `release-8.0`, merged (generated from those two files). A code the two
-//! releases define with different names (1249, 1250) has one entry per release.
+//! releases define differently has one entry per release: 1249 and 1250 have different
+//! names, 2117 (`special_keys_api_failure`) a different description.
 
 use super::Release;
 
@@ -260,7 +261,8 @@ pub(super) static ERRORS: &[Entry] = &[
     e(2114, "special_keys_write_disabled", "Special Key space is not allowed to write by default. Refer to the `special_key_space_enable_writes` transaction option for more details.", Release::Both),
     e(2115, "special_keys_no_write_module_found", "Special key space key or keyrange in set or clear does not intersect a module", Release::Both),
     e(2116, "special_keys_cross_module_clear", "Special key space clear crosses modules", Release::Both),
-    e(2117, "special_keys_api_failure", "Api call through special keys failed. For more information, call get on special key 0xff0xff/error_message to get a json string of the error message.", Release::Both),
+    e(2117, "special_keys_api_failure", "Api call through special keys failed. For more information, call get on special key 0xff0xff/error_message to get a json string of the error message.", Release::V7_4),
+    e(2117, "special_keys_api_failure", "Api call through special keys failed. For more information, call get - within the same transaction - on special key 0xff0xff/error_message to get a json string of the error message.", Release::V8_0),
     e(2118, "client_lib_invalid_metadata", "Invalid client library metadata.", Release::Both),
     e(2119, "client_lib_already_exists", "Client library with same identifier already exists on the cluster.", Release::Both),
     e(2120, "client_lib_not_found", "Client library for the given identifier not found.", Release::Both),

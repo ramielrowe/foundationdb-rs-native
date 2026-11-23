@@ -28,7 +28,8 @@
 //!   `transaction_throttled_hot_shard`, `batch_transaction_throttled`, `process_behind`,
 //!   `tag_throttled`, `transaction_rejected_range_locked`, and on 7.4 `proxy_tag_throttled`.
 //! * [`is_retryable`](ClientError::is_retryable) is `RETRYABLE`, the union of the two.
-//! * [`transaction_retry`](ClientError::transaction_retry) is what `Transaction::onError`
+//! * [`transaction_retry`](ClientError::transaction_retry) (and
+//!   [`on_error`](ClientError::on_error)) is what `Transaction::onError`
 //!   does with the error (NativeAPI 7.4:8112-8167, 8.0:5908-5958): reset the transaction and
 //!   retry after the transaction's exponential backoff ([`TransactionRetry::Backoff`]) for
 //!   the codes listed there, after `FUTURE_VERSION_RETRY_DELAY` (10 ms, capped by the
@@ -37,7 +38,20 @@
 //!   the predicate in two codes: `cluster_version_changed` is not retried by `onError` (the
 //!   multi-version client handles it, and this client has no counterpart), and
 //!   `blob_granule_request_failed` (7.4 only) is retried by `onError` but not in the
-//!   predicate.
+//!   predicate. `success` (0) is not an error: `onError(success)` fails with
+//!   `client_invalid_operation` (7.4:8118-8120, 8.0:5914-5916).
+//! * **`commit_unknown_result` is retried, but the transaction may already have
+//!   committed.** `onError` retries it like a conflict, so a retry loop re-runs a
+//!   transaction that may have been applied: the transaction must be idempotent (or check
+//!   whether its first attempt landed) for that to be safe. That is what
+//!   [`is_maybe_committed`](ClientError::is_maybe_committed) is for.
+//!
+//! # Commits
+//!
+//! A request that may have reached the server without a reply saying what became of it is
+//! `request_maybe_delivered` for a read ([`ClientError::from_request`]); for a commit, C++'s
+//! `tryCommit` turns it into `commit_unknown_result` (NativeAPI 7.4:7060-7061, 8.0:4755-4756):
+//! [`ClientError::from_commit_request`].
 //!
 //! **Both releases.** The two releases agree on every code except a few that exist on one
 //! only (7.4's tenant and blob errors, `proxy_tag_throttled` 1223 and
@@ -214,6 +228,29 @@ impl ClientError {
         }
     }
 
+    /// The error a commit request gets when it fails the way `error` says (`tryCommit`):
+    /// a request that is not [certainly
+    /// undelivered](RequestError::certainly_not_delivered) and has no definite answer from
+    /// the server (a broken connection, `broken_promise`, a pending request to an endpoint
+    /// that went away, an undecodable reply, a cancellation, or a server reply of
+    /// `request_maybe_delivered`) is `commit_unknown_result` (1021): the transaction may have
+    /// committed. A server's other error replies keep their code (`not_committed`,
+    /// `transaction_too_old`, ...), and a request that certainly was not delivered is
+    /// [`from_request`](Self::from_request)'s code (`connection_failed` for `NotSent`, ...).
+    /// The [`RequestError`] is kept as the source.
+    pub fn from_commit_request(error: RequestError) -> ClientError {
+        let code = match &error {
+            RequestError::Fdb(e) if e.code != REQUEST_MAYBE_DELIVERED => e.code,
+            RequestError::Fdb(_) => COMMIT_UNKNOWN_RESULT,
+            other if !other.certainly_not_delivered() => COMMIT_UNKNOWN_RESULT,
+            other => other.fdb_code(),
+        };
+        ClientError {
+            code,
+            source: Some(Arc::new(error)),
+        }
+    }
+
     /// The code.
     pub const fn code(&self) -> u16 {
         self.code
@@ -230,14 +267,9 @@ impl ClientError {
     }
 
     /// The error's name (`"transaction_too_old"`), if either release defines the code and
-    /// both agree on it. See [`name_for`](Self::name_for).
+    /// both that do agree on its name. See [`name_for`](Self::name_for).
     pub fn name(&self) -> Option<&'static str> {
-        let mut entries = entries(self.code);
-        let first = entries.next()?;
-        match entries.next() {
-            None => Some(first.name),
-            Some(_) => None,
-        }
+        agreed(entries(self.code).map(|e| e.name))
     }
 
     /// The error's name on a server of `schema`'s release.
@@ -247,15 +279,17 @@ impl ClientError {
             .map(|e| e.name)
     }
 
-    /// The error's description (what `fdb_get_error` returns), if [`name`](Self::name) is
-    /// known.
+    /// The error's description (what `fdb_get_error` returns), if the releases that define
+    /// the code agree on it. See [`description_for`](Self::description_for).
     pub fn description(&self) -> Option<&'static str> {
-        let mut entries = entries(self.code);
-        let first = entries.next()?;
-        match entries.next() {
-            None => Some(first.description),
-            Some(_) => None,
-        }
+        agreed(entries(self.code).map(|e| e.description))
+    }
+
+    /// The error's description on a server of `schema`'s release.
+    pub fn description_for(&self, schema: SchemaVersion) -> Option<&'static str> {
+        entries(self.code)
+            .find(|e| e.release.has(schema))
+            .map(|e| e.description)
     }
 
     /// `fdb_error_predicate(FDB_ERROR_PREDICATE_MAYBE_COMMITTED)`: the transaction may have
@@ -292,7 +326,10 @@ impl ClientError {
     }
 
     /// What `Transaction::onError` does with this error: `Some` if it resets the transaction
-    /// and retries (and how long it waits first), `None` if it rethrows the error.
+    /// and retries (and how long it waits first), `None` if it rethrows the error (or, for
+    /// `success`, fails with `client_invalid_operation`; see [`on_error`](Self::on_error)).
+    /// [`TransactionRetry::Backoff`] for `commit_unknown_result` means the transaction may
+    /// already have committed.
     pub const fn transaction_retry(&self) -> Option<TransactionRetry> {
         match self.code {
             NOT_COMMITTED
@@ -312,6 +349,24 @@ impl ClientError {
             _ => None,
         }
     }
+}
+
+impl ClientError {
+    /// `Transaction::onError(e)` as a result: `Ok` with how to wait before retrying the
+    /// reset transaction, or `Err` with the error the transaction fails with: this one, or
+    /// `client_invalid_operation` for `success` (C++: "onError(success)" is a misuse).
+    pub fn on_error(&self) -> Result<TransactionRetry, ClientError> {
+        if self.code == SUCCESS {
+            return Err(ClientError::new(CLIENT_INVALID_OPERATION));
+        }
+        self.transaction_retry().ok_or_else(|| self.clone())
+    }
+}
+
+/// The value every item has, if they all have the same one.
+fn agreed(mut items: impl Iterator<Item = &'static str>) -> Option<&'static str> {
+    let first = items.next()?;
+    items.all(|i| i == first).then_some(first)
 }
 
 fn entries(code: u16) -> impl Iterator<Item = &'static table::Entry> {
@@ -347,6 +402,7 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.description(), self.name()) {
             (Some(description), Some(name)) => write!(f, "{description} ({name}, {})", self.code)?,
+            (None, Some(name)) => write!(f, "{name} ({})", self.code)?,
             _ => write!(f, "FDB error {}", self.code)?,
         }
         if let Some(source) = &self.source {
@@ -402,6 +458,16 @@ mod tests {
             ClientError::new(1249).name_for(SchemaVersion::V7_4),
             Some("finish_move_keys_too_many_retries")
         );
+        // The same name, different descriptions.
+        let e = ClientError::new(2117);
+        assert_eq!(e.name(), Some("special_keys_api_failure"));
+        assert_eq!(e.description(), None);
+        assert!(
+            e.description_for(SchemaVersion::V8_0)
+                .unwrap()
+                .contains("within the same transaction")
+        );
+        assert_eq!(e.to_string(), "special_keys_api_failure (2117)");
         assert_eq!(ClientError::new(9999).name(), None);
         assert_eq!(ClientError::new(9999).to_string(), "FDB error 9999");
     }
@@ -443,6 +509,56 @@ mod tests {
         assert_eq!(ClientError::new(1039).transaction_retry(), None);
         assert_eq!(ClientError::new(1251).transaction_retry(), None);
         assert_eq!(ClientError::new(2102).transaction_retry(), None);
+        assert_eq!(ClientError::new(0).transaction_retry(), None);
+        assert_eq!(
+            ClientError::new(0).on_error(),
+            Err(ClientError::new(CLIENT_INVALID_OPERATION))
+        );
+        assert_eq!(ClientError::new(1021).on_error(), Ok(Backoff));
+        assert_eq!(
+            ClientError::new(2102).on_error(),
+            Err(ClientError::new(2102))
+        );
+    }
+
+    #[test]
+    fn commit_requests_that_may_have_been_delivered_are_unknown_results() {
+        let unknown = [
+            RequestError::MaybeDelivered(None),
+            RequestError::BrokenPromise,
+            RequestError::Cancelled,
+            RequestError::Decode(fdb_native_wire::DecodeError::TooShort { len: 1 }),
+            RequestError::EndpointNotFound {
+                token: fdb_native_wire::Uid::new(1, 2),
+                maybe_delivered: true,
+            },
+            RequestError::Fdb(FdbError::new(REQUEST_MAYBE_DELIVERED)),
+        ];
+        for error in unknown {
+            let e = ClientError::from_commit_request(error.clone());
+            assert_eq!(e.code(), COMMIT_UNKNOWN_RESULT, "{error:?}");
+            assert!(e.is_maybe_committed());
+            assert!(e.request_error().is_some());
+        }
+        // Certainly not delivered: what `from_request` says.
+        for error in [
+            RequestError::NotSent(None),
+            RequestError::Backpressure,
+            RequestError::EndpointNotFound {
+                token: fdb_native_wire::Uid::new(1, 2),
+                maybe_delivered: false,
+            },
+        ] {
+            let e = ClientError::from_commit_request(error.clone());
+            assert_eq!(e.code(), ClientError::from_request(error.clone()).code());
+            assert!(!e.is_maybe_committed(), "{error:?}");
+        }
+        // A server's definite answer.
+        assert_eq!(
+            ClientError::from_commit_request(RequestError::Fdb(FdbError::new(NOT_COMMITTED)))
+                .code(),
+            NOT_COMMITTED
+        );
     }
 
     #[test]

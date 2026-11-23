@@ -172,6 +172,16 @@ impl QueueModel {
         }
     }
 
+    /// How many endpoints the model has data for.
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Keeps the data of the endpoints `keep` accepts.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.data.retain(|id, _| keep(*id));
+    }
+
     /// `getMeasurement`.
     pub(crate) fn measurement(&mut self, id: u64) -> &mut QueueData {
         self.data.entry(id).or_default()
@@ -270,14 +280,6 @@ fn grow_backoff(backoff: f64) -> f64 {
 }
 
 impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
-    fn shut_down(&self) -> Result<(), ClientError> {
-        if self.peers.is_shut_down() {
-            Err(ClientError::new(OPERATION_CANCELLED))
-        } else {
-            Ok(())
-        }
-    }
-
     fn is_failed(&self, (address, token): &(NetworkAddress, Uid)) -> bool {
         self.peers
             .failure_monitor()
@@ -322,7 +324,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let mut num_attempts = 0;
         let mut backoff = 0.0;
         loop {
-            self.shut_down()?;
+            self.check_open()?;
             let mut chosen = None;
             for _ in 0..n {
                 let alt = use_alt(next_alt, start_alt, best_alt, start_distance, n);
@@ -335,7 +337,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             match chosen {
                 None => {
                     // Everything is down: wait for someone to be up.
-                    any_available(self.peers.failure_monitor(), &targets).await;
+                    let up = any_available(self.peers.failure_monitor(), &targets);
+                    if let Either::Right(()) = race(up, self.closed()).await {
+                        return Err(ClientError::new(OPERATION_CANCELLED));
+                    }
                     num_attempts = 0;
                 }
                 Some(alt) => {
@@ -397,13 +402,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             f.newest = now;
             lock(&self.rng).jitter(delay)
         };
-        match race(
-            any_available(self.peers.failure_monitor(), targets),
-            self.rt.sleep(delay),
-        )
-        .await
-        {
-            Either::Left(()) => Ok(()),
+        let up = any_available(self.peers.failure_monitor(), targets);
+        match race(race(up, self.closed()), self.rt.sleep(delay)).await {
+            Either::Left(Either::Left(())) => Ok(()),
+            Either::Left(Either::Right(())) => Err(ClientError::new(OPERATION_CANCELLED)),
             Either::Right(()) => Err(ClientError::new(ALL_ALTERNATIVES_FAILED)),
         }
     }
@@ -423,10 +425,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             // An empty team (C++ asserts): nothing to ask until the location is refreshed.
             return Err(ClientError::new(ALL_ALTERNATIVES_FAILED));
         }
-        let targets: Vec<(NetworkAddress, Uid)> = alternatives
-            .iter()
-            .map(|s| (s.address, s.get_value.token))
-            .collect();
+        let targets: Vec<(NetworkAddress, Uid)> = alternatives.iter().map(|s| s.target()).collect();
         let count_best = location.best_count.max(1);
         let (mut best_alt, mut next_alt) = {
             let mut rng = lock(&self.rng);
@@ -498,7 +497,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let mut backoff = 0.0;
         let mut tried_all = false;
         loop {
-            self.shut_down()?;
+            self.check_open()?;
             let mut chosen = None;
             for _ in 0..n {
                 let alt = use_alt(next_alt, start_alt, best_alt, start_distance, n);
@@ -539,6 +538,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 }
             }
             next_alt = (next_alt + 1) % n;
+            // With one alternative `next_alt` is 0 from here on, never `start_alt` (1): as in
+            // C++, `tried_all` stays false, so `process_behind` is retried (with backoff)
+            // rather than returned.
             if next_alt == start_alt {
                 tried_all = true;
             }
