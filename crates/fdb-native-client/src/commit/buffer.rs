@@ -94,11 +94,6 @@ impl CommitBuffer {
         operand: &[u8],
         op: MutationType,
     ) -> Result<(), CommitError> {
-        let op = match op {
-            MutationType::MIN => MutationType::MIN_V2,
-            MutationType::AND => MutationType::AND_V2,
-            other => other,
-        };
         if op == MutationType::SET_VALUE || op == MutationType::CLEAR_RANGE {
             return Err(CommitError::Unsupported(op.0));
         }

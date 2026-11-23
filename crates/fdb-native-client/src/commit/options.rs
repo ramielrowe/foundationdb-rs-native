@@ -64,6 +64,11 @@ pub struct CommitterConfig {
     pub initial_backoff: Duration,
     /// `DEFAULT_MAX_BACKOFF` (1 s).
     pub max_backoff: Duration,
+    /// `RESOURCE_CONSTRAINED_MAX_BACKOFF` (30 s): the cap after
+    /// `commit_proxy_memory_limit_exceeded`, `grv_proxy_memory_limit_exceeded`,
+    /// `transaction_throttled_hot_shard` and `transaction_rejected_range_locked`
+    /// (`Transaction::getBackoff`, 7.4:6433-6438).
+    pub resource_constrained_max_backoff: Duration,
     /// `BACKOFF_GROWTH_RATE` (2).
     pub backoff_growth: f64,
     /// `FUTURE_VERSION_RETRY_DELAY` (0.01 s): the delay after `transaction_too_old` and
@@ -80,6 +85,7 @@ impl Default for CommitterConfig {
             limits: None,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_secs(1),
+            resource_constrained_max_backoff: Duration::from_secs(30),
             backoff_growth: 2.0,
             future_version_retry_delay: Duration::from_millis(10),
             seed: None,

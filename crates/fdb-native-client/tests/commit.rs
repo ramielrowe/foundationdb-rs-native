@@ -672,6 +672,23 @@ async fn proxies_changing_mid_commit_is_an_unknown_result() {
         }));
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
+
+        // The abandoned request did not disturb the connection: a later commit works.
+        let mut b = buffer(&env);
+        b.set(b"k2", b"v").unwrap();
+        let options = opts(|o| {
+            o.causal_write_risky = true;
+        });
+        let later = spawn_commit(&env.committer, 1, b, options);
+        let call = env.commit_proxies[0].next().await;
+        call.reply_commit(Ok(CommitId {
+            version: 77,
+            ..CommitId::default()
+        }));
+        match done(later).await.unwrap() {
+            CommitOutcome::Committed(id) => assert_eq!(id.version, 77),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -779,4 +796,174 @@ async fn limits_are_checked_before_anything_is_sent() {
     assert!(env.commit_proxies[0].try_next().is_none());
     // The self-conflict key is what schema builds.
     assert_eq!(self_conflict_key(Uid::new(1, 2)).unwrap().len(), 21);
+}
+
+// ---- review regressions -----------------------------------------------------------------------
+
+/// Answer every read version request with `version` until the proxy is dropped.
+fn auto_grv(mut grv: FakeProxy, version: i64) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(call) = grv.rx.recv().await {
+            call.reply_grv(version);
+        }
+    })
+}
+
+/// Whatever the dummy transaction does, an unsettled request is `commit_unknown_result`:
+/// here the proxy rejects the dummy with an error that is not retried.
+#[tokio::test(start_paused = true)]
+async fn a_dummy_transaction_that_fails_for_good_is_still_an_unknown_result() {
+    for schema in SCHEMAS {
+        let mut env = env(schema, 1, 1).await;
+        let mut b = buffer(&env);
+        b.set(b"k", b"v").unwrap();
+        let handle = spawn_commit(&env.committer, 100, b, CommitOptions::default());
+        env.commit_proxies[0].next().await.close();
+        env.grv_proxies[0].next().await.reply_grv(900);
+        // 2000 client_invalid_operation: not on the retry list.
+        env.commit_proxies[0].next().await.reply_commit(Err(2000));
+        let e = done(handle).await.unwrap_err();
+        assert_eq!(e, CommitError::CommitUnknownResult);
+        assert!(e.maybe_committed() && !e.is_safe_to_retry());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(env.commit_proxies[0].try_next().is_none());
+    }
+}
+
+/// The monitor shuts down while a commit that may have been delivered is outstanding: an
+/// unknown result, and no dummy transaction (there are no proxies to ask).
+#[tokio::test(start_paused = true)]
+async fn shutdown_while_a_commit_is_outstanding_is_an_unknown_result() {
+    for schema in SCHEMAS {
+        let mut env = env(schema, 1, 1).await;
+        let mut b = buffer(&env);
+        b.set(b"k", b"v").unwrap();
+        let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
+        let _call = env.commit_proxies[0].next().await;
+        let grvs = auto_grv(env.grv_proxies.remove(0), 1000);
+        env.monitor.shutdown().await;
+        let e = done(handle).await.unwrap_err();
+        assert_eq!(e, CommitError::CommitUnknownResult);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(env.commit_proxies[0].try_next().is_none(), "no dummy");
+        grvs.abort();
+    }
+}
+
+/// A commit started after the monitor shut down sends nothing: `Closed`, even though the
+/// monitor still holds its last info.
+#[tokio::test(start_paused = true)]
+async fn a_commit_after_shutdown_sends_nothing() {
+    for schema in SCHEMAS {
+        let mut env = env(schema, 1, 1).await;
+        env.monitor.shutdown().await;
+        for causal_write_risky in [true, false] {
+            let mut b = buffer(&env);
+            b.set(b"k", b"v").unwrap();
+            let options = opts(|o| o.causal_write_risky = causal_write_risky);
+            let e = done(spawn_commit(&env.committer, 1, b, options))
+                .await
+                .unwrap_err();
+            assert_eq!(e, CommitError::Closed);
+            assert!(e.is_safe_to_retry());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(env.commit_proxies[0].try_next().is_none());
+    }
+}
+
+/// A commit that is waiting for proxies (a recovery) when the monitor shuts down was never
+/// sent: `Closed`.
+#[tokio::test(start_paused = true)]
+async fn shutdown_while_waiting_for_proxies_is_closed() {
+    let schema = SchemaVersion::V8_0;
+    let mut env = env(schema, 1, 1).await;
+    env.coord.next_call().await.reply(&info(2, 0, 0, schema));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut b = buffer(&env);
+    b.set(b"k", b"v").unwrap();
+    let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!handle.is_finished());
+    env.monitor.shutdown().await;
+    assert_eq!(done(handle).await.unwrap_err(), CommitError::Closed);
+    assert!(env.commit_proxies[0].try_next().is_none());
+}
+
+/// The request was delivered, the proxies went away (a recovery), and the monitor shuts down
+/// while the dummy transaction waits for proxies: still an unknown result, not `Closed`.
+#[tokio::test(start_paused = true)]
+async fn shutdown_while_the_dummy_waits_for_proxies_is_an_unknown_result() {
+    let schema = SchemaVersion::V8_0;
+    let mut env = env(schema, 1, 1).await;
+    let mut b = buffer(&env);
+    b.set(b"k", b"v").unwrap();
+    let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
+    let _call = env.commit_proxies[0].next().await;
+    env.coord.next_call().await.reply(&info(2, 0, 0, schema));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!handle.is_finished());
+    env.monitor.shutdown().await;
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e, CommitError::CommitUnknownResult);
+    assert!(e.maybe_committed());
+}
+
+/// The first key of the intersection is a key truncated to its limit + 1 bytes (8.0 has no
+/// slack): the dummy transaction must still carry a non-empty conflict range.
+#[tokio::test(start_paused = true)]
+async fn the_dummy_transaction_has_a_conflict_range_for_a_truncated_key() {
+    let mut env = env(SchemaVersion::V8_0, 1, 1).await;
+    let k = vec![b'a'; 20_000];
+    let mut b = buffer(&env);
+    b.add_read_conflict_range(&k, b"b").unwrap();
+    b.add_write_conflict_range(&k, b"b").unwrap();
+    let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
+    let call = env.commit_proxies[0].next().await;
+    let (original, _) = call.commit();
+    let written = original.write_conflict_ranges[0].clone();
+    assert_eq!(written.begin.len(), 10_001, "truncated to limit + 1");
+    call.close();
+    env.grv_proxies[0].next().await.reply_grv(500);
+    let dummy_call = env.commit_proxies[0].next().await;
+    let (dummy, _) = dummy_call.commit();
+    assert_eq!(dummy.read_conflict_ranges, vec![written]);
+    assert_eq!(dummy.write_conflict_ranges, dummy.read_conflict_ranges);
+    dummy_call.reply_commit(Ok(CommitId {
+        version: 501,
+        ..CommitId::default()
+    }));
+    assert_eq!(
+        done(handle).await.unwrap_err(),
+        CommitError::CommitUnknownResult
+    );
+}
+
+/// The dummy's read version is asked again when the proxies change while it waits, and a
+/// read version of zero is rejected.
+#[tokio::test(start_paused = true)]
+async fn the_dummys_read_version_follows_the_proxies() {
+    let schema = SchemaVersion::V7_4;
+    let mut env = env(schema, 1, 1).await;
+    let mut b = buffer(&env);
+    b.set(b"k", b"v").unwrap();
+    let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
+    env.commit_proxies[0].next().await.close();
+    // The GRV request goes to the old GRV proxy, which never answers.
+    let stale = env.grv_proxies[0].next().await;
+    env.coord.next_call().await.reply(&info(2, 1, 1, schema));
+    // It is asked again, of the new GRV proxy.
+    let fresh = env.grv_proxies[0].next().await;
+    assert_ne!(fresh.token, stale.token);
+    fresh.reply_grv(400);
+    let dummy_call = env.commit_proxies[0].next().await;
+    assert_eq!(dummy_call.commit().0.read_snapshot, 400);
+    dummy_call.reply_commit(Ok(CommitId {
+        version: 401,
+        ..CommitId::default()
+    }));
+    assert_eq!(
+        done(handle).await.unwrap_err(),
+        CommitError::CommitUnknownResult
+    );
 }

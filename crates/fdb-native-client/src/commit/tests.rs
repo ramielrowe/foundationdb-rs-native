@@ -389,3 +389,57 @@ fn versionstamp_is_big_endian() {
         0x0102_0304_0506_0708
     );
 }
+
+#[test]
+fn raw_min_and_and_become_the_v2_operations() {
+    let ms = vec![
+        Mutation::new(MutationType::MIN, "a", "x").unwrap(),
+        Mutation::new(MutationType::AND, "b", "x").unwrap(),
+        Mutation::new(MutationType::MAX, "c", "x").unwrap(),
+    ];
+    let c = prepare(
+        1,
+        ms,
+        vec![],
+        vec![],
+        &CommitOptions::default(),
+        &limits(),
+        uid,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        c.mutations.iter().map(|m| m.kind).collect::<Vec<_>>(),
+        vec![
+            MutationType::MIN_V2,
+            MutationType::AND_V2,
+            MutationType::MAX
+        ]
+    );
+}
+
+#[test]
+fn not_sent_is_retryable_and_safe() {
+    use fdb_native_transport::rpc::RequestError;
+    let e = CommitError::NotSent(RequestError::NotSent(None));
+    assert!(e.is_retryable() && e.is_safe_to_retry() && !e.maybe_committed());
+}
+
+#[test]
+fn the_dummy_range_survives_a_truncated_key() {
+    let limits = CommitLimits::for_schema(SchemaVersion::V8_0);
+    let key = vec![b'a'; limits.key_size_limit + 1];
+    let overlap = KeyRange::new(key.clone(), "b").unwrap();
+    // The single-key range of a truncated key is cut to nothing...
+    assert_eq!(
+        super::limits::normalize_range(&KeyRange::single_key(&key), &limits).unwrap(),
+        None
+    );
+    // ...so the overlap is used.
+    assert_eq!(super::committer::dummy_range(&overlap, &limits), overlap);
+    let short = KeyRange::new("k", "z").unwrap();
+    assert_eq!(
+        super::committer::dummy_range(&short, &limits),
+        KeyRange::single_key(b"k")
+    );
+}

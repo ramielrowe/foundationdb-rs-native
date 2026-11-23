@@ -44,6 +44,15 @@ pub(crate) fn check_mutation(
     if !supported(m.kind) {
         return Err(CommitError::Unsupported(m.kind.0));
     }
+    // `apiVersionAtLeast(510)` (`atomicOp`): `Min` and `And` are sent as `MinV2` and `AndV2`.
+    let m = Mutation {
+        kind: match m.kind {
+            MutationType::MIN => MutationType::MIN_V2,
+            MutationType::AND => MutationType::AND_V2,
+            other => other,
+        },
+        ..m
+    };
     if m.kind == MutationType::CLEAR_RANGE {
         let range = KeyRange {
             begin: m.param1,

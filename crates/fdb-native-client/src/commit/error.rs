@@ -136,9 +136,12 @@ pub enum CommitError {
         /// conflicted, deduplicated, in request order. `None` if the proxy did not say.
         conflicting_ranges: Option<Vec<KeyRange>>,
     },
-    /// The commit may or may not have happened (`commit_unknown_result`, 1021). By the time
-    /// this is returned the commit is no longer in flight (unless `causal_write_risky` was
-    /// set): either it committed or it never will.
+    /// The commit may or may not have happened (`commit_unknown_result`, 1021). Once the
+    /// request may have been delivered this is the **only** error returned, even if the
+    /// conflicting dummy transaction that settles it could not be committed (the monitor was
+    /// shut down, a definite error from the proxy). When the dummy did commit, the original is
+    /// no longer in flight: either it committed or it never will; with `causal_write_risky`
+    /// (or a dummy that failed) it may still be.
     #[error("commit_unknown_result: the transaction may have committed")]
     CommitUnknownResult,
     /// The proxy said the read version is too old (`transaction_too_old`, 1007).
@@ -204,13 +207,15 @@ impl CommitError {
     /// `transaction_rejected_range_locked` (the default `TRANSACTION_LOCK_REJECTION_RETRIABLE`
     /// is taken to be true), and (with a short fixed delay) `transaction_too_old` and
     /// `future_version`. A [`NotSent`](Self::NotSent) is not in C++'s list (C++ reports
-    /// `commit_unknown_result` for it, which is); it is also safe to retry, see
+    /// `commit_unknown_result` for such a failure, which is in it, so a retry loop retries
+    /// it); the request was certainly not delivered, so it is retryable here too, see
     /// [`is_safe_to_retry`](Self::is_safe_to_retry).
     pub fn is_retryable(&self) -> bool {
         match self {
             CommitError::NotCommitted { .. }
             | CommitError::CommitUnknownResult
-            | CommitError::TransactionTooOld => true,
+            | CommitError::TransactionTooOld
+            | CommitError::NotSent(_) => true,
             CommitError::Server(e) => matches!(
                 e.code,
                 DATABASE_LOCKED
@@ -231,7 +236,7 @@ impl CommitError {
     /// Whether the commit request was certainly not applied and sending the same request
     /// again cannot execute it twice: every error but
     /// [`CommitUnknownResult`](Self::CommitUnknownResult). (Whether a resend can *succeed* is
-    /// [`is_retryable`](Self::is_retryable) and, for [`NotSent`](Self::NotSent), true.)
+    /// [`is_retryable`](Self::is_retryable).)
     pub fn is_safe_to_retry(&self) -> bool {
         !self.maybe_committed()
     }

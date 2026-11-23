@@ -109,7 +109,21 @@
 //!   ([`RequestError::certainly_not_delivered`](fdb_native_transport::rpc::RequestError::certainly_not_delivered)).
 //!   When a connection fails before the request is sent, the next proxy is tried (each once);
 //!   if none got it the result is [`NotSent`](CommitError::NotSent) (code 1026), which is safe
-//!   to retry and needs no dummy transaction. C++ reports `commit_unknown_result`.
+//!   and retryable (`is_retryable`) and needs no dummy transaction. C++ reports `commit_unknown_result`.
+//! * **An unknown result stays unknown.** In C++ an error of the dummy transaction that
+//!   `onError` does not retry escapes `tryCommit` in place of `commit_unknown_result`, so the
+//!   caller would believe the original did not commit although it may have been delivered.
+//!   Here every way out of the settling is [`CommitUnknownResult`](CommitError::CommitUnknownResult):
+//!   the dummy's own failure only means that the original was not settled. The dummy's read
+//!   version is requested again if the proxies change while it waits (as
+//!   `getConsistentReadVersion` does) and its backoff is capped at
+//!   `RESOURCE_CONSTRAINED_MAX_BACKOFF` for the resource-constrained errors.
+//! * **Shutdown of the cluster monitor**: a commit that was never offered to a proxy is
+//!   [`Closed`](CommitError::Closed); once the request may have been delivered it is an
+//!   unknown result. Nothing is sent after the shutdown.
+//! * **The dummy's key**: when the first key of the intersection was truncated to its limit
+//!   plus one byte, the one-key range would be cut to nothing (C++ then commits an empty
+//!   transaction that settles nothing), so the intersection's range is used instead.
 //! * **No proxies yet** (a recovery): C++ would wait and then report an unknown result without
 //!   having sent anything; the committer waits for proxies and then sends.
 //! * **Read version**: supplied by the caller. A transaction that did not read has none; C++
