@@ -126,6 +126,9 @@ version = "0.0.0"
 dependencies = [
  "fdb-native-schema",
  "fdb-native-transport",
+ "proptest",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

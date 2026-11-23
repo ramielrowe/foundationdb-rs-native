@@ -2,6 +2,13 @@
 //!
 //! Built on `fdb-native-schema` and `fdb-native-transport`.
 
+pub mod cluster_file;
+
+pub use cluster_file::{
+    ClusterConnectionString, ClusterFile, ClusterFileError, ClusterFileLocation, ClusterFileSource,
+    ConnectionStringError, Coordinator,
+};
+
 #[cfg(test)]
 mod tests {
     #[test]
