@@ -316,6 +316,25 @@ Permitted strict checks (the `violations` vocabulary, implemented in `src/strict
 | `empty_table_offset` | the offset to a zero-field table (e.g. `Void`) is out of bounds (C++ never follows it) |
 | `out_of_bounds` | an offset the C++ reader does not follow (e.g. a zero-field table's) is out of bounds |
 | `too_deep` | nesting deeper than 64 tables |
+| `work_limit` | one decode of the message charges more than 4 × the buffer length + 1024 units (see below) |
+
+`work_limit` bounds the work of decoding messages whose offsets reference the same objects
+many times over (an aliasing bomb: N offsets to one large string cost N times its length).
+`src/strict.h` does not compute it, so it never appears in `violations`; no current corpus
+entry reaches it, and a decoder that implements it may reject any accepted entry that does.
+A decode starts from the root table and is charged, every time it reaches an object:
+
+| object reached | units |
+| --- | --- |
+| a table (opened to read its fields) | 4 |
+| a zero-field table (offset checked, not followed) | 4 |
+| a string or blob | 4 + its length |
+| a vector of `count` elements | 4 + `count` × element wire size (inline size, or 4 for an offset) |
+| a vector of `count` unions | 5 × `count` |
+| an out-of-line union scalar or struct | its size |
+
+Every object the C++ writer emits is referenced once, except the shared empty blob, so its
+messages cost at most about 2 units per byte and never reach the limit.
 
 No other check is permitted: in particular not object overlap or aliasing (the C++ writer
 itself points every empty string/vector at one shared blob), not alignment of tables,

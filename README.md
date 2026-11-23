@@ -27,7 +27,7 @@ FoundationDB 7.4 and 8.0.
 [`tools/golden-vectors/`](tools/golden-vectors/) is a dev-only C++ tool that builds against
 FoundationDB's own serializer headers and writes golden flatbuffers-dialect vectors (bytes plus
 decoded field dumps, and malformed-input cases) to `tools/golden-vectors/fixtures/`. The fixtures
-are checked in; the Rust crates never build or run the tool. See its
+are checked in; the Rust crates never build the tool, and only an opt-in test runs it. See its
 [README](tools/golden-vectors/README.md) for the fixture format and how to regenerate.
 
 ## Testing
@@ -39,7 +39,11 @@ Requires [cargo-nextest](https://nexte.st/).
 cargo nextest run --workspace
 
 # Integration tests that need a live FoundationDB (requires Docker)
-cargo nextest run --workspace --run-ignored only --no-tests=pass
+cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
+
+# fdb-native-wire's encoder against FDB's C++ readers (requires tools/golden-vectors to be built)
+FDB_GOLDEN_VECTORS_BIN=$PWD/tools/golden-vectors/build/golden-vectors \
+  cargo nextest run -p fdb-native-wire --run-ignored only -E 'binary(cpp_crosscheck)'
 ```
 
 Tests that need a live FoundationDB container are marked `#[ignore = "requires docker"]`.
@@ -47,7 +51,8 @@ The `FDB_IMAGE` environment variable selects the server image
 (default `foundationdb/foundationdb:7.4.10`):
 
 ```bash
-FDB_IMAGE=foundationdb/foundationdb:8.0.1 cargo nextest run --workspace --run-ignored only
+FDB_IMAGE=foundationdb/foundationdb:8.0.1 cargo nextest run --workspace --run-ignored only \
+  -E 'not binary(cpp_crosscheck)'
 ```
 
 Tests must only target disposable containers started by `fdb-native-testkit`, never a
