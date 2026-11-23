@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use fdb_native_transport::{
     CHECKSUM_LEN, Checksum, DEFAULT_PACKET_LIMIT, DEFAULT_PACKET_WARNING, FrameConfig,
-    FrameDecoder, FrameError, LENGTH_LEN, TOKEN_LEN, parse_frame,
+    FrameDecoder, FrameError, FrameWriteError, LENGTH_LEN, TOKEN_LEN, parse_frame,
 };
 use fdb_native_wire::Uid;
 use proptest::prelude::*;
@@ -561,6 +561,23 @@ fn the_decoder_does_not_allocate_from_the_declared_length() {
         assert!(matches!(d.next_frame(), Ok(None)));
     }
     assert_eq!(d.buffered_len(), header.len() + 10_000);
+    // The declared 100 MiB was never reserved: the buffer holds what arrived, give or take the
+    // doubling.
+    assert!(d.capacity() < 64 * 1024, "capacity {}", d.capacity());
+
+    // The same asking for room instead: growth is geometric and capped at the frame.
+    let mut d = FrameDecoder::new(config);
+    d.push(&header);
+    for _ in 0..200 {
+        let n = d.spare(4096).len().min(4096);
+        d.commit(n);
+    }
+    assert!(
+        d.capacity() <= 2 * d.buffered_len().max(4096),
+        "capacity {} for {} bytes",
+        d.capacity(),
+        d.buffered_len()
+    );
 }
 
 #[test]
@@ -580,6 +597,8 @@ fn a_large_frame_does_not_pin_its_memory() {
     assert!(matches!(d.next_frame(), Ok(None)));
     d.push(&[]);
     assert_eq!(d.buffered_len(), 0);
+    // The 2 MiB buffer is cut back once it is empty.
+    assert!(d.capacity() <= 64 * 1024, "capacity {}", d.capacity());
 }
 
 #[test]
@@ -601,12 +620,105 @@ fn many_small_frames_in_one_chunk_are_all_returned() {
 
 #[test]
 fn encode_frame_with_survives_a_writer_that_shrinks_the_buffer() {
+    // A writer that clears the vector removes the caller's bytes too: nothing is left to
+    // restore, and the call fails.
     let mut out = vec![1, 2, 3, 4, 5];
     let err = plain()
         .encode_frame_with(Uid::new(1, 2), &mut out, |b| b.clear())
         .unwrap_err();
     assert!(matches!(err, FrameError::TooShort { .. }));
-    assert!(out.is_empty() || out.len() <= 5);
+    assert!(out.is_empty());
+
+    // One that cuts into the frame, but not below its start, is undone exactly.
+    let framing = plain().header_len() + TOKEN_LEN;
+    for cut in 0..framing + 3 {
+        let mut out = vec![1, 2, 3, 4, 5];
+        let before = out.len();
+        let result = plain().encode_frame_with(Uid::new(1, 2), &mut out, |b| {
+            b.extend_from_slice(b"abc");
+            b.truncate(before + cut);
+        });
+        if cut < framing {
+            // Less than the token is left of the frame.
+            assert!(
+                matches!(result, Err(FrameError::TooShort { .. })),
+                "cut {cut}"
+            );
+            assert_eq!(out, [1, 2, 3, 4, 5], "cut {cut}");
+        } else {
+            // Header and token intact, and 0 to 2 payload bytes: a frame.
+            assert!(result.is_ok(), "cut {cut}");
+            let (frame, _) = parse_frame(&plain(), &out[before..]).unwrap().unwrap();
+            assert_eq!(frame.payload, &b"abc"[..cut - framing]);
+        }
+    }
+}
+
+#[test]
+fn a_failing_payload_writer_leaves_the_buffer_alone() {
+    for config in [plain(), tls()] {
+        let mut out = b"keep".to_vec();
+        let err = config
+            .try_encode_frame_with(Uid::new(1, 2), &mut out, |b| {
+                b.extend_from_slice(&[0; 100]);
+                Err("boom")
+            })
+            .unwrap_err();
+        assert_eq!(err, FrameWriteError::Payload("boom"));
+        assert_eq!(out, b"keep");
+
+        let ok = config.try_encode_frame_with(Uid::new(1, 2), &mut out, |b| {
+            b.extend_from_slice(b"hi");
+            Ok::<(), &str>(())
+        });
+        assert!(ok.is_ok());
+        let (frame, _) = parse_frame(&config, &out[4..]).unwrap().unwrap();
+        assert_eq!(frame.payload, b"hi");
+
+        let small = config.with_max_packet_len(20);
+        let mut out = b"keep".to_vec();
+        let err = small
+            .try_encode_frame_with(Uid::new(1, 2), &mut out, |b| {
+                b.extend_from_slice(&[0; 5]);
+                Ok::<(), ()>(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameWriteError::Frame(FrameError::Oversize { len: 21, limit: 20 })
+        ));
+        assert_eq!(out, b"keep");
+    }
+}
+
+#[test]
+fn a_flatbuffers_message_is_serialized_straight_into_the_frame() {
+    use fdb_native_wire::Writer;
+    let build = |w: &mut Writer| {
+        let mut t = w.table();
+        t.field(&0xDEAD_BEEFu32).unwrap();
+        t.field(&7u64).unwrap();
+        t.finish().unwrap()
+    };
+    let mut w = Writer::new();
+    let root = build(&mut w);
+    let message = w.finish(root, 0x1234).unwrap();
+
+    for config in [plain(), tls()] {
+        let mut separate = Vec::new();
+        config
+            .encode_frame(Uid::new(9, 8), &message, &mut separate)
+            .unwrap();
+
+        let mut in_place = Vec::new();
+        config
+            .try_encode_frame_with(Uid::new(9, 8), &mut in_place, |out| {
+                let root = build(&mut w);
+                w.finish_into(out, root, 0x1234)
+            })
+            .unwrap();
+        assert_eq!(in_place, separate);
+    }
 }
 
 #[test]
@@ -794,4 +906,225 @@ proptest! {
             prop_assert!(oversize);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Memory
+
+/// A frame of `payload_len` bytes.
+fn frame_bytes(config: &FrameConfig, payload_len: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    config
+        .encode_frame(Uid::new(1, 2), &vec![7u8; payload_len], &mut v)
+        .unwrap();
+    v
+}
+
+/// A frame received while an earlier, larger prefix is still in the buffer: the consumed part
+/// must be moved out of the way, not doubled over (a frame of 100 MiB would otherwise hold
+/// 240 MiB). Sizes are scaled to a 1 MiB limit.
+#[test]
+fn a_consumed_prefix_is_not_kept_while_a_partial_frame_grows() {
+    const MIB: usize = 1 << 20;
+    let config = plain().with_max_packet_len(MIB as u32);
+    let a = frame_bytes(&config, 600 * 1024);
+    let b = frame_bytes(&config, MIB - TOKEN_LEN); // the largest frame
+    let t = b.len(); // header + declared length
+    assert_eq!(t, MIB + config.header_len());
+    let cut = 610 * 1024;
+
+    // One push of [A | first 610 KiB of B], then B's rest in 64 KiB pieces.
+    let mut first = a.clone();
+    first.extend_from_slice(&b[..cut]);
+    let mut d = FrameDecoder::new(config);
+    d.push(&first);
+    assert_eq!(d.next_frame().unwrap().unwrap().payload.len(), 600 * 1024);
+    assert!(d.next_frame().unwrap().is_none());
+    // What the caller pushed in one go is what is held: that is its own bound.
+    let held_by_first_push = d.capacity();
+    assert!(held_by_first_push <= first.len() + 4096);
+    for chunk in b[cut..].chunks(64 * 1024) {
+        d.push(chunk);
+        assert!(
+            d.capacity() <= held_by_first_push.max(t),
+            "capacity {} after {} buffered",
+            d.capacity(),
+            d.buffered_len()
+        );
+        if let Some(frame) = d.next_frame().unwrap() {
+            assert_eq!(frame.payload.len(), MIB - TOKEN_LEN);
+        }
+    }
+    assert_eq!(d.buffered_len(), 0);
+
+    // The same frames in 64 KiB pushes throughout: never more than the larger frame.
+    let mut d = FrameDecoder::new(config);
+    let mut stream = a.clone();
+    stream.extend_from_slice(&b);
+    let mut got = 0;
+    for chunk in stream.chunks(64 * 1024) {
+        d.push(chunk);
+        assert!(d.capacity() <= t, "capacity {}", d.capacity());
+        while d.next_frame().unwrap().is_some() {
+            got += 1;
+        }
+    }
+    assert_eq!(got, 2);
+}
+
+/// One large frame, then small frames in small reads that never end on a frame boundary: the
+/// large buffer is not kept.
+#[test]
+fn a_buffer_grown_for_a_large_frame_is_cut_back_while_the_stream_continues() {
+    let config = plain().with_max_packet_len(8 << 20);
+    let mut stream = frame_bytes(&config, 5 << 20);
+    let small = frame_bytes(&config, 100);
+    for _ in 0..2000 {
+        stream.extend_from_slice(&small);
+    }
+    let mut d = FrameDecoder::new(config);
+    let mut frames = 0;
+    let mut peak = 0;
+    for chunk in stream.chunks(4093) {
+        d.push(chunk);
+        peak = peak.max(d.capacity());
+        while d.next_frame().unwrap().is_some() {
+            frames += 1;
+        }
+    }
+    assert_eq!(frames, 2001);
+    assert!(peak >= 5 << 20);
+    assert!(d.capacity() <= 64 * 1024, "capacity {}", d.capacity());
+
+    // The same through spare/commit.
+    let mut d = FrameDecoder::new(config);
+    for chunk in stream.chunks(4093) {
+        let room = d.spare(chunk.len());
+        room[..chunk.len()].copy_from_slice(chunk);
+        d.commit(chunk.len());
+        while d.next_frame().unwrap().is_some() {}
+    }
+    assert!(d.capacity() <= 64 * 1024, "capacity {}", d.capacity());
+}
+
+// ---------------------------------------------------------------------------------------
+// Reading into the decoder
+
+#[test]
+fn spare_and_commit_decode_what_push_decodes() {
+    let config = plain();
+    let mut wire = Vec::new();
+    for i in 0..50u64 {
+        config
+            .encode_frame(
+                Uid::new(i, i * 3),
+                &vec![i as u8; (i * 37) as usize],
+                &mut wire,
+            )
+            .unwrap();
+    }
+    for chunk_size in [1usize, 5, 13, 100, 4096, 100_000] {
+        let mut d = FrameDecoder::new(config);
+        let mut got = Vec::new();
+        for chunk in wire.chunks(chunk_size) {
+            let room = d.spare(chunk.len());
+            assert!(room.len() >= chunk.len());
+            room[..chunk.len()].copy_from_slice(chunk);
+            d.commit(chunk.len());
+            while let Some(f) = d.next_frame().unwrap() {
+                got.push((f.token, f.payload.to_vec()));
+            }
+        }
+        assert_eq!(got.len(), 50, "chunk {chunk_size}");
+        for (i, (token, payload)) in got.iter().enumerate() {
+            assert_eq!(*token, Uid::new(i as u64, i as u64 * 3));
+            assert_eq!(payload.len(), i * 37);
+        }
+    }
+}
+
+#[test]
+fn spare_honors_the_limit_and_final_errors() {
+    let config = plain().with_max_packet_len(1000);
+    let mut d = FrameDecoder::new(config);
+    // A declared length above the limit, written straight into the buffer.
+    let room = d.spare(4);
+    room[..4].copy_from_slice(&1001u32.to_le_bytes());
+    d.commit(4);
+    let oversize = FrameError::Oversize {
+        len: 1001,
+        limit: 1000,
+    };
+    assert_eq!(d.next_frame().unwrap_err(), oversize);
+    assert!(d.spare(100).is_empty());
+    d.commit(10); // ignored
+    assert_eq!(d.buffered_len(), 0);
+    assert_eq!(d.error(), Some(oversize));
+
+    // A commit larger than the room is the room.
+    let mut d = FrameDecoder::new(plain());
+    let room = d.spare(10);
+    room[..4].copy_from_slice(&16u32.to_le_bytes());
+    let room = room.len();
+    d.commit(room + 1_000_000);
+    assert_eq!(d.buffered_len(), room);
+}
+
+#[test]
+fn the_handshake_can_be_read_from_the_same_buffer() {
+    use fdb_native_transport::ConnectPacket;
+    use fdb_native_wire::ProtocolVersion;
+    let hello = ConnectPacket::client(ProtocolVersion::V7_4)
+        .encode()
+        .unwrap();
+    assert_eq!(hello.len(), ConnectPacket::SIZE);
+    let config = plain();
+    let mut frames = Vec::new();
+    config
+        .encode_frame(Uid::new(4, 5), b"first", &mut frames)
+        .unwrap();
+    config
+        .encode_frame(Uid::new(6, 7), b"second", &mut frames)
+        .unwrap();
+    let mut wire = hello.clone();
+    wire.extend_from_slice(&frames);
+
+    for chunk_size in [1usize, 7, 44, 45, 1000] {
+        let mut d = FrameDecoder::before_handshake(config);
+        let mut seen_hello = false;
+        let mut got = Vec::new();
+        for chunk in wire.chunks(chunk_size) {
+            d.push(chunk);
+            if !seen_hello {
+                // Nothing is parsed as a frame before the handshake is consumed.
+                assert!(d.next_frame().unwrap().is_none());
+                if d.peek().len() >= ConnectPacket::SIZE {
+                    assert_eq!(&d.peek()[..ConnectPacket::SIZE], hello.as_slice());
+                    d.consume(ConnectPacket::SIZE);
+                    seen_hello = true;
+                }
+            }
+            if seen_hello {
+                while let Some(f) = d.next_frame().unwrap() {
+                    got.push((f.token, f.payload.to_vec()));
+                }
+            }
+        }
+        assert!(seen_hello, "chunk {chunk_size}");
+        assert_eq!(
+            got,
+            vec![
+                (Uid::new(4, 5), b"first".to_vec()),
+                (Uid::new(6, 7), b"second".to_vec())
+            ],
+            "chunk {chunk_size}"
+        );
+    }
+
+    // Consuming more than is there is harmless.
+    let mut d = FrameDecoder::new(config);
+    d.consume(10);
+    d.push(&frames);
+    d.consume(usize::MAX);
+    assert_eq!(d.buffered_len(), 0);
 }

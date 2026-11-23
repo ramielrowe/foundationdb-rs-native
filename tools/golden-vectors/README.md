@@ -1079,13 +1079,14 @@ message fixtures, from the `golden_vectors_framing` target (`messages/framing_ve
 
 **How the bytes are made.** `sendPacket()` is a `static` function of `FlowTransport.actor.cpp` /
 `FlowTransport.cpp` that needs a whole transport, so it cannot be called. The generator instead runs
-the framing core of `sendPacket()` verbatim (the two regions marked `MIRROR A` and `MIRROR B`:
+the framing core of `sendPacket()` verbatim (the regions marked `MIRROR A` and `MIRROR B`:
 `PacketWriter` construction, `writeAhead` for the length and checksum, `<< token`, the payload,
 `finish()`, then the XXH3 one-shot or streaming checksum over the buffer chain, and the
-`SplitBuffer::write` of the length and checksum) over the release's real `PacketBuffer`,
+`SplitBuffer::write` of the length and checksum; `MIRROR C` is `PACKET_LEN_WIDTH`) over the release's real `PacketBuffer`,
 `PacketWriter`, `SplitBuffer` and `flow/xxhash.h`. `check_mirrors.py` compares both regions with the
-branch's `sendPacket()` (ignoring comments and whitespace) and fails the build if they differ; it also
-fingerprints `sendPacket`, `scanPackets` and `getNewBufferSize` (and 8.0's limit helpers) so that a
+branch's source (ignoring comments and whitespace) and fails the build if they differ; it also
+fingerprints `sendPacket`, `scanPackets`, `getNewBufferSize` (and 8.0's limit helpers), `PACKET_LEN_WIDTH`
+and the `connectionReader` block that dispatches what follows the handshake, so that a
 change to the code the Rust codec follows is noticed. The payloads are either raw bytes written the
 way a payload is written (one `writeBytes` allocation, which is how the `ObjectWriter` writes a
 flatbuffers message, or `serializeBytes` pieces) or real flatbuffers messages made by

@@ -432,12 +432,35 @@ impl Writer {
         root: ObjectRef,
         file_identifier: u32,
     ) -> Result<Vec<u8>, EncodeError> {
-        let result = self.assemble(root, file_identifier);
+        let mut out = Vec::new();
+        let result = self.assemble(&mut out, root, file_identifier);
+        self.reset();
+        result.map(|()| out)
+    }
+
+    /// [`finish`](Writer::finish), appending the message to `out` instead of returning a new
+    /// vector: the bytes appended are those `finish` would return. This lets a message be
+    /// serialized straight into a buffer that already holds other bytes, such as a frame's
+    /// header (`fdb-native-transport`'s `FrameConfig::encode_frame_with`). On an error `out`
+    /// is left as it was. The writer is reset either way.
+    pub fn finish_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        root: ObjectRef,
+        file_identifier: u32,
+    ) -> Result<(), EncodeError> {
+        let result = self.assemble(out, root, file_identifier);
         self.reset();
         result
     }
 
-    fn assemble(&mut self, root: ObjectRef, file_identifier: u32) -> Result<Vec<u8>, EncodeError> {
+    /// Appends the message to `out`, leaving `out` as it was on an error.
+    fn assemble(
+        &mut self,
+        out: &mut Vec<u8>,
+        root: ObjectRef,
+        file_identifier: u32,
+    ) -> Result<(), EncodeError> {
         // An even body keeps the vtable block 2-aligned.
         self.pad_for(0, 4)?;
         let body = self.used();
@@ -450,10 +473,11 @@ impl Writer {
         if root.0 > body || root.0 == 0 {
             return Err(EncodeError::ForeignRef);
         }
-        let mut out = Vec::with_capacity(total);
+        let base = out.len();
+        out.reserve(total);
         out.extend_from_slice(&((total - root.0) as u32).to_le_bytes());
         out.extend_from_slice(&file_identifier.to_le_bytes());
-        out.resize(8 + pad, 0);
+        out.resize(base + 8 + pad, 0);
         for entry in &self.vtables.pool {
             out.extend_from_slice(&entry.to_le_bytes());
         }
@@ -463,9 +487,10 @@ impl Writer {
             let vtable_at = 8 + pad + 2 * self.vtables.start(vtable);
             // Vtables precede every table, so the soffset is positive and fits an i32.
             let soffset = (table_at - vtable_at) as i32;
-            out[table_at..table_at + 4].copy_from_slice(&soffset.to_le_bytes());
+            let at = base + table_at;
+            out[at..at + 4].copy_from_slice(&soffset.to_le_bytes());
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Lays out and writes the table whose fields are `slots[slot_base..]`.

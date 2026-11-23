@@ -18,7 +18,8 @@
 
 3. The packet framing (messages/framing_vectors.cpp; fdb-native-transport's framing module).
    The generator runs the framing core of FlowTransport's sendPacket() verbatim: the two regions
-   it marks MIRROR A and MIRROR B are compared with sendPacket() (same normalization). The
+   it marks MIRROR A and MIRROR B are compared with sendPacket() (same normalization), and its
+   PACKET_LEN_WIDTH line (MIRROR C) with the branch's declaration. The
    Rust codec also follows sendPacket()'s length/limit code, scanPackets() (the reader), and
    getNewBufferSize() with the limit helpers of release-8.0: the normalized text of each of
    them is fingerprinted like the code in 2.
@@ -36,17 +37,19 @@ HERE = Path(__file__).resolve().parent
 FINGERPRINTS = {
     "FlowTransport.actor.cpp": {  # release-7.4
         "prependConnectPacket": "6c31de51b6f91e38ab21c597f9f2e93d191df75561ee4499031bdc170074affc",
-        "connectPacketReader": "326acf6aa8bf94c13fa208acc72acd111178f76c8b51cacc14d7f56f0bbbb9cb",
+        "connectPacketReader": "01c8c486a457679b451bce41dc62a87793b90afe1ccbc456064e59ae83351375",
         "sendPacket": "8489f0024dfee1aabb649a06f73d652a33c9e8a54d11b80e0933aaad822fe695",
         "scanPackets": "247c32a3851303392a9eaa5d158f139e1a8fed51754f3f5ebf6cf6bd2fbc942e",
         "packetLimit": "6479b9a5aa7ffcc88148accfa28f53c339bfd8333bc17a3983b94d0e0cc8ef80",
+        "packetLenWidth": "3207dd55f79230e402f2415c6610e72bcee35f589168ecdaab2a9b3a8c299821",
     },
     "FlowTransport.cpp": {  # release-8.0 (the reader differs from 7.4's only in contains() and co_await)
         "prependConnectPacket": "6c31de51b6f91e38ab21c597f9f2e93d191df75561ee4499031bdc170074affc",
-        "connectPacketReader": "959c06e485d8b281df1af2f5d3f6ba5671185488e399726258cbbf63a946f99b",
+        "connectPacketReader": "6fae4ad1cdaeddc2b07fef99252a1ab3f759accc380281e41982cd1272efb413",
         "sendPacket": "bf0a36bdee7d01325714fbcc3388a5805c9ce1cb3affee2363fd3968102711d6",
         "scanPackets": "8cd9e79949b01335ecde362a716f48cf8f70e12e1b5bad1e141e64a564ffd951",
         "packetLimit": "3d98e1c70c0cd7d2a3d455ac737dd374dadca176ffa60f971034bc62ea6b0319",
+        "packetLenWidth": "3207dd55f79230e402f2415c6610e72bcee35f589168ecdaab2a9b3a8c299821",
     },
 }
 
@@ -109,6 +112,11 @@ def send_packet_regions(text):
     return body[a_start : a_end + 1], body[b_start : b_end + 1]
 
 
+def packet_len_width_line(text):
+    """The declaration of PACKET_LEN_WIDTH, the width of the length field."""
+    return [next(l for l in text.splitlines() if l.startswith("constexpr int PACKET_LEN_WIDTH"))]
+
+
 def packet_limit_region(text):
     """getNewBufferSize() and, where they exist (release-8.0), the helpers that compute the limit."""
     lines = function_region(text, "static int getNewBufferSize(")
@@ -126,10 +134,15 @@ def prepend_region(text):
 
 
 def reader_region(text):
+    """The connectionReader block that reads and validates the ConnectPacket, up to and including
+    the `if (!expectConnectPacket)` block after it: the dispatch of what follows to scanPackets()
+    (or dropping it, for an incompatible peer without stable interfaces)."""
     lines = text.split("\n")
     start = next(i for i, l in enumerate(lines) if "if (expectConnectPacket &&" in l)
-    end = next(i for i, l in enumerate(lines) if i > start and "peer->protocolVersion->set(peerProtocolVersion);" in l)
-    return lines[start : end + 1]
+    after = next(i for i, l in enumerate(lines) if i > start and "peer->protocolVersion->set(peerProtocolVersion);" in l)
+    drop = next(i for i, l in enumerate(lines) if i > after and "peer->resetPing.trigger();" in l)
+    # The `else {` and `if (!expectConnectPacket) {` blocks close on the next two lines.
+    return lines[start : drop + 3]
 
 
 def fingerprint(lines):
@@ -156,6 +169,7 @@ def main():
         "sendPacket": fingerprint(function_region(text, "static ReliablePacket* sendPacket(")),
         "scanPackets": fingerprint(function_region(text, "static void scanPackets(")),
         "packetLimit": fingerprint(packet_limit_region(text)),
+        "packetLenWidth": fingerprint(packet_len_width_line(text)),
     }
     if show:
         print(source.name, prints)
@@ -178,6 +192,11 @@ def main():
             for line in difflib.unified_diff(want, have, "source", "mirror", lineterm=""):
                 print(line, file=sys.stderr)
             return 1
+
+    # The generator's own PACKET_LEN_WIDTH must be the branch's.
+    if normalize(packet_len_width_line(text)) != normalize(mirror_region(framing, " C")):
+        print(f"check_mirrors: messages/framing_vectors.cpp (MIRROR C) differs from PACKET_LEN_WIDTH in {source}", file=sys.stderr)
+        return 1
 
     expected = FINGERPRINTS[source.name]
     for name, got in prints.items():

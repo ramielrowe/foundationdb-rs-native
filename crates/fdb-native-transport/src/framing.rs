@@ -47,8 +47,15 @@
 //!   `*_chunked` and `boundary_*` fixtures confirm against [`xxhash_rust`].
 //! * **When there is a checksum.** `checksumEnabled = !peerAddress.isTLS()` when reading
 //!   (7.4:1335, 8.0:1451) and `!destination.getPrimaryAddress().isTLS()` when writing
-//!   (7.4:2290, 8.0:2447): it follows whether the connection's address is a TLS address, which
-//!   both ends know. It is not a knob, and nothing negotiates it. [`Checksum::for_tls`].
+//!   (7.4:2290, 8.0:2447). It is not a knob, and nothing negotiates it. [`Checksum::for_tls`].
+//!   Both ends agree only if the address a sender uses for the checksum decision has the same
+//!   TLS flag as the connection the receiver reads it on: the receiver always uses the
+//!   connection's own `peerAddress`, a sender uses the *destination endpoint's* primary address.
+//!   For a request from us the server answers to the reply endpoint we put in the request, so the
+//!   connection layer (as8.3) must send reply endpoints without an address (they are then
+//!   resolved to the connection's `peerAddress`) or with an address whose TLS flag matches the
+//!   connection; otherwise the server may frame its replies in the other mode and every reply
+//!   fails the checksum (or is misread as a token).
 //! * **Token.** `wr << destination.token` (7.4:2329, 8.0:2487) and `reader >> token`
 //!   (7.4:1431, 8.0:1551): a `UID`, which saves as `serializer(ar, part[0], part[1])`
 //!   (`flow/include/flow/IRandom.h:98` on 7.4, `:100` on 8.0), with the "can't simply be
@@ -64,8 +71,9 @@
 //!   it is. [`FrameConfig::with_max_packet_len`] applies the 8.0 clamp for both.
 //! * **Oversize.** A reader that sees `packetLen > PACKET_LIMIT` logs `PacketLimitExceeded` and
 //!   throws `platform_error` (7.4:1355-1360, 8.0:1475-1480), from `scanPackets`, and also from
-//!   `getNewBufferSize` as soon as the 4 length bytes are in (7.4:1477-1482, 8.0:1596-1601): the
-//!   connection is closed and re-established (the error leaves `connectionReader` through the
+//!   `getNewBufferSize` (7.4:1477-1482, 8.0:1596-1601), which runs whenever the read buffer has
+//!   fewer than `MIN_PACKET_BUFFER_FREE_BYTES` (256) bytes free and its first 4 unprocessed
+//!   bytes are a length (7.4:1514, 8.0:1644): the connection is closed and re-established (the error leaves `connectionReader` through the
 //!   `wait(connectionWriter || reader || ...)` in `connectionKeeper`, 7.4:954, 8.0:1047). A
 //!   writer differs: 7.4 only logs the error and sends the frame anyway (the `throw` is commented
 //!   out, 7.4:2387-2391) so the peer drops the connection; 8.0 discards the packet and throws
@@ -90,11 +98,22 @@
 //!   (`unprocessed_begin += connectPacketSize`, then `expectConnectPacket = false`; 7.4:1549-1623,
 //!   8.0:1679-1755), and calls `scanPackets` on whatever follows in that buffer (7.4:1662-1677,
 //!   8.0:1795-1809). So frames start immediately after the handshake bytes and the stream is one
-//!   sequence: [`FrameDecoder::push`] the bytes left over after the handshake, then the rest. The
-//!   handshake itself is not a frame: no checksum, and its length field is the 40 of
-//!   `ConnectPacket::LENGTH`. If the peer's version is incompatible (and has no stable
-//!   interfaces) FDB does not parse frames at all: it drops what it reads (the `else` branch of
-//!   the same block, which also triggers `resetPing`). That is the connection layer's decision.
+//!   sequence. The handshake itself is not a frame: no checksum, and its length field is the 40
+//!   of `ConnectPacket::LENGTH`. **Never push the ConnectPacket's bytes into a [`FrameDecoder`]
+//!   made with [`FrameDecoder::new`]**: they would be parsed as a frame (length 40, then
+//!   "checksum" and "token" from the version and port). Either decode the handshake first with
+//!   [`ConnectPacket::decode`](crate::ConnectPacket::decode) from your own buffer and push only
+//!   what follows it, or read everything into a decoder made with
+//!   [`FrameDecoder::before_handshake`], [`peek`](FrameDecoder::peek) the handshake and
+//!   [`consume`](FrameDecoder::consume) it.
+//! * **Incompatible peers.** If the peer's version is incompatible, FDB hangs up on a peer that
+//!   lacks `hasInexpensiveMultiVersionClient()` (`throw incompatible_protocol_version()`,
+//!   7.4:1597-1607, 8.0:1729-1739). A newer multi-version client's connection stays open but
+//!   `compatible` is false: then, unless the peer `hasStableInterfaces()`, FDB drops whatever it
+//!   reads instead of parsing frames, and triggers `resetPing` (7.4:1662-1677, 8.0:1795-1809);
+//!   and `sendPacket` sends such a peer only frames for the ping token (7.4:2295, 8.0:2452;
+//!   everything else is silently not sent). Those are connection-layer decisions; the framing is
+//!   what it is for the frames that do flow.
 //! * **No per-frame flags, no versioning.** Nothing in the frame says how to read the
 //!   payload except the connection's protocol version, and the framing is identical in 7.4 and
 //!   8.0 (apart from the 8.0 limit clamp and the writer's oversize handling above).
@@ -115,20 +134,31 @@
 //! same on a buffer the caller owns (a memory-mapped or pooled receive buffer), with no copy at
 //! all.
 //!
-//! **Hostile input.** The length is checked against the limit as soon as its four bytes are in
-//! (and again in [`parse_frame`] before the checksum is read), before any payload bytes are
-//! kept for it: the decoder's buffer only ever grows with bytes the caller pushed, never
-//! to a length the peer declared. [`FrameDecoder::push`] re-checks the pending header on every
-//! call, so after an oversize or too-short length it rejects the stream without keeping more.
-//! The buffer holds at most the current frame (at most `max_packet_len + 12` bytes) plus whatever
-//! the last `push` added, as long as the caller calls [`FrameDecoder::next_frame`] until it
-//! returns `None` after each push. The arithmetic uses checked operations on lengths that
-//! are at most `i32::MAX`.
+//! **Hostile input and memory.** The length is checked against the limit as soon as its four
+//! bytes are in (and again in [`parse_frame`] before the checksum is read), before any payload
+//! bytes are kept for it. The decoder never allocates *from* a declared length: it grows its
+//! buffer in response to bytes the caller pushes or asks room for ([`FrameDecoder::push`],
+//! [`FrameDecoder::spare`]), geometrically, and stops doubling at the end of the frame being
+//! received. Precisely, after any call its capacity is at most
+//! `max(U, T)`, where `U` is the most the caller has had it hold at once (unconsumed bytes pushed
+//! or committed, plus the `min` of a `spare` call) and `T` is the size of the frame at the front
+//! (`header + declared length`, at most `max_packet_len + 12`; zero while fewer than four of its
+//! bytes are in). A consumed prefix is moved out of the way before the buffer would grow
+//! (never doubled over), and a buffer above 256 KiB is cut back to 64 KiB as soon as at most
+//! 64 KiB is held and no large frame is pending, so one large frame does not pin its memory.
+//! For this to hold the caller must call [`FrameDecoder::next_frame`] until it returns `None`
+//! after each push or commit. The arithmetic uses checked operations on lengths that are at most
+//! `i32::MAX`.
+//!
+//! **Reading from a socket.** [`FrameDecoder::spare`] and [`FrameDecoder::commit`] let a read go
+//! straight into the decoder's buffer, so the receive path has no intermediate buffer:
+//! `let n = socket.read(decoder.spare(4096))?; decoder.commit(n);`.
 //!
 //! **Encoding.** [`FrameConfig::encode_frame`] copies a payload into the output buffer;
 //! [`FrameConfig::encode_frame_with`] lets the caller write the payload straight into it
-//! (the way FDB's `ObjectWriter` writes into the `PacketWriter`'s buffer), and fills in the
-//! header afterwards, as `sendPacket` does with `packetInfoBuffer`.
+//! (the way FDB's `ObjectWriter` writes into the `PacketWriter`'s buffer; with
+//! `fdb_native_wire::Writer::finish_into` a flatbuffers message is serialized in place), and
+//! fills in the header afterwards, as `sendPacket` does with `packetInfoBuffer`.
 
 use fdb_native_wire::Uid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -280,11 +310,14 @@ impl FrameConfig {
     ///
     /// `write_payload` must only append to the vector it is given. This is how a serializer
     /// can write its output in place, without an intermediate buffer; the length and the
-    /// checksum are filled in afterwards. If the payload turns out to be too large (the token
-    /// and payload together are above the limit) `out` is truncated back to its length before the
-    /// call and the error is returned. If `write_payload` shortens the vector below where it
-    /// started, which it must not, `out` is truncated to its original length too and the call
-    /// fails with [`FrameError::TooShort`].
+    /// checksum are filled in afterwards. If the token and payload together are above the limit,
+    /// `out` is truncated back to its length before the call and the error is returned.
+    ///
+    /// A closure that shortens the vector breaks the contract. It is not a panic: if less than
+    /// the token is left of the frame the call fails with [`FrameError::TooShort`] and `out` is
+    /// truncated to its original length, or to what the closure left if that is shorter (the
+    /// bytes the closure removed from before the frame are gone; they cannot be restored without
+    /// a copy of the whole buffer).
     pub fn encode_frame_with<F>(
         &self,
         token: Uid,
@@ -294,24 +327,53 @@ impl FrameConfig {
     where
         F: FnOnce(&mut Vec<u8>),
     {
+        match self.try_encode_frame_with(token, out, |out| {
+            write_payload(out);
+            Ok::<(), core::convert::Infallible>(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(FrameWriteError::Frame(e)) => Err(e),
+            Err(FrameWriteError::Payload(never)) => match never {},
+        }
+    }
+
+    /// [`encode_frame_with`](FrameConfig::encode_frame_with) for a payload writer that can fail
+    /// (a flatbuffers encoder, say). On an error from `write_payload`, `out` is truncated to its
+    /// length before the call and the error is returned as [`FrameWriteError::Payload`].
+    pub fn try_encode_frame_with<F, E>(
+        &self,
+        token: Uid,
+        out: &mut Vec<u8>,
+        write_payload: F,
+    ) -> Result<(), FrameWriteError<E>>
+    where
+        F: FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    {
         let start = out.len();
         let header = self.header_len();
         let counted = start + header;
         out.resize(counted, 0);
         out.extend_from_slice(&token.first.to_le_bytes());
         out.extend_from_slice(&token.second.to_le_bytes());
-        write_payload(out);
-
-        let Some(len) = out.len().checked_sub(counted) else {
+        if let Err(e) = write_payload(out) {
             out.truncate(start);
-            return Err(FrameError::TooShort { len: 0 });
-        };
+            return Err(FrameWriteError::Payload(e));
+        }
+
+        // What the payload writer left: if it removed bytes, less than the token may be there.
+        let len = out.len().saturating_sub(counted);
+        if len < TOKEN_LEN {
+            out.truncate(start);
+            return Err(FrameWriteError::Frame(FrameError::TooShort {
+                len: u32::try_from(len).unwrap_or(0),
+            }));
+        }
         if len > self.max_packet_len as usize {
             out.truncate(start);
-            return Err(FrameError::Oversize {
+            return Err(FrameWriteError::Frame(FrameError::Oversize {
                 len: len as u64,
                 limit: self.max_packet_len,
-            });
+            }));
         }
         // len <= max_packet_len <= i32::MAX, so this cannot fail; the fallback keeps the
         // function total.
@@ -327,6 +389,17 @@ impl FrameConfig {
         }
         Ok(())
     }
+}
+
+/// Why [`FrameConfig::try_encode_frame_with`] failed: the frame, or the payload writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FrameWriteError<E> {
+    /// The frame could not be built around the payload.
+    #[error(transparent)]
+    Frame(FrameError),
+    /// The payload writer failed.
+    #[error("writing the payload failed: {0}")]
+    Payload(E),
 }
 
 /// A decoded frame: the destination endpoint's token and the message payload.
@@ -469,31 +542,82 @@ pub fn parse_frame<'a>(
 /// # Ok::<(), fdb_native_transport::FrameError>(())
 /// ```
 ///
+/// Reading from a socket without an intermediate buffer:
+///
+/// ```
+/// # use fdb_native_transport::{Checksum, FrameConfig, FrameDecoder};
+/// # use fdb_native_wire::Uid;
+/// # let config = FrameConfig::new(Checksum::Disabled);
+/// # let mut wire = Vec::new();
+/// # config.encode_frame(Uid::new(1, 2), b"hello", &mut wire)?;
+/// # let mut socket = std::io::Cursor::new(wire);
+/// use std::io::Read;
+/// let mut decoder = FrameDecoder::new(config);
+/// loop {
+///     let n = socket.read(decoder.spare(4096))?;
+///     if n == 0 {
+///         break; // end of stream (or the decoder has failed: see `error`)
+///     }
+///     decoder.commit(n);
+///     while let Some(frame) = decoder.next_frame()? {
+///         assert_eq!(frame.payload, b"hello");
+///     }
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
 /// The first error is final: FDB closes the connection on any framing error, since a byte stream
-/// with no delimiters cannot be resynchronized. Every call after it returns the same error and
-/// pushed bytes are discarded.
+/// with no delimiters cannot be resynchronized. Every call after it returns the same error,
+/// pushed bytes are discarded and [`spare`](FrameDecoder::spare) gives no room.
+///
+/// See the [module documentation](self) for how much memory a decoder holds.
 #[derive(Debug)]
 pub struct FrameDecoder {
     config: FrameConfig,
+    /// Storage, all initialized: `buf[start..filled]` is the unconsumed data, the rest of `buf`
+    /// is room for more.
     buf: Vec<u8>,
     /// The first unconsumed byte of `buf`.
     start: usize,
+    /// The end of the data in `buf`.
+    filled: usize,
     failed: Option<FrameError>,
+    /// Set by [`FrameDecoder::before_handshake`] until [`FrameDecoder::consume`] is called: the
+    /// buffered bytes are not frames yet.
+    handshake: bool,
 }
 
-/// Capacity above which an emptied buffer is shrunk, so that one large frame does not pin its
-/// memory for the life of the connection.
+/// Capacity above which a decoder holding little is cut back, so that one large frame does not
+/// pin its memory for the life of the connection.
 const SHRINK_ABOVE: usize = 256 * 1024;
+/// What it is cut back to.
 const SHRINK_TO: usize = 64 * 1024;
+/// The size of the first allocation.
+const MIN_ALLOC: usize = 4096;
 
 impl FrameDecoder {
-    /// A decoder for one connection's frames, with nothing buffered.
+    /// A decoder for one connection's frames, with nothing buffered. The bytes pushed to it must
+    /// start with a frame: see the module documentation about the ConnectPacket.
     pub fn new(config: FrameConfig) -> FrameDecoder {
         FrameDecoder {
             config,
             buf: Vec::new(),
             start: 0,
+            filled: 0,
             failed: None,
+            handshake: false,
+        }
+    }
+
+    /// A decoder whose first bytes are the peer's ConnectPacket, which the caller reads with
+    /// [`peek`](FrameDecoder::peek) and removes with [`consume`](FrameDecoder::consume). Until
+    /// `consume` is called nothing is parsed as a frame ([`next_frame`](FrameDecoder::next_frame)
+    /// returns `Ok(None)`), so the handshake bytes are not mistaken for one; the caller bounds the
+    /// handshake (it is 44 bytes, and its length field can be checked after four).
+    pub fn before_handshake(config: FrameConfig) -> FrameDecoder {
+        FrameDecoder {
+            handshake: true,
+            ..FrameDecoder::new(config)
         }
     }
 
@@ -507,21 +631,76 @@ impl FrameDecoder {
     ///
     /// Bytes pushed after an error are discarded. The header of the frame being received is
     /// checked here too, so an oversize length is reported on the next call to `next_frame`
-    /// even if more bytes follow.
+    /// even if more bytes follow, and nothing more is kept.
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.failed.is_some() {
+        if bytes.is_empty() {
             return;
         }
-        self.compact();
-        self.buf.extend_from_slice(bytes);
-        // A bad header: do not keep what follows it.
-        let pending = self.buf.get(self.start..).unwrap_or(&[]);
-        if let Err(e) = check_length(&self.config, pending) {
-            self.fail(e);
+        let room = self.spare(bytes.len());
+        if let Some(dst) = room.get_mut(..bytes.len()) {
+            dst.copy_from_slice(bytes);
+            self.commit(bytes.len());
         }
     }
 
-    /// The next whole frame, if the pushed bytes contain one.
+    /// Room for at least `min` more bytes (at least one), at the end of the buffered data: read
+    /// into the start of the slice and tell the decoder how much with
+    /// [`commit`](FrameDecoder::commit). The slice may be much longer than `min`; it is the
+    /// room the decoder already has, never more than it would allocate for a push of `min`
+    /// bytes (see the module documentation: it is not sized from a declared length).
+    ///
+    /// After an error the slice is empty, so a read into it returns 0; check
+    /// [`error`](FrameDecoder::error) or call [`next_frame`](FrameDecoder::next_frame).
+    pub fn spare(&mut self, min: usize) -> &mut [u8] {
+        if self.failed.is_some() {
+            return &mut [];
+        }
+        let min = min.max(1);
+        self.trim();
+        if self.buf.len() - self.filled < min {
+            self.compact();
+            if self.buf.len() - self.filled < min {
+                self.grow(min);
+            }
+        }
+        self.buf.get_mut(self.filled..).unwrap_or(&mut [])
+    }
+
+    /// Records that `n` bytes were written to the start of the slice [`spare`] returned. A
+    /// larger `n` than the slice is taken to be the slice's length. The header of the frame
+    /// being received is checked now, as in [`push`](FrameDecoder::push).
+    ///
+    /// [`spare`]: FrameDecoder::spare
+    pub fn commit(&mut self, n: usize) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.filled += n.min(self.buf.len() - self.filled);
+        self.check_pending();
+    }
+
+    /// The unconsumed bytes: what has been pushed or committed and not yet returned by
+    /// [`next_frame`](FrameDecoder::next_frame) or removed by [`consume`](FrameDecoder::consume).
+    /// This is where the handshake is read from a decoder made with
+    /// [`before_handshake`](FrameDecoder::before_handshake).
+    pub fn peek(&self) -> &[u8] {
+        self.pending()
+    }
+
+    /// Removes `n` bytes from the front of the unconsumed bytes (all of them if `n` is larger).
+    /// This ends the handshake phase of a decoder made with
+    /// [`before_handshake`](FrameDecoder::before_handshake): what follows is parsed as frames,
+    /// and the header of the first one is checked now.
+    pub fn consume(&mut self, n: usize) {
+        if self.failed.is_some() {
+            return;
+        }
+        self.start += n.min(self.filled - self.start);
+        self.handshake = false;
+        self.check_pending();
+    }
+
+    /// The next whole frame, if the buffered bytes contain one.
     ///
     /// The payload borrows the decoder and is valid until the next call that takes `&mut self`
     /// (copy it with [`Frame::into_owned`] to keep it).
@@ -529,9 +708,11 @@ impl FrameDecoder {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        self.compact();
-        let pending = self.buf.get(self.start..).unwrap_or(&[]);
-        let parsed = match parse_prefix(&self.config, pending) {
+        if self.handshake {
+            return Ok(None);
+        }
+        self.trim();
+        let parsed = match parse_prefix(&self.config, self.pending()) {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -551,7 +732,12 @@ impl FrameDecoder {
 
     /// The number of bytes held that are not part of a frame returned yet.
     pub fn buffered_len(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
+        self.filled - self.start
+    }
+
+    /// The memory the decoder's buffer has allocated, in bytes.
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// The error that ended the stream, if one did.
@@ -559,27 +745,75 @@ impl FrameDecoder {
         self.failed
     }
 
+    /// Fails the decoder if the frame at the front has an unacceptable length.
+    fn check_pending(&mut self) {
+        if self.handshake {
+            return;
+        }
+        if let Err(e) = check_length(&self.config, self.pending()) {
+            self.fail(e);
+        }
+    }
+
+    fn pending(&self) -> &[u8] {
+        self.buf.get(self.start..self.filled).unwrap_or(&[])
+    }
+
     fn fail(&mut self, e: FrameError) {
         self.failed = Some(e);
         self.buf = Vec::new();
         self.start = 0;
+        self.filled = 0;
     }
 
-    /// Drops the bytes of frames already returned. Amortized: only when at least half the buffer
-    /// is consumed, or all of it.
+    /// Size of the frame at the front (header and declared length), once its length is known and
+    /// acceptable.
+    fn pending_frame_len(&self) -> Option<usize> {
+        if self.handshake {
+            return None;
+        }
+        match check_length(&self.config, self.pending()) {
+            Ok(Some(len)) => Some(self.config.header_len() + len as usize),
+            _ => None,
+        }
+    }
+
+    /// Moves the unconsumed bytes to the front of the buffer.
     fn compact(&mut self) {
-        if self.start == 0 {
-            return;
-        }
-        if self.start >= self.buf.len() {
-            self.buf.clear();
-            self.start = 0;
-            if self.buf.capacity() > SHRINK_ABOVE {
-                self.buf.shrink_to(SHRINK_TO);
-            }
-        } else if self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.filled, 0);
+            self.filled -= self.start;
             self.start = 0;
         }
+    }
+
+    /// Resets an emptied buffer and cuts a large one that holds little back to `SHRINK_TO`.
+    fn trim(&mut self) {
+        if self.start == self.filled {
+            self.start = 0;
+            self.filled = 0;
+        }
+        if self.buf.len() > SHRINK_ABOVE
+            && self.buffered_len() <= SHRINK_TO
+            && self.pending_frame_len().is_none_or(|t| t <= SHRINK_TO)
+        {
+            self.compact();
+            self.buf.truncate(SHRINK_TO);
+            self.buf.shrink_to(SHRINK_TO);
+        }
+    }
+
+    /// Makes room for `min` more bytes after the data, which starts at 0 (`compact` was called).
+    ///
+    /// Doubles the buffer, but not past the end of the frame being received (its declared size
+    /// is a limit on growth, never a size to allocate), and never to less than what is needed.
+    fn grow(&mut self, min: usize) {
+        let needed = self.filled.saturating_add(min);
+        let target = match self.pending_frame_len() {
+            Some(frame) => needed.max(self.buf.len().saturating_mul(2).max(MIN_ALLOC).min(frame)),
+            None => needed.max(MIN_ALLOC),
+        };
+        self.buf.reserve_exact(target - self.buf.len());
+        self.buf.resize(target, 0);
     }
 }

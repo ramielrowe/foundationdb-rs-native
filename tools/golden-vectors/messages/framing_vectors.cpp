@@ -43,7 +43,9 @@ using namespace std::string_literals;
 namespace {
 
 constexpr int kFormatVersion = 1;
-constexpr int PACKET_LEN_WIDTH = sizeof(uint32_t); // FlowTransport: PACKET_LEN_WIDTH
+// BEGIN MIRROR C (FlowTransport: the width of the length field)
+constexpr int PACKET_LEN_WIDTH = sizeof(uint32_t);
+// END MIRROR C
 
 // ---------------------------------------------------------------------------------------
 // Bytes and JSON.
