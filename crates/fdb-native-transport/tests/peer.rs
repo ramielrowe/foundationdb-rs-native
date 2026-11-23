@@ -149,9 +149,13 @@ async fn a_request_connects_by_itself_and_its_reply_completes_it() {
     );
 
     // The raw payload and decoding are separate steps too, and a server error is an error.
-    let payload = peer.request(token(7), echo_encode(1)).await.unwrap();
+    let reply = peer.request(token(7), echo_encode(1)).await.unwrap();
     assert_eq!(
-        fdb_native_transport::rpc::decode_reply::<EchoReply>(&payload),
+        reply.version, V80,
+        "the reply says which version it arrived on"
+    );
+    assert_eq!(
+        fdb_native_transport::rpc::decode_reply::<EchoReply>(&reply.payload),
         Ok(EchoReply {
             value: 1 + ECHO_ADDS
         })

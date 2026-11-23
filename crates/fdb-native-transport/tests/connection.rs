@@ -458,6 +458,61 @@ fn send_errors() {
     assert_eq!(conn.send(Uid::new(2, 2), b"x"), Err(SendError::Closed));
 }
 
+/// A payload writer that assigns to the output buffer instead of appending destroys the frames
+/// queued before it. The connection notices (the buffer is shorter than where the frame began),
+/// fails with `InternalEncode` and writes nothing, rather than sending what is left unframed.
+#[test]
+fn a_writer_that_shortens_the_output_fails_the_connection() {
+    for overwrite in [true, false] {
+        let (mut conn, _server) = connected(ProtocolVersion::V7_4, false);
+        conn.send(Uid::new(2, 2), &[7; 100]).unwrap();
+        let queued = conn.pending_output().len();
+        assert!(queued > 100);
+        let result = conn.send_with(Uid::new(3, 3), |out| {
+            if overwrite {
+                *out = vec![1, 2, 3];
+            } else {
+                out.clear();
+            }
+            Ok::<(), ()>(())
+        });
+        assert_eq!(result, Err(SendError::Closed), "overwrite {overwrite}");
+        assert_eq!(conn.state(), ConnectionState::Closed);
+        assert!(matches!(
+            conn.error(),
+            Some(ConnectionError::InternalEncode(_))
+        ));
+        assert!(conn.pending_output().is_empty(), "nothing is written");
+        assert!(matches!(
+            events(&mut conn)[..],
+            [Ev::Closed(ConnectionError::InternalEncode(_))]
+        ));
+        assert_eq!(conn.send(Uid::new(2, 2), b"x"), Err(SendError::Closed));
+    }
+
+    // A writer that only fails, or cuts into its own frame, leaves the connection alone.
+    let (mut conn, _server) = connected(ProtocolVersion::V7_4, false);
+    conn.send(Uid::new(2, 2), &[7; 100]).unwrap();
+    let queued = conn.pending_output().to_vec();
+    assert_eq!(
+        conn.send_with(Uid::new(3, 3), |out| {
+            out.extend_from_slice(&[9; 10]);
+            Err::<(), _>("no")
+        }),
+        Err(SendError::Payload("no"))
+    );
+    assert!(matches!(
+        conn.send_with(Uid::new(3, 3), |out| {
+            let keep = out.len() - 4;
+            out.truncate(keep);
+            Ok::<(), ()>(())
+        }),
+        Err(SendError::Frame(FrameError::TooShort { .. }))
+    ));
+    assert_eq!(conn.state(), ConnectionState::Established);
+    assert!(conn.pending_output().starts_with(&queued));
+}
+
 // ---- dispatch ------------------------------------------------------------------------------
 
 #[test]

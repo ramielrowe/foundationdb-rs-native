@@ -17,7 +17,7 @@ use fdb_native_wire::{EncodeError, ProtocolVersion, Uid};
 use futures_channel::oneshot;
 
 use super::waiters::Waiters;
-use super::{Generation, PeerError, SendError};
+use super::{Generation, PeerError, Reply, SendError};
 use crate::rpc::RequestError;
 
 /// Writes a request message (reply token, negotiated version, output).
@@ -35,7 +35,7 @@ pub(crate) enum Cmd {
         id: u64,
         endpoint: Uid,
         encode: RequestEncoder,
-        reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+        reply: oneshot::Sender<Result<Reply, RequestError>>,
     },
     /// A one-way frame, acknowledged through `ack`.
     Send {

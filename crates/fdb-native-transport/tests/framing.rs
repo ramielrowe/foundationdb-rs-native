@@ -622,13 +622,27 @@ fn many_small_frames_in_one_chunk_are_all_returned() {
 #[test]
 fn encode_frame_with_survives_a_writer_that_shrinks_the_buffer() {
     // A writer that clears the vector removes the caller's bytes too: nothing is left to
-    // restore, and the call fails.
+    // restore, and the call says so (the owner of the vector must discard it).
     let mut out = vec![1, 2, 3, 4, 5];
     let err = plain()
         .encode_frame_with(Uid::new(1, 2), &mut out, |b| b.clear())
         .unwrap_err();
-    assert!(matches!(err, FrameError::TooShort { .. }));
+    assert_eq!(err, FrameError::OutputShrunk { start: 5, len: 0 });
     assert!(out.is_empty());
+
+    // So does one that assigns a shorter vector, and its own error does not hide that.
+    let mut out = vec![1, 2, 3, 4, 5];
+    let result = plain().try_encode_frame_with(Uid::new(1, 2), &mut out, |b| {
+        *b = vec![9, 9];
+        Err("boom")
+    });
+    assert_eq!(
+        result,
+        Err(FrameWriteError::Frame(FrameError::OutputShrunk {
+            start: 5,
+            len: 2
+        }))
+    );
 
     // One that cuts into the frame, but not below its start, is undone exactly.
     let framing = plain().header_len() + TOKEN_LEN;

@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fdb_native_wire::{NetworkAddress, ProtocolVersion, Uid};
+use fdb_native_wire::{EncodeError, NetworkAddress, ProtocolVersion, Uid};
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
@@ -19,7 +20,8 @@ use super::backoff::Backoff;
 use super::queue::{Cmd, Refusal};
 use super::stream::{MaybeTls, StreamWrapper};
 use super::{
-    Ctrl, Generation, PeerError, PeerEvent, PeerPhase, PeerShared, PeerStatus, SendError, Shared,
+    Ctrl, Generation, PeerError, PeerEvent, PeerPhase, PeerShared, PeerStatus, Reply, SendError,
+    Shared,
 };
 use crate::connection::{
     Connection, ConnectionConfig, ConnectionError, ConnectionState, SendError as FrameRefused,
@@ -34,6 +36,9 @@ type BoxedSleep<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// How much is read from the socket at once.
 const READ_SIZE: usize = 16 * 1024;
+
+/// The capacity above which the vector encoders write into is dropped after use instead of kept.
+const SCRATCH_KEEP: usize = 1 << 20;
 
 /// How many times a pass goes round its sources before the task yields to the executor.
 const ROUNDS: usize = 8;
@@ -60,6 +65,32 @@ impl Rng {
     fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
+}
+
+/// Runs an application's encoder on `scratch`, a vector of its own, and appends what it wrote
+/// to `out` (the connection's output, shared with other frames) only if it succeeded. So an
+/// encoder that overwrites its vector instead of appending, fails halfway, or panics cannot
+/// damage the frames around its own: nothing reaches `out` unless it returned `Ok`. A panic is
+/// caught and reported as an encode error.
+fn encode_isolated(
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    encode: impl FnOnce(&mut Vec<u8>) -> Result<(), EncodeError>,
+) -> Result<(), EncodeError> {
+    scratch.clear();
+    let result = match catch_unwind(AssertUnwindSafe(|| encode(&mut *scratch))) {
+        Ok(result) => result,
+        Err(_) => Err(EncodeError::Invalid("the encoder panicked")),
+    };
+    if result.is_ok() {
+        out.extend_from_slice(scratch);
+    }
+    if scratch.capacity() > SCRATCH_KEEP {
+        *scratch = Vec::new();
+    } else {
+        scratch.clear();
+    }
+    result
 }
 
 /// Raised by [`timeout`] when the time ran out first.
@@ -143,9 +174,11 @@ enum RunEnd {
 
 /// A request that was sent and awaits its reply.
 struct Waiter {
-    reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+    reply: oneshot::Sender<Result<Reply, RequestError>>,
     /// Its reply token in the registry, to cancel it.
     token: Uid,
+    /// The version of the connection it went out on, which its reply arrives on.
+    version: ProtocolVersion,
 }
 
 /// One connection being run: the sans-IO core and its socket.
@@ -173,6 +206,13 @@ pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     /// registry completes every one when a connection ends.
     registry: ReplyRegistry<u64>,
     waiters: HashMap<u64, Waiter>,
+    /// Tokens registered on the connection by commands, by command id and by token: a
+    /// registration whose caller dropped the future after it was applied is undone by its
+    /// cancellation. Cleared with the connection.
+    registered: HashMap<u64, Uid>,
+    registered_by_token: HashMap<Uid, u64>,
+    /// The vector request encoders write into (see [`encode_isolated`]).
+    scratch: Vec<u8>,
     backoff: Backoff,
     rng: Rng,
     /// The number of the latest connection.
@@ -189,6 +229,9 @@ pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     shutdown: bool,
     /// The peer was removed from its manager.
     retired: bool,
+    /// [`finish`](PeerTask::finish) completed: the peer ended in order. If the task is dropped
+    /// without it (a panic, or a runtime that drops its tasks), [`Drop`] cleans up.
+    finished: bool,
 }
 
 impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
@@ -218,6 +261,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             ctrl,
             registry: ReplyRegistry::new(registry_config),
             waiters: HashMap::new(),
+            registered: HashMap::new(),
+            registered_by_token: HashMap::new(),
+            scratch: Vec::new(),
             rng,
             generation: 0,
             demand: false,
@@ -226,6 +272,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             first_failure: None,
             shutdown: false,
             retired: false,
+            finished: false,
         }
     }
 
@@ -257,6 +304,40 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         if self.retired {
             self.emit(PeerEvent::Removed);
         }
+        self.finished = true;
+    }
+
+    /// The task is going away without having finished: a panic on it (in the event sink, the
+    /// stream wrapper, or the manager's own code), or the executor dropping it. Leaves the peer
+    /// as `finish` would, as far as callers and the manager can tell, and calls no application
+    /// code (it may be running while a panic unwinds):
+    ///
+    /// * the queue is closed, so nothing more is accepted, and what is queued (never applied)
+    ///   is refused as not sent;
+    /// * the waiters of requests already on the connection are dropped, so their callers see
+    ///   [`Called::Lost`](super::Called), maybe delivered;
+    /// * the phase becomes [`Shutdown`](PeerPhase::Shutdown);
+    /// * the address's `on_disconnect` waiters are woken if it was connected;
+    /// * the entry in the manager's map is removed if it is still this peer, so the next
+    ///   [`PeerManager::peer`](super::PeerManager::peer) creates a new one.
+    fn abandon(&mut self) {
+        let was_connected = self.peer.status.read(|s| s.phase == PeerPhase::Connected);
+        for cmd in self.peer.queue.close() {
+            cmd.refuse(Refusal::Shutdown);
+        }
+        self.waiters.clear();
+        self.update(|s| {
+            let changed = s.phase != PeerPhase::Shutdown || s.version.is_some();
+            s.phase = PeerPhase::Shutdown;
+            s.version = None;
+            s.connected_since = None;
+            changed
+        });
+        self.shared.forget(&self.key, &self.peer);
+        if was_connected {
+            self.notify_disconnect();
+        }
+        self.ctrl.close();
     }
 
     fn rt(&self) -> R {
@@ -618,8 +699,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     /// A request finished: hand its caller the result.
     fn complete(&mut self, completion: Completion<u64>) {
         if let Some(waiter) = self.waiters.remove(&completion.key) {
+            let version = waiter.version;
             // The caller may have given up.
-            let _ = waiter.reply.send(completion.result);
+            let _ = waiter
+                .reply
+                .send(completion.result.map(|payload| Reply { version, payload }));
         }
     }
 
@@ -677,11 +761,19 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             }
             Ctrl::Unregister(token) => {
                 run.conn.unregister(token);
+                if let Some(id) = self.registered_by_token.remove(&token) {
+                    self.registered.remove(&id);
+                }
             }
             Ctrl::Cancel(id) => {
                 if let Some(waiter) = self.waiters.remove(&id) {
                     // The caller is gone: no completion is owed.
                     self.registry.cancel(&mut run.conn, waiter.token);
+                } else if let Some(token) = self.registered.remove(&id) {
+                    // A registration that was applied, and whose caller dropped the future
+                    // before seeing it: nobody will unregister it.
+                    self.registered_by_token.remove(&token);
+                    run.conn.unregister(token);
                 }
             }
             Ctrl::CloseConnection => run.conn.close(),
@@ -724,14 +816,23 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 if self.registry.endpoint_failure(endpoint).is_some() {
                     self.registry.forget_failed_endpoint(endpoint);
                 }
+                // The encoder writes into a vector of its own (a panic is caught there too).
+                let scratch = &mut self.scratch;
                 let sent = self
                     .registry
                     .send_with(&mut run.conn, endpoint, id, |token, out| {
-                        encode(token, version, out)
+                        encode_isolated(scratch, out, |buf| encode(token, version, buf))
                     });
                 match sent {
                     Ok(token) => {
-                        self.waiters.insert(id, Waiter { reply, token });
+                        self.waiters.insert(
+                            id,
+                            Waiter {
+                                reply,
+                                token,
+                                version,
+                            },
+                        );
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -744,7 +845,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 if ack.is_canceled() {
                     return;
                 }
-                let result = match run.conn.send_with(token, |out| encode(version, out)) {
+                let scratch = &mut self.scratch;
+                let sent = run.conn.send_with(token, |out| {
+                    encode_isolated(scratch, out, |buf| encode(version, buf))
+                });
+                let result = match sent {
                     Ok(()) => Ok(run.generation),
                     Err(FrameRefused::Frame(e)) => Err(SendError::Frame(e)),
                     Err(FrameRefused::Payload(e)) => Err(SendError::Encode(e)),
@@ -761,15 +866,20 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 };
                 let _ = ack.send(result);
             }
-            Cmd::Register { token, ack, .. } => {
+            Cmd::Register { id, token, ack } => {
                 if ack.is_canceled() {
                     return;
                 }
-                let _ = ack.send(if run.conn.register(token) {
+                let result = if run.conn.register(token) {
+                    // Remembered until its caller is known to have the answer: a caller that
+                    // drops the future after this cancels it, which undoes the registration.
+                    self.registered.insert(id, token);
+                    self.registered_by_token.insert(token, id);
                     Ok(run.generation)
                 } else {
                     Err(SendError::TokenUnavailable(token))
-                });
+                };
+                let _ = ack.send(result);
             }
         }
     }
@@ -892,6 +1002,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         let rt = self.rt();
         self.generation += 1;
         let generation = Generation(self.generation);
+        self.registered.clear();
+        self.registered_by_token.clear();
         self.update(|s| {
             s.generation = generation;
             true
@@ -926,6 +1038,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         };
 
         let end = poll_fn(|cx| self.poll_run(&mut run, cx)).await;
+        // Registrations end with their connection.
+        self.registered.clear();
+        self.registered_by_token.clear();
 
         if let RunEnd::Shutdown = end {
             // What was sent and not answered completes as cancelled; what was queued is
@@ -935,6 +1050,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             self.close_gracefully(&mut run).await;
             run.conn.close();
             self.drain(&mut run);
+            // The connection ended: its waiters on the failure monitor are woken, as for any
+            // other end (`notifyDisconnect`), not left until the monitor is dropped.
+            self.notify_disconnect();
         }
         end
     }
@@ -961,6 +1079,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             let _ = poll_fn(|cx| Pin::new(&mut *stream).poll_close(cx)).await;
         };
         let _ = timeout(&rt, self.shared.config.shutdown_timeout, work).await;
+    }
+}
+
+impl<R: Runtime, W: StreamWrapper<R::Stream>> Drop for PeerTask<R, W> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Never let this panic: it can run while another panic unwinds, which aborts.
+            let _ = catch_unwind(AssertUnwindSafe(|| self.abandon()));
+        }
     }
 }
 
