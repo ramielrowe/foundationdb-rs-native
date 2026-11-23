@@ -3,6 +3,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::OnceLock;
 
 use fdb_native_wire::ProtocolVersion;
 use fdb_native_wire::binary::{DecodeError, EncodeError, Reader, Writer};
@@ -89,6 +90,17 @@ pub enum ConnectPacketError {
     },
 }
 
+/// This process's transport id: drawn at random on first use, then the same for the life of
+/// the process, and always above 1 (a multi-version client's id). See
+/// [`ConnectPacket::process_multi_version_client`].
+pub fn process_transport_id() -> u64 {
+    static ID: OnceLock<u64> = OnceLock::new();
+    *ID.get_or_init(|| {
+        let random = RandomState::new().build_hasher().finish();
+        if random <= 1 { random + 2 } else { random }
+    })
+}
+
 impl ConnectPacket {
     /// `connectPacketLength` of the packets this crate reads and writes: the 40 bytes after
     /// the length.
@@ -116,12 +128,22 @@ impl ConnectPacket {
         ConnectPacket::with_connection_id(version, id)
     }
 
-    /// [`multi_version_client`](ConnectPacket::multi_version_client) with a random id from
-    /// the standard library's per-process random state (not a cryptographic source; the id
-    /// only has to be unlikely to repeat).
+    /// [`multi_version_client`](ConnectPacket::multi_version_client) with a **new** random id on
+    /// every call, from the standard library's random state (not a cryptographic source; the
+    /// id only has to be unlikely to repeat). For tests: a real client uses one id for all its
+    /// connections, [`process_multi_version_client`](ConnectPacket::process_multi_version_client).
     pub fn random_multi_version_client(version: ProtocolVersion) -> ConnectPacket {
         let random = RandomState::new().build_hasher().finish();
         ConnectPacket::multi_version_client(version, random)
+    }
+
+    /// [`multi_version_client`](ConnectPacket::multi_version_client) with the process-wide
+    /// transport id ([`process_transport_id`]): what every connection of a client should send.
+    /// The `MultiVersionApi` draws one id per process and gives it to all its client libraries
+    /// (`fdbclient/MultiVersionTransaction.actor.cpp`, 7.4:3116-3120), so that a server can tell
+    /// the connections of one client apart from an unrelated incompatible client.
+    pub fn process_multi_version_client(version: ProtocolVersion) -> ConnectPacket {
+        ConnectPacket::multi_version_client(version, process_transport_id())
     }
 
     /// A listening process's packet, as `fdbserver` sends it: connection id 1 and the
@@ -318,6 +340,13 @@ mod tests {
         for _ in 0..8 {
             assert!(ConnectPacket::random_multi_version_client(V).is_multi_version());
         }
+        let id = process_transport_id();
+        assert!(id > 1);
+        assert_eq!(process_transport_id(), id);
+        assert_eq!(
+            ConnectPacket::process_multi_version_client(V).connection_id,
+            id
+        );
     }
 
     #[test]

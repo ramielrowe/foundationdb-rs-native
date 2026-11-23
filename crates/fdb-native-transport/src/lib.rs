@@ -9,7 +9,7 @@ pub mod connection;
 pub mod framing;
 pub mod runtime;
 
-pub use connect_packet::{ConnectPacket, ConnectPacketError};
+pub use connect_packet::{ConnectPacket, ConnectPacketError, process_transport_id};
 pub use connection::{
     Connection, ConnectionConfig, ConnectionError, ConnectionState, Event, MonitorConfig, SendError,
 };

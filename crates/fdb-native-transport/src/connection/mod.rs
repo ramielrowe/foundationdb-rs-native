@@ -26,21 +26,35 @@
 //!   [`Event::Closed`] with a [`ConnectionError`];
 //! * **the next deadline**, [`poll_timeout`](Connection::poll_timeout).
 //!
-//! A driver loop:
+//! A driver loop, in this order:
 //!
 //! ```text
 //! conn = Connection::new(config, now)
 //! loop:
-//!     write conn.pending_output() to the socket; conn.consume_output(written)
-//!     wait for: socket readable | conn.poll_timeout() | a command
-//!     readable:  n = socket.read(conn.recv_buf(16 * 1024)); n == 0 ? conn.recv_eof(now) : conn.recv_commit(n, now)
-//!     deadline:  conn.handle_timeout(now)
-//!     while let Some(event) = conn.poll_event(): handle it (Closed ends the loop)
+//!     1. input     one of: readable  → n = socket.read(conn.recv_buf(16 * 1024));
+//!                                      n == 0 ? conn.recv_eof(now) : conn.recv_commit(n, now)
+//!                          deadline  → conn.handle_timeout(now)
+//!                          a command → conn.send(..) / register(..) / ...
+//!     2. drain     while let Some(event) = conn.poll_event(): handle it (Closed ends the loop)
+//!     3. write     conn.pending_output() to the socket; conn.consume_output(written)
+//!     4. wait      for: socket readable | conn.poll_timeout() | a command
 //! ```
 //!
-//! Frames are parsed lazily, in [`poll_event`](Connection::poll_event): that is also where pings
-//! are answered, so a driver must drain events after every input. Read with a fixed size; do
-//! not size reads from anything the peer sent.
+//! * **Drain after every input.** Frames are parsed lazily, in
+//!   [`poll_event`](Connection::poll_event): that is also where pings are answered. Until the
+//!   events are drained, [`recv_buf`](Connection::recv_buf) gives no room (an empty slice: do not
+//!   read into it, it is not the end of the stream), so undrained input cannot pile up; in a
+//!   build with debug assertions, feeding bytes to an undrained connection panics.
+//!   [`has_undrained_input`](Connection::has_undrained_input) tells.
+//! * **Feed bytes before handling a deadline.** If the socket is readable when a deadline
+//!   passes, read first: the ping monitor counts bytes received, and the bytes in the socket
+//!   would otherwise be missed.
+//! * **Read with a fixed size.** Never size reads from anything the peer sent.
+//! * **Output is bounded** by [`ConnectionConfig::max_pending_output`] (see
+//!   [Sending](self#sending)).
+//!
+//! Citations `7.4:N` are lines of `fdbrpc/FlowTransport.actor.cpp` on `release-7.4` and `8.0:N`
+//! of `fdbrpc/FlowTransport.cpp` on `release-8.0`, unless another file is named.
 //!
 //! # States
 //!
@@ -148,8 +162,10 @@
 //!
 //! 1. When the handshake completes, and after each ping is answered (or reset): if nothing
 //!    is outstanding (no output waiting to be written and no registered token, which stands
-//!    for FDB's `outstandingReplies`: `PeerHolder` counts a request's reply while it is
-//!    awaited, `fdbrpc/genericactors.actor.h` 7.4:312), close the connection as
+//!    for FDB's `outstandingReplies` and `reliable`: `RequestStream::getReply` sends with
+//!    `sendReliable` and waits in `sendCanceler`, whose `PeerHolder` counts the reply while
+//!    it is awaited; `fdbrpc/fdbrpc.h` 7.4:767-772, 8.0:790-791,
+//!    `fdbrpc/include/fdbrpc/genericactors.actor.h` 7.4:312-324 and 409), close the connection as
 //!    [`Unreferenced`](ConnectionError::Unreferenced) if it is
 //!    [unreferenced](Connection::set_referenced) and sent no data for
 //!    `unreferenced_close_delay`, or as [`Idle`](ConnectionError::Idle) if it was opened and
@@ -182,6 +198,26 @@
 //! wrong, and a request layer knows a request queued before [`Event::Connected`] was not sent
 //! if the connection fails first.)
 //!
+//! **Backpressure.** FDB queues output without limit; here
+//! [`ConnectionConfig::max_pending_output`] bounds it. When the output waiting to be written
+//! (held frames included) is at or above the limit, [`send`](Connection::send) refuses with
+//! [`SendError::Backpressure`] (a frame is accepted whatever its size below the limit), and
+//! the advisory endpoint-not-found notices for unknown stream tokens are not sent (the event
+//! then says `reported: false`). Ping replies are mandatory: if the peer keeps pinging while
+//! not reading, so that the FlowTransport traffic it caused (ping replies and notices) waiting
+//! to be written reaches the limit, the connection ends with
+//! [`ConnectionError::OutputOverflow`]. Our own pings, one per loop at most, are always
+//! queued.
+//!
+//! **File identifiers.** Send every message with its type's exact file identifier
+//! ([`send_message`](Connection::send_message) does). FDB's `ObjectReader::deserialize`
+//! compares it with the receiver's type and, apart from a 7.0-to-6.3 downgrade, logs
+//! `MismatchedFileIdentifier` at `SevError` and `ASSERT`s (`flow/include/flow/ObjectSerializer.h`
+//! 7.4:68-86, 8.0:68-86); in a server process a receiver's error ends in `flushAndExit`
+//! (`deliver`, 7.4:1283-1285). This side checks the identifier of the messages it reads
+//! itself (pings and endpoint-not-found notices) and ends the connection with
+//! [`MalformedMessage`](ConnectionError::MalformedMessage) on a mismatch.
+//!
 //! The checksum follows the TLS-ness of the connection ([`ConnectionConfig::tls`]), as it does
 //! for the server reading the same connection, *provided* replies come back on it: see the
 //! [framing documentation](crate::framing). A [`ReplyPromise`]
@@ -197,16 +233,19 @@ use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use fdb_native_wire::{
-    Encode, EncodeError, FileIdentified, ProtocolVersion, Reader, ReplyPromise, Uid, Writer, binary,
+    DecodeError, DecodeOwned, Encode, EncodeError, FileIdentified, ProtocolVersion, ReplyPromise,
+    Uid, Writer, binary,
 };
 
-pub use config::{ConnectionConfig, MonitorConfig};
+pub use config::{ConnectionConfig, DEFAULT_MAX_PENDING_OUTPUT, MonitorConfig};
 pub use error::{ConnectionError, SendError};
 pub use messages::{
     EndpointNotFound, PING_REPLY_OK, PingReply, PingRequest, TOKEN_STREAM_FLAG, well_known,
 };
 
-use crate::framing::{Checksum, Frame, FrameConfig, FrameDecoder, FrameWriteError, TOKEN_LEN};
+use crate::framing::{
+    Checksum, Frame, FrameConfig, FrameDecoder, FrameWriteError, LENGTH_LEN, TOKEN_LEN,
+};
 use crate::runtime::Instant;
 use crate::{ConnectPacket, ConnectPacketError};
 
@@ -351,6 +390,16 @@ struct Core {
     out_pos: usize,
     /// Frames sent before the handshake completed.
     held: Vec<u8>,
+    /// Bytes of `out` written so far, over the connection's life.
+    written_total: u64,
+    /// FlowTransport frames this side queued in response to the peer (ping replies and
+    /// endpoint-not-found notices) and not yet written: their end in the stream (counted like
+    /// `written_total`) and length.
+    internal: VecDeque<(u64, usize)>,
+    /// The sum of the lengths in `internal`.
+    internal_pending: usize,
+    /// The length of the slice `recv_buf` last returned.
+    recv_room: usize,
     receivers: HashSet<Uid>,
     events: VecDeque<Queued>,
     /// The peer closed its side; buffered frames are still delivered.
@@ -386,6 +435,10 @@ impl Connection {
             out: Vec::new(),
             out_pos: 0,
             held: Vec::new(),
+            written_total: 0,
+            internal: VecDeque::new(),
+            internal_pending: 0,
+            recv_room: 0,
             receivers: HashSet::new(),
             events: VecDeque::new(),
             eof: false,
@@ -457,20 +510,36 @@ impl Connection {
     // ---- input ---------------------------------------------------------------------------
 
     /// Room for at least `min` received bytes: read into the start of it, then call
-    /// [`recv_commit`](Self::recv_commit). Use a fixed read size (say 16 KiB). Empty once the
-    /// connection has ended.
+    /// [`recv_commit`](Self::recv_commit) with the count the read returned. Use a fixed read
+    /// size (say 16 KiB; it is clamped to [`MAX_SPARE`](crate::framing::MAX_SPARE)).
+    ///
+    /// The slice is **empty** once the connection has ended, after the end of the stream, and
+    /// while input is undrained ([`has_undrained_input`](Self::has_undrained_input): drain
+    /// [`poll_event`](Self::poll_event) first). Never read into an empty slice: a read of 0
+    /// bytes into it is not the end of the stream.
     pub fn recv_buf(&mut self, min: usize) -> &mut [u8] {
         self.release_decoder();
-        if self.core.state == ConnectionState::Closed || self.core.eof {
+        self.core.recv_room = 0;
+        if self.core.state == ConnectionState::Closed || self.core.eof || self.has_undrained_input()
+        {
             return &mut [];
         }
-        self.decoder.spare(min)
+        let room = self.decoder.spare(min);
+        self.core.recv_room = room.len();
+        room
     }
 
     /// Records that `n` bytes were read into the start of [`recv_buf`](Self::recv_buf)'s slice
-    /// at `now`. `n` must not exceed the slice's length.
+    /// at `now`. `n` must not exceed the slice's length (it is a bug, which panics in a build
+    /// with debug assertions; otherwise only the slice's length is taken).
     pub fn recv_commit(&mut self, n: usize, now: Instant) {
         self.core.advance(now);
+        let room = std::mem::take(&mut self.core.recv_room);
+        debug_assert!(
+            n <= room,
+            "recv_commit({n}) is more than the {room} bytes of room given"
+        );
+        let n = n.min(room);
         if self.core.state == ConnectionState::Closed || self.core.eof || n == 0 {
             return;
         }
@@ -480,12 +549,18 @@ impl Connection {
     }
 
     /// Copies received bytes in (the same as [`recv_buf`](Self::recv_buf) and
-    /// [`recv_commit`](Self::recv_commit)).
+    /// [`recv_commit`](Self::recv_commit), except that bytes given while input is undrained are
+    /// still taken, so nothing bounds the buffer then; that is a bug in the driver, which
+    /// panics in a build with debug assertions).
     pub fn recv(&mut self, bytes: &[u8], now: Instant) {
         self.core.advance(now);
         if self.core.state == ConnectionState::Closed || self.core.eof || bytes.is_empty() {
             return;
         }
+        debug_assert!(
+            !self.has_undrained_input(),
+            "bytes fed to a connection whose events were not drained"
+        );
         self.decoder.push(bytes);
         self.core.bytes_received = self.core.bytes_received.saturating_add(bytes.len() as u64);
         self.try_handshake();
@@ -506,6 +581,14 @@ impl Connection {
                 self.core.monitor = Monitor::Off;
             }
         }
+    }
+
+    /// Whether [`poll_event`](Self::poll_event) has something to give: a queued event, or a
+    /// whole frame received and not parsed yet. Drain it before feeding more bytes.
+    pub fn has_undrained_input(&self) -> bool {
+        !self.core.events.is_empty()
+            || (self.core.state == ConnectionState::Established
+                && (self.decoder.error().is_some() || front_frame_complete(&self.decoder)))
     }
 
     /// The socket failed at `now`: the connection ends with [`ConnectionError::Io`].
@@ -539,6 +622,9 @@ impl Connection {
 
     /// Sends `payload` (a serialized message) to the remote endpoint `token`. Before the
     /// handshake completes the frame is held (see the [module documentation](self#sending)).
+    ///
+    /// Fails with [`SendError::Backpressure`] when the output waiting to be written has
+    /// reached [`ConnectionConfig::max_pending_output`].
     pub fn send(&mut self, token: Uid, payload: &[u8]) -> Result<(), SendError> {
         self.core.check_sendable()?;
         let core = &mut self.core;
@@ -561,6 +647,7 @@ impl Connection {
         if let Err(e) = self.core.check_sendable() {
             return Err(match e {
                 SendError::Closed => SendError::Closed,
+                SendError::Backpressure => SendError::Backpressure,
                 SendError::Frame(f) => SendError::Frame(f),
                 SendError::Payload(never) => match never {},
             });
@@ -579,13 +666,19 @@ impl Connection {
     }
 
     /// Serializes `message` as a flatbuffers message with its file identifier and sends it to
-    /// `token`.
+    /// `token`. The identifier must be exactly the one the receiver's C++ type has (see
+    /// [File identifiers](self#sending)).
     pub fn send_message<T>(&mut self, token: Uid, message: &T) -> Result<(), SendError<EncodeError>>
     where
         T: Encode + FileIdentified + ?Sized,
     {
-        if self.core.state == ConnectionState::Closed || self.core.eof {
-            return Err(SendError::Closed);
+        if let Err(e) = self.core.check_sendable() {
+            return Err(match e {
+                SendError::Closed => SendError::Closed,
+                SendError::Backpressure => SendError::Backpressure,
+                SendError::Frame(f) => SendError::Frame(f),
+                SendError::Payload(never) => match never {},
+            });
         }
         let core = &mut self.core;
         let config = core.frame_config;
@@ -637,9 +730,11 @@ impl Connection {
     /// referenced). An unreferenced connection with nothing outstanding is closed as
     /// [`Unreferenced`](ConnectionError::Unreferenced) once it has sent no data for
     /// `unreferenced_close_delay`. Dropping the reference while a ping is out resets the ping
-    /// so that the rule is checked at once, as `removePeerReference` does.
-    pub fn set_referenced(&mut self, referenced: bool) {
+    /// so that the rule is checked at once, as `removePeerReference` does (while the monitor
+    /// waits to send the next ping, the rule is checked after that ping's reply).
+    pub fn set_referenced(&mut self, referenced: bool, now: Instant) {
         let core = &mut self.core;
+        core.advance(now);
         core.referenced = referenced;
         if !referenced
             && core.state == ConnectionState::Established
@@ -669,10 +764,22 @@ impl Connection {
     /// written.
     pub fn consume_output(&mut self, n: usize) {
         let core = &mut self.core;
-        core.out_pos = core.out_pos.saturating_add(n).min(core.out.len());
+        let n = n.min(core.out.len() - core.out_pos);
+        core.out_pos += n;
+        core.written_total += n as u64;
+        while let Some(&(end, len)) = core.internal.front() {
+            if end > core.written_total {
+                break;
+            }
+            core.internal.pop_front();
+            core.internal_pending -= len;
+        }
         if core.out_pos == core.out.len() {
             core.out.clear();
             core.out_pos = 0;
+            if core.out.capacity() > SHRINK_ABOVE {
+                core.out = Vec::new();
+            }
         } else if core.out_pos >= 64 * 1024 && core.out_pos * 2 >= core.out.len() {
             core.out.drain(..core.out_pos);
             core.out_pos = 0;
@@ -707,6 +814,11 @@ impl Connection {
             if self.core.route(token) == Route::Local {
                 // The frame is returned borrowed, so this path must not loop again.
                 return match self.decoder.next_frame() {
+                    Ok(Some(frame)) if frame.payload.is_empty() => {
+                        let token = frame.token;
+                        self.core.fail(empty_payload(token));
+                        self.core.events.pop_front().map(Queued::into_event)
+                    }
                     Ok(Some(frame)) => Some(Event::Frame(frame)),
                     Ok(None) => self.core.eof_or_none(),
                     Err(e) => {
@@ -716,6 +828,10 @@ impl Connection {
                 };
             }
             let event = match self.decoder.next_frame() {
+                Ok(Some(frame)) if frame.payload.is_empty() => {
+                    self.core.fail(empty_payload(frame.token));
+                    continue;
+                }
                 Ok(Some(frame)) => self.core.internal_frame(frame.token, frame.payload),
                 Ok(None) => {
                     if self.core.eof {
@@ -749,10 +865,14 @@ impl Connection {
                 self.core.peer = Some(packet);
                 let local = self.core.config.local.protocol_version;
                 match packet.check(local, self.core.config.dialed_port) {
-                    Ok(()) => {
-                        self.decoder.consume(len);
-                        self.core.established(packet);
-                    }
+                    Ok(()) => match self.decoder.consume(len) {
+                        Ok(()) => self.core.established(packet),
+                        // Not reachable: the decoder is in its handshake phase and holds
+                        // the `len` bytes just decoded.
+                        Err(e) => self
+                            .core
+                            .fail(ConnectionError::InternalEncode(format!("consume: {e}"))),
+                    },
                     Err(ConnectPacketError::Incompatible { local, peer }) => self
                         .core
                         .fail(ConnectionError::Incompatible { local, peer }),
@@ -785,6 +905,31 @@ fn front_token(decoder: &FrameDecoder) -> Option<Uid> {
     ))
 }
 
+/// Whether a whole frame is buffered at the front of the decoder.
+fn front_frame_complete(decoder: &FrameDecoder) -> bool {
+    let pending = decoder.peek();
+    let Some(len) = pending.first_chunk::<LENGTH_LEN>() else {
+        return false;
+    };
+    let len = u32::from_le_bytes(*len) as usize;
+    decoder
+        .config()
+        .header_len()
+        .checked_add(len)
+        .is_some_and(|total| pending.len() >= total)
+}
+
+/// A frame with nothing after the token: FDB `ASSERT(!reader.empty())`s.
+fn empty_payload(token: Uid) -> ConnectionError {
+    ConnectionError::MalformedMessage {
+        token,
+        error: DecodeError::TooShort { len: 0 },
+    }
+}
+
+/// Capacity above which an emptied output buffer is released.
+const SHRINK_ABOVE: usize = 256 * 1024;
+
 /// Appends `value` as the only member of a flatbuffers message to `out`.
 fn encode_root<T: Encode + ?Sized>(
     w: &mut Writer,
@@ -798,12 +943,10 @@ fn encode_root<T: Encode + ?Sized>(
     w.finish_into(out, root, file_identifier)
 }
 
-/// Decodes the root of a FlowTransport message. Like FDB's `ObjectReader`, it does not insist
-/// on the file identifier.
-fn decode_root<'de, T: fdb_native_wire::Decode<'de>>(
-    bytes: &'de [u8],
-) -> Result<T, fdb_native_wire::DecodeError> {
-    Reader::new(bytes)?.decode_root()
+/// Decodes a FlowTransport message, checking its file identifier as FDB's
+/// `ObjectReader::deserialize` does (see [File identifiers](self#sending)).
+fn decode_message<T: DecodeOwned + FileIdentified>(bytes: &[u8]) -> Result<T, DecodeError> {
+    fdb_native_wire::decode(bytes)
 }
 
 impl Core {
@@ -822,6 +965,8 @@ impl Core {
         self.out = Vec::new();
         self.out_pos = 0;
         self.held = Vec::new();
+        self.internal.clear();
+        self.internal_pending = 0;
         self.events.push_back(Queued::Closed(error));
     }
 
@@ -849,9 +994,16 @@ impl Core {
     fn check_sendable(&self) -> Result<(), SendError> {
         if self.state == ConnectionState::Closed || self.eof {
             Err(SendError::Closed)
+        } else if self.pending_len() >= self.config.max_pending_output {
+            Err(SendError::Backpressure)
         } else {
             Ok(())
         }
+    }
+
+    /// Output waiting to be written, held frames included.
+    fn pending_len(&self) -> usize {
+        (self.out.len() - self.out_pos) + self.held.len()
     }
 
     fn send_buffer(&mut self) -> &mut Vec<u8> {
@@ -869,15 +1021,32 @@ impl Core {
         }
     }
 
-    /// Sends one of FlowTransport's own messages (only once established).
-    fn send_internal<T: Encode + ?Sized>(&mut self, token: Uid, value: &T, file_identifier: u32) {
+    /// Sends one of FlowTransport's own messages (only once established). `reply` marks a
+    /// frame sent because the peer asked for it (a ping reply or an endpoint-not-found notice),
+    /// which counts towards [`ConnectionError::OutputOverflow`].
+    fn send_internal<T: Encode + ?Sized>(
+        &mut self,
+        token: Uid,
+        value: &T,
+        file_identifier: u32,
+        reply: bool,
+    ) {
         let config = self.frame_config;
+        let before = self.out.len();
         let Core { out, writer, .. } = self;
         let result = config.try_encode_frame_with(token, out, |buf| {
             encode_root(writer, buf, value, file_identifier)
         });
         match result {
-            Ok(()) => self.note_sent(token),
+            Ok(()) => {
+                if reply {
+                    let len = self.out.len() - before;
+                    let end = self.written_total + (self.out.len() - self.out_pos) as u64;
+                    self.internal.push_back((end, len));
+                    self.internal_pending += len;
+                }
+                self.note_sent(token)
+            }
             Err(FrameWriteError::Payload(e)) => {
                 self.fail(ConnectionError::InternalEncode(e.to_string()))
             }
@@ -995,6 +1164,7 @@ impl Core {
             well_known::PING_PACKET,
             &request,
             PingRequest::FILE_IDENTIFIER.value(),
+            false,
         );
         if self.state == ConnectionState::Closed {
             return;
@@ -1029,18 +1199,22 @@ impl Core {
     fn internal_frame(&mut self, token: Uid, payload: &[u8]) -> Option<Event<'static>> {
         match self.route(token) {
             Route::Ping => {
-                match decode_root::<PingRequest>(payload) {
+                match decode_message::<PingRequest>(payload) {
+                    Ok(_) if self.internal_pending >= self.config.max_pending_output => {
+                        self.fail(ConnectionError::OutputOverflow(self.internal_pending))
+                    }
                     Ok(request) => self.send_internal(
                         request.reply.token(),
                         &PING_REPLY_OK,
                         <PingReply as FileIdentified>::FILE_IDENTIFIER.value(),
+                        true,
                     ),
                     Err(error) => self.fail(ConnectionError::MalformedMessage { token, error }),
                 }
                 self.events.pop_front().map(Queued::into_event)
             }
             Route::EndpointNotFound | Route::Unauthorized => {
-                match decode_root::<EndpointNotFound>(payload) {
+                match decode_message::<EndpointNotFound>(payload) {
                     Ok(remote) if token == well_known::ENDPOINT_NOT_FOUND => {
                         Some(Event::EndpointNotFound { token: remote })
                     }
@@ -1064,13 +1238,16 @@ impl Core {
             // A token registered between the routing and here cannot happen (routing and
             // handling see the same state); treat it as unknown.
             Route::Local | Route::Unknown => {
-                let reported =
-                    token.first & TOKEN_STREAM_FLAG != 0 && !well_known::is_well_known(token);
+                // The notice is advisory: it is not sent while output is backed up.
+                let reported = token.first & TOKEN_STREAM_FLAG != 0
+                    && !well_known::is_well_known(token)
+                    && self.pending_len() < self.config.max_pending_output;
                 if reported {
                     self.send_internal(
                         well_known::ENDPOINT_NOT_FOUND,
                         &token,
                         <Uid as FileIdentified>::FILE_IDENTIFIER.value(),
+                        true,
                     );
                     if let Some(q) = self.events.pop_front() {
                         return Some(q.into_event());

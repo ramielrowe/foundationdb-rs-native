@@ -38,8 +38,10 @@ pub enum ConnectionError {
     /// A frame was refused (`checksum_failed` or `platform_error`).
     #[error("framing error: {0}")]
     Framing(#[from] FrameError),
-    /// A FlowTransport message (a ping, or an endpoint-not-found notice) could not be
-    /// decoded.
+    /// A FlowTransport message (a ping, or an endpoint-not-found notice) could not be decoded,
+    /// has another file identifier than its type's (FDB's `ObjectReader` asserts on that), or a
+    /// frame has an empty payload (FDB asserts `!reader.empty()`, `FlowTransport.actor.cpp`
+    /// 7.4:1443, `FlowTransport.cpp` 8.0:1563).
     #[error("malformed message for token {token:?}: {error}")]
     MalformedMessage {
         /// The token it was sent to.
@@ -68,6 +70,11 @@ pub enum ConnectionError {
     /// unreferenced close delay (`connection_unreferenced`).
     #[error("connection unreferenced")]
     Unreferenced,
+    /// The peer kept asking for replies (pings) while not reading them: the FlowTransport
+    /// traffic it caused reached [`max_pending_output`](super::ConnectionConfig::max_pending_output)
+    /// bytes unwritten.
+    #[error("{0} bytes of transport replies wait unwritten; the peer is not reading")]
+    OutputOverflow(usize),
     /// [`Connection::close`](super::Connection::close) was called.
     #[error("connection closed locally")]
     LocalClose,
@@ -118,6 +125,7 @@ impl ConnectionError {
             ConnectionError::HandshakeTimeout(_)
             | ConnectionError::PeerClosed { .. }
             | ConnectionError::Io(_)
+            | ConnectionError::OutputOverflow(_)
             | ConnectionError::PingTimeout(_) => "connection_failed",
         }
     }
@@ -130,6 +138,11 @@ pub enum SendError<E = core::convert::Infallible> {
     /// The connection has ended.
     #[error("connection is closed")]
     Closed,
+    /// Output waiting to be written has reached
+    /// [`max_pending_output`](super::ConnectionConfig::max_pending_output): write some, then
+    /// retry. Nothing was sent.
+    #[error("too much output waits to be written")]
+    Backpressure,
     /// The frame could not be built (the payload is too large).
     #[error(transparent)]
     Frame(FrameError),

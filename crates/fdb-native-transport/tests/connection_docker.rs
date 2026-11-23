@@ -1,6 +1,11 @@
 //! Smoke tests of the connection state machine against real, disposable FDB servers started
 //! by `fdb-native-testkit`, driven over the tokio runtime adapter: the handshake, one ping
-//! exchange, and version detection. Run with `cargo nextest run --run-ignored only`.
+//! exchange, version detection, and endpoint-not-found. Run with
+//! `cargo nextest run --run-ignored only`.
+//!
+//! Each test runs against both pinned images, 7.4.10 and 8.0.1 (the version under test is
+//! part of the test), so `FDB_IMAGE`, which picks the testkit's default image, does not apply
+//! here.
 
 #![cfg(feature = "tokio")]
 
@@ -8,24 +13,29 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use fdb_native_testkit::FdbContainer;
+use fdb_native_transport::connection::TOKEN_STREAM_FLAG;
 use fdb_native_transport::runtime::{Runtime, TokioRuntime};
 use fdb_native_transport::{
     ConnectPacket, Connection, ConnectionConfig, ConnectionError, ConnectionState, Event,
 };
-use fdb_native_wire::ProtocolVersion;
+use fdb_native_wire::{ProtocolVersion, Uid};
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
 
-const IMAGE_7_4: &str = "foundationdb/foundationdb:7.4.10";
-const IMAGE_8_0: &str = "foundationdb/foundationdb:8.0.1";
+const IMAGES: [(&str, ProtocolVersion); 2] = [
+    ("foundationdb/foundationdb:7.4.10", ProtocolVersion::V7_4),
+    ("foundationdb/foundationdb:8.0.1", ProtocolVersion::V8_0),
+];
 
 /// One process-wide transport id, as the multi-version client uses.
 const TRANSPORT_ID: u64 = 0x5eed_0000_0000_0042;
 
-/// Drives a connection to `addr` until `done` holds or the connection ends (or 15 s pass).
+/// Drives a connection to `addr` in the documented order (input, drain events, write output,
+/// wait) until `hook` returns true or the connection ends (or 15 s pass). `hook` sees each
+/// event (as text) and, with `None`, the connection once per turn of the loop.
 fn drive(
     addr: SocketAddr,
     version: ProtocolVersion,
-    done: impl Fn(&Connection) -> bool,
+    mut hook: impl FnMut(&mut Connection, Option<&str>) -> bool,
 ) -> (Connection, Vec<String>) {
     let tokio = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -44,22 +54,30 @@ fn drive(
         let mut log = Vec::new();
         let mut buf = vec![0u8; 16 * 1024];
         loop {
+            // Drain.
+            while let Some(event) = conn.poll_event() {
+                let text = format!("{event:?}");
+                let closed = matches!(event, Event::Closed(_));
+                log.push(text.clone());
+                if closed || hook(&mut conn, Some(&text)) {
+                    return (conn, log);
+                }
+            }
+            if hook(&mut conn, None) {
+                return (conn, log);
+            }
+            // Write.
             let out = conn.pending_output().to_vec();
             if !out.is_empty() {
                 match stream.write_all(&out).await {
                     Ok(()) => conn.consume_output(out.len()),
-                    Err(e) => conn.io_error(e.kind(), rt.now()),
+                    Err(e) => {
+                        conn.io_error(e.kind(), rt.now());
+                        continue;
+                    }
                 }
             }
-            while let Some(event) = conn.poll_event() {
-                log.push(format!("{event:?}"));
-                if let Event::Closed(_) = event {
-                    return (conn, log);
-                }
-            }
-            if done(&conn) {
-                return (conn, log);
-            }
+            // Wait, then input.
             assert!(rt.now() < give_up, "gave up: {log:?}");
             let deadline = conn.poll_timeout().unwrap_or(give_up).min(give_up);
             enum Wake {
@@ -82,32 +100,24 @@ fn drive(
     })
 }
 
-fn handshake_and_ping(image: &str, version: ProtocolVersion) {
-    let fdb = FdbContainer::start_with_image(image).expect("container");
-    let (conn, log) = drive(fdb.address(), version, |c| c.last_ping_rtt().is_some());
-    assert_eq!(conn.state(), ConnectionState::Established, "{log:?}");
-    assert!(log[0].starts_with("Connected"), "{log:?}");
-    let peer = conn.peer().expect("peer packet");
-    assert!(peer.protocol_version.is_compatible(version));
-    assert_eq!(peer.connection_id, 1, "a server's transport id");
-    assert_eq!(peer.canonical_remote_address(), Some(fdb.address()));
-    eprintln!(
-        "{image}: server version {:#x}, ping rtt {:?}",
-        peer.protocol_version.0,
-        conn.last_ping_rtt()
-    );
-}
-
 #[test]
 #[ignore = "requires docker"]
-fn docker_handshake_and_ping_7_4() {
-    handshake_and_ping(IMAGE_7_4, ProtocolVersion::V7_4);
-}
-
-#[test]
-#[ignore = "requires docker"]
-fn docker_handshake_and_ping_8_0() {
-    handshake_and_ping(IMAGE_8_0, ProtocolVersion::V8_0);
+fn docker_handshake_and_ping() {
+    for (image, version) in IMAGES {
+        let fdb = FdbContainer::start_with_image(image).expect("container");
+        let (conn, log) = drive(fdb.address(), version, |c, _| c.last_ping_rtt().is_some());
+        assert_eq!(conn.state(), ConnectionState::Established, "{log:?}");
+        assert!(log[0].starts_with("Connected"), "{log:?}");
+        let peer = conn.peer().expect("peer packet");
+        assert!(peer.protocol_version.is_compatible(version));
+        assert_eq!(peer.connection_id, 1, "a server's transport id");
+        assert_eq!(peer.canonical_remote_address(), Some(fdb.address()));
+        eprintln!(
+            "{image}: server version {:#x}, ping rtt {:?}",
+            peer.protocol_version.0,
+            conn.last_ping_rtt()
+        );
+    }
 }
 
 /// Announcing the wrong version ends the connection with the server's version, which a
@@ -115,12 +125,14 @@ fn docker_handshake_and_ping_8_0() {
 #[test]
 #[ignore = "requires docker"]
 fn docker_version_detection() {
-    for (image, right, wrong) in [
-        (IMAGE_7_4, ProtocolVersion::V7_4, ProtocolVersion::V8_0),
-        (IMAGE_8_0, ProtocolVersion::V8_0, ProtocolVersion::V7_4),
-    ] {
+    for (image, right) in IMAGES {
+        let wrong = if right == ProtocolVersion::V7_4 {
+            ProtocolVersion::V8_0
+        } else {
+            ProtocolVersion::V7_4
+        };
         let fdb = FdbContainer::start_with_image(image).expect("container");
-        let (conn, log) = drive(fdb.address(), wrong, |_| false);
+        let (conn, log) = drive(fdb.address(), wrong, |_, _| false);
         let error = conn.error().expect("closed").clone();
         assert!(
             matches!(error, ConnectionError::Incompatible { .. }),
@@ -128,7 +140,7 @@ fn docker_version_detection() {
         );
         let detected = error.incompatible_version().unwrap();
         assert!(detected.is_compatible(right), "{image}: {detected}");
-        let (conn, log) = drive(fdb.address(), detected, |c| {
+        let (conn, log) = drive(fdb.address(), detected, |c, _| {
             c.state() == ConnectionState::Established
         });
         assert_eq!(
@@ -136,5 +148,38 @@ fn docker_version_detection() {
             ConnectionState::Established,
             "{image}: {log:?}"
         );
+    }
+}
+
+/// One well-formed frame (a complete, non-empty message) to a stream token the server does not
+/// have is answered with endpoint-not-found carrying that token. The server only looks the
+/// token up; it never parses the payload.
+#[test]
+#[ignore = "requires docker"]
+fn docker_unknown_stream_token_is_reported() {
+    for (image, version) in IMAGES {
+        let fdb = FdbContainer::start_with_image(image).expect("container");
+        let token = Uid::new(
+            0x5eed_1234_5678_9a00 | TOKEN_STREAM_FLAG,
+            0xfeed_0000_dead_0001,
+        );
+        let payload = fdb_native_wire::encode(&Uid::new(1, 2)).unwrap();
+        let mut sent = false;
+        let expected = format!("{:?}", Event::EndpointNotFound { token });
+        let (conn, log) = drive(fdb.address(), version, |c, event| match event {
+            Some(e) if e.starts_with("Connected") && !sent => {
+                c.send(token, &payload).expect("send");
+                sent = true;
+                false
+            }
+            Some(e) => e == expected,
+            None => false,
+        });
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Established,
+            "{image}: {log:?}"
+        );
+        assert_eq!(log.last(), Some(&expected), "{image}: {log:?}");
     }
 }

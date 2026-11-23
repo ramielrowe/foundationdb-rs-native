@@ -4,8 +4,13 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
+use fdb_native_wire::ProtocolVersion;
+
 use crate::ConnectPacket;
 use crate::framing::DEFAULT_PACKET_LIMIT;
+
+/// The default [`ConnectionConfig::max_pending_output`]: 4 MiB.
+pub const DEFAULT_MAX_PENDING_OUTPUT: usize = 4 << 20;
 
 /// The connection monitor's timing: FlowTransport's `connectionMonitor` knobs
 /// (`flow/Knobs.cpp`). The defaults are the non-simulation values, identical on 7.4 and 8.0:
@@ -77,8 +82,9 @@ impl Default for MonitorConfig {
 pub struct ConnectionConfig {
     /// The ConnectPacket this side sends. Its protocol version is the version announced, and
     /// the only one the peer's must be [compatible](fdb_native_wire::ProtocolVersion::is_compatible)
-    /// with. Use [`ConnectPacket::multi_version_client`] with one process-wide id (see the
-    /// [module documentation](super#connection-ids)).
+    /// with. Use [`ConnectPacket::process_multi_version_client`] (one id for the whole process;
+    /// see the [module documentation](super#connection-ids)), as
+    /// [`ConnectionConfig::for_version`] does.
     pub local: ConnectPacket,
     /// Whether the connection is TLS: frames then carry no checksum
     /// ([`Checksum::for_tls`](crate::Checksum::for_tls)). It must be the TLS flag of the
@@ -98,12 +104,29 @@ pub struct ConnectionConfig {
     pub handshake_timeout: Duration,
     /// The connection monitor's timing.
     pub monitor: MonitorConfig,
+    /// How much output may wait to be written (including frames held before the handshake)
+    /// before the connection pushes back. See the [module documentation](super#sending):
+    /// at or above it [`send`](super::Connection::send) refuses with
+    /// [`SendError::Backpressure`](super::SendError::Backpressure) and endpoint-not-found
+    /// notices are no longer sent, and ping replies the peer asks for while its earlier
+    /// FlowTransport traffic (ping replies and notices) still waits unwritten above it end
+    /// the connection ([`OutputOverflow`](super::ConnectionError::OutputOverflow)). A single
+    /// frame is accepted whatever its size when the output is below the limit, so the limit
+    /// need not be as large as [`max_packet_len`](Self::max_packet_len). Default
+    /// [`DEFAULT_MAX_PENDING_OUTPUT`] (4 MiB). FDB has no such limit.
+    pub max_pending_output: usize,
     /// Seed of the connection's random numbers (the jitter and the reply tokens of its pings).
     /// [`ConnectionConfig::new`] draws one; set it for a reproducible run.
     pub seed: u64,
 }
 
 impl ConnectionConfig {
+    /// A connection announcing `version` with this process's transport id
+    /// ([`ConnectPacket::process_multi_version_client`]): what a client normally uses.
+    pub fn for_version(version: ProtocolVersion, tls: bool) -> ConnectionConfig {
+        ConnectionConfig::new(ConnectPacket::process_multi_version_client(version), tls)
+    }
+
     /// A connection that sends `local` first, over TLS or not, with FDB's defaults and a random
     /// seed.
     pub fn new(local: ConnectPacket, tls: bool) -> ConnectionConfig {
@@ -114,6 +137,7 @@ impl ConnectionConfig {
             max_packet_len: DEFAULT_PACKET_LIMIT,
             handshake_timeout: Duration::from_secs(3),
             monitor: MonitorConfig::FDB_DEFAULT,
+            max_pending_output: DEFAULT_MAX_PENDING_OUTPUT,
             seed: RandomState::new().build_hasher().finish(),
         }
     }

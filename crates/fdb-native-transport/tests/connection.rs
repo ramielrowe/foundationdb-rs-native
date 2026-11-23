@@ -119,7 +119,7 @@ impl Server {
             match ConnectPacket::decode(self.decoder.peek()) {
                 Ok((packet, n)) => {
                     self.hello = Some(packet);
-                    self.decoder.consume(n);
+                    self.decoder.consume(n).expect("handshake prefix");
                 }
                 Err(_) => return Vec::new(),
             }
@@ -665,7 +665,7 @@ fn framing_errors_end_the_connection_after_the_good_frames() {
         }
     }
 
-    // A frame with a checksum on a TLS connection is misread, as FDB would misread it.
+    // On a TLS connection frames carry no checksum.
     let (mut conn, _) = connected(ProtocolVersion::V8_0, true);
     conn.register(token);
     conn.recv(&frame(true, token, b"tls"), t(20));
@@ -846,7 +846,7 @@ fn an_outstanding_reply_or_recent_data_keeps_a_connection() {
 #[test]
 fn an_unreferenced_connection_is_closed() {
     let (mut conn, mut server) = connected(ProtocolVersion::V7_4, false);
-    conn.set_referenced(false);
+    conn.set_referenced(false, t(10));
     let (at, error) = run_pings(&mut conn, &mut server, t(10_000), |_, _| {}).expect("closed");
     assert_eq!(error, ConnectionError::Unreferenced);
     assert!(error.is_clean());
@@ -862,8 +862,7 @@ fn dropping_the_reference_resets_a_ping() {
     take_ping(&mut conn, &mut server, t(2020));
     // Still referenced: nothing. Unreferenced while the ping is out, 2 s after the last
     // data: the check runs at once (FDB's resetPing).
-    conn.recv(&[], t(2500));
-    conn.set_referenced(false);
+    conn.set_referenced(false, t(2500));
     assert_eq!(
         events(&mut conn),
         vec![Ev::Closed(ConnectionError::Unreferenced)]
@@ -907,6 +906,7 @@ fn run_split(tls: bool, cuts: &[usize]) -> (Vec<Ev>, Vec<u8>) {
         let n = chunk.len().min(buf.len());
         buf[..n].copy_from_slice(&chunk[..n]);
         conn.recv_commit(n, t(1));
+        got.extend(events(&mut conn));
         conn.recv(&chunk[n..], t(1));
         got.extend(events(&mut conn));
         output.extend_from_slice(conn.pending_output());
@@ -950,4 +950,276 @@ fn ping_request_type_round_trips() {
         fdb_native_wire::decode::<PingRequest>(&bytes).unwrap(),
         request
     );
+}
+
+#[test]
+fn dropping_the_reference_while_waiting_takes_effect_after_the_next_reply() {
+    let (mut conn, mut server) = connected(ProtocolVersion::V7_4, false);
+    let ping = take_ping(&mut conn, &mut server, t(1010));
+    reply_to_ping(&mut conn, ping, false, t(1020));
+    // Waiting for the next ping (due at 2020), more than 2 s after the last data: FDB's
+    // resetPing is only watched while a ping is out, so nothing happens yet.
+    conn.set_referenced(false, t(2015));
+    assert_eq!(events(&mut conn), vec![]);
+    assert_eq!(conn.state(), ConnectionState::Established);
+    let ping = take_ping(&mut conn, &mut server, t(2020));
+    conn.recv(
+        &frame(false, ping, &fixture("release-7.4", "ping_reply").0),
+        t(2030),
+    );
+    assert_eq!(
+        events(&mut conn),
+        vec![Ev::Closed(ConnectionError::Unreferenced)]
+    );
+}
+
+// ---- review findings: bounds, drain discipline, file identifiers ----------------------------
+
+fn small_output(cap: usize) -> (Connection, Server) {
+    let mut c = config(ProtocolVersion::V7_4, false);
+    c.max_pending_output = cap;
+    let mut conn = Connection::new(c, t(0));
+    let mut server = Server::new(false);
+    server.read(&mut conn);
+    conn.recv(&server_hello(ProtocolVersion::V7_4), t(1));
+    events(&mut conn);
+    (conn, server)
+}
+
+#[test]
+fn an_unknown_stream_flood_does_not_grow_the_output_past_the_cap() {
+    // 29-byte frames to an unknown stream token, from a peer that never reads: each would be
+    // answered by a 56-byte endpoint-not-found notice.
+    let cap = 64 * 1024;
+    let (mut conn, _) = small_output(cap);
+    let one = frame(false, Uid::new(0x11, 5), b"x");
+    assert_eq!(one.len(), 29);
+    let mut reported = 0;
+    let mut unreported = 0;
+    for _ in 0..100_000 {
+        conn.recv(&one, t(2));
+        for e in events(&mut conn) {
+            match e {
+                Ev::Unknown(_, true) => reported += 1,
+                Ev::Unknown(_, false) => unreported += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(conn.state(), ConnectionState::Established);
+    assert!(
+        conn.pending_output().len() < cap + 128,
+        "{}",
+        conn.pending_output().len()
+    );
+    assert!(reported > 0 && unreported > 0, "{reported} {unreported}");
+    // Writing the output lets notices flow again.
+    let len = conn.pending_output().len();
+    conn.consume_output(len);
+    conn.recv(&one, t(3));
+    assert_eq!(
+        events(&mut conn),
+        vec![Ev::Unknown(Uid::new(0x11, 5), true)]
+    );
+}
+
+#[test]
+fn a_ping_flood_from_a_peer_that_does_not_read_ends_the_connection() {
+    let cap = 16 * 1024;
+    let (mut conn, _) = small_output(cap);
+    let (ping, _) = ping_fixture("release-7.4");
+    let one = frame(false, well_known::PING_PACKET, &ping);
+    let mut closed = None;
+    for _ in 0..10_000 {
+        conn.recv(&one, t(2));
+        if let Some(Ev::Closed(e)) = events(&mut conn).pop() {
+            closed = Some(e);
+            break;
+        }
+    }
+    let error = closed.expect("closed");
+    assert!(
+        matches!(error, ConnectionError::OutputOverflow(n) if n >= cap),
+        "{error:?}"
+    );
+    assert_eq!(error.fdb_error(), "connection_failed");
+}
+
+#[test]
+fn a_ping_flood_from_a_peer_that_reads_is_fine() {
+    let (mut conn, _) = small_output(16 * 1024);
+    let (ping, _) = ping_fixture("release-7.4");
+    let one = frame(false, well_known::PING_PACKET, &ping);
+    for _ in 0..10_000 {
+        conn.recv(&one, t(2));
+        assert_eq!(events(&mut conn), vec![]);
+        let len = conn.pending_output().len();
+        conn.consume_output(len);
+    }
+    assert_eq!(conn.state(), ConnectionState::Established);
+}
+
+#[test]
+fn sends_push_back_at_the_cap() {
+    let cap = 1000;
+    let (mut conn, mut server) = small_output(cap);
+    // Below the cap a frame of any size is accepted, even one larger than the cap.
+    conn.send(Uid::new(2, 2), &[1; 5000]).unwrap();
+    assert_eq!(
+        conn.send(Uid::new(2, 2), b"x"),
+        Err(SendError::Backpressure)
+    );
+    assert_eq!(
+        conn.send_message(Uid::new(2, 2), &Uid::new(1, 1)),
+        Err(SendError::Backpressure)
+    );
+    assert_eq!(
+        conn.send_with(Uid::new(2, 2), |_| Ok::<(), ()>(())),
+        Err(SendError::Backpressure)
+    );
+    // Our own pings still go out.
+    conn.handle_timeout(t(1001));
+    let frames = server.read(&mut conn);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1].token, well_known::PING_PACKET);
+    // Once written, sends are accepted again.
+    conn.send(Uid::new(2, 2), b"x").unwrap();
+
+    // Frames held before the handshake count too.
+    let mut c = config(ProtocolVersion::V7_4, false);
+    c.max_pending_output = 100;
+    let mut early = Connection::new(c, t(0));
+    let len = early.pending_output().len();
+    early.consume_output(len);
+    early.send(Uid::new(2, 2), &[0; 100]).unwrap();
+    assert_eq!(
+        early.send(Uid::new(2, 2), b"x"),
+        Err(SendError::Backpressure)
+    );
+}
+
+#[test]
+fn recv_buf_gives_no_room_until_events_are_drained() {
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    let token = Uid::new(0x20, 1);
+    conn.register(token);
+    let two = [frame(false, token, b"a"), frame(false, token, b"b")].concat();
+    let buf = conn.recv_buf(4096);
+    buf[..two.len()].copy_from_slice(&two);
+    conn.recv_commit(two.len(), t(20));
+    assert!(conn.has_undrained_input());
+    assert!(conn.recv_buf(4096).is_empty());
+    assert!(matches!(conn.poll_event(), Some(Event::Frame(_))));
+    // One frame is still there.
+    assert!(conn.has_undrained_input());
+    assert!(conn.recv_buf(4096).is_empty());
+    assert!(matches!(conn.poll_event(), Some(Event::Frame(_))));
+    assert_eq!(conn.poll_event(), None);
+    assert!(!conn.has_undrained_input());
+    assert!(!conn.recv_buf(4096).is_empty());
+    // A partial frame is not undrained input.
+    let partial = frame(false, token, b"c");
+    conn.recv_commit(0, t(21));
+    let buf = conn.recv_buf(4096);
+    buf[..5].copy_from_slice(&partial[..5]);
+    conn.recv_commit(5, t(21));
+    assert!(!conn.has_undrained_input());
+    // The Connected event counts too.
+    let mut fresh = Connection::new(config(ProtocolVersion::V7_4, false), t(0));
+    fresh.recv(&server_hello(ProtocolVersion::V7_4), t(1));
+    assert!(fresh.has_undrained_input());
+    assert!(fresh.recv_buf(4096).is_empty());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "not drained")]
+fn feeding_an_undrained_connection_panics_in_debug_builds() {
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    conn.recv(&frame(false, Uid::new(0x20, 1), b"a"), t(20));
+    conn.recv(&frame(false, Uid::new(0x20, 1), b"b"), t(21));
+}
+
+#[test]
+fn recv_commit_counts_only_the_room_given() {
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    let before = conn.bytes_received();
+    let room = conn.recv_buf(16).len();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.recv_commit(room + 1000, t(20));
+    }));
+    if cfg!(debug_assertions) {
+        assert!(result.is_err(), "a commit past the room is a bug");
+    } else {
+        assert_eq!(conn.bytes_received() - before, room as u64);
+    }
+}
+
+#[test]
+fn empty_payloads_end_the_connection() {
+    for token in [
+        Uid::new(0x20, 1),
+        Uid::new(0x11, 5),
+        well_known::PING_PACKET,
+    ] {
+        let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+        conn.register(Uid::new(0x20, 1));
+        conn.recv(&frame(false, token, b""), t(20));
+        let got = events(&mut conn);
+        assert!(
+            matches!(&got[..], [Ev::Closed(ConnectionError::MalformedMessage { token: t, .. })] if *t == token),
+            "{got:?}"
+        );
+        assert!(conn.pending_output().is_empty());
+    }
+}
+
+#[test]
+fn file_identifiers_are_checked() {
+    // A ping whose payload is a well-formed message with another type's identifier.
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    let wrong = fdb_native_wire::encode(&ReplyPromise::<Void>::new(Uid::new(1, 2))).unwrap();
+    conn.recv(&frame(false, well_known::PING_PACKET, &wrong), t(20));
+    let got = events(&mut conn);
+    assert!(
+        matches!(
+            &got[..],
+            [Ev::Closed(ConnectionError::MalformedMessage { .. })]
+        ),
+        "{got:?}"
+    );
+    // An endpoint-not-found notice carrying a ping reply.
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    let reply = fixture("release-7.4", "ping_reply").0;
+    conn.recv(&frame(false, well_known::ENDPOINT_NOT_FOUND, &reply), t(20));
+    let got = events(&mut conn);
+    assert!(
+        matches!(
+            &got[..],
+            [Ev::Closed(ConnectionError::MalformedMessage { .. })]
+        ),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn the_output_buffer_is_released_when_emptied() {
+    let (mut conn, mut server) = connected(ProtocolVersion::V7_4, false);
+    conn.send(Uid::new(2, 2), &vec![0; 1 << 20]).unwrap();
+    assert_eq!(server.read(&mut conn).len(), 1);
+    // A small frame afterwards does not sit in the megabyte buffer.
+    conn.send(Uid::new(2, 2), b"x").unwrap();
+    assert!(conn.pending_output().len() < 100);
+}
+
+#[test]
+fn the_process_transport_id_is_shared() {
+    let a = ConnectionConfig::for_version(ProtocolVersion::V7_4, false);
+    let b = ConnectionConfig::for_version(ProtocolVersion::V8_0, true);
+    assert_eq!(a.local.connection_id, b.local.connection_id);
+    assert_eq!(
+        a.local.connection_id,
+        fdb_native_transport::process_transport_id()
+    );
+    assert!(a.local.is_multi_version());
 }

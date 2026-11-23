@@ -1,4 +1,7 @@
 //! FlowTransport's own messages and well-known tokens.
+//!
+//! Citations `7.4:N` are lines of `fdbrpc/FlowTransport.actor.cpp` on `release-7.4` and `8.0:N`
+//! of `fdbrpc/FlowTransport.cpp` on `release-8.0`, unless another file is named.
 
 use fdb_native_wire::{EnsureTable, ErrorOr, ReplyPromise, Uid, Void, Wire};
 
@@ -20,7 +23,7 @@ pub mod well_known {
 
     /// Whether `token` is a well-known token (its first half is `-1`). C++ never answers a
     /// packet for an unknown well-known token with endpoint-not-found
-    /// (`destination.token.first() != -1`, 7.4:1303, 8.0:1376).
+    /// (`destination.token.first() != -1`, `deliver`, 7.4:1303, 8.0:1376).
     pub const fn is_well_known(token: Uid) -> bool {
         token.first == u64::MAX
     }
@@ -86,15 +89,15 @@ pub mod well_known {
     pub const RESERVED_COUNT: u32 = 25;
 }
 
-/// `TOKEN_STREAM_FLAG` (`FlowTransport.cpp`, 7.4:75, 8.0:99): set in the first half of a
-/// token that names a stream (a `RequestStream` or `PromiseStream` endpoint), clear for a
+/// `TOKEN_STREAM_FLAG` (`FlowTransport.actor.cpp` 7.4:75, `FlowTransport.cpp` 8.0:99): set in
+/// the first half of a token that names a stream (a `RequestStream` or `PromiseStream` endpoint), clear for a
 /// single reply (`ReplyPromise`, `FlowTransport::addEndpoint`, 7.4:2237-2240,
 /// 8.0:2376-2379). Only a packet for an unknown *stream* token is answered with
 /// endpoint-not-found.
 pub const TOKEN_STREAM_FLAG: u64 = 1;
 
-/// FlowTransport's `PingRequest` (`FlowTransport.cpp`, 7.4:238-246, 8.0:341-349; file identifier
-/// 4707015, `serializer(ar, reply)`), the same on both releases. Each side's connection monitor
+/// FlowTransport's `PingRequest` (`FlowTransport.actor.cpp` 7.4:238-246, `FlowTransport.cpp`
+/// 8.0:341-349; file identifier 4707015, `serializer(ar, reply)`), the same on both releases. Each side's connection monitor
 /// sends one to [`well_known::PING_PACKET`] and the receiver answers with a [`PingReply`] to
 /// `reply`'s token (`PingReceiver::receive`: `req.reply.send(Void())`, 7.4:255, 8.0:358).
 ///
