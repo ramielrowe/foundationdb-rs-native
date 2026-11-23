@@ -1,4 +1,4 @@
-error: unknown fdb attribute; expected `file_identifier = N`, `struct` or `crate = "path"`
+error: unknown fdb attribute; expected `file_identifier = N`, `struct`, `absent = "default"` or `crate = "path"`
  --> tests/ui/unknown_attributes.rs:4:7
   |
 4 | #[fdb(ensure_table)]

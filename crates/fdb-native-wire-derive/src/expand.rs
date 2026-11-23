@@ -19,6 +19,8 @@ struct Cx<'a> {
     krate: Path,
     name: &'a Ident,
     generics: &'a Generics,
+    /// `absent = "default"` (the span of `absent`): `absent()` is `Default::default()`.
+    absent_default: Option<Span>,
 }
 
 struct Field<'a> {
@@ -39,6 +41,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
         krate,
         name: &input.ident,
         generics: &input.generics,
+        absent_default: attrs.absent_default,
     };
     let body = match &input.data {
         Data::Struct(s) => {
@@ -54,6 +57,14 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
                 return Err(Error::new(
                     span,
                     "`#[fdb(struct)]` only applies to structs; an enum derives a union",
+                ));
+            }
+            if let Some(span) = attrs.absent_default {
+                return Err(Error::new(
+                    span,
+                    "`absent = \"default\"` applies to tables and `#[fdb(struct)]`s; a union's \
+                     absent value is its first alternative's (C++ `std::variant{}` \
+                     default-constructs it), so put `absent = \"default\"` on that alternative",
                 ));
             }
             expand_union(&cx, e)?
@@ -203,7 +214,7 @@ fn expand_table(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         }
     };
 
-    let absent = absent_inits(cx, fields);
+    let absent = absent_body(cx, fields);
     let wire = impl_wire(cx, &[], quote!(#krate::Shape::Table), None);
     let (encode_generics, decode_generics) = codec_bounds(cx, fields);
     let name = cx.name;
@@ -226,7 +237,7 @@ fn expand_table(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         #[automatically_derived]
         impl #decode_impl_g #krate::Decode<#de> for #name #ty_g #decode_generics {
             fn absent() -> Self {
-                Self { #(#absent),* }
+                #absent
             }
 
             fn decode_object(
@@ -321,7 +332,7 @@ fn expand_struct(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         }
     }
 
-    let absent = absent_inits(cx, fields);
+    let absent = absent_body(cx, fields);
     let (encode_generics, decode_generics) = codec_bounds(cx, fields);
     let name = cx.name;
     let (impl_g, ty_g, _) = cx.generics.split_for_impl();
@@ -347,7 +358,7 @@ fn expand_struct(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         #[automatically_derived]
         impl #decode_impl_g #krate::Decode<#de> for #name #ty_g #decode_generics {
             fn absent() -> Self {
-                Self { #(#absent),* }
+                #absent
             }
 
             fn decode_inline(
@@ -561,6 +572,19 @@ fn default_init(member: &Member, ty: &Type) -> TokenStream {
     }
 }
 
+/// The body of `Decode::absent()` of a table or struct: `Default::default()` with
+/// `absent = "default"`, otherwise every field's own absent value.
+fn absent_body(cx: &Cx<'_>, fields: &[Field<'_>]) -> TokenStream {
+    match cx.absent_default {
+        // Spanned at the attribute, so a missing `Default` impl is reported there.
+        Some(span) => quote_spanned!(span=> <Self as ::core::default::Default>::default()),
+        None => {
+            let inits = absent_inits(cx, fields);
+            quote!(Self { #(#inits),* })
+        }
+    }
+}
+
 fn absent_inits(cx: &Cx<'_>, fields: &[Field<'_>]) -> Vec<TokenStream> {
     let krate = &cx.krate;
     let de = de_lifetime();
@@ -593,13 +617,24 @@ fn codec_bounds(cx: &Cx<'_>, fields: &[Field<'_>]) -> (MaybeWhere, MaybeWhere) {
         .map(|f| f.ty)
         .collect();
     let encode = bounds(cx, &[(&serialized, quote!(#krate::Encode))]);
-    let decode = bounds(
+    let mut decode = bounds(
         cx,
         &[
             (&serialized, quote!(#krate::Decode<#de>)),
             (&defaulted, quote!(::core::default::Default)),
         ],
     );
+    // `absent = "default"` on a generic type needs the `Default` impl to exist for the
+    // parameters in use (a non-generic type reports a missing impl at the attribute).
+    if cx.absent_default.is_some()
+        && (cx.generics.type_params().next().is_some()
+            || cx.generics.const_params().next().is_some())
+    {
+        let name = cx.name;
+        let (_, ty_g, _) = cx.generics.split_for_impl();
+        let predicate: WherePredicate = parse_quote!(#name #ty_g: ::core::default::Default);
+        decode.0.predicates.push(predicate);
+    }
     (encode, decode)
 }
 

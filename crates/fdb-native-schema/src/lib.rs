@@ -48,6 +48,19 @@
 //! `ClientTagThrottleLimits`, which travels as a duration relative to the sender's clock
 //! ([`domain::TagThrottleLimits::expires_at`]).
 //!
+//! # Defaults and absent tables
+//!
+//! A table that is absent from a message reads as what its C++ default constructor builds
+//! (`LoadMember` assigns `T{}` to a missing member), which is not always all zeros; the
+//! derive's `#[fdb(absent = "default")]` makes `absent()` the type's [`Default`]. Where the
+//! constructor sets non-zero values, `Default` now matches it: `ReadOptions` (`NORMAL`, cache
+//! on), `GetReadVersionRequest` (one transaction, `maxVersion` -1), `GetReadVersionReply`
+//! (`version` -1), `GetKeyServerLocationsRequest` (`minTenantVersion`/`legacyVersion` -2),
+//! `CommitID` (`version` -1), `OpenDatabaseCoordRequest` (`internal` true) and
+//! `ClientVersionRef` (`"Unknown"`), in both schema sets, as `GetValueReply` (`penalty` 1.0)
+//! and `TenantInfo` already did. A *present* table whose vtable lacks a scalar slot still
+//! reads zero for it. Each type's docs say what its absent value is.
+//!
 //! # Binary-format values
 //!
 //! A few values a client reads or writes are not flatbuffers messages but FDB's legacy binary

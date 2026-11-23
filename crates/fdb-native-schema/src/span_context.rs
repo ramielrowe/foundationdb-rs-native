@@ -43,7 +43,8 @@ impl<'de> Decode<'de> for TraceFlags {
 /// It has both wire forms, identical on 7.4 and 8.0: in the binary format (the
 /// `SPAN_PARENT` option value, see [`SpanContext::to_option_value`]) it is 25 bytes; in a
 /// flatbuffers message (the `spanContext` of every request) it is a table of those three
-/// fields. [`Default`] is `SpanContext()`: all zero, unsampled.
+/// fields. [`Default`] is `SpanContext()`: all zero, unsampled; so is an absent table
+/// (`SpanContext() : traceID(), spanID(0), m_Flags(unsampled)`, 7.4 and 8.0).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Wire)]
 pub struct SpanContext {
     /// `traceID`.

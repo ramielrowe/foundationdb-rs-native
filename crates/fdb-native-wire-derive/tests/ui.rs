@@ -7,6 +7,7 @@
 #[test]
 fn derive_errors() {
     let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/absent.rs");
     t.compile_fail("tests/ui/field_attributes.rs");
     t.compile_fail("tests/ui/file_identifier.rs");
     t.compile_fail("tests/ui/unions.rs");
@@ -19,5 +20,9 @@ fn derive_errors() {
 /// is what CI tests with.
 #[test]
 fn const_evaluation_errors() {
-    trybuild::TestCases::new().compile_fail("tests/ui/const_checks.rs");
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/const_checks.rs");
+    // A trait-bound error from rustc, worded by the compiler (and with compiler-written
+    // help), so also a current-stable snapshot.
+    t.compile_fail("tests/ui/absent_without_default.rs");
 }
