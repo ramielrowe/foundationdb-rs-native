@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "name": "length_15_checksum",
+  "group": "negative",
+  "kind": "negative",
+  "description": "A frame whose length (15) is smaller than a token (16).",
+  "checksum_enabled": true,
+  "size": 27,
+  "bytes": "0f000000b9aa7938810ed5e15a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "length": 15,
+  "error": "too_short",
+  "packet_limit": 104857600
+}

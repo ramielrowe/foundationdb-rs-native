@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "raw_1_byte_nochecksum",
+  "group": "raw",
+  "kind": "positive",
+  "description": "A one-byte payload.",
+  "checksum_enabled": false,
+  "start_offset": 0,
+  "segments": [21],
+  "size": 21,
+  "bytes": "11000000efcdab89674523011032547698badcfe07",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 17,
+      "checksum": null,
+      "token": {
+        "first": 81985529216486895,
+        "second": 18364758544493064720
+      },
+      "payload_len": 1,
+      "payload_pattern": {
+        "mul": 31,
+        "add": 7
+      }
+    }
+  ]
+}

@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 fdb-native-wire.workspace = true
 thiserror = "2.0.21"
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

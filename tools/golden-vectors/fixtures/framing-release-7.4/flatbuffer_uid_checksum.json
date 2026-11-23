@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "name": "flatbuffer_uid_checksum",
+  "group": "flatbuffer",
+  "kind": "positive",
+  "description": "A real flatbuffers message: the UID (1, 2).",
+  "checksum_enabled": true,
+  "start_offset": 0,
+  "segments": [68],
+  "size": 68,
+  "bytes": "380000009872b7cc66cba654ffffffffffffffff0100000000000000140000005bfeed000000000000000600140004000600000001000000000000000200000000000000",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 56,
+      "checksum": 6099786387701592728,
+      "token": {
+        "first": 18446744073709551615,
+        "second": 1
+      },
+      "payload_len": 40,
+      "payload_hex": "140000005bfeed000000000000000600140004000600000001000000000000000200000000000000"
+    }
+  ]
+}

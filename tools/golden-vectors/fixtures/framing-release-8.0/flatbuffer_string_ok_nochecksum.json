@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "name": "flatbuffer_string_ok_nochecksum",
+  "group": "flatbuffer",
+  "kind": "positive",
+  "description": "A real flatbuffers message (ObjectWriter through PacketWriter): the StringRef \"ok\".",
+  "checksum_enabled": false,
+  "start_offset": 0,
+  "segments": [52],
+  "size": 52,
+  "bytes": "30000000efcdab89674523011032547698badcfe100000004bf4ca0000000600080004000600000004000000020000006f6b0000",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 48,
+      "checksum": null,
+      "token": {
+        "first": 81985529216486895,
+        "second": 18364758544493064720
+      },
+      "payload_len": 32,
+      "payload_hex": "100000004bf4ca0000000600080004000600000004000000020000006f6b0000"
+    }
+  ]
+}
