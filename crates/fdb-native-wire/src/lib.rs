@@ -79,8 +79,25 @@
 //!
 //! The crate implements them for integers, floats, `bool`, [`Uid`], tuples (FDB
 //! `std::tuple` structs), `&[u8]` (zero-copy strings), `Vec<T>`, `[T]` and `[T; N]`
-//! (vectors, `std::array`), `Option<T>` (`Optional`), [`ErrorOr<T>`] (`Result<T,
-//! FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`], plus `&T` and `Box<T>`.
+//! (vectors, `std::array`), `BTreeMap`/`BTreeSet`/`HashMap`/`HashSet` (`std::map`,
+//! `std::set`, `std::unordered_map`, `std::unordered_set`), `Option<T>` (`Optional`),
+//! [`ErrorOr<T>`] (`Result<T, FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`],
+//! plus `&T` and `Box<T>`.
+//!
+//! **Maps and sets** are vectors on the wire: a set is a vector of its keys, a map a vector
+//! of two-slot pair tables. They decode like C++ builds them, inserting in wire order, so
+//! the first of several entries with one key wins and the wire order need not be sorted.
+//! Only `HashSet` has a [file identifier](FileIdentified) (code 6), as in FDB. They are
+//! encoded straight from the container's iterator with [`Writer::vector_iter`], which a
+//! custom collection can use too.
+//!
+//! **Lazy vectors.** A [`VectorView`] field decodes only its vector's header and reads the
+//! elements as they are asked for (by index or with an iterator), under the same checks and
+//! the same shared [work limit](Reader#work-limit) as an eager `Vec`; this is how to walk a
+//! large reply without materializing it. For a collection of your own,
+//! [`Reader::vector_header`] and [`Decode::decode_element`] give the same element-wise
+//! access, and [`Reader::blob_range`] the position of a string in the message for owned
+//! zero-copy types (such as `bytes::Bytes` slices of a packet).
 //!
 //! **Tables** are hand-written for now (a `#[derive]` comes later) and are mechanical: one
 //! [`TableWriter::field`] / [`TableReader::field`] call per `serializer(ar, ...)` argument,
@@ -147,21 +164,24 @@
 #![warn(missing_docs)]
 
 mod codec;
+mod collections;
 mod error;
 mod file_identifier;
 mod protocol_version;
 mod reader;
 mod shape;
 mod types;
+mod view;
 mod writer;
 
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
 pub use error::{DecodeError, EncodeError, StrictCheck};
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
-pub use reader::{MAX_DEPTH, Reader, TableReader};
+pub use reader::{MAX_DEPTH, Reader, TableReader, VectorHeader};
 pub use shape::Shape;
 pub use types::{EnsureTable, ErrorOr, FdbError, Uid, Void};
+pub use view::{VectorIter, VectorView};
 pub use writer::{ObjectRef, TableWriter, UnionRef, Writer};
 
 /// Encodes `value` as the only member of a message with `T`'s file identifier.

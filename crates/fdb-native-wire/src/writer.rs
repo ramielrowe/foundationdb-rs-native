@@ -1,7 +1,7 @@
 //! The encoder: a back-to-front message builder.
 
 use crate::shape::right_align;
-use crate::{Encode, EncodeError, ProtocolVersion, Shape};
+use crate::{Encode, EncodeError, ProtocolVersion, Shape, Wire};
 
 /// Largest message the writer produces (offsets and soffsets must fit an `i32`).
 const MAX_MESSAGE: usize = i32::MAX as usize;
@@ -187,31 +187,99 @@ impl Writer {
     /// (scalars, structs) or as `u32` offsets (tables, strings, vectors). The elements
     /// start at a multiple of max(4, element alignment).
     pub fn vector<T: Encode>(&mut self, items: &[T]) -> Result<ObjectRef, EncodeError> {
-        if items.is_empty() {
-            return self.empty_vector();
+        self.vector_counted(items.len(), items)
+    }
+
+    /// Writes a vector of non-union elements from an iterator of known length, without
+    /// collecting the elements first: the wire form of [`Writer::vector`]. This is what the
+    /// collection impls (`BTreeMap`, `HashSet`, ...) use, and what a custom collection
+    /// uses to encode itself from its own iterator.
+    ///
+    /// The items may be values or references (`&T` is [`Encode`] wherever `T` is); an
+    /// item that is a table, string or vector is written as the iterator yields it. The
+    /// writer does remember one 8-byte reference per item of an out-of-line element (the
+    /// offsets are written after the elements, as the writer works back to front).
+    ///
+    /// ```
+    /// use fdb_native_wire::{
+    ///     encode_with_identifier, Encode, EncodeError, ObjectRef, Reader, Shape, Wire, Writer,
+    /// };
+    ///
+    /// /// The first `n` multiples of 10, written without building a `Vec`.
+    /// struct Tens(u32);
+    ///
+    /// impl Wire for Tens {
+    ///     const SHAPE: Shape = Shape::Object;
+    /// }
+    ///
+    /// impl Encode for Tens {
+    ///     fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+    ///         w.vector_iter((0..self.0).map(|i| i * 10))
+    ///     }
+    /// }
+    ///
+    /// let bytes = encode_with_identifier(&Tens(3), 1)?;
+    /// assert_eq!(Reader::new(&bytes)?.decode_root::<Vec<u32>>()?, [0, 10, 20]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::InvalidShape`] if the iterator's `len()` was wrong (it ended early or
+    /// had more items), and the errors of [`Writer::vector`].
+    pub fn vector_iter<I>(&mut self, items: I) -> Result<ObjectRef, EncodeError>
+    where
+        I: IntoIterator,
+        I::IntoIter: ExactSizeIterator,
+        I::Item: Encode,
+    {
+        let items = items.into_iter();
+        self.vector_counted(items.len(), items)
+    }
+
+    /// Writes a vector of `count` non-union elements taken from `items`, which must yield
+    /// exactly `count` items (for an iterator that does not know its length, such as a
+    /// filtered one, whose count the caller already has). See [`Writer::vector_iter`].
+    pub fn vector_counted<I>(&mut self, count: usize, items: I) -> Result<ObjectRef, EncodeError>
+    where
+        I: IntoIterator,
+        I::Item: Encode,
+    {
+        const SHORT: EncodeError =
+            EncodeError::InvalidShape("vector iterator ended before its count");
+        const LONG: EncodeError =
+            EncodeError::InvalidShape("vector iterator has more items than its count");
+        let mut items = items.into_iter();
+        if count == 0 {
+            return match items.next() {
+                None => self.empty_vector(),
+                Some(_) => Err(LONG),
+            };
         }
-        let count = u32::try_from(items.len()).map_err(|_| EncodeError::TooLarge)?;
-        match T::SHAPE {
+        let count32 = u32::try_from(count).map_err(|_| EncodeError::TooLarge)?;
+        match <I::Item as Wire>::SHAPE {
             Shape::Inline { size, align } => {
-                let len = items.len().checked_mul(size).ok_or(EncodeError::TooLarge)?;
+                let len = count.checked_mul(size).ok_or(EncodeError::TooLarge)?;
                 self.pad_for(len, align.max(4))?;
                 let start = self.reserve(len)?;
-                for (i, item) in items.iter().enumerate() {
+                for i in 0..count {
+                    let item = items.next().ok_or(SHORT)?;
                     let at = start + i * size;
                     item.encode_inline(&mut self.buf[at..at + size])?;
                 }
             }
             Shape::Table | Shape::Object => {
                 let base = self.refs.len();
-                for item in items {
+                for _ in 0..count {
+                    let item = items.next().ok_or(SHORT)?;
                     let r = item.encode_object(self)?;
                     self.refs.push(r);
                 }
-                let len = items.len().checked_mul(4).ok_or(EncodeError::TooLarge)?;
+                let len = count.checked_mul(4).ok_or(EncodeError::TooLarge)?;
                 self.pad_for(len, 4)?;
                 let start = self.reserve(len)?;
                 let first = self.used();
-                for i in 0..items.len() {
+                for i in 0..count {
                     let target = self.refs[base + i];
                     let value = relative(first - 4 * i, target)?;
                     let at = start + 4 * i;
@@ -225,7 +293,10 @@ impl Writer {
                 ));
             }
         }
-        self.push_u32(count)
+        if items.next().is_some() {
+            return Err(LONG);
+        }
+        self.push_u32(count32)
     }
 
     /// Writes a vector of unions: returns the `vector<u8>` of tags and the vector of

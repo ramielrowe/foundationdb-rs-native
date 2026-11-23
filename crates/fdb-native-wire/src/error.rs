@@ -89,6 +89,14 @@ pub enum DecodeError {
         /// The encoded count.
         found: u32,
     },
+    /// An element index past the end of a [`VectorView`](crate::VectorView).
+    #[error("index {index} is out of range for a vector of {len} elements")]
+    IndexOutOfRange {
+        /// The index asked for.
+        index: usize,
+        /// The vector's element count.
+        len: usize,
+    },
     /// A vector of unions has its tags slot but not its offsets slot.
     #[error("union vector has a tags slot but no offsets slot")]
     UnionVectorMissingOffsets,
