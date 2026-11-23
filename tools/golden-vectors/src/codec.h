@@ -13,10 +13,10 @@
 #include "dump.h"
 #include "schema.h"
 #include "strict.h"
-#include "stubs.h"
+#include "gv_types.h"
 
 // The save context ObjectWriter passes to save_members.
-struct SaveContext {
+struct GvSaveContext {
 	std::vector<uint8_t>* out;
 	uint8_t fill;
 	uint8_t* allocate(size_t n) {
@@ -24,12 +24,13 @@ struct SaveContext {
 		return out->data();
 	}
 	void addArena(Arena&) {}
-	SaveContext& context() { return *this; }
+	GvSaveContext& context() { return *this; }
+	GV_VISITOR_EXTRAS
 };
 
 // The load context, mirroring LoadContext<ArenaObjectReader> on FDB main,
 // including its bounds checks (_ObjectReader::checkRange).
-struct LoadContext {
+struct GvLoadContext {
 	const uint8_t* begin;
 	const uint8_t* end;
 	Arena* arenaPtr;
@@ -49,7 +50,8 @@ struct LoadContext {
 		}
 	}
 	[[noreturn]] void loadFailed(const char* reason) const { throw DecodeError(reason); }
-	LoadContext& context() { return *this; }
+	GvLoadContext& context() { return *this; }
+	GV_VISITOR_EXTRAS
 };
 
 // ObjectWriter::serialize(file_identifier, items...). Encodes twice with
@@ -57,9 +59,9 @@ struct LoadContext {
 template <class... Items>
 std::vector<uint8_t> encode(FileIdentifier fid, const Items&... items) {
 	std::vector<uint8_t> a, b;
-	SaveContext ca{ &a, 0x00 };
+	GvSaveContext ca{ &a, 0x00 };
 	save_members(ca, fid, items...);
-	SaveContext cb{ &b, 0xff };
+	GvSaveContext cb{ &b, 0xff };
 	save_members(cb, fid, items...);
 	if (a != b) {
 		throw std::runtime_error("writer left uninitialized bytes in the buffer");
@@ -85,7 +87,7 @@ void decode_into(Arena& arena,
 	if (opts.checkFileIdentifier && read_file_identifier(data) != fid) {
 		throw DecodeError("file identifier mismatch");
 	}
-	LoadContext ctx{ data, data + size, &arena };
+	GvLoadContext ctx{ data, data + size, &arena };
 	load_members(data, ctx, items...);
 }
 
@@ -108,6 +110,26 @@ inline std::map<std::string, DecodableType>& registry() {
 
 template <class... Items>
 Json decode_as(const uint8_t* data, size_t size, FileIdentifier fid, const DecodeOptions& opts) {
+#ifdef GV_REAL_FDB
+	// The branch's own reader, exactly as FlowTransport runs it (ArenaObjectReader over
+	// the packet payload). It ASSERTs on a file identifier mismatch, so check that first.
+	// Release readers have no bounds checks: only feed them trusted bytes.
+	if (size < 2 * sizeof(uint32_t)) {
+		throw DecodeError("buffer too short for header");
+	}
+	if (opts.checkFileIdentifier && read_file_identifier(data) != fid) {
+		throw DecodeError("file identifier mismatch");
+	}
+	Arena arena;
+	uint8_t* buf = new (arena) uint8_t[size];
+	memcpy(buf, data, size);
+	ArenaObjectReader reader(arena, StringRef(buf, size), AssumeVersion(currentProtocolVersion()));
+	// Never destroyed: a deserialized ReplyPromise starts a networkSender, which would
+	// send broken_promise through FlowTransport when the promise is dropped.
+	auto* items = new std::tuple<Items...>();
+	std::apply([&](Items&... it) { reader.deserialize(read_file_identifier(buf), it...); }, *items);
+	return std::apply([](const Items&... it) { return dump_root(it...); }, *items);
+#else
 	// Copy into an exactly-sized heap block so sanitizers catch over-reads.
 	std::unique_ptr<uint8_t[]> buf(new uint8_t[size ? size : 1]);
 	if (size) {
@@ -117,6 +139,7 @@ Json decode_as(const uint8_t* data, size_t size, FileIdentifier fid, const Decod
 	std::tuple<Items...> items{};
 	std::apply([&](Items&... it) { decode_into(arena, buf.get(), size, fid, opts, it...); }, items);
 	return std::apply([](const Items&... it) { return dump_root(it...); }, items);
+#endif
 }
 
 template <class... Items>

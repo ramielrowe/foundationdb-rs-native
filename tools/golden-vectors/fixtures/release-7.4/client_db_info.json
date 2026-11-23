@@ -1,0 +1,945 @@
+{
+  "format_version": 1,
+  "name": "client_db_info",
+  "group": "coordinator",
+  "kind": "positive",
+  "description": "ClientDBInfo as a bare table: two GRV proxies and two commit proxies (each a request_stream endpoint: GrvProxyInterface::getConsistentReadVersion and CommitProxyInterface::commit; the other endpoints are derived with Endpoint::getAdjustedEndpoint, commit index 1 = GRV (unused), 2 = getKeyServersLocations on both branches). The first proxy of each kind has a secondary (TLS) address. 7.4 slots: (grvProxies, commitProxies, id, forward, history, tenantMode (TenantMode, a table holding mode: u32), encryptKeyProxy (Optional<EncryptKeyProxyInterface>), clusterId, clusterType, metaclusterName). 8.0 drops tenantMode, encryptKeyProxy and metaclusterName and appends nativeCdcEnabled, nativeCdcTagCount, cdcProxies, streamToCDCProxyId, so clusterId is slot 7 on 7.4 (union slots count twice) and slot 6 on 8.0.",
+  "cpp_type": "ClientDBInfo",
+  "file_identifier": 5355080,
+  "file_identifier_hex": "0x0051b648",
+  "size": 1224,
+  "bytes": "7c00000048b65100000008000900080004000600080004000a000d0004000c0008000a000d000c0004000800080010000c00040008001800140004000c000d00040008000a000c001e00470024002800040044002c00300034004500380014003c00460040000c000e000c0004000d0008000a001c001400040018006a000000040000003c000000f0b10d0000000000f1b10d000000000005c100000000000006c1000000000000f8020000cc0100009c010000500100004401000018000000000000000800000001010100040000006d657461620000004b0e0000000000004c0e000000000000600000000800000000000000e200000004000000c8000000000000000000b0e4000000000000b0e40800000000000000000100000c0000000000000000000000ec0000000c00000094110000000000002e01000008000000010000000100000a360100000400000004000000900000005c00000030000000040000004c010000180000000800000001000000060000007a6f6e652d610000060000007a6f6e65696400007401000014000000080000000100000003000000656b70000900000070726f6365737369640000009c0100001c0000000800000001000000090000006d616368696e652d31000000090000006d616368696e656964000000cc0100000c00000000000000000000000400000064636964ea010000010000000100000004000000e0010000008028a5460700000800000000000000010000000400000006020000140000000800000000000000010000003100000008000000ff2f636f6e662f7827000000666f72776172642d636f6e6e656374696f6e2d737472696e674031302e302e302e393a34353030000200000080000000040000001e020000600000000800000001010000820200000400000068020000020000000000a0c0000000000000a0c00800000000000000a00200000c00000000000000000000008c0200000c0000009411000000000000ce02000008000000010000000100000a10000000636f6d6d69742d70726f636573732d32960200008c0000000800000001000000fa02000004000000e0020000010000000000a0c0000000000000a0c004000000140300003c0000000800000001000000000300000c000000951102000000000042030000080000000200000010000000fddb0000000000000000000000000001300300000c00000094110000000000007203000008000000010000000100000a10000000636f6d6d69742d70726f636573732d3102000000800000000400000046030000600000000800000001010000aa0300000400000090030000020000000000e067000000000000e0670800000000000000c80300000c0000000000000000000000b40300000c0000009411000000000000f603000008000000010000000100000a0d0000006772762d70726f636573732d32000000be0300008c0000000800000001000000220400000400000008040000010000000000e067000000000000e067040000003c0400003c0000000800000001000000280400000c00000095110200000000006a040000080000000200000010000000fddb0000000000000000000000000001580400000c00000094110000000000009a04000008000000010000000100000a0d0000006772762d70726f636573732d31000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<ClientDBInfo>",
+        "value": [
+          {
+            "field": "grvProxies",
+            "slot": 0,
+            "type": "vector<table<GrvProxyInterface>>",
+            "value": [
+              {
+                "type": "table<GrvProxyInterface>",
+                "value": [
+                  {
+                    "field": "processId",
+                    "slot": 0,
+                    "type": "optional<bytes>",
+                    "tag": 1,
+                    "value": {
+                      "type": "bytes",
+                      "value": "6772762d70726f636573732d31"
+                    }
+                  },
+                  {
+                    "field": "provisional",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": false
+                  },
+                  {
+                    "field": "getConsistentReadVersion",
+                    "slot": 3,
+                    "type": "table<request_stream>",
+                    "value": [
+                      {
+                        "field": "endpoint",
+                        "slot": 0,
+                        "type": "table<Endpoint>",
+                        "value": [
+                          {
+                            "field": "addresses",
+                            "slot": 0,
+                            "type": "table<NetworkAddressList>",
+                            "value": [
+                              {
+                                "field": "address",
+                                "slot": 0,
+                                "type": "table<NetworkAddress>",
+                                "value": [
+                                  {
+                                    "field": "ip",
+                                    "slot": 0,
+                                    "type": "table<IPAddress>",
+                                    "value": [
+                                      {
+                                        "field": "addr",
+                                        "slot": 0,
+                                        "type": "variant<u32,array<u8,16>>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "u32",
+                                          "value": 167772161
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "field": "port",
+                                    "slot": 1,
+                                    "type": "u16",
+                                    "value": 4500
+                                  },
+                                  {
+                                    "field": "flags",
+                                    "slot": 2,
+                                    "type": "u16",
+                                    "value": 0
+                                  },
+                                  {
+                                    "field": "fromHostname",
+                                    "slot": 3,
+                                    "type": "bool",
+                                    "value": false
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "secondaryAddress",
+                                "slot": 1,
+                                "type": "optional<table<NetworkAddress>>",
+                                "tag": 1,
+                                "value": {
+                                  "type": "table<NetworkAddress>",
+                                  "value": [
+                                    {
+                                      "field": "ip",
+                                      "slot": 0,
+                                      "type": "table<IPAddress>",
+                                      "value": [
+                                        {
+                                          "field": "addr",
+                                          "slot": 0,
+                                          "type": "variant<u32,array<u8,16>>",
+                                          "tag": 2,
+                                          "value": {
+                                            "type": "array<u8,16>",
+                                            "value": [
+                                              {
+                                                "type": "u8",
+                                                "value": 253
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 219
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 1
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "field": "port",
+                                      "slot": 1,
+                                      "type": "u16",
+                                      "value": 4501
+                                    },
+                                    {
+                                      "field": "flags",
+                                      "slot": 2,
+                                      "type": "u16",
+                                      "value": 2
+                                    },
+                                    {
+                                      "field": "fromHostname",
+                                      "slot": 3,
+                                      "type": "bool",
+                                      "value": false
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          },
+                          {
+                            "field": "token",
+                            "slot": 1,
+                            "type": "uid",
+                            "value": {
+                              "first": 7484982580689764353,
+                              "second": 7484982580689764352
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "table<GrvProxyInterface>",
+                "value": [
+                  {
+                    "field": "processId",
+                    "slot": 0,
+                    "type": "optional<bytes>",
+                    "tag": 1,
+                    "value": {
+                      "type": "bytes",
+                      "value": "6772762d70726f636573732d32"
+                    }
+                  },
+                  {
+                    "field": "provisional",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": true
+                  },
+                  {
+                    "field": "getConsistentReadVersion",
+                    "slot": 3,
+                    "type": "table<request_stream>",
+                    "value": [
+                      {
+                        "field": "endpoint",
+                        "slot": 0,
+                        "type": "table<Endpoint>",
+                        "value": [
+                          {
+                            "field": "addresses",
+                            "slot": 0,
+                            "type": "table<NetworkAddressList>",
+                            "value": [
+                              {
+                                "field": "address",
+                                "slot": 0,
+                                "type": "table<NetworkAddress>",
+                                "value": [
+                                  {
+                                    "field": "ip",
+                                    "slot": 0,
+                                    "type": "table<IPAddress>",
+                                    "value": [
+                                      {
+                                        "field": "addr",
+                                        "slot": 0,
+                                        "type": "variant<u32,array<u8,16>>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "u32",
+                                          "value": 167772161
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "field": "port",
+                                    "slot": 1,
+                                    "type": "u16",
+                                    "value": 4500
+                                  },
+                                  {
+                                    "field": "flags",
+                                    "slot": 2,
+                                    "type": "u16",
+                                    "value": 0
+                                  },
+                                  {
+                                    "field": "fromHostname",
+                                    "slot": 3,
+                                    "type": "bool",
+                                    "value": false
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "secondaryAddress",
+                                "slot": 1,
+                                "type": "optional<table<NetworkAddress>>",
+                                "tag": 0,
+                                "value": null
+                              }
+                            ]
+                          },
+                          {
+                            "field": "token",
+                            "slot": 1,
+                            "type": "uid",
+                            "value": {
+                              "first": 7484982580689764354,
+                              "second": 7484982580689764352
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "commitProxies",
+            "slot": 1,
+            "type": "vector<table<CommitProxyInterface>>",
+            "value": [
+              {
+                "type": "table<CommitProxyInterface>",
+                "value": [
+                  {
+                    "field": "processId",
+                    "slot": 0,
+                    "type": "optional<bytes>",
+                    "tag": 1,
+                    "value": {
+                      "type": "bytes",
+                      "value": "636f6d6d69742d70726f636573732d31"
+                    }
+                  },
+                  {
+                    "field": "provisional",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": false
+                  },
+                  {
+                    "field": "commit",
+                    "slot": 3,
+                    "type": "table<request_stream>",
+                    "value": [
+                      {
+                        "field": "endpoint",
+                        "slot": 0,
+                        "type": "table<Endpoint>",
+                        "value": [
+                          {
+                            "field": "addresses",
+                            "slot": 0,
+                            "type": "table<NetworkAddressList>",
+                            "value": [
+                              {
+                                "field": "address",
+                                "slot": 0,
+                                "type": "table<NetworkAddress>",
+                                "value": [
+                                  {
+                                    "field": "ip",
+                                    "slot": 0,
+                                    "type": "table<IPAddress>",
+                                    "value": [
+                                      {
+                                        "field": "addr",
+                                        "slot": 0,
+                                        "type": "variant<u32,array<u8,16>>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "u32",
+                                          "value": 167772161
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "field": "port",
+                                    "slot": 1,
+                                    "type": "u16",
+                                    "value": 4500
+                                  },
+                                  {
+                                    "field": "flags",
+                                    "slot": 2,
+                                    "type": "u16",
+                                    "value": 0
+                                  },
+                                  {
+                                    "field": "fromHostname",
+                                    "slot": 3,
+                                    "type": "bool",
+                                    "value": false
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "secondaryAddress",
+                                "slot": 1,
+                                "type": "optional<table<NetworkAddress>>",
+                                "tag": 1,
+                                "value": {
+                                  "type": "table<NetworkAddress>",
+                                  "value": [
+                                    {
+                                      "field": "ip",
+                                      "slot": 0,
+                                      "type": "table<IPAddress>",
+                                      "value": [
+                                        {
+                                          "field": "addr",
+                                          "slot": 0,
+                                          "type": "variant<u32,array<u8,16>>",
+                                          "tag": 2,
+                                          "value": {
+                                            "type": "array<u8,16>",
+                                            "value": [
+                                              {
+                                                "type": "u8",
+                                                "value": 253
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 219
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 0
+                                              },
+                                              {
+                                                "type": "u8",
+                                                "value": 1
+                                              }
+                                            ]
+                                          }
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "field": "port",
+                                      "slot": 1,
+                                      "type": "u16",
+                                      "value": 4501
+                                    },
+                                    {
+                                      "field": "flags",
+                                      "slot": 2,
+                                      "type": "u16",
+                                      "value": 2
+                                    },
+                                    {
+                                      "field": "fromHostname",
+                                      "slot": 3,
+                                      "type": "bool",
+                                      "value": false
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          },
+                          {
+                            "field": "token",
+                            "slot": 1,
+                            "type": "uid",
+                            "value": {
+                              "first": 13880094051555868673,
+                              "second": 13880094051555868672
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "table<CommitProxyInterface>",
+                "value": [
+                  {
+                    "field": "processId",
+                    "slot": 0,
+                    "type": "optional<bytes>",
+                    "tag": 1,
+                    "value": {
+                      "type": "bytes",
+                      "value": "636f6d6d69742d70726f636573732d32"
+                    }
+                  },
+                  {
+                    "field": "provisional",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": true
+                  },
+                  {
+                    "field": "commit",
+                    "slot": 3,
+                    "type": "table<request_stream>",
+                    "value": [
+                      {
+                        "field": "endpoint",
+                        "slot": 0,
+                        "type": "table<Endpoint>",
+                        "value": [
+                          {
+                            "field": "addresses",
+                            "slot": 0,
+                            "type": "table<NetworkAddressList>",
+                            "value": [
+                              {
+                                "field": "address",
+                                "slot": 0,
+                                "type": "table<NetworkAddress>",
+                                "value": [
+                                  {
+                                    "field": "ip",
+                                    "slot": 0,
+                                    "type": "table<IPAddress>",
+                                    "value": [
+                                      {
+                                        "field": "addr",
+                                        "slot": 0,
+                                        "type": "variant<u32,array<u8,16>>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "u32",
+                                          "value": 167772161
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "field": "port",
+                                    "slot": 1,
+                                    "type": "u16",
+                                    "value": 4500
+                                  },
+                                  {
+                                    "field": "flags",
+                                    "slot": 2,
+                                    "type": "u16",
+                                    "value": 0
+                                  },
+                                  {
+                                    "field": "fromHostname",
+                                    "slot": 3,
+                                    "type": "bool",
+                                    "value": false
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "secondaryAddress",
+                                "slot": 1,
+                                "type": "optional<table<NetworkAddress>>",
+                                "tag": 0,
+                                "value": null
+                              }
+                            ]
+                          },
+                          {
+                            "field": "token",
+                            "slot": 1,
+                            "type": "uid",
+                            "value": {
+                              "first": 13880094051555868674,
+                              "second": 13880094051555868672
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "id",
+            "slot": 2,
+            "type": "uid",
+            "value": {
+              "first": 897520,
+              "second": 897521
+            }
+          },
+          {
+            "field": "forward",
+            "slot": 3,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "666f72776172642d636f6e6e656374696f6e2d737472696e674031302e302e302e393a34353030"
+            }
+          },
+          {
+            "field": "history",
+            "slot": 5,
+            "type": "vector<table<VersionHistory>>",
+            "value": [
+              {
+                "type": "table<VersionHistory>",
+                "value": [
+                  {
+                    "field": "mutations",
+                    "slot": 0,
+                    "type": "vector<table<MutationRef>>",
+                    "value": [
+                      {
+                        "type": "table<MutationRef>",
+                        "value": [
+                          {
+                            "field": "type",
+                            "slot": 0,
+                            "type": "u8",
+                            "value": 0
+                          },
+                          {
+                            "field": "param1",
+                            "slot": 1,
+                            "type": "bytes",
+                            "value": "ff2f636f6e662f78"
+                          },
+                          {
+                            "field": "param2",
+                            "slot": 2,
+                            "type": "bytes",
+                            "value": "31"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "field": "version",
+                    "slot": 1,
+                    "type": "i64",
+                    "value": 8000000000000
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "tenantMode",
+            "slot": 6,
+            "type": "table<TenantMode>",
+            "value": [
+              {
+                "field": "mode",
+                "slot": 0,
+                "type": "u32",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "encryptKeyProxy",
+            "slot": 7,
+            "type": "optional<table<EncryptKeyProxyInterface>>",
+            "tag": 1,
+            "value": {
+              "type": "table<EncryptKeyProxyInterface>",
+              "value": [
+                {
+                  "field": "locality",
+                  "slot": 0,
+                  "type": "table<LocalityData>",
+                  "value": [
+                    {
+                      "field": "_data",
+                      "slot": 0,
+                      "type": "vector<table<pair<bytes,optional<bytes>>>>",
+                      "value": [
+                        {
+                          "type": "table<pair<bytes,optional<bytes>>>",
+                          "value": [
+                            {
+                              "field": "first",
+                              "slot": 0,
+                              "type": "bytes",
+                              "value": "64636964"
+                            },
+                            {
+                              "field": "second",
+                              "slot": 1,
+                              "type": "optional<bytes>",
+                              "tag": 0,
+                              "value": null
+                            }
+                          ]
+                        },
+                        {
+                          "type": "table<pair<bytes,optional<bytes>>>",
+                          "value": [
+                            {
+                              "field": "first",
+                              "slot": 0,
+                              "type": "bytes",
+                              "value": "6d616368696e656964"
+                            },
+                            {
+                              "field": "second",
+                              "slot": 1,
+                              "type": "optional<bytes>",
+                              "tag": 1,
+                              "value": {
+                                "type": "bytes",
+                                "value": "6d616368696e652d31"
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "table<pair<bytes,optional<bytes>>>",
+                          "value": [
+                            {
+                              "field": "first",
+                              "slot": 0,
+                              "type": "bytes",
+                              "value": "70726f636573736964"
+                            },
+                            {
+                              "field": "second",
+                              "slot": 1,
+                              "type": "optional<bytes>",
+                              "tag": 1,
+                              "value": {
+                                "type": "bytes",
+                                "value": "656b70"
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "table<pair<bytes,optional<bytes>>>",
+                          "value": [
+                            {
+                              "field": "first",
+                              "slot": 0,
+                              "type": "bytes",
+                              "value": "7a6f6e656964"
+                            },
+                            {
+                              "field": "second",
+                              "slot": 1,
+                              "type": "optional<bytes>",
+                              "tag": 1,
+                              "value": {
+                                "type": "bytes",
+                                "value": "7a6f6e652d61"
+                              }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "field": "myId",
+                  "slot": 1,
+                  "type": "uid",
+                  "value": {
+                    "first": 3659,
+                    "second": 3660
+                  }
+                },
+                {
+                  "field": "waitFailure",
+                  "slot": 2,
+                  "type": "table<request_stream>",
+                  "value": [
+                    {
+                      "field": "endpoint",
+                      "slot": 0,
+                      "type": "table<Endpoint>",
+                      "value": [
+                        {
+                          "field": "addresses",
+                          "slot": 0,
+                          "type": "table<NetworkAddressList>",
+                          "value": [
+                            {
+                              "field": "address",
+                              "slot": 0,
+                              "type": "table<NetworkAddress>",
+                              "value": [
+                                {
+                                  "field": "ip",
+                                  "slot": 0,
+                                  "type": "table<IPAddress>",
+                                  "value": [
+                                    {
+                                      "field": "addr",
+                                      "slot": 0,
+                                      "type": "variant<u32,array<u8,16>>",
+                                      "tag": 1,
+                                      "value": {
+                                        "type": "u32",
+                                        "value": 167772161
+                                      }
+                                    }
+                                  ]
+                                },
+                                {
+                                  "field": "port",
+                                  "slot": 1,
+                                  "type": "u16",
+                                  "value": 4500
+                                },
+                                {
+                                  "field": "flags",
+                                  "slot": 2,
+                                  "type": "u16",
+                                  "value": 0
+                                },
+                                {
+                                  "field": "fromHostname",
+                                  "slot": 3,
+                                  "type": "bool",
+                                  "value": false
+                                }
+                              ]
+                            },
+                            {
+                              "field": "secondaryAddress",
+                              "slot": 1,
+                              "type": "optional<table<NetworkAddress>>",
+                              "tag": 0,
+                              "value": null
+                            }
+                          ]
+                        },
+                        {
+                          "field": "token",
+                          "slot": 1,
+                          "type": "uid",
+                          "value": {
+                            "first": 16478671036548644864,
+                            "second": 16478671036548644864
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "field": "clusterId",
+            "slot": 9,
+            "type": "uid",
+            "value": {
+              "first": 49413,
+              "second": 49414
+            }
+          },
+          {
+            "field": "clusterType",
+            "slot": 10,
+            "type": "i32",
+            "value": 0
+          },
+          {
+            "field": "metaclusterName",
+            "slot": 11,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "6d657461"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

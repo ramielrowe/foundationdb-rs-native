@@ -1,0 +1,60 @@
+{
+  "format_version": 1,
+  "name": "get_value_reply_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetValueReply as sent: ErrorOr<EnsureTable<GetValueReply>>, tag 2 (success).",
+  "cpp_type": "ErrorOr<EnsureTable<GetValueReply>>",
+  "file_identifier": 34933361,
+  "file_identifier_hex": "0x02150a71",
+  "size": 104,
+  "bytes": "30000000710a150200000000080009000800040006000600040010001700040014000c0015001000160006000800040024000000080000000200000022000000000000000000f83f000000000c0000000001010000000000090000007468652076616c7565000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetValueReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetValueReply>>",
+          "value": {
+            "type": "table<GetValueReply>",
+            "value": [
+              {
+                "field": "penalty",
+                "slot": 0,
+                "type": "f64",
+                "value": 1.5
+              },
+              {
+                "field": "error",
+                "slot": 1,
+                "type": "optional<table<Error>>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "value",
+                "slot": 3,
+                "type": "optional<bytes>",
+                "tag": 1,
+                "value": {
+                  "type": "bytes",
+                  "value": "7468652076616c7565"
+                }
+              },
+              {
+                "field": "cached",
+                "slot": 5,
+                "type": "bool",
+                "value": true
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

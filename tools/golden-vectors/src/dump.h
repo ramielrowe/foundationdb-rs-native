@@ -13,8 +13,8 @@
 #include <variant>
 #include <vector>
 
+#include "gv_types.h"
 #include "json.h"
-#include "stubs.h"
 
 // ---------------------------------------------------------------------------
 // Type classification helpers.
@@ -84,7 +84,13 @@ struct type_list_of<Tmpl<Ts...>> {
 
 template <class T>
 std::string type_name() {
-	if constexpr (std::is_same_v<T, bool>)
+	if constexpr (!std::is_same_v<T, gv_unwrap_t<T>>)
+		return type_name<gv_unwrap_t<T>>();
+	else if constexpr (gv_leaf<T>::value)
+		return gv_leaf<T>::name();
+	else if constexpr (std::is_enum_v<T>)
+		return type_name<std::underlying_type_t<T>>(); // enums are scalars of their size
+	else if constexpr (std::is_same_v<T, bool>)
 		return "bool";
 	else if constexpr (std::is_same_v<T, uint8_t>)
 		return "u8";
@@ -112,8 +118,10 @@ std::string type_name() {
 		return "arena";
 	else if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, StringRef>)
 		return "bytes";
+#ifndef GV_REAL_FDB
 	else if constexpr (std::is_same_v<T, PreserializedKVVector>)
 		return "preserialized_kv_vector";
+#endif
 	else if constexpr (std::is_same_v<T, std::vector<bool>>)
 		return "vector<bool>";
 	else if constexpr (is_std_array<T>::value)
@@ -126,14 +134,16 @@ std::string type_name() {
 		return "variant<" + type_list_of<T>::get() + ">";
 	else if constexpr (is_spec_v<T, EnsureTable>)
 		return "ensure_table<" + type_name<std::decay_t<decltype(std::declval<T&>().asUnderlyingType())>>() + ">";
-	else if constexpr (is_spec_v<T, std::tuple>)
-		return "struct<" + type_list_of<T>::get() + ">";
+	else if constexpr (struct_like_traits<T>::value)
+		return "struct<" + type_list_of<typename struct_like_traits<T>::types>::get() + ">";
 	else if constexpr (is_spec_v<T, std::pair>)
 		return "table<pair<" + type_list_of<T>::get() + ">>";
 	else if constexpr (is_spec_v<T, ReplyPromise>)
 		return "table<reply_promise>";
 	else if constexpr (vector_like_traits<T>::value)
 		return "vector<" + type_name<typename vector_like_traits<T>::value_type>() + ">";
+	else if constexpr (HasTableInfo<T>)
+		return std::string("table<") + gv_table_info<T>::name + ">";
 	else if constexpr (HasTypeName<T>)
 		return std::string("table<") + T::type_name + ">";
 	else
@@ -148,8 +158,14 @@ struct TableDumper {
 	static constexpr bool is_fb_visitor = true;
 	static constexpr bool isDeserializing = false;
 	static constexpr bool isSerializing = true;
+	GV_VISITOR_EXTRAS
 
 	std::vector<std::string> names;
+	// Per argument: the address of the data member the name refers to, or nullptr
+	// (gv_table_info::addresses). Used to check names against the actual arguments.
+	std::vector<const void*> addresses;
+	// The same for an alternative serializer() call with the same slots (gv_table_info::alt_addresses).
+	std::vector<const void*> altAddresses;
 	Json fields = Json::array();
 	int index = 0;
 	int slot = 0;
@@ -162,6 +178,13 @@ struct TableDumper {
 private:
 	template <class M>
 	void add(const M& m) {
+		const void* at = &m;
+		bool mainOk = index >= (int)addresses.size() || !addresses[index] || addresses[index] == at;
+		bool altOk = index < (int)altAddresses.size() && (!altAddresses[index] || altAddresses[index] == at);
+		if (!mainOk && !altOk) {
+			throw std::runtime_error("serializer argument " + std::to_string(index) + " is not the member named '" +
+			                         names.at(index) + "'");
+		}
 		Json node = Json::object();
 		node.set("field", Json::string(index < (int)names.size() ? names[index] : "f" + std::to_string(index)));
 		// Same rule as detail::fields_helper: zero-size members (Arena) take no slot, unions take two.
@@ -177,17 +200,28 @@ private:
 template <class T>
 Json dump_table(const T& v) {
 	TableDumper d;
+	bool named = true;
 	if constexpr (is_spec_v<T, std::pair>) {
 		d.names = { "first", "second" };
+	} else if constexpr (HasTableInfo<T>) {
+		d.names = split_names(gv_table_info<T>::field_names);
+		d.addresses = gv_table_info<T>::addresses(v);
+		d.altAddresses = gv_table_info<T>::alt_addresses(v);
 	} else if constexpr (HasFieldNames<T>) {
 		d.names = split_names(T::field_names);
 	} else if constexpr (HasTraitFieldNames<T>) {
 		d.names = split_names(serializable_traits<T>::field_names);
+	} else {
+		named = false; // dumped as f0, f1, ...
 	}
 	if constexpr (serializable_traits<T>::value) {
 		serializable_traits<T>::serialize(d, const_cast<T&>(v));
 	} else {
 		const_cast<T&>(v).serialize(d);
+	}
+	if (named && d.index != (int)d.names.size()) {
+		throw std::runtime_error(type_name<T>() + ": " + std::to_string(d.index) + " serializer arguments but " +
+		                         std::to_string(d.names.size()) + " field names");
 	}
 	return d.fields;
 }
@@ -209,14 +243,16 @@ Json dump_union_alt(const Union& u, int idx) {
 
 template <class Tuple, size_t... I>
 Json dump_struct(const Tuple& t, std::index_sequence<I...>) {
-	using types = typename struct_like_traits<Tuple>::types;
+	using Traits = struct_like_traits<Tuple>;
+	using types = typename Traits::types;
 	Json arr = Json::array();
+	int ctx = 0;
 	(
 	    [&] {
 		    Json n = Json::object();
 		    n.set("field", Json::string(std::to_string(I)));
 		    n.set("offset", Json::integer(detail::struct_offset<I>(types{})));
-		    n.mergeFrom(dump_node(std::get<I>(t)));
+		    n.mergeFrom(dump_node(Traits::template get<I>(t, ctx)));
 		    arr.push(std::move(n));
 	    }(),
 	    ...);
@@ -224,11 +260,15 @@ Json dump_struct(const Tuple& t, std::index_sequence<I...>) {
 }
 
 template <class T>
-Json dump_node(const T& v) {
+Json dump_node_impl(const T& v) {
 	Json value;
 	Json tag;
 	bool hasTag = false;
-	if constexpr (std::is_same_v<T, bool>) {
+	if constexpr (gv_leaf<T>::value) {
+		value = gv_leaf<T>::dump(v);
+	} else if constexpr (std::is_enum_v<T>) {
+		return dump_node(static_cast<std::underlying_type_t<T>>(v));
+	} else if constexpr (std::is_same_v<T, bool>) {
 		value = Json::boolean(v);
 	} else if constexpr (std::is_floating_point_v<T>) {
 		value = Json::number(v);
@@ -244,6 +284,7 @@ Json dump_node(const T& v) {
 		value = Json::string(hex(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
 	} else if constexpr (std::is_same_v<T, StringRef>) {
 		value = Json::string(hex(v.begin(), v.size()));
+#ifndef GV_REAL_FDB
 	} else if constexpr (std::is_same_v<T, PreserializedKVVector>) {
 		value = Json::array();
 		for (const auto& kv : v.items) {
@@ -251,6 +292,7 @@ Json dump_node(const T& v) {
 			               .set("key", Json::string(hex((const uint8_t*)kv.key.data(), kv.key.size())))
 			               .set("value", Json::string(hex((const uint8_t*)kv.value.data(), kv.value.size()))));
 		}
+#endif
 	} else if constexpr (std::is_same_v<T, std::vector<bool>>) {
 		value = Json::array();
 		for (bool b : v) {
@@ -271,7 +313,7 @@ Json dump_node(const T& v) {
 			value = dump_union_alt<T>(v, idx);
 		}
 	} else if constexpr (struct_like_traits<T>::value) {
-		value = dump_struct(v, std::make_index_sequence<std::tuple_size_v<T>>{});
+		value = dump_struct(v, std::make_index_sequence<pack_size(typename struct_like_traits<T>::types{})>{});
 	} else if constexpr (vector_like_traits<T>::value) {
 		value = Json::array();
 		int dummy = 0;
@@ -293,6 +335,15 @@ Json dump_node(const T& v) {
 	}
 	n.set("value", std::move(value));
 	return n;
+}
+
+template <class T>
+Json dump_node(const T& v) {
+	if constexpr (!std::is_same_v<T, gv_unwrap_t<T>>) {
+		return dump_node(static_cast<const gv_unwrap_t<T>&>(v)); // e.g. Standalone<T> is serialized as T
+	} else {
+		return dump_node_impl(v);
+	}
 }
 
 // The synthetic root wrapper (detail::FakeRoot) around the serialized members.

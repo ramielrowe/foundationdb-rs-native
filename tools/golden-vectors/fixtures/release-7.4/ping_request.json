@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "name": "ping_request",
+  "group": "transport",
+  "kind": "positive",
+  "description": "FlowTransport's connection-keeper ping, sent to the well-known token WLTOKEN_PING_PACKET (UID(-1, 1)). PingRequest lives in fdbrpc/FlowTransport.cpp; this tool mirrors it (file identifier and fields checked against that file).",
+  "cpp_type": "PingRequest",
+  "file_identifier": 4707015,
+  "file_identifier_hex": "0x0047d2c7",
+  "size": 56,
+  "bytes": "14000000c7d247000600080004000600140004000c000000040000001400000004000000160000000a00000000009d5e0a00000000009d7e",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<PingRequest>",
+        "value": [
+          {
+            "field": "reply",
+            "slot": 0,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798986,
+                  "second": 9123448420122492938
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

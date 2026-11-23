@@ -1,0 +1,113 @@
+{
+  "format_version": 1,
+  "name": "watch_value_request",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageServerInterface::watchValue request (adjusted endpoint 10). 7.4 had tenantInfo (TenantInfo) after spanContext; 8.0 removed it mid-table, so every later slot is one lower than on 7.4.",
+  "cpp_type": "WatchValueRequest",
+  "file_identifier": 14747733,
+  "file_identifier_hex": "0x00e10855",
+  "size": 216,
+  "bytes": "3c0000005508e1000000000000000600080004000600140004000a001d00040014001c00180027000c0024001000040025001400260018001c0020002e000000040000002000000000409452a30300007c000000680000005c000000480000002c000000080000000101010052000000040000000000ce7a040000000010ce7a040000000000a05b01000000780000000400000000009d5e0400000000009d7e00000000b1de000000000000b2de0000000000000200000001770000090000006f6c642d76616c7565000000070000007761746368656400",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<WatchValueRequest>",
+        "value": [
+          {
+            "field": "key",
+            "slot": 0,
+            "type": "bytes",
+            "value": "77617463686564"
+          },
+          {
+            "field": "value",
+            "slot": 1,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "6f6c642d76616c7565"
+            }
+          },
+          {
+            "field": "version",
+            "slot": 3,
+            "type": "i64",
+            "value": 4000000000000
+          },
+          {
+            "field": "tags",
+            "slot": 4,
+            "type": "optional<tag_set>",
+            "tag": 1,
+            "value": {
+              "type": "tag_set",
+              "value": ["77"]
+            }
+          },
+          {
+            "field": "debugID",
+            "slot": 6,
+            "type": "optional<uid>",
+            "tag": 1,
+            "value": {
+              "type": "uid",
+              "value": {
+                "first": 57009,
+                "second": 57010
+              }
+            }
+          },
+          {
+            "field": "reply",
+            "slot": 8,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798980,
+                  "second": 9123448420122492932
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 9,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 8849010317829603332,
+                  "second": 8849027910015647748
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 6602277053725147140
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

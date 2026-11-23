@@ -1,0 +1,1116 @@
+{
+  "format_version": 1,
+  "name": "get_key_server_locations_reply_envelope",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "GetKeyServerLocationsReply as sent.",
+  "cpp_type": "ErrorOr<EnsureTable<GetKeyServerLocationsReply>>",
+  "file_identifier": 44190455,
+  "file_identifier_hex": "0x02a24af7",
+  "size": 1632,
+  "bytes": "6c000000f74aa20208000900080004000600060004000600080004000a000d0004000c00080008000c00040008000a001000040008000c001000220004001400180020001c00210008001800140004000c000d00040008000a000c00080018000400140008001800040014006400000008000000020000004a00000098010000440000000400000002000000200000000400000030000000030000000000550003000000001055002c01fe004800000001000000000055000100000000105500010000000100000004000000700000000200000000005500020000000010550004000000ac000000040000000000550004000000001055006800000010000000000000000000000000000000f600000004000000cc000000040000000000706e000000000000706e0800000000000000140100000c0000000000000000000000f00000000c00000094110000000000004801000008000000010000000100000a4a0100000400000004000000900000005c000000300000000400000060010000180000000800000001000000060000007a6f6e652d610000060000007a6f6e6569640000880100001400000008000000010000000400000073732d340900000070726f636573736964000000b00100001c0000000800000001000000090000006d616368696e652d31000000090000006d616368696e656964000000e00100000c00000000000000000000000400000064636964020000006c01000004000000fa0100003c010000040000000100000004000000fc01000003000000000055000300000000105500640000001000000000000000000100000000000046020000040000001c020000030000000000706e000000000000706e04000000600200000c00000000000000000000003c0200000c00000094110000000000009402000008000000010000000100000a960200000400000004000000900000005c0000003000000004000000ac020000180000000800000001000000060000007a6f6e652d610000060000007a6f6e6569640000d40200001400000008000000010000000400000073732d330900000070726f636573736964000000fc0200001c0000000800000001000000090000006d616368696e652d31000000090000006d616368696e6569640000002c0300000c000000000000000000000004000000646369643a0300001400000004000000050000006c6f632f7a000000050000006c6f632f6d0000005e030000b402000004000000020000004801000004000000640300000200000000005500020000000010550078000000200000000c000000010000000000000002000000000050750100000000000000be0300000400000094030000020000000000706e000000000000706e0800000000000000dc0300000c0000000000000000000000b80300000c00000094110000000000001004000008000000010000000100000a120400000400000004000000900000005c000000300000000400000028040000180000000800000001000000060000007a6f6e652d610000060000007a6f6e6569640000500400001400000008000000010000000400000073732d320900000070726f636573736964000000780400001c0000000800000001000000090000006d616368696e652d31000000090000006d616368696e656964000000a80400000c00000000000000000000000400000064636964a4040000010000000000550001000000001055009800000010000000000000000001000000000000ee04000004000000c4040000010000000000706e000000000000706e08000000000000000c0500003c0000000800000001000000e80400000c000000951102000000000040050000080000000200000010000000fddb0000000000000000000000000001180500000c00000094110000000000007005000008000000010000000100000a720500000400000004000000900000005c000000300000000400000088050000180000000800000001000000060000007a6f6e652d610000060000007a6f6e6569640000b00500001400000008000000010000000400000073732d310900000070726f636573736964000000d80500001c0000000800000001000000090000006d616368696e652d31000000090000006d616368696e656964000000080600000c00000000000000000000000400000064636964160600001400000004000000050000006c6f632f6d000000050000006c6f632f61000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetKeyServerLocationsReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetKeyServerLocationsReply>>",
+          "value": {
+            "type": "table<GetKeyServerLocationsReply>",
+            "value": [
+              {
+                "field": "results",
+                "slot": 0,
+                "type": "vector<table<pair<table<KeyRangeRef>,vector<table<StorageServerInterface>>>>>",
+                "value": [
+                  {
+                    "type": "table<pair<table<KeyRangeRef>,vector<table<StorageServerInterface>>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "table<KeyRangeRef>",
+                        "value": [
+                          {
+                            "field": "begin",
+                            "slot": 0,
+                            "type": "bytes",
+                            "value": "6c6f632f61"
+                          },
+                          {
+                            "field": "end",
+                            "slot": 1,
+                            "type": "bytes",
+                            "value": "6c6f632f6d"
+                          }
+                        ]
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "vector<table<StorageServerInterface>>",
+                        "value": [
+                          {
+                            "type": "table<StorageServerInterface>",
+                            "value": [
+                              {
+                                "field": "uniqueID",
+                                "slot": 0,
+                                "type": "uid",
+                                "value": {
+                                  "first": 23925373020405761,
+                                  "second": 23942965206450177
+                                }
+                              },
+                              {
+                                "field": "locality",
+                                "slot": 1,
+                                "type": "table<LocalityData>",
+                                "value": [
+                                  {
+                                    "field": "_data",
+                                    "slot": 0,
+                                    "type": "vector<table<pair<bytes,optional<bytes>>>>",
+                                    "value": [
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "64636964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 0,
+                                            "value": null
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "6d616368696e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "6d616368696e652d31"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "70726f636573736964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "73732d31"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "7a6f6e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "7a6f6e652d61"
+                                            }
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "getValue",
+                                "slot": 2,
+                                "type": "table<request_stream>",
+                                "value": [
+                                  {
+                                    "field": "endpoint",
+                                    "slot": 0,
+                                    "type": "table<Endpoint>",
+                                    "value": [
+                                      {
+                                        "field": "addresses",
+                                        "slot": 0,
+                                        "type": "table<NetworkAddressList>",
+                                        "value": [
+                                          {
+                                            "field": "address",
+                                            "slot": 0,
+                                            "type": "table<NetworkAddress>",
+                                            "value": [
+                                              {
+                                                "field": "ip",
+                                                "slot": 0,
+                                                "type": "table<IPAddress>",
+                                                "value": [
+                                                  {
+                                                    "field": "addr",
+                                                    "slot": 0,
+                                                    "type": "variant<u32,array<u8,16>>",
+                                                    "tag": 1,
+                                                    "value": {
+                                                      "type": "u32",
+                                                      "value": 167772161
+                                                    }
+                                                  }
+                                                ]
+                                              },
+                                              {
+                                                "field": "port",
+                                                "slot": 1,
+                                                "type": "u16",
+                                                "value": 4500
+                                              },
+                                              {
+                                                "field": "flags",
+                                                "slot": 2,
+                                                "type": "u16",
+                                                "value": 0
+                                              },
+                                              {
+                                                "field": "fromHostname",
+                                                "slot": 3,
+                                                "type": "bool",
+                                                "value": false
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "field": "secondaryAddress",
+                                            "slot": 1,
+                                            "type": "optional<table<NetworkAddress>>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "table<NetworkAddress>",
+                                              "value": [
+                                                {
+                                                  "field": "ip",
+                                                  "slot": 0,
+                                                  "type": "table<IPAddress>",
+                                                  "value": [
+                                                    {
+                                                      "field": "addr",
+                                                      "slot": 0,
+                                                      "type": "variant<u32,array<u8,16>>",
+                                                      "tag": 2,
+                                                      "value": {
+                                                        "type": "array<u8,16>",
+                                                        "value": [
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 253
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 219
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 0
+                                                          },
+                                                          {
+                                                            "type": "u8",
+                                                            "value": 1
+                                                          }
+                                                        ]
+                                                      }
+                                                    }
+                                                  ]
+                                                },
+                                                {
+                                                  "field": "port",
+                                                  "slot": 1,
+                                                  "type": "u16",
+                                                  "value": 4501
+                                                },
+                                                {
+                                                  "field": "flags",
+                                                  "slot": 2,
+                                                  "type": "u16",
+                                                  "value": 2
+                                                },
+                                                {
+                                                  "field": "fromHostname",
+                                                  "slot": 3,
+                                                  "type": "bool",
+                                                  "value": false
+                                                }
+                                              ]
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "field": "token",
+                                        "slot": 1,
+                                        "type": "uid",
+                                        "value": {
+                                          "first": 7957860541563666433,
+                                          "second": 7957860541563666432
+                                        }
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "tssPairID",
+                                "slot": 3,
+                                "type": "optional<uid>",
+                                "tag": 0,
+                                "value": null
+                              },
+                              {
+                                "field": "acceptingRequests",
+                                "slot": 5,
+                                "type": "bool",
+                                "value": true
+                              }
+                            ]
+                          },
+                          {
+                            "type": "table<StorageServerInterface>",
+                            "value": [
+                              {
+                                "field": "uniqueID",
+                                "slot": 0,
+                                "type": "uid",
+                                "value": {
+                                  "first": 23925373020405762,
+                                  "second": 23942965206450178
+                                }
+                              },
+                              {
+                                "field": "locality",
+                                "slot": 1,
+                                "type": "table<LocalityData>",
+                                "value": [
+                                  {
+                                    "field": "_data",
+                                    "slot": 0,
+                                    "type": "vector<table<pair<bytes,optional<bytes>>>>",
+                                    "value": [
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "64636964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 0,
+                                            "value": null
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "6d616368696e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "6d616368696e652d31"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "70726f636573736964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "73732d32"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "7a6f6e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "7a6f6e652d61"
+                                            }
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "getValue",
+                                "slot": 2,
+                                "type": "table<request_stream>",
+                                "value": [
+                                  {
+                                    "field": "endpoint",
+                                    "slot": 0,
+                                    "type": "table<Endpoint>",
+                                    "value": [
+                                      {
+                                        "field": "addresses",
+                                        "slot": 0,
+                                        "type": "table<NetworkAddressList>",
+                                        "value": [
+                                          {
+                                            "field": "address",
+                                            "slot": 0,
+                                            "type": "table<NetworkAddress>",
+                                            "value": [
+                                              {
+                                                "field": "ip",
+                                                "slot": 0,
+                                                "type": "table<IPAddress>",
+                                                "value": [
+                                                  {
+                                                    "field": "addr",
+                                                    "slot": 0,
+                                                    "type": "variant<u32,array<u8,16>>",
+                                                    "tag": 1,
+                                                    "value": {
+                                                      "type": "u32",
+                                                      "value": 167772161
+                                                    }
+                                                  }
+                                                ]
+                                              },
+                                              {
+                                                "field": "port",
+                                                "slot": 1,
+                                                "type": "u16",
+                                                "value": 4500
+                                              },
+                                              {
+                                                "field": "flags",
+                                                "slot": 2,
+                                                "type": "u16",
+                                                "value": 0
+                                              },
+                                              {
+                                                "field": "fromHostname",
+                                                "slot": 3,
+                                                "type": "bool",
+                                                "value": false
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "field": "secondaryAddress",
+                                            "slot": 1,
+                                            "type": "optional<table<NetworkAddress>>",
+                                            "tag": 0,
+                                            "value": null
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "field": "token",
+                                        "slot": 1,
+                                        "type": "uid",
+                                        "value": {
+                                          "first": 7957860541563666434,
+                                          "second": 7957860541563666432
+                                        }
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "tssPairID",
+                                "slot": 3,
+                                "type": "optional<uid>",
+                                "tag": 1,
+                                "value": {
+                                  "type": "uid",
+                                  "value": {
+                                    "first": 8453256500574420994,
+                                    "second": 1
+                                  }
+                                }
+                              },
+                              {
+                                "field": "acceptingRequests",
+                                "slot": 5,
+                                "type": "bool",
+                                "value": false
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<pair<table<KeyRangeRef>,vector<table<StorageServerInterface>>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "table<KeyRangeRef>",
+                        "value": [
+                          {
+                            "field": "begin",
+                            "slot": 0,
+                            "type": "bytes",
+                            "value": "6c6f632f6d"
+                          },
+                          {
+                            "field": "end",
+                            "slot": 1,
+                            "type": "bytes",
+                            "value": "6c6f632f7a"
+                          }
+                        ]
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "vector<table<StorageServerInterface>>",
+                        "value": [
+                          {
+                            "type": "table<StorageServerInterface>",
+                            "value": [
+                              {
+                                "field": "uniqueID",
+                                "slot": 0,
+                                "type": "uid",
+                                "value": {
+                                  "first": 23925373020405763,
+                                  "second": 23942965206450179
+                                }
+                              },
+                              {
+                                "field": "locality",
+                                "slot": 1,
+                                "type": "table<LocalityData>",
+                                "value": [
+                                  {
+                                    "field": "_data",
+                                    "slot": 0,
+                                    "type": "vector<table<pair<bytes,optional<bytes>>>>",
+                                    "value": [
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "64636964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 0,
+                                            "value": null
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "6d616368696e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "6d616368696e652d31"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "70726f636573736964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "73732d33"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "type": "table<pair<bytes,optional<bytes>>>",
+                                        "value": [
+                                          {
+                                            "field": "first",
+                                            "slot": 0,
+                                            "type": "bytes",
+                                            "value": "7a6f6e656964"
+                                          },
+                                          {
+                                            "field": "second",
+                                            "slot": 1,
+                                            "type": "optional<bytes>",
+                                            "tag": 1,
+                                            "value": {
+                                              "type": "bytes",
+                                              "value": "7a6f6e652d61"
+                                            }
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "getValue",
+                                "slot": 2,
+                                "type": "table<request_stream>",
+                                "value": [
+                                  {
+                                    "field": "endpoint",
+                                    "slot": 0,
+                                    "type": "table<Endpoint>",
+                                    "value": [
+                                      {
+                                        "field": "addresses",
+                                        "slot": 0,
+                                        "type": "table<NetworkAddressList>",
+                                        "value": [
+                                          {
+                                            "field": "address",
+                                            "slot": 0,
+                                            "type": "table<NetworkAddress>",
+                                            "value": [
+                                              {
+                                                "field": "ip",
+                                                "slot": 0,
+                                                "type": "table<IPAddress>",
+                                                "value": [
+                                                  {
+                                                    "field": "addr",
+                                                    "slot": 0,
+                                                    "type": "variant<u32,array<u8,16>>",
+                                                    "tag": 1,
+                                                    "value": {
+                                                      "type": "u32",
+                                                      "value": 167772161
+                                                    }
+                                                  }
+                                                ]
+                                              },
+                                              {
+                                                "field": "port",
+                                                "slot": 1,
+                                                "type": "u16",
+                                                "value": 4500
+                                              },
+                                              {
+                                                "field": "flags",
+                                                "slot": 2,
+                                                "type": "u16",
+                                                "value": 0
+                                              },
+                                              {
+                                                "field": "fromHostname",
+                                                "slot": 3,
+                                                "type": "bool",
+                                                "value": false
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "field": "secondaryAddress",
+                                            "slot": 1,
+                                            "type": "optional<table<NetworkAddress>>",
+                                            "tag": 0,
+                                            "value": null
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "field": "token",
+                                        "slot": 1,
+                                        "type": "uid",
+                                        "value": {
+                                          "first": 7957860541563666435,
+                                          "second": 7957860541563666432
+                                        }
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "field": "tssPairID",
+                                "slot": 3,
+                                "type": "optional<uid>",
+                                "tag": 0,
+                                "value": null
+                              },
+                              {
+                                "field": "acceptingRequests",
+                                "slot": 5,
+                                "type": "bool",
+                                "value": true
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "resultsTssMapping",
+                "slot": 1,
+                "type": "vector<table<pair<uid,table<StorageServerInterface>>>>",
+                "value": [
+                  {
+                    "type": "table<pair<uid,table<StorageServerInterface>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "uid",
+                        "value": {
+                          "first": 23925373020405762,
+                          "second": 23942965206450178
+                        }
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "table<StorageServerInterface>",
+                        "value": [
+                          {
+                            "field": "uniqueID",
+                            "slot": 0,
+                            "type": "uid",
+                            "value": {
+                              "first": 23925373020405764,
+                              "second": 23942965206450180
+                            }
+                          },
+                          {
+                            "field": "locality",
+                            "slot": 1,
+                            "type": "table<LocalityData>",
+                            "value": [
+                              {
+                                "field": "_data",
+                                "slot": 0,
+                                "type": "vector<table<pair<bytes,optional<bytes>>>>",
+                                "value": [
+                                  {
+                                    "type": "table<pair<bytes,optional<bytes>>>",
+                                    "value": [
+                                      {
+                                        "field": "first",
+                                        "slot": 0,
+                                        "type": "bytes",
+                                        "value": "64636964"
+                                      },
+                                      {
+                                        "field": "second",
+                                        "slot": 1,
+                                        "type": "optional<bytes>",
+                                        "tag": 0,
+                                        "value": null
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "type": "table<pair<bytes,optional<bytes>>>",
+                                    "value": [
+                                      {
+                                        "field": "first",
+                                        "slot": 0,
+                                        "type": "bytes",
+                                        "value": "6d616368696e656964"
+                                      },
+                                      {
+                                        "field": "second",
+                                        "slot": 1,
+                                        "type": "optional<bytes>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "bytes",
+                                          "value": "6d616368696e652d31"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "type": "table<pair<bytes,optional<bytes>>>",
+                                    "value": [
+                                      {
+                                        "field": "first",
+                                        "slot": 0,
+                                        "type": "bytes",
+                                        "value": "70726f636573736964"
+                                      },
+                                      {
+                                        "field": "second",
+                                        "slot": 1,
+                                        "type": "optional<bytes>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "bytes",
+                                          "value": "73732d34"
+                                        }
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "type": "table<pair<bytes,optional<bytes>>>",
+                                    "value": [
+                                      {
+                                        "field": "first",
+                                        "slot": 0,
+                                        "type": "bytes",
+                                        "value": "7a6f6e656964"
+                                      },
+                                      {
+                                        "field": "second",
+                                        "slot": 1,
+                                        "type": "optional<bytes>",
+                                        "tag": 1,
+                                        "value": {
+                                          "type": "bytes",
+                                          "value": "7a6f6e652d61"
+                                        }
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "field": "getValue",
+                            "slot": 2,
+                            "type": "table<request_stream>",
+                            "value": [
+                              {
+                                "field": "endpoint",
+                                "slot": 0,
+                                "type": "table<Endpoint>",
+                                "value": [
+                                  {
+                                    "field": "addresses",
+                                    "slot": 0,
+                                    "type": "table<NetworkAddressList>",
+                                    "value": [
+                                      {
+                                        "field": "address",
+                                        "slot": 0,
+                                        "type": "table<NetworkAddress>",
+                                        "value": [
+                                          {
+                                            "field": "ip",
+                                            "slot": 0,
+                                            "type": "table<IPAddress>",
+                                            "value": [
+                                              {
+                                                "field": "addr",
+                                                "slot": 0,
+                                                "type": "variant<u32,array<u8,16>>",
+                                                "tag": 1,
+                                                "value": {
+                                                  "type": "u32",
+                                                  "value": 167772161
+                                                }
+                                              }
+                                            ]
+                                          },
+                                          {
+                                            "field": "port",
+                                            "slot": 1,
+                                            "type": "u16",
+                                            "value": 4500
+                                          },
+                                          {
+                                            "field": "flags",
+                                            "slot": 2,
+                                            "type": "u16",
+                                            "value": 0
+                                          },
+                                          {
+                                            "field": "fromHostname",
+                                            "slot": 3,
+                                            "type": "bool",
+                                            "value": false
+                                          }
+                                        ]
+                                      },
+                                      {
+                                        "field": "secondaryAddress",
+                                        "slot": 1,
+                                        "type": "optional<table<NetworkAddress>>",
+                                        "tag": 0,
+                                        "value": null
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "field": "token",
+                                    "slot": 1,
+                                    "type": "uid",
+                                    "value": {
+                                      "first": 7957860541563666436,
+                                      "second": 7957860541563666432
+                                    }
+                                  }
+                                ]
+                              }
+                            ]
+                          },
+                          {
+                            "field": "tssPairID",
+                            "slot": 3,
+                            "type": "optional<uid>",
+                            "tag": 0,
+                            "value": null
+                          },
+                          {
+                            "field": "acceptingRequests",
+                            "slot": 5,
+                            "type": "bool",
+                            "value": false
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "resultsTagMapping",
+                "slot": 2,
+                "type": "vector<table<pair<uid,struct<u16,i8>>>>",
+                "value": [
+                  {
+                    "type": "table<pair<uid,struct<u16,i8>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "uid",
+                        "value": {
+                          "first": 23925373020405761,
+                          "second": 23942965206450177
+                        }
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "struct<u16,i8>",
+                        "value": [
+                          {
+                            "field": "0",
+                            "offset": 0,
+                            "type": "u16",
+                            "value": 1
+                          },
+                          {
+                            "field": "1",
+                            "offset": 2,
+                            "type": "i8",
+                            "value": 0
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<pair<uid,struct<u16,i8>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "uid",
+                        "value": {
+                          "first": 23925373020405763,
+                          "second": 23942965206450179
+                        }
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "struct<u16,i8>",
+                        "value": [
+                          {
+                            "field": "0",
+                            "offset": 0,
+                            "type": "u16",
+                            "value": 300
+                          },
+                          {
+                            "field": "1",
+                            "offset": 2,
+                            "type": "i8",
+                            "value": -2
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "format_version": 1,
+  "name": "get_key_server_locations_request",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "CommitProxyInterface::getKeyServersLocations request (adjusted endpoint 2 on both branches). 7.4: (begin, end, limit, reverse, reply, spanContext, tenant: TenantInfo, minTenantVersion, arena); 8.0: tenant removed and minTenantVersion renamed legacyVersion, so legacyVersion is slot 6 where 7.4 has tenant.",
+  "cpp_type": "GetKeyServerLocationsRequest",
+  "file_identifier": 9144680,
+  "file_identifier_hex": "0x008b8968",
+  "size": 176,
+  "bytes": "3400000068898b0000000600080004000600140004000a001d00040014001c00140022000c00200010001400210018001c0004002a000000040000001c000000007083d05d0600005c0000004c00000064000000300000000c00000001010000000000004e000000080000000000ce7a080000000010ce7a080000000000a05b01000000740000000800000000009d5e0800000000009d7e050000006c6f632f7a000000050000006c6f632f61000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetKeyServerLocationsRequest>",
+        "value": [
+          {
+            "field": "begin",
+            "slot": 0,
+            "type": "bytes",
+            "value": "6c6f632f61"
+          },
+          {
+            "field": "end",
+            "slot": 1,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "6c6f632f7a"
+            }
+          },
+          {
+            "field": "limit",
+            "slot": 3,
+            "type": "i32",
+            "value": 100
+          },
+          {
+            "field": "reverse",
+            "slot": 4,
+            "type": "bool",
+            "value": true
+          },
+          {
+            "field": "reply",
+            "slot": 5,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798984,
+                  "second": 9123448420122492936
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 6,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 8849010317829603336,
+                  "second": 8849027910015647752
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 6602277053725147144
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "legacyVersion",
+            "slot": 7,
+            "type": "i64",
+            "value": 7000000000000
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

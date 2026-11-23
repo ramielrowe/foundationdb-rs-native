@@ -1,0 +1,114 @@
+{
+  "format_version": 1,
+  "name": "get_value_request_minimal",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetValueRequest with tags and options absent and a default SpanContext. ssLatestCommitVersions needs 2-byte version deltas.",
+  "cpp_type": "GetValueRequest",
+  "file_identifier": 8454530,
+  "file_identifier_hex": "0x00810182",
+  "size": 232,
+  "bytes": "4c00000082018100000000000000060008000400160026000c000400240010001400180025001c0020000600140004000a001d00040014001c0012001400040010001100080012000c0013003e00000004000000400000000100000000000000800000000000000064000000400000000000000008000000000000002b00000001000000000000000002000102e803000000000000020000000000000002000003e803d007000000000000007c00000000000000000000000000000000000000000000000000000000000000a20000000b00000000009d5e0b00000000009d7e010000006b000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetValueRequest>",
+        "value": [
+          {
+            "field": "key",
+            "slot": 0,
+            "type": "bytes",
+            "value": "6b"
+          },
+          {
+            "field": "version",
+            "slot": 1,
+            "type": "i64",
+            "value": 1
+          },
+          {
+            "field": "tags",
+            "slot": 2,
+            "type": "optional<tag_set>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "reply",
+            "slot": 4,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798987,
+                  "second": 9123448420122492939
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 5,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 0,
+                  "second": 0
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 0
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "field": "options",
+            "slot": 6,
+            "type": "optional<table<ReadOptions>>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "ssLatestCommitVersions",
+            "slot": 8,
+            "type": "version_vector",
+            "value": {
+              "versions": [
+                {
+                  "locality": 0,
+                  "id": 2,
+                  "version": 1000
+                },
+                {
+                  "locality": 0,
+                  "id": 3,
+                  "version": 2000
+                }
+              ],
+              "maxVersion": 2000
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
