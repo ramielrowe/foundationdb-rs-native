@@ -31,6 +31,8 @@ tls-aws-lc-rs = ["tls", "rustls/aws_lc_rs"]
 
 [dependencies]
 fdb-native-wire.workspace = true
+futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-core = "0.3.34"
 futures-io = "0.3.34"
 thiserror = "2.0.21"
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }

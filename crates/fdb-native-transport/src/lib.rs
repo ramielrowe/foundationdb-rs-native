@@ -2,12 +2,15 @@
 //!
 //! [`runtime`] is the small async runtime abstraction (with a tokio adapter), [`framing`] the
 //! packet framing codec, [`ConnectPacket`] the handshake packet, [`connection`] the sans-IO
-//! state machine of one connection (handshake, dispatch, pings and liveness), and [`rpc`] the
-//! sans-IO request/reply layer over it (reply tokens, pending requests, at-most-once failures).
+//! state machine of one connection (handshake, dispatch, pings and liveness), [`rpc`] the
+//! sans-IO request/reply layer over it (reply tokens, pending requests, at-most-once failures),
+//! and [`peer`] the async peer manager that drives connections over a runtime (one per address,
+//! reconnect backoff, failure state, requests).
 
 mod connect_packet;
 pub mod connection;
 pub mod framing;
+pub mod peer;
 pub mod rpc;
 pub mod runtime;
 #[cfg(feature = "tls")]
