@@ -5,6 +5,8 @@
 mod connect_packet;
 pub mod framing;
 pub mod runtime;
+#[cfg(feature = "tls")]
+pub mod tls_verify;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError};
 pub use framing::{
