@@ -23,6 +23,7 @@ xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 tokio = { version = "1.54.1", optional = true, default-features = false, features = ["net", "time", "rt"] }
 
 [dev-dependencies]
+fdb-native-testkit = { path = "../fdb-native-testkit" }
 futures-lite = "2.6.1"
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 proptest = "1.11.0"
