@@ -2,11 +2,14 @@
 //!
 //! [`runtime`] is the small async runtime abstraction (with a tokio adapter), [`framing`] the
 //! packet framing codec, [`ConnectPacket`] the handshake packet, and [`connection`] the sans-IO
-//! state machine of one connection (handshake, dispatch, pings and liveness).
+//! state machine of one connection (handshake, dispatch, pings and liveness), and [`peer`] the
+//! async peer manager that drives connections over a runtime (one per address, reconnect
+//! backoff, failure state).
 
 mod connect_packet;
 pub mod connection;
 pub mod framing;
+pub mod peer;
 pub mod runtime;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError, process_transport_id};
