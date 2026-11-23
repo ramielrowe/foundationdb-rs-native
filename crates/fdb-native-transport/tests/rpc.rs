@@ -280,6 +280,47 @@ fn send_with_writes_the_callers_encoding() {
     assert!(server.read(&mut conn).is_empty());
 }
 
+/// An encoder that shortens the shared output buffer destroyed the frames before its own: the
+/// connection fails (nothing is written) and the request, which was never written, is `NotSent`
+/// with the reason. The request queued before it completes as maybe delivered with the
+/// connection's end.
+#[test]
+fn an_encoder_that_shortens_the_output_fails_the_connection() {
+    let mut registry = Registry::new(registry_config(2));
+    let (mut conn, _server) = connected(&mut registry);
+    registry
+        .send_with(&mut conn, EP_A, 1, |reply, out| {
+            out.extend(fdb_native_wire::encode(&EchoRequest {
+                reply: ReplyPromise::new(reply),
+                value: 5,
+            })?);
+            Ok(())
+        })
+        .unwrap();
+    let err = registry
+        .send_with(&mut conn, EP_A, 2, |_, out| {
+            *out = vec![1, 2, 3];
+            Ok(())
+        })
+        .unwrap_err();
+    let RequestError::NotSent(Some(ConnectionError::InternalEncode(_))) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(err.certainly_not_delivered());
+    assert!(conn.pending_output().is_empty());
+    let events = drain(&mut registry, &mut conn);
+    let done = completions(&events);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].key, 1);
+    assert!(matches!(
+        done[0].result,
+        Err(RequestError::MaybeDelivered(Some(
+            ConnectionError::InternalEncode(_)
+        )))
+    ));
+    assert!(registry.is_empty());
+}
+
 #[test]
 fn a_server_error_reply_maps_to_an_fdb_error() {
     let mut registry = Registry::new(registry_config(3));

@@ -324,8 +324,11 @@ impl<K> ReplyRegistry<K> {
     /// registers it on the connection, and calls `write(reply_token, out)` to append the
     /// request message to `out` (for instance
     /// `|reply, out| request.encode_request_into(version, reply, out)` with
-    /// `fdb_native_schema::Request`). The message must carry `reply_token` as its
-    /// `ReplyPromise`. Returns the reply token, which identifies the request for
+    /// `fdb_native_schema::Request`). `write` must only **append** to `out`, which is the
+    /// connection's output buffer, shared with the frames before it; see
+    /// [`Connection::send_with`] for what happens to a writer that does not (the connection
+    /// fails, and the request is [`NotSent`](RequestError::NotSent)). The message must carry
+    /// `reply_token` as its `ReplyPromise`. Returns the reply token, which identifies the request for
     /// [`cancel`](Self::cancel); `key` comes back in its [`Completion`].
     ///
     /// The request is [`Queued`](RequestState::Queued) if the connection is still

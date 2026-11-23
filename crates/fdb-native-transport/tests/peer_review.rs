@@ -314,7 +314,7 @@ async fn replies_complete_before_the_connection_is_reported_closed() {
         .expect("completed before Closed")
         .expect("the reply");
     assert_eq!(
-        fdb_native_transport::rpc::decode_reply::<EchoReply>(&first),
+        fdb_native_transport::rpc::decode_reply::<EchoReply>(&first.payload),
         Ok(EchoReply {
             value: 1 + ECHO_ADDS
         })
@@ -422,7 +422,9 @@ async fn the_failure_monitor_is_the_truth_about_endpoints() {
 
     // A broken_promise reply fails the endpoint in the registry and in the monitor ...
     assert_eq!(
-        peer.request(token(7), echo_encode(BROKEN)).await,
+        peer.request(token(7), echo_encode(BROKEN))
+            .await
+            .map(|reply| reply.payload),
         Ok(echo_error(1100))
     );
     assert!(fm.endpoint_failure(&server.address, token(7)).is_some());

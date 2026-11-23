@@ -258,6 +258,21 @@ pub enum FrameError {
         /// The checksum of the bytes.
         computed: u64,
     },
+    /// A payload writer shortened the output vector below where its frame began (it assigned
+    /// to the vector instead of appending, or cleared it), which destroyed bytes that were
+    /// there before: other frames. The vector can not be repaired, so whoever owns it must
+    /// treat it as lost (a [`Connection`](crate::Connection) fails with
+    /// [`ConnectionError::InternalEncode`](crate::ConnectionError::InternalEncode)).
+    #[error(
+        "the payload writer shortened the output to {len} bytes, below the {start} bytes \
+         that were there before the frame"
+    )]
+    OutputShrunk {
+        /// The length of the output when the frame began.
+        start: usize,
+        /// Its length after the payload writer ran.
+        len: usize,
+    },
 }
 
 /// How frames are laid out on one connection: whether they carry a checksum, and the largest
@@ -335,16 +350,23 @@ impl FrameConfig {
 
     /// Appends a frame for `token` to `out`, with the payload written by `write_payload`.
     ///
-    /// `write_payload` must only append to the vector it is given. This is how a serializer
-    /// can write its output in place, without an intermediate buffer; the length and the
-    /// checksum are filled in afterwards. If the token and payload together are above the limit,
-    /// `out` is truncated back to its length before the call and the error is returned.
+    /// `write_payload` must only **append** to the vector it is given, and leave what was in it
+    /// alone. This is how a serializer can write its output in place, without an intermediate
+    /// buffer; the length and the checksum are filled in afterwards. If the token and payload
+    /// together are above the limit, `out` is truncated back to its length before the call and
+    /// the error is returned.
     ///
-    /// A closure that shortens the vector breaks the contract. It is not a panic: if less than
-    /// the token is left of the frame the call fails with [`FrameError::TooShort`] and `out` is
-    /// truncated to its original length, or to what the closure left if that is shorter (the
-    /// bytes the closure removed from before the frame are gone; they cannot be restored without
-    /// a copy of the whole buffer).
+    /// A closure that breaks the contract is not a panic, and what happens depends on how:
+    ///
+    /// * It removes bytes of its own frame (but nothing before it): the call fails with
+    ///   [`FrameError::TooShort`] and `out` is truncated to its original length.
+    /// * It shortens the vector below where the frame began (`*out = ...`, `out.clear()`):
+    ///   bytes from before the frame, other frames, are gone and cannot be restored without a
+    ///   copy of the whole buffer. The call fails with [`FrameError::OutputShrunk`] and leaves
+    ///   `out` as the closure left it; the owner must discard it.
+    ///
+    /// A closure that replaces the vector's contents with something at least as long is not
+    /// detected: use a separate vector for a writer that is not trusted.
     pub fn encode_frame_with<F>(
         &self,
         token: Uid,
@@ -366,7 +388,9 @@ impl FrameConfig {
 
     /// [`encode_frame_with`](FrameConfig::encode_frame_with) for a payload writer that can fail
     /// (a flatbuffers encoder, say). On an error from `write_payload`, `out` is truncated to its
-    /// length before the call and the error is returned as [`FrameWriteError::Payload`].
+    /// length before the call and the error is returned as [`FrameWriteError::Payload`]. The
+    /// contract of [`encode_frame_with`](FrameConfig::encode_frame_with) applies, including
+    /// [`FrameError::OutputShrunk`], which is reported in preference to the writer's own error.
     pub fn try_encode_frame_with<F, E>(
         &self,
         token: Uid,
@@ -382,7 +406,16 @@ impl FrameConfig {
         out.resize(counted, 0);
         out.extend_from_slice(&token.first.to_le_bytes());
         out.extend_from_slice(&token.second.to_le_bytes());
-        if let Err(e) = write_payload(out) {
+        let written = write_payload(out);
+        // A writer that shortened the vector below `start` destroyed what was there: nothing
+        // can be truncated back to, and the bytes that follow are not a frame.
+        if out.len() < start {
+            return Err(FrameWriteError::Frame(FrameError::OutputShrunk {
+                start,
+                len: out.len(),
+            }));
+        }
+        if let Err(e) = written {
             out.truncate(start);
             return Err(FrameWriteError::Payload(e));
         }
