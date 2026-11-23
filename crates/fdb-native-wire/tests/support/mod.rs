@@ -641,21 +641,22 @@ impl Arb for () {
 // fixtures then check against what the derive does.
 
 /// The strategy of a field, whose type is inferred from the struct literal it builds.
-fn arb_field<T: Arb>(_name: &str) -> BoxedStrategy<T> {
+pub fn arb_field<T: Arb>(_name: &str) -> BoxedStrategy<T> {
     T::arb()
 }
 
 /// The number of slots a field takes.
-fn slots_of<T: Wire>(_: &T) -> usize {
+pub fn slots_of<T: Wire>(_: &T) -> usize {
     T::SHAPE.slots()
 }
 
-/// `Dump` and (unless `@custom_arb`) `Arb` for a derived table: the C++ type name, then its
+/// `Dump` and (unless `@no_arb`) `Arb` for a derived table: the C++ type name, then its
 /// serialized fields in order with their C++ names. `@arena` names the `#[fdb(arena)]`
-/// field, dumped as an `arena` member.
+/// field, dumped as an `arena` member. Other test files use it via `#[macro_use] mod
+/// support;` and `use support::*;`.
 macro_rules! dump_table {
-    (@custom_arb $cpp:literal $name:ident { $($f:ident = $fname:literal),* $(,)? }) => {
-        dump_table!(@dump $cpp, $name, [], { $($f = $fname),* });
+    (@no_arb $cpp:literal $name:ident $(<$lt:lifetime>)? { $($f:ident = $fname:literal),* $(,)? } $(@ $arena:ident)?) => {
+        dump_table!(@dump $cpp, $name, [$($lt)?], { $($f = $fname),* } $(@ $arena)?);
     };
     ($cpp:literal $name:ident { $($f:ident = $fname:literal),* $(,)? } $(@ $arena:ident)?) => {
         dump_table!(@dump $cpp, $name, [], { $($f = $fname),* } $(@ $arena)?);
@@ -830,7 +831,7 @@ pub struct Containers {
     pub s: Vec<u32>,
     pub nested: Vec<Vec<u16>>,
 }
-dump_table!(@custom_arb "Containers" Containers { m = "m", s = "s", nested = "nested" });
+dump_table!(@no_arb "Containers" Containers { m = "m", s = "s", nested = "nested" });
 
 impl Arb for Containers {
     fn arb() -> BoxedStrategy<Self> {

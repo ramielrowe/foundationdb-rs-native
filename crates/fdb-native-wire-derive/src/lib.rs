@@ -216,7 +216,9 @@ use proc_macro::TokenStream;
 /// Rust type per version, in per-version schema sets (`schema::v7_4::GetValueRequest`,
 /// `schema::v8_0::GetValueRequest`), each deriving its exact layout; the client logic
 /// works on version-neutral domain types and converts at the edge. `skip_slots` covers a
-/// slot a version's type does not model.
+/// slot a version's type does not model. `crates/fdb-native-wire/tests/release_messages.rs`
+/// does this for `GetValueRequest` and `GetValueReply` and checks the result against the
+/// messages FDB 7.4 and 8.0 write.
 ///
 /// # Generics and lifetimes
 ///
