@@ -16,14 +16,14 @@ pub(super) enum SelfSignature {
 }
 
 /// One DER element: its content, what follows it, and the whole element.
-struct Tlv<'a> {
-    tag: u8,
-    content: &'a [u8],
-    rest: &'a [u8],
-    whole: &'a [u8],
+pub(super) struct Tlv<'a> {
+    pub(super) tag: u8,
+    pub(super) content: &'a [u8],
+    pub(super) rest: &'a [u8],
+    pub(super) whole: &'a [u8],
 }
 
-fn tlv(buf: &[u8]) -> Option<Tlv<'_>> {
+pub(super) fn tlv(buf: &[u8]) -> Option<Tlv<'_>> {
     let tag = *buf.first()?;
     let first = *buf.get(1)?;
     let (len, header) = if first < 0x80 {

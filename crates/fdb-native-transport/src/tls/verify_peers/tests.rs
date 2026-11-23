@@ -1019,6 +1019,7 @@ mod eval {
     }
 }
 
+mod openssl_profile;
 mod verifier;
 
 mod props {

@@ -106,20 +106,43 @@
 //!   port splits correctly there.
 //! * **Rule parse positions.** FDB only reports `tls_error`; [`ParseError`] adds a kind and
 //!   offset.
-//! * **Chain validation** is webpki's, shaped to follow OpenSSL's use of its trust store
-//!   (see [`VerifyPeersVerifier`]): only a *self-signed*, CA-capable certificate of the CA file
-//!   is a trust anchor and its validity period is checked; the other CA-file certificates
-//!   (intermediates) only complete chains; `R.` criteria see the self-signed root. The peer's
-//!   certificate must also be valid for TLS server use (`keyUsage` and `extendedKeyUsage`, as
-//!   OpenSSL's `ssl_server` purpose). A peer that is itself a configured, self-signed,
-//!   in-date root is accepted as OpenSSL does (webpki alone would reject a `CA:TRUE`
-//!   certificate as an end entity). Revocation is not checked, as in FDB.
+//! * **Chain validation** is webpki's, with OpenSSL's remaining checks added so that no chain
+//!   is accepted that OpenSSL 3 (`openssl verify -purpose sslserver`) rejects (see
+//!   [`VerifyPeersVerifier`] for the full list): only a *self-signed* CA-file certificate (the
+//!   names match and an authority key identifier, if any, does not name another key) that is
+//!   CA-capable, has no critical extension OpenSSL does not support, and has no
+//!   `extendedKeyUsage` or one with `serverAuth`, is a trust anchor, and its validity period
+//!   is checked; the other CA-file certificates (intermediates) only complete chains; `R.`
+//!   criteria see the self-signed root. Each path webpki finds is then checked for the anchor's
+//!   `pathLenConstraint`, every intermediate's `keyCertSign`, authority key identifiers, and
+//!   name constraints on the subject's `emailAddress` and host-name-like `commonName`s. The
+//!   peer's certificate must also be valid for TLS server use (`keyUsage`,
+//!   `extendedKeyUsage` and `nsCertType`, as OpenSSL's `ssl_server` purpose). A peer that is
+//!   itself a configured, self-signed, in-date root is accepted as OpenSSL does (webpki alone
+//!   would reject a `CA:TRUE` certificate as an end entity), if it is version 3 and has no
+//!   unsupported critical extension. Revocation is not checked, as in FDB.
 //! * **Certificates webpki is stricter about** than OpenSSL are refused, with errors that say
-//!   what to change ([`CertificateRejected`]): an end-entity certificate with `CA:TRUE`
-//!   issued by another CA, and X.509 version 1 end-entity or intermediate certificates (a
-//!   self-signed v1 root in the CA file is fine). Also unsupported by the underlying
-//!   libraries: RSA keys under 2048 bits, SHA-1 signatures, DSA, Ed448, and (with the `ring`
-//!   provider) P-521.
+//!   what to change where they can ([`CertificateRejected`]): an end-entity certificate with
+//!   `CA:TRUE` issued by another CA, X.509 version 1 end-entity or intermediate certificates
+//!   (a self-signed v1 root in the CA file is a fine trust anchor, but is refused as the
+//!   server's own certificate: rustls would fail the handshake anyway), a `directoryName`
+//!   name constraint anywhere in the path (permitted or excluded), a critical extension webpki
+//!   does not process, such as `certificatePolicies` on an intermediate, and a CA-file
+//!   certificate with a bad self-signature, which is not treated as a root (OpenSSL never
+//!   checks it). Also unsupported by the underlying libraries: RSA keys under 2048 bits, SHA-1
+//!   signatures, DSA, Ed448, and (with the `ring` provider) P-521.
+//! * **Path building** differs, and webpki finds more: OpenSSL builds one path, picking issuers
+//!   by name (and by key identifier where the certificates carry them), while webpki backtracks
+//!   over every candidate. Two roots with the same subject and no key identifiers, where
+//!   OpenSSL picks the wrong one, and a cross-signed intermediate sent in both forms, are
+//!   accepted here and not by OpenSSL. This is accepted: every path ends at a configured,
+//!   in-date, CA-capable anchor and has passed all the checks above.
+//! * **`anyExtendedKeyUsage`** alone does not make a certificate valid as a server
+//!   certificate, or as an anchor or intermediate, as in OpenSSL 3.5. OpenSSL 1.1.1 left the
+//!   trust anchor out of these checks (`check_chain_extensions` looped over the untrusted part
+//!   of the chain only), so a CA file certificate with a `clientAuth`-only `extendedKeyUsage` or
+//!   an unhandled critical extension anchored a chain there; 3.x checks every certificate, and
+//!   so does this verifier.
 //! * **Name matching of malformed certificates.** A subjectAltName with any undecodable name
 //!   is treated as absent (OpenSSL fails to decode the extension), and a name attribute whose
 //!   value is not a universal primitive string never matches.
@@ -137,6 +160,7 @@
 
 mod cert;
 mod eval;
+mod profile;
 mod rules;
 mod selfsig;
 mod verifier;

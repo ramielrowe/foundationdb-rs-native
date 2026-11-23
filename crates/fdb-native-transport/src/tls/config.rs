@@ -149,7 +149,12 @@ impl TlsConfig {
     /// This is a snapshot: later changes to the environment are not seen.
     /// It is rarely needed, since [`load`](Self::load) already consults the
     /// environment. See [`from_env_with`](Self::from_env_with).
-    pub fn from_env() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::VerifyPeersNotUtf8`] if `FDB_TLS_VERIFY_PEERS` is not valid
+    /// UTF-8.
+    pub fn from_env() -> Result<Self, TlsError> {
         Self::from_env_with(|name| std::env::var_os(name))
     }
 
@@ -159,7 +164,14 @@ impl TlsConfig {
     /// A variable that is set but empty counts as unset here. Values are
     /// `OsString`s because FoundationDB's are byte strings: a path or password
     /// that is not valid UTF-8 must not be dropped.
-    pub fn from_env_with(lookup: impl Fn(&str) -> Option<OsString>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::VerifyPeersNotUtf8`] if `FDB_TLS_VERIFY_PEERS` is not valid
+    /// UTF-8. The rules are a grammar over bytes that this crate parses as
+    /// text; replacing the invalid bytes (as a lossy conversion would)
+    /// silently changes the rule, so the setting is refused instead.
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, TlsError> {
         let get = |name: &str| lookup(name).filter(|v| !v.is_empty());
         let mut config = Self::new();
         if let Some(path) = get(ENV_CERTIFICATE_FILE) {
@@ -175,12 +187,12 @@ impl TlsConfig {
             config = config.password(os_to_bytes(password));
         }
         if let Some(rules) = get(ENV_VERIFY_PEERS) {
-            config = config.verify_peers(rules.to_string_lossy());
+            config = config.verify_peers(verify_peers_text(rules)?);
         }
         if let Some(flag) = lookup(ENV_DISABLE_PLAINTEXT_CONNECTION).and_then(parse_bool) {
             config = config.disable_plaintext_connection(flag);
         }
-        config
+        Ok(config)
     }
 
     /// Reads the certificate chain from a PEM file (`TLS_cert_path`).
@@ -330,7 +342,7 @@ impl TlsConfig {
 
         let verify_peers = if self.verify_peers.is_empty() {
             match lookup(ENV_VERIFY_PEERS) {
-                Some(rules) => vec![rules.to_string_lossy().into_owned()],
+                Some(rules) => vec![verify_peers_text(rules)?],
                 None => vec![DEFAULT_VERIFY_PEERS.to_owned()],
             }
         } else {
@@ -394,6 +406,15 @@ fn os_to_bytes(value: OsString) -> Vec<u8> {
     {
         value.to_string_lossy().into_owned().into_bytes()
     }
+}
+
+/// The text of an `FDB_TLS_VERIFY_PEERS` value. A value that is not valid UTF-8 is an error:
+/// converting it lossily would turn each invalid byte into U+FFFD and so change what the rule
+/// matches, without telling anyone.
+fn verify_peers_text(value: OsString) -> Result<String, TlsError> {
+    value
+        .into_string()
+        .map_err(|_| TlsError::VerifyPeersNotUtf8)
 }
 
 fn resolve_material(
@@ -774,6 +795,28 @@ mod tests {
         assert_eq!(loaded.verify_peers(), ["S.CN=a", "S.CN=b"]);
     }
 
+    /// A rule is text. Replacing invalid bytes with U+FFFD would silently change what it matches,
+    /// so a non-UTF-8 `FDB_TLS_VERIFY_PEERS` is an error (both when loading and when taking a
+    /// snapshot), and an explicit rule is still preferred over a bad variable.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_verify_peers_variable_is_an_error() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = |name: &str| -> Option<OsString> {
+            (name == ENV_VERIFY_PEERS).then(|| OsString::from_vec(b"S.O=caf\xE9".to_vec()))
+        };
+        let err = TlsConfig::new().load_with(bad, None).unwrap_err();
+        assert!(matches!(err, TlsError::VerifyPeersNotUtf8), "{err:?}");
+        let err = TlsConfig::from_env_with(bad).unwrap_err();
+        assert!(matches!(err, TlsError::VerifyPeersNotUtf8), "{err:?}");
+        // The explicit rules win, so the variable is not read at all.
+        let loaded = TlsConfig::new()
+            .verify_peers("S.O=x")
+            .load_with(bad, None)
+            .unwrap();
+        assert_eq!(loaded.verify_peers(), ["S.O=x"]);
+    }
+
     #[test]
     fn plaintext_flag_env_overrides_the_option_when_valid() {
         let on = TlsConfig::new().disable_plaintext_connection(true);
@@ -805,7 +848,8 @@ mod tests {
             (ENV_PASSWORD, "pw"),
             (ENV_VERIFY_PEERS, "S.O=x"),
             (ENV_DISABLE_PLAINTEXT_CONNECTION, "1"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(config.cert, Some(Source::Path("/c.pem".into())));
         assert_eq!(config.key, Some(Source::Path("/k.pem".into())));
         assert_eq!(config.ca, Some(Source::Path("/ca.pem".into())));
@@ -816,7 +860,7 @@ mod tests {
         assert_eq!(config.verify_peers, ["S.O=x"]);
         assert!(config.disable_plaintext);
 
-        let empty = TlsConfig::from_env_with(env(&[(ENV_CA_FILE, "")]));
+        let empty = TlsConfig::from_env_with(env(&[(ENV_CA_FILE, "")])).unwrap();
         assert_eq!(empty.ca, None);
     }
 
