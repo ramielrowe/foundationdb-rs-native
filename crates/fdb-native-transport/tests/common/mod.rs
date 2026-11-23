@@ -18,7 +18,10 @@ use std::time::Duration;
 use fdb_native_transport::connection::{PING_REPLY_OK, PingRequest, well_known};
 use fdb_native_transport::runtime::{Instant, Runtime, TokioRuntime, TokioTask};
 use fdb_native_transport::{Checksum, ConnectPacket, FrameConfig, FrameDecoder, OwnedFrame};
-use fdb_native_wire::{NetworkAddress, ProtocolVersion, Uid};
+use fdb_native_wire::{
+    EncodeError, EnsureTable, ErrorOr, FdbError, NetworkAddress, ProtocolVersion, ReplyPromise,
+    Uid, Wire,
+};
 use futures_io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
@@ -50,11 +53,18 @@ pub enum Behavior {
 pub struct Net {
     behaviors: Mutex<HashMap<SocketAddr, Behavior>>,
     connects: Mutex<HashMap<SocketAddr, usize>>,
+    /// How long a connect that is not refused takes.
+    connect_delay: Mutex<Duration>,
 }
 
 impl Net {
     pub fn new() -> Arc<Net> {
         Arc::new(Net::default())
+    }
+
+    /// Makes every connect that succeeds take this long (virtual time).
+    pub fn set_connect_delay(&self, delay: Duration) {
+        *self.connect_delay.lock().unwrap() = delay;
     }
 
     pub fn set(&self, addr: SocketAddr, behavior: Behavior) {
@@ -166,6 +176,10 @@ impl Runtime for MemRuntime {
             Plan::Refuse => Err(io::ErrorKind::ConnectionRefused.into()),
             Plan::Hang => std::future::pending().await,
             Plan::Accept(tx, capacity) => {
+                let delay = *self.net.connect_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let (client, server) = tokio::io::duplex(capacity);
                 tx.send(server)
                     .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused))?;
@@ -460,4 +474,100 @@ pub async fn until(what: &str, mut cond: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+// ---- an echo service -----------------------------------------------------------------------
+
+/// The reply of [`EchoRequest`]: its value plus [`ECHO_ADDS`].
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 9_200_002)]
+pub struct EchoReply {
+    pub value: u64,
+}
+
+/// A request that carries its reply token as a `ReplyPromise`, like every FDB request.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 9_200_001)]
+pub struct EchoRequest {
+    pub reply: ReplyPromise<EchoReply>,
+    pub value: u64,
+}
+
+/// What the echo responder adds to the value it was asked about.
+pub const ECHO_ADDS: u64 = 1000;
+/// A value the echo responder never answers.
+pub const SILENT: u64 = u64::MAX;
+/// A value it answers with `broken_promise`.
+pub const BROKEN: u64 = u64::MAX - 1;
+/// A value it answers with FDB error 1020.
+pub const FAILS: u64 = u64::MAX - 2;
+
+/// The encoder of an [`EchoRequest`] for [`PeerHandle::request`](fdb_native_transport::peer::PeerHandle::request).
+pub fn echo_encode(
+    value: u64,
+) -> impl FnOnce(Uid, ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static {
+    move |reply, _version, out| {
+        let request = EchoRequest {
+            reply: ReplyPromise::new(reply),
+            value,
+        };
+        out.extend_from_slice(&fdb_native_wire::encode(&request)?);
+        Ok(())
+    }
+}
+
+pub fn echo_ok(value: u64) -> Vec<u8> {
+    let envelope: ErrorOr<EnsureTable<EchoReply>> = Ok(EnsureTable(EchoReply { value }));
+    fdb_native_wire::encode(&envelope).unwrap()
+}
+
+pub fn echo_error(code: u16) -> Vec<u8> {
+    let envelope: ErrorOr<EnsureTable<EchoReply>> = Err(FdbError::new(code));
+    fdb_native_wire::encode(&envelope).unwrap()
+}
+
+/// A responder that answers every [`EchoRequest`] on the reply token it carries.
+pub fn echo_responder() -> Responder {
+    Arc::new(|frame: &OwnedFrame| {
+        let Ok(request) = fdb_native_wire::decode::<EchoRequest>(&frame.payload) else {
+            return Vec::new();
+        };
+        let reply = request.reply.token();
+        match request.value {
+            SILENT => Vec::new(),
+            BROKEN => vec![(reply, echo_error(1100))],
+            FAILS => vec![(reply, echo_error(1020))],
+            value => vec![(reply, echo_ok(value + ECHO_ADDS))],
+        }
+    })
+}
+
+impl Script {
+    /// A server that answers echo requests.
+    pub fn echo(version: ProtocolVersion) -> Script {
+        let mut script = Script::new(version);
+        script.responder = Some(echo_responder());
+        script
+    }
+}
+
+impl Server {
+    /// The echo request values connection `index` received, in order.
+    pub fn echo_values(&self, index: usize) -> Vec<u64> {
+        self.records.lock().unwrap()[index]
+            .frames
+            .iter()
+            .filter_map(|f| fdb_native_wire::decode::<EchoRequest>(&f.payload).ok())
+            .map(|r| r.value)
+            .collect()
+    }
+
+    /// The echo requests connection `index` received, in order.
+    pub fn echo_requests(&self, index: usize) -> Vec<EchoRequest> {
+        self.records.lock().unwrap()[index]
+            .frames
+            .iter()
+            .filter_map(|f| fdb_native_wire::decode::<EchoRequest>(&f.payload).ok())
+            .collect()
+    }
 }

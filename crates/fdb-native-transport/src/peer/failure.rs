@@ -1,14 +1,19 @@
 //! A client-side `SimpleFailureMonitor`: which addresses and endpoints are known to be down.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use fdb_native_wire::{NetworkAddress, Uid};
 
 use super::address::PeerKey;
-use super::watch::Watch;
+use super::waiters::Waiters;
 use crate::connection::well_known;
 use crate::runtime::Instant;
+
+pub use crate::rpc::EndpointFailure;
 
 /// FDB's cap on remembered failed endpoints, after which it forgets them all
 /// (`SimpleFailureMonitor::endpointNotFound`, `fdbrpc/FailureMonitor.actor.cpp`).
@@ -25,15 +30,6 @@ pub struct AddressStatus {
     pub since: Option<Instant>,
     /// How many times a connection to the address has ended (FDB's `notifyDisconnect`).
     pub disconnects: u64,
-}
-
-/// Why an endpoint is known to be unusable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointFailure {
-    /// The peer answered a request with endpoint-not-found: it does not have the endpoint.
-    NotFound,
-    /// The peer refused the endpoint as unauthorized (`WLTOKEN_UNAUTHORIZED_ENDPOINT`).
-    Unauthorized,
 }
 
 /// The failure state of one endpoint (an address and a token), `IFailureMonitor::getState`.
@@ -58,6 +54,9 @@ impl EndpointStatus {
 struct State {
     addresses: HashMap<PeerKey, Entry>,
     endpoints: HashMap<(PeerKey, Uid), EndpointFailure>,
+    /// The waits on each address (its status, its disconnects, its endpoints). A change to one
+    /// address wakes only that address's waiters.
+    topics: HashMap<PeerKey, Waiters>,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +91,14 @@ impl State {
             EndpointStatus::Available
         }
     }
+
+    /// Takes the wakers of the waits on `key`, to wake once the lock is released.
+    fn wakers(&mut self, key: &PeerKey) -> Vec<Waker> {
+        self.topics
+            .get_mut(key)
+            .map(Waiters::take_all)
+            .unwrap_or_default()
+    }
 }
 
 /// What this process knows about the health of the processes it talks to: FDB's
@@ -102,26 +109,33 @@ impl State {
 /// * **Addresses.** An address starts available (FDB treats an address it knows nothing
 ///   about as not failed). A [`PeerManager`](super::PeerManager) marks it available when a
 ///   connection completes its handshake, and failed once connections to it have failed
-///   continuously for `failure_detection_delay` (4 s). Every end of a connection is also
-///   counted as a disconnect.
+///   continuously for `failure_detection_delay` (4 s). Every end of a connection or failed
+///   attempt is also counted as a disconnect, once.
 /// * **Endpoints.** An endpoint (address and token) is failed for good once the peer answers a
-///   request to it with endpoint-not-found ([`endpoint_not_found`](Self::endpoint_not_found),
-///   which the peer manager calls itself for every such notice) or unauthorized. It is not
-///   cleared by a reconnect (tokens are not reused), only by
+///   request to it with endpoint-not-found or unauthorized, or a request to it gets
+///   `broken_promise`. It is not cleared by a reconnect (tokens are not reused), only by
 ///   [`forget_endpoint`](Self::forget_endpoint). Well-known tokens are never marked: FDB
 ///   ignores a not-found for them (they exist again when the process restarts).
 ///
+/// # Relation to the request layer
+///
+/// Each peer's [`ReplyRegistry`](crate::rpc::ReplyRegistry) also remembers the endpoints that
+/// failed, and reports each new one as an event; the peer task records it here
+/// ([`endpoint_not_found`](Self::endpoint_not_found) /
+/// [`unauthorized_endpoint`](Self::unauthorized_endpoint)). **This monitor is the source of
+/// truth**: it is process-wide, and anything may write to it (a caller that learned of an
+/// endpoint's death another way, or [`forget_endpoint`](Self::forget_endpoint) when an endpoint
+/// is announced again). Before every request the peer task consults it: a failed endpoint is
+/// refused with the matching [`RequestError`](crate::rpc::RequestError) and nothing sent,
+/// and an endpoint that is available here is forgotten by the registry too, so the two never
+/// disagree for longer than one request.
+///
 /// The monitor is cheap to clone (a shared handle) and has no executor dependency: the
-/// `async` methods wait on its changes with plain wakers.
+/// `async` methods wait on its changes with plain wakers, one slot per wait, returned when the
+/// wait is dropped. A change to one address wakes only the waits on that address.
 #[derive(Clone, Debug, Default)]
 pub struct FailureMonitor {
-    state: Arc<Watch<State>>,
-}
-
-impl Default for Watch<State> {
-    fn default() -> Self {
-        Watch::new(State::default())
-    }
+    state: Arc<Mutex<State>>,
 }
 
 impl FailureMonitor {
@@ -130,10 +144,34 @@ impl FailureMonitor {
         FailureMonitor::default()
     }
 
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A panic while holding the lock leaves plain data behind: keep going.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Changes the state of `key`; `f` returns whether it changed anything (the address's
+    /// waiters are woken only then) and a result.
+    fn modify<R>(&self, key: &PeerKey, f: impl FnOnce(&mut State) -> (bool, R)) -> R {
+        let (result, wakers) = {
+            let mut state = self.lock();
+            let (changed, result) = f(&mut state);
+            let wakers = if changed {
+                state.wakers(key)
+            } else {
+                Vec::new()
+            };
+            (result, wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+        result
+    }
+
     /// The state of `address`.
     pub fn address_status(&self, address: &NetworkAddress) -> AddressStatus {
         let key = PeerKey::new(address);
-        self.state.read(|s| s.address(&key))
+        self.lock().address(&key)
     }
 
     /// Whether `address` is failed.
@@ -145,7 +183,18 @@ impl FailureMonitor {
     /// its address does; an endpoint of a failed address is failed too.
     pub fn endpoint_status(&self, address: &NetworkAddress, token: Uid) -> EndpointStatus {
         let key = PeerKey::new(address);
-        self.state.read(|s| s.endpoint(&key, token))
+        self.lock().endpoint(&key, token)
+    }
+
+    /// Why the endpoint `token` at `address` is failed for good, if it is (its address being
+    /// failed does not count).
+    pub fn endpoint_failure(
+        &self,
+        address: &NetworkAddress,
+        token: Uid,
+    ) -> Option<EndpointFailure> {
+        let key = PeerKey::new(address);
+        self.lock().endpoints.get(&(key, token)).copied()
     }
 
     /// Records that the peer at `address` does not have the endpoint `token`
@@ -162,12 +211,12 @@ impl FailureMonitor {
     }
 
     fn fail_endpoint(&self, address: &NetworkAddress, token: Uid, why: EndpointFailure) -> bool {
-        if well_known::is_well_known(token) {
+        if well_known::is_well_known(token) && why == EndpointFailure::NotFound {
             return false;
         }
         let key = PeerKey::new(address);
-        self.state.modify(|s| {
-            if s.endpoints.len() > MAX_FAILED_ENDPOINTS {
+        self.modify(&key, |s| {
+            if why == EndpointFailure::NotFound && s.endpoints.len() > MAX_FAILED_ENDPOINTS {
                 s.endpoints.clear();
             }
             let changed = s.endpoints.insert((key, token), why) != Some(why);
@@ -179,7 +228,7 @@ impl FailureMonitor {
     /// failed.
     pub fn forget_endpoint(&self, address: &NetworkAddress, token: Uid) -> bool {
         let key = PeerKey::new(address);
-        self.state.modify(|s| {
+        self.modify(&key, |s| {
             let was = s.endpoints.remove(&(key, token)).is_some();
             (was, was)
         })
@@ -193,7 +242,7 @@ impl FailureMonitor {
         now: Instant,
     ) -> bool {
         let key = PeerKey::new(address);
-        self.state.modify(|s| {
+        self.modify(&key, |s| {
             let entry = s.addresses.entry(key).or_default();
             if entry.failed == failed {
                 return (false, false);
@@ -207,10 +256,20 @@ impl FailureMonitor {
     /// A connection to `address` ended (`notifyDisconnect`).
     pub(crate) fn notify_disconnect(&self, address: &NetworkAddress) {
         let key = PeerKey::new(address);
-        self.state.modify(|s| {
+        self.modify(&key, |s| {
             s.addresses.entry(key).or_default().disconnects += 1;
             (true, ())
         });
+    }
+
+    /// A wait on `key`'s state that resolves with `f`'s first `Some`.
+    fn wait<R, F: FnMut(&State) -> Option<R>>(&self, key: PeerKey, f: F) -> Wait<'_, F> {
+        Wait {
+            monitor: self,
+            key,
+            f,
+            slot: None,
+        }
     }
 
     /// Resolves once `address` is failed (`failed`) or available (`!failed`): immediately if
@@ -221,12 +280,11 @@ impl FailureMonitor {
         failed: bool,
     ) -> AddressStatus {
         let key = PeerKey::new(address);
-        self.state
-            .wait_for(|s| {
-                let status = s.address(&key);
-                (status.failed == failed).then_some(status)
-            })
-            .await
+        self.wait(key, |s| {
+            let status = s.address(&key);
+            (status.failed == failed).then_some(status)
+        })
+        .await
     }
 
     /// Resolves with the endpoint's new state when it differs from what it is now
@@ -234,31 +292,92 @@ impl FailureMonitor {
     /// again, so this never resolves for one.
     pub async fn on_state_changed(&self, address: &NetworkAddress, token: Uid) -> EndpointStatus {
         let key = PeerKey::new(address);
-        let from = self.state.read(|s| s.endpoint(&key, token));
-        self.state
-            .wait_for(|s| {
-                let now = s.endpoint(&key, token);
-                (now != from).then_some(now)
-            })
-            .await
+        let from = self.lock().endpoint(&key, token);
+        self.wait(key, |s| {
+            let now = s.endpoint(&key, token);
+            (now != from).then_some(now)
+        })
+        .await
     }
 
     /// Resolves once a connection to `address` has ended after the call
     /// (`IFailureMonitor::onDisconnect`). Returns the address's disconnect count then.
     pub async fn on_disconnect(&self, address: &NetworkAddress) -> u64 {
         let key = PeerKey::new(address);
-        let from = self.state.read(|s| s.address(&key).disconnects);
-        self.state
-            .wait_for(|s| {
-                let now = s.address(&key).disconnects;
-                (now != from).then_some(now)
-            })
-            .await
+        let from = self.lock().address(&key).disconnects;
+        self.wait(key, |s| {
+            let now = s.address(&key).disconnects;
+            (now != from).then_some(now)
+        })
+        .await
+    }
+
+    /// How many waits are registered on `address` (for tests).
+    #[cfg(test)]
+    fn waiting(&self, address: &NetworkAddress) -> usize {
+        let key = PeerKey::new(address);
+        self.lock().topics.get(&key).map_or(0, Waiters::len)
+    }
+}
+
+/// A wait on one address's state.
+struct Wait<'a, F> {
+    monitor: &'a FailureMonitor,
+    key: PeerKey,
+    f: F,
+    slot: Option<usize>,
+}
+
+impl<F> Wait<'_, F> {
+    /// Gives the slot back, forgetting the address's waiter list once it is empty.
+    fn release(&mut self, state: &mut State) {
+        if self.slot.is_none() {
+            return;
+        }
+        if let Some(waiters) = state.topics.get_mut(&self.key) {
+            waiters.release(&mut self.slot);
+            if waiters.is_empty() {
+                state.topics.remove(&self.key);
+            }
+        }
+        self.slot = None;
+    }
+}
+
+impl<F: Unpin> Unpin for Wait<'_, F> {}
+
+impl<R, F: FnMut(&State) -> Option<R> + Unpin> Future for Wait<'_, F> {
+    type Output = R;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        let this = &mut *self;
+        let mut state = this.monitor.lock();
+        if let Some(result) = (this.f)(&state) {
+            this.release(&mut state);
+            return Poll::Ready(result);
+        }
+        state
+            .topics
+            .entry(this.key)
+            .or_default()
+            .register(&mut this.slot, cx.waker());
+        Poll::Pending
+    }
+}
+
+impl<F> Drop for Wait<'_, F> {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            let mut state = self.monitor.lock();
+            self.release(&mut state);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
     use std::time::Duration;
 
     use fdb_native_wire::IpAddress;
@@ -321,6 +440,10 @@ mod tests {
             fm.endpoint_status(&a, token),
             EndpointStatus::EndpointFailed(EndpointFailure::NotFound)
         );
+        assert_eq!(
+            fm.endpoint_failure(&a, token),
+            Some(EndpointFailure::NotFound)
+        );
         // A reconnect (an address becoming available) does not clear it.
         fm.set_address_failed(&a, true, t(1));
         fm.set_address_failed(&a, false, t(2));
@@ -362,5 +485,68 @@ mod tests {
             assert_eq!(s.since, Some(t(3)));
             assert_eq!(changed.await, EndpointStatus::AddressFailed);
         });
+        assert_eq!(fm.waiting(&a), 0, "finished waits give their slots back");
+    }
+
+    struct Counting(AtomicUsize);
+
+    impl Wake for Counting {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropped_waits_keep_no_wakers() {
+        let fm = FailureMonitor::new();
+        let a = addr(1);
+        let tokens: Vec<Arc<Counting>> = (0..1000)
+            .map(|_| Arc::new(Counting(AtomicUsize::new(0))))
+            .collect();
+        for (i, token) in tokens.iter().enumerate() {
+            let waker = Waker::from(token.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut wait = Box::pin(fm.on_state_changed(&a, Uid::new(1, i as u64)));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(fm.waiting(&a), 1);
+        }
+        assert_eq!(fm.waiting(&a), 0);
+        assert!(tokens.iter().all(|t| Arc::strong_count(t) == 1));
+        assert!(
+            fm.lock().topics.is_empty(),
+            "the address's list is gone too"
+        );
+    }
+
+    #[test]
+    fn a_change_wakes_only_the_waits_on_that_address() {
+        let fm = FailureMonitor::new();
+        let (a, b) = (addr(1), addr(2));
+        let on_a = Arc::new(Counting(AtomicUsize::new(0)));
+        let on_b = Arc::new(Counting(AtomicUsize::new(0)));
+        let (wa, wb) = (Waker::from(on_a.clone()), Waker::from(on_b.clone()));
+        let mut wait_a = Box::pin(fm.on_disconnect(&a));
+        let mut wait_b = Box::pin(fm.on_disconnect(&b));
+        assert!(
+            wait_a
+                .as_mut()
+                .poll(&mut Context::from_waker(&wa))
+                .is_pending()
+        );
+        assert!(
+            wait_b
+                .as_mut()
+                .poll(&mut Context::from_waker(&wb))
+                .is_pending()
+        );
+        fm.notify_disconnect(&a);
+        assert_eq!(on_a.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            on_b.0.load(Ordering::SeqCst),
+            0,
+            "another address is not woken"
+        );
+        fm.notify_disconnect(&b);
+        assert_eq!(on_b.0.load(Ordering::SeqCst), 1);
     }
 }

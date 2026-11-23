@@ -1,7 +1,8 @@
 //! The peer manager over an in-memory network on tokio's paused clock, against a scripted
-//! FDB-like server (see `common`): connect and reuse, replies, reconnect backoff, version
-//! detection, failure state, timeouts, backpressure, idle closes, TLS hook, shutdown. One test
-//! at the end runs over real loopback TCP.
+//! FDB-like server (see `common`): connect and reuse, requests and replies, reconnect backoff,
+//! version detection, failure state, timeouts, backpressure, idle closes, TLS hook, shutdown.
+//! One test at the end runs over real loopback TCP. The review findings (starvation, the
+//! command queue's bound, peer removal, ...) are in `peer_review.rs`.
 
 #![cfg(feature = "tokio")]
 
@@ -16,9 +17,10 @@ use common::*;
 use fdb_native_transport::ConnectionError;
 use fdb_native_transport::connection::well_known;
 use fdb_native_transport::peer::{
-    EndpointFailure, EndpointStatus, EventReceiver, FailureMonitor, Generation, NoTls, Outgoing,
-    PeerError, PeerEvent, PeerManager, PeerManagerConfig, PeerPhase, SendError, event_channel,
+    EndpointFailure, EndpointStatus, EventReceiver, FailureMonitor, Generation, NoTls, PeerError,
+    PeerEvent, PeerManager, PeerManagerConfig, PeerPhase, SendError, event_channel,
 };
+use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::TokioRuntime;
 use fdb_native_wire::{NetworkAddress, NetworkAddressList, ProtocolVersion, Uid};
 
@@ -35,7 +37,9 @@ fn manager(net: &Arc<Net>, config: PeerManagerConfig) -> (PeerManager<MemRuntime
 }
 
 fn drain(events: &mut EventReceiver) -> Vec<(NetworkAddress, PeerEvent)> {
-    std::iter::from_fn(|| events.try_next()).collect()
+    std::iter::from_fn(|| events.try_next())
+        .map(|record| (record.address, record.event))
+        .collect()
 }
 
 /// A monitor that never pings or times out, so a test can leave the peer alone for long.
@@ -103,70 +107,107 @@ async fn one_connection_is_shared_by_every_user_of_an_address() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_send_connects_by_itself_and_replies_come_back_to_the_registered_token() {
+async fn a_request_connects_by_itself_and_its_reply_completes_it() {
     let net = Net::new();
-    // The "request" carries its reply token in its first 16 bytes; the server answers there.
-    let mut script = Script::new(V80);
-    script.responder = Some(Arc::new(|frame: &fdb_native_transport::OwnedFrame| {
-        let first = u64::from_le_bytes(frame.payload[..8].try_into().unwrap());
-        let second = u64::from_le_bytes(frame.payload[8..16].try_into().unwrap());
-        vec![(Uid::new(first, second), b"the reply".to_vec())]
-    }));
-    let server = listen_one(&net, sock(4500), script);
-    let (mgr, mut events) = manager(&net, config());
+    let server = listen_one(&net, sock(4500), Script::echo(V80));
+    let (mgr, _events) = manager(&net, config());
     let peer = mgr.peer(&server.address);
 
-    let reply_token = Uid::new(0x1111, 0x2222);
-    let mut payload = Vec::new();
-    payload.extend(0x1111u64.to_le_bytes());
-    payload.extend(0x2222u64.to_le_bytes());
-    payload.extend(b"request body");
-    let generation = peer
-        .send_with(Outgoing::new(token(7), payload).reply_token(reply_token))
+    // The encoder is told the negotiated version, not the first guess (7.4): the first
+    // connection is refused as incompatible, and the request waits for the second.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let reply = peer
+        .request_as::<EchoReply, _>(token(7), move |reply, version, out| {
+            log.lock().unwrap().push(version);
+            echo_encode(5)(reply, version, out)
+        })
         .await
         .unwrap();
-    // The first guess (7.4) was wrong: the frame went to the second connection.
-    assert_eq!(generation, Generation(2));
-
-    until("the reply", || {
-        let seen = drain(&mut events);
-        seen.iter().any(|(_, e)| {
-            matches!(e, PeerEvent::Frame(f) if f.token == reply_token && f.payload == b"the reply")
-        })
-    })
-    .await;
-
-    // A token can be registered once.
     assert_eq!(
-        peer.register(reply_token).await,
-        Err(SendError::TokenUnavailable(reply_token))
+        reply,
+        EchoReply {
+            value: 5 + ECHO_ADDS
+        }
     );
-    assert_eq!(peer.register(token(55)).await, Ok(Generation(2)));
-    peer.unregister(token(55));
-    peer.unregister(reply_token);
-    // Well-known tokens cannot.
+    assert_eq!(*seen.lock().unwrap(), vec![V80], "encoded once, for 8.0");
+    assert_eq!(server.announced(), vec![Some(V74), Some(V80)]);
+    assert_eq!(server.echo_values(1), vec![5]);
+    assert_eq!(
+        server.echo_values(0),
+        Vec::<u64>::new(),
+        "nothing on the wrong one"
+    );
+    let sent = server.record(1).frames[0].clone();
+    assert_eq!(sent.token, token(7));
+    let request = fdb_native_wire::decode::<EchoRequest>(&sent.payload).unwrap();
+    assert_ne!(request.reply.token(), Uid::default());
+    assert_eq!(
+        request.reply.token().first & 1,
+        0,
+        "a reply token has the stream flag clear"
+    );
+
+    // The raw payload and decoding are separate steps too, and a server error is an error.
+    let payload = peer.request(token(7), echo_encode(1)).await.unwrap();
+    assert_eq!(
+        fdb_native_transport::rpc::decode_reply::<EchoReply>(&payload),
+        Ok(EchoReply {
+            value: 1 + ECHO_ADDS
+        })
+    );
+    assert_eq!(
+        peer.request_as::<EchoReply, _>(token(7), echo_encode(FAILS))
+            .await,
+        Err(RequestError::Fdb(fdb_native_wire::FdbError::new(1020)))
+    );
+    assert_eq!(
+        peer.request_as::<EchoReply, _>(token(7), echo_encode(BROKEN))
+            .await,
+        Err(RequestError::BrokenPromise)
+    );
+    // broken_promise also fails the endpoint, as C++ does: the next request is refused and
+    // never sent.
+    let frames = server.frames(1);
+    assert_eq!(
+        peer.request(token(7), echo_encode(2)).await,
+        Err(RequestError::EndpointNotFound {
+            token: token(7),
+            maybe_delivered: false
+        })
+    );
+    assert_eq!(server.frames(1), frames);
+    assert!(
+        mgr.failure_monitor()
+            .endpoint_status(&server.address, token(7))
+            .is_failed()
+    );
+    // A request to another endpoint is fine.
+    assert!(peer.request(token(8), echo_encode(3)).await.is_ok());
+
+    // A token can be registered once; well-known tokens cannot.
+    let stream = Uid::new(0x1111, 0x2222);
+    assert_eq!(peer.register(stream).await, Ok(Generation(2)));
+    assert_eq!(
+        peer.register(stream).await,
+        Err(SendError::TokenUnavailable(stream))
+    );
+    peer.unregister(stream);
     assert_eq!(
         peer.register(well_known::PING_PACKET).await,
         Err(SendError::TokenUnavailable(well_known::PING_PACKET))
     );
-    // A payload encoded for the other version is refused, and nothing is registered.
-    let wrong = Outgoing::new(token(8), vec![1])
-        .reply_token(token(9))
-        .for_version(V74);
-    assert_eq!(
-        peer.send_with(wrong).await,
-        Err(SendError::VersionMismatch {
-            expected: V74,
-            actual: V80
-        })
-    );
-    peer.send_with(
-        Outgoing::new(token(8), vec![1])
-            .reply_token(token(9))
-            .for_version(V80),
-    )
+    // A one-way send is told the version too.
+    let one_way = Arc::new(std::sync::Mutex::new(None));
+    let slot = one_way.clone();
+    peer.send_with(token(9), move |version, out| {
+        *slot.lock().unwrap() = Some(version);
+        out.extend_from_slice(b"fire and forget");
+        Ok(())
+    })
     .await
     .unwrap();
+    assert_eq!(*one_way.lock().unwrap(), Some(V80));
 }
 
 #[tokio::test(start_paused = true)]
@@ -453,6 +494,8 @@ async fn an_address_fails_after_four_seconds_of_failures_and_recovers_by_itself(
     let (mgr, _events) = manager(&net, config());
     let fm: FailureMonitor = mgr.failure_monitor().clone();
     let peer = mgr.peer(&address);
+    // Only a referenced peer is probed once it has failed.
+    let _reference = peer.reference();
     let t0 = tokio::time::Instant::now();
 
     assert!(!fm.is_failed(&address), "unknown addresses are available");
@@ -499,6 +542,7 @@ async fn an_available_peer_that_failed_is_probed_after_four_seconds() {
     let server = listen(&net, sock(4500), vec![flaky, Script::new(V74)], 64 * 1024);
     let (mgr, _events) = manager(&net, config());
     let peer = mgr.peer(&server.address);
+    let _reference = peer.reference();
     peer.connect().await.unwrap();
     until("the first connection ends", || peer.status().failures == 1).await;
     assert!(!peer.is_failed(), "a single failure leaves it available");
@@ -514,12 +558,24 @@ async fn an_unreferenced_failed_peer_is_not_probed() {
     let net = Net::new();
     let (mgr, _events) = manager(&net, config());
     let address = na(sock(4500), false);
-    let peer = mgr.peer(&address);
-    peer.connect().await.unwrap_err();
-    peer.set_referenced(false);
+    // Never referenced (C++'s peerReferences == -1): not probed after a failure.
+    let never = mgr.peer(&address);
+    never.connect().await.unwrap_err();
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(net.connects(sock(4500)), 1);
-    assert!(!peer.status().referenced);
+    assert_eq!(never.status().references, 0);
+
+    // Referenced and released again (peerReferences == 0): neither.
+    let other = na(sock(4501), false);
+    let released = mgr.peer(&other);
+    let reference = released.reference();
+    assert_eq!(released.status().references, 1);
+    released.connect().await.unwrap_err();
+    drop(reference);
+    assert_eq!(released.status().references, 0);
+    let before = net.connects(sock(4501));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(net.connects(sock(4501)), before);
 }
 
 #[tokio::test(start_paused = true)]
@@ -555,6 +611,16 @@ async fn endpoint_not_found_marks_the_endpoint_failed_for_good() {
             .iter()
             .any(|(_, e)| matches!(e, PeerEvent::EndpointNotFound { token } if *token == gone))
     );
+    // A request to it is refused without being sent, and forgetting the mark allows it again.
+    let frames = server.frames(0);
+    assert_eq!(
+        peer.request(gone, echo_encode(1)).await,
+        Err(RequestError::EndpointNotFound {
+            token: gone,
+            maybe_delivered: false
+        })
+    );
+    assert_eq!(server.frames(0), frames);
     // The rest of the address is fine, and the mark survives a reconnect.
     assert!(!fm.is_failed(&server.address));
     assert!(!fm.endpoint_status(&server.address, token(1)).is_failed());
@@ -579,6 +645,10 @@ async fn commands_without_a_connection_are_refused_as_not_sent() {
     );
     let error = peer.register(token(2)).await.unwrap_err();
     assert!(matches!(error, SendError::NotSent(_)), "{error:?}");
+    // A request that was never put on a connection is safe to resend.
+    let error = peer.request(token(3), echo_encode(1)).await.unwrap_err();
+    assert_eq!(error, RequestError::NotSent(None));
+    assert!(error.certainly_not_delivered() && error.should_retry());
 }
 
 // ---- timeouts ------------------------------------------------------------------------------
@@ -674,14 +744,14 @@ async fn a_dropped_send_is_not_sent() {
     let net = Net::new();
     let mut script = Script::new(V74);
     script.read = false;
-    let server = listen(&net, sock(4500), vec![script], 256);
+    let mut server = listen(&net, sock(4500), vec![script], 256);
     let mut c = config();
     c.max_pending_output = 2048;
     quiet_monitor(&mut c);
     let (mgr, _events) = manager(&net, c);
     let peer = mgr.peer(&server.address);
     peer.connect().await.unwrap();
-    // Fill the output, then give up on one more send.
+    // Fill the output, then give up on more sends: they never leave the queue.
     let mut filled = 0;
     loop {
         let send = peer.send(token(filled), vec![7; 1000]);
@@ -694,7 +764,35 @@ async fn a_dropped_send_is_not_sent() {
         }
     }
     assert!(filled >= 2, "{filled}");
+    assert_eq!(peer.queued_commands(), 0, "the dropped send left the queue");
+    for i in 0..3 {
+        let send = peer.send(token(1000 + i), vec![0xEE; 1000]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), send)
+                .await
+                .is_err()
+        );
+    }
     assert_eq!(server.frames(0), 0, "the server has read nothing");
+    // Now the server reads everything that was sent: exactly the accepted frames, and none
+    // of the abandoned ones.
+    server.conns_next().await.start_reading();
+    until("the server read the accepted frames", || {
+        server.frames(0) == filled as usize
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(server.frames(0), filled as usize);
+    let frames = server.record(0).frames;
+    assert!(
+        frames.iter().all(|f| f.payload.iter().all(|b| *b == 7)),
+        "an abandoned frame was sent"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.token.first == token(0).first && f.token.second < 1000)
+    );
 }
 
 // ---- idle and unreferenced -----------------------------------------------------------------
@@ -705,8 +803,9 @@ async fn an_unreferenced_connection_closes_cleanly_and_a_send_reopens_it() {
     let server = listen_one(&net, sock(4500), Script::new(V74));
     let (mgr, mut events) = manager(&net, config());
     let peer = mgr.peer(&server.address);
+    let reference = peer.reference();
     peer.connect().await.unwrap();
-    peer.set_referenced(false);
+    drop(reference);
 
     until("the connection is closed", || {
         peer.status().phase == PeerPhase::Idle
@@ -737,7 +836,7 @@ async fn an_unreferenced_connection_closes_cleanly_and_a_send_reopens_it() {
     // Nothing probes an idle, clean peer; the next use connects again (generation 2).
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(server.connections(), 1);
-    peer.set_referenced(true);
+    let _reference = peer.reference();
     assert_eq!(peer.send(token(1), vec![1]).await, Ok(Generation(2)));
     assert_eq!(server.connections(), 2);
 }
@@ -827,7 +926,7 @@ async fn a_stuck_or_failing_tls_handshake_is_reported() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn choose_primary_address_follows_the_managers_tls_mode() {
+async fn choose_primary_address_prefers_the_plain_address_like_a_cpp_client() {
     let net = Net::new();
     let plain = na(sock(4500), false);
     let tls = na(sock(4501), true);
@@ -837,13 +936,29 @@ async fn choose_primary_address_follows_the_managers_tls_mode() {
     };
     let (mgr, _events) = manager(&net, config());
     assert_eq!(mgr.primary_address(&list), plain, "no TLS configured");
-    let (sink, _events) = event_channel();
     let wrapper = |s: MemStream, _p: NetworkAddress| async move { Ok::<_, io::Error>(s) };
+    // A libfdb_c client never sets a local address, so even one that has TLS configured
+    // prefers the plain address of an endpoint that has both ...
+    let (sink, _events) = event_channel();
     let tls_mgr = PeerManager::with_stream_wrapper(MemRuntime::new(&net), config(), wrapper, sink);
-    assert_eq!(tls_mgr.primary_address(&list), tls);
+    assert_eq!(tls_mgr.primary_address(&list), plain);
+    // ... unless it is asked to prefer TLS.
+    let (sink, _events) = event_channel();
+    let mut c = config();
+    c.prefer_tls = true;
+    let prefers = PeerManager::with_stream_wrapper(MemRuntime::new(&net), c, wrapper, sink);
+    assert_eq!(prefers.primary_address(&list), tls);
+    // An endpoint with only a TLS address is connected to over TLS either way.
+    let only_tls = NetworkAddressList {
+        address: tls,
+        secondary_address: None,
+    };
+    assert_eq!(tls_mgr.primary_address(&only_tls), tls);
+    assert_eq!(mgr.primary_address(&only_tls), tls);
     let endpoint = fdb_native_wire::Endpoint::new(list, token(3));
     assert_eq!(mgr.peer_for_endpoint(&endpoint).address(), &plain);
-    assert_eq!(tls_mgr.peer_for_endpoint(&endpoint).address(), &tls);
+    assert_eq!(tls_mgr.peer_for_endpoint(&endpoint).address(), &plain);
+    assert_eq!(prefers.peer_for_endpoint(&endpoint).address(), &tls);
 }
 
 // ---- shutdown ------------------------------------------------------------------------------
@@ -940,16 +1055,23 @@ async fn shutdown_refuses_commands_waiting_in_backoff() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn dropping_the_manager_and_every_handle_ends_the_tasks() {
+async fn dropping_the_last_manager_shuts_the_peers_down() {
     let net = Net::new();
     let server = listen_one(&net, sock(4500), Script::new(V74));
     let baseline = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
-    {
+    let peer = {
         let (mgr, _events) = manager(&net, config());
-        mgr.peer(&server.address).connect().await.unwrap();
-    }
+        let clone = mgr.clone();
+        let peer = mgr.peer(&server.address);
+        peer.connect().await.unwrap();
+        drop(mgr);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(peer.status().phase, PeerPhase::Connected, "a clone is left");
+        drop(clone);
+        peer
+    };
     until("the peer task ends", || {
         tokio::runtime::Handle::current()
             .metrics()
@@ -961,6 +1083,8 @@ async fn dropping_the_manager_and_every_handle_ends_the_tasks() {
         server.record(0).closed_at.is_some()
     })
     .await;
+    assert_eq!(peer.status().phase, PeerPhase::Shutdown);
+    assert_eq!(peer.send(token(1), vec![1]).await, Err(SendError::Shutdown));
 }
 
 // ---- the real tokio adapter over loopback TCP ----------------------------------------------
@@ -972,16 +1096,7 @@ async fn tcp_loopback_end_to_end() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let records = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut script = Script::new(V80);
-    script.responder = Some(Arc::new(|frame: &fdb_native_transport::OwnedFrame| {
-        vec![(
-            Uid::new(
-                u64::from_le_bytes(frame.payload[..8].try_into().unwrap()),
-                u64::from_le_bytes(frame.payload[8..16].try_into().unwrap()),
-            ),
-            b"pong".to_vec(),
-        )]
-    }));
+    let script = Script::echo(V80);
     let accepted = records.clone();
     tokio::spawn(async move {
         loop {
@@ -1008,32 +1123,28 @@ async fn tcp_loopback_end_to_end() {
         }
     });
 
-    let (sink, mut events) = event_channel();
+    let (sink, _events) = event_channel();
     let mgr: PeerManager<TokioRuntime, NoTls> =
         PeerManager::new(TokioRuntime::new(), config(), sink);
     let peer = mgr.peer(&na(addr, false));
     // Version detection happens over a real socket too.
     assert_eq!(peer.connect().await, Ok(V80));
     assert_eq!(records.lock().unwrap().len(), 2);
-    let reply_token = Uid::new(0x77, 0x88);
-    let mut payload = Vec::new();
-    payload.extend(0x77u64.to_le_bytes());
-    payload.extend(0x88u64.to_le_bytes());
-    for _ in 0..20 {
-        let reply = Uid::new(0x77, 0x88);
-        peer.register(reply).await.ok();
-        peer.send(token(5), payload.clone()).await.unwrap();
-        peer.unregister(reply);
+    let mut requests = Vec::new();
+    for value in 0..40u64 {
+        let peer = peer.clone();
+        requests.push(tokio::spawn(async move {
+            peer.request_as::<EchoReply, _>(token(5), echo_encode(value))
+                .await
+        }));
     }
-    let got = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let (_, event) = events.next().await.expect("events");
-            if matches!(&event, PeerEvent::Frame(f) if f.token == reply_token) {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(got.is_ok(), "no reply arrived");
+    for (value, request) in requests.into_iter().enumerate() {
+        let reply = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("a reply arrived")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.value, value as u64 + ECHO_ADDS);
+    }
     mgr.shutdown().await;
 }

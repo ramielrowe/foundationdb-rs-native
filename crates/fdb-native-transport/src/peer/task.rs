@@ -1,25 +1,32 @@
-//! The task of one peer: connects, runs the [`Connection`], reconnects.
+//! The task of one peer: connects, runs the [`Connection`] and its [`ReplyRegistry`],
+//! reconnects.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fdb_native_wire::{NetworkAddress, ProtocolVersion};
-use futures_channel::mpsc;
+use fdb_native_wire::{NetworkAddress, ProtocolVersion, Uid};
+use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
 
 use super::address::PeerKey;
 use super::backoff::Backoff;
+use super::queue::{Cmd, Refusal};
 use super::stream::{MaybeTls, StreamWrapper};
 use super::{
-    Ctrl, DataCmd, Generation, PeerError, PeerEvent, PeerPhase, PeerShared, PeerStatus, SendError,
-    Shared,
+    Ctrl, Generation, PeerError, PeerEvent, PeerPhase, PeerShared, PeerStatus, SendError, Shared,
 };
-use crate::connection::{Connection, ConnectionConfig, ConnectionError, ConnectionState, Event};
+use crate::connection::{
+    Connection, ConnectionConfig, ConnectionError, ConnectionState, SendError as FrameRefused,
+};
+use crate::rpc::{
+    Completion, EndpointFailure, RegistryConfig, ReplyRegistry, RequestError, RpcEvent,
+};
 use crate::runtime::{Instant, Runtime};
 
 /// A boxed timer, re-made when the connection's deadline moves.
@@ -27,6 +34,14 @@ type BoxedSleep<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// How much is read from the socket at once.
 const READ_SIZE: usize = 16 * 1024;
+
+/// How many times a pass goes round its sources before the task yields to the executor.
+const ROUNDS: usize = 8;
+/// How many reads, control messages and commands one round takes from each source, so that no
+/// source can keep the others waiting.
+const READS_PER_ROUND: usize = 8;
+const CTRL_PER_ROUND: usize = 64;
+const CMDS_PER_ROUND: usize = 64;
 
 /// A small deterministic generator (SplitMix64) for the jitter and the connection seeds.
 #[derive(Clone, Debug)]
@@ -70,8 +85,10 @@ async fn timeout<R: Runtime, F: Future>(
     .await
 }
 
-/// Connects to `address`: TCP, then the TLS hook for a TLS address. Owns what it needs, so it
-/// can be driven while the task keeps taking commands.
+/// Connects to `address`: TCP, then the TLS hook for a TLS address, all within one
+/// `connect_timeout` (as `connectionKeeper`'s `timeoutError(connect, CONNECTION_MONITOR_TIMEOUT)`
+/// covers a TLS handshake too). Owns what it needs, so it can be driven while the task keeps
+/// taking control messages.
 async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
     shared: Arc<Shared<R, W>>,
     address: NetworkAddress,
@@ -81,21 +98,30 @@ async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
         return Err(PeerError::TlsNotConfigured);
     }
     let after = shared.config.connect_timeout;
-    let socket = match timeout(&shared.rt, after, shared.rt.connect(address.socket_addr())).await {
-        Ok(Ok(socket)) => socket,
-        Ok(Err(e)) => return Err(PeerError::Connect(e.kind())),
-        Err(Elapsed) => return Err(PeerError::ConnectTimeout { after }),
+    // Which part ran out of time.
+    let tcp_done = AtomicBool::new(false);
+    let work = async {
+        let socket = shared
+            .rt
+            .connect(address.socket_addr())
+            .await
+            .map_err(|e| PeerError::Connect(e.kind()))?;
+        if !tls {
+            return Ok(MaybeTls::Plain(socket));
+        }
+        tcp_done.store(true, Ordering::SeqCst);
+        match shared.wrapper.wrap(socket, address).await {
+            Ok(stream) => Ok(MaybeTls::Tls(stream)),
+            Err(e) => Err(PeerError::Tls {
+                kind: e.kind(),
+                message: e.to_string(),
+            }),
+        }
     };
-    if !tls {
-        return Ok(MaybeTls::Plain(socket));
-    }
-    match timeout(&shared.rt, after, shared.wrapper.wrap(socket, address)).await {
-        Ok(Ok(stream)) => Ok(MaybeTls::Tls(stream)),
-        Ok(Err(e)) => Err(PeerError::Tls {
-            kind: e.kind(),
-            message: e.to_string(),
-        }),
-        Err(Elapsed) => Err(PeerError::TlsTimeout { after }),
+    match timeout(&shared.rt, after, work).await {
+        Ok(result) => result,
+        Err(Elapsed) if tcp_done.load(Ordering::SeqCst) => Err(PeerError::TlsTimeout { after }),
+        Err(Elapsed) => Err(PeerError::ConnectTimeout { after }),
     }
 }
 
@@ -103,7 +129,7 @@ async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
 enum Step<T> {
     /// The future it was driving finished.
     Done(T),
-    /// A command was absorbed: look at the state again.
+    /// A message arrived and was absorbed: look at the state again.
     Changed,
     /// The peer is to shut down.
     Shutdown,
@@ -115,88 +141,44 @@ enum RunEnd {
     Shutdown,
 }
 
-/// Why the connection's wait loop woke.
-enum Wake {
-    /// Output was written, input was fed, or an error was recorded: go round.
-    Progress,
-    Timer,
-    Ctrl(Ctrl),
-    CtrlClosed,
-    Data(DataCmd),
-    DataClosed,
+/// A request that was sent and awaits its reply.
+struct Waiter {
+    reply: oneshot::Sender<Result<Vec<u8>, RequestError>>,
+    /// Its reply token in the registry, to cancel it.
+    token: Uid,
 }
 
-/// What applying a command to a connection came to.
-enum Applied {
-    /// It was applied, or refused for good.
-    Done(Result<(), SendError>),
-    /// The connection's output is full: try again after a write.
-    NoRoom,
-    /// The connection ended.
-    Closed,
-}
-
-/// Applies one command to `conn`.
-fn apply(conn: &mut Connection, cmd: &DataCmd) -> Applied {
-    use crate::connection::SendError as Refused;
-    if conn.state() == ConnectionState::Closed {
-        return Applied::Closed;
-    }
-    match cmd {
-        DataCmd::Register { token, .. } => Applied::Done(if conn.register(*token) {
-            Ok(())
-        } else {
-            Err(SendError::TokenUnavailable(*token))
-        }),
-        DataCmd::Send { out, .. } => {
-            if let Some(expected) = out.version {
-                if !expected.is_compatible(conn.local_version()) {
-                    return Applied::Done(Err(SendError::VersionMismatch {
-                        expected,
-                        actual: conn.local_version(),
-                    }));
-                }
-            }
-            if let Some(reply) = out.reply_token {
-                if !conn.register(reply) {
-                    return Applied::Done(Err(SendError::TokenUnavailable(reply)));
-                }
-            }
-            match conn.send(out.token, &out.payload) {
-                Ok(()) => Applied::Done(Ok(())),
-                Err(error) => {
-                    if let Some(reply) = out.reply_token {
-                        conn.unregister(reply);
-                    }
-                    match error {
-                        Refused::Backpressure => Applied::NoRoom,
-                        Refused::Frame(e) => Applied::Done(Err(SendError::Frame(e))),
-                        // `Closed`: the next drain reports why. (`Payload` holds `Infallible`
-                        // and the enum is non-exhaustive.)
-                        _ => Applied::Closed,
-                    }
-                }
-            }
-        }
-    }
+/// One connection being run: the sans-IO core and its socket.
+struct Run<'a, R: Runtime, S> {
+    rt: &'a R,
+    conn: Connection,
+    stream: S,
+    generation: Generation,
+    /// The version the connection announced.
+    announce: ProtocolVersion,
+    /// The version negotiated, once the handshake completed.
+    negotiated: Option<ProtocolVersion>,
+    established: bool,
+    needs_flush: bool,
+    sleep: Option<(Instant, BoxedSleep<'a>)>,
 }
 
 /// The task of one peer. See the [module documentation](super).
 pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     shared: Arc<Shared<R, W>>,
-    address: NetworkAddress,
+    key: PeerKey,
     peer: Arc<PeerShared>,
     ctrl: mpsc::UnboundedReceiver<Ctrl>,
-    data: mpsc::Receiver<DataCmd>,
-    data_closed: bool,
-    /// Commands taken from the queue and not applied yet, oldest first.
-    pending: VecDeque<DataCmd>,
+    /// Requests sent and awaiting replies, by command id. Empty between connections: the
+    /// registry completes every one when a connection ends.
+    registry: ReplyRegistry<u64>,
+    waiters: HashMap<u64, Waiter>,
     backoff: Backoff,
     rng: Rng,
     /// The number of the latest connection.
     generation: u64,
-    referenced: bool,
-    /// Something wants a connection now.
+    /// Something wants a connection. Lasts until a connection is established or an attempt
+    /// fails.
     demand: bool,
     /// When the next attempt starts, once decided.
     connect_at: Option<Instant>,
@@ -205,16 +187,16 @@ pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     /// When the current run of failures began.
     first_failure: Option<Instant>,
     shutdown: bool,
+    /// The peer was removed from its manager.
+    retired: bool,
 }
 
 impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     pub(crate) fn new(
         shared: Arc<Shared<R, W>>,
-        address: NetworkAddress,
         key: PeerKey,
         peer: Arc<PeerShared>,
         ctrl: mpsc::UnboundedReceiver<Ctrl>,
-        data: mpsc::Receiver<DataCmd>,
     ) -> Self {
         // Peers draw different jitter: mix the address into the seed.
         let mixed = shared.seed
@@ -223,27 +205,31 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 std::net::IpAddr::V4(ip) => u64::from(u32::from(ip)) << 16,
                 std::net::IpAddr::V6(ip) => (u128::from(ip) as u64).rotate_left(7),
             };
+        let mut rng = Rng(mixed);
+        let mut registry_config = RegistryConfig::new();
+        if shared.config.seed.is_some() {
+            registry_config.seed = rng.next_u64();
+        }
         PeerTask {
             backoff: Backoff::new(shared.config.backoff),
             shared,
-            address,
+            key,
             peer,
             ctrl,
-            data,
-            data_closed: false,
-            pending: VecDeque::new(),
-            rng: Rng(mixed),
+            registry: ReplyRegistry::new(registry_config),
+            waiters: HashMap::new(),
+            rng,
             generation: 0,
-            referenced: true,
             demand: false,
             connect_at: None,
             probe_at: None,
             first_failure: None,
             shutdown: false,
+            retired: false,
         }
     }
 
-    /// Runs the peer until it is shut down (or every handle and the manager are gone).
+    /// Runs the peer until it is shut down or removed.
     pub(crate) async fn run(mut self) {
         loop {
             if !self.wait_for_attempt().await || !self.attempt().await {
@@ -254,7 +240,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     }
 
     fn finish(&mut self) {
-        self.fail_pending(SendError::Shutdown);
+        // Nothing is left in the registry (a connection's end completes every request); a
+        // waiter that is, was not answered, which its caller reads as maybe delivered.
+        self.waiters.clear();
+        for cmd in self.peer.queue.close() {
+            cmd.refuse(Refusal::Shutdown);
+        }
         self.update(|s| {
             let changed = s.phase != PeerPhase::Shutdown || s.version.is_some();
             s.phase = PeerPhase::Shutdown;
@@ -263,10 +254,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             changed
         });
         self.ctrl.close();
-        self.data.close();
-        // Anything still queued is dropped here, which cancels its sender's wait.
-        while let Ok(cmd) = self.data.try_recv() {
-            cmd.refuse(SendError::Shutdown);
+        if self.retired {
+            self.emit(PeerEvent::Removed);
         }
     }
 
@@ -275,7 +264,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     }
 
     fn emit(&self, event: PeerEvent) {
-        self.shared.sink.on_event(&self.address, event);
+        self.shared
+            .sink
+            .on_event(self.peer.id, &self.peer.address, event);
     }
 
     /// Changes the shared status; `f` returns whether it changed anything.
@@ -291,19 +282,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         });
     }
 
-    fn set_referenced(&mut self, referenced: bool) {
-        self.referenced = referenced;
-        self.update(|s| {
-            let changed = s.referenced != referenced;
-            s.referenced = referenced;
-            changed
-        });
-    }
-
-    /// Refuses every command that was not applied.
-    fn fail_pending(&mut self, error: SendError) {
-        for cmd in self.pending.drain(..) {
-            cmd.refuse(error.clone());
+    /// Refuses every command still queued, and every sender still waiting for room (not those
+    /// whose callers gave up).
+    fn refuse_queue(&self, error: &PeerError) {
+        for cmd in self.peer.queue.refuse_waiting(error) {
+            if !cmd.is_cancelled() {
+                cmd.refuse(Refusal::NotSent(error.clone()));
+            }
         }
     }
 
@@ -312,15 +297,25 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     fn apply_ctrl(&mut self, ctrl: Ctrl) {
         match ctrl {
             Ctrl::Connect => self.demand = true,
-            Ctrl::SetReferenced(referenced) => self.set_referenced(referenced),
-            Ctrl::Unregister(_) | Ctrl::CloseConnection => {}
             Ctrl::Shutdown => self.shutdown = true,
+            // Nothing to do without a connection (a request that is gone from the queue was
+            // never applied; the rest look at the state again).
+            Ctrl::RefsChanged
+            | Ctrl::Released
+            | Ctrl::Unregister(_)
+            | Ctrl::Cancel(_)
+            | Ctrl::CloseConnection => {}
         }
     }
 
-    /// Drives `fut` while taking commands: returns when it finishes, when a command was
-    /// taken (so that the caller can look at the state again), or at shutdown.
-    async fn step<F: Future>(&mut self, mut fut: Pin<&mut F>) -> Step<F::Output> {
+    /// Drives `fut` while taking control messages: returns when it finishes, when a message
+    /// was taken (so that the caller can look at the state again), or at shutdown. With
+    /// `watch_queue` it also returns when a command arrives.
+    async fn step<F: Future>(
+        &mut self,
+        mut fut: Pin<&mut F>,
+        watch_queue: bool,
+    ) -> Step<F::Output> {
         poll_fn(|cx| {
             match Pin::new(&mut self.ctrl).poll_next(cx) {
                 Poll::Ready(Some(ctrl)) => {
@@ -337,13 +332,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 }
                 Poll::Pending => {}
             }
-            if !self.data_closed && self.pending.len() < self.shared.config.command_queue_len {
-                match Pin::new(&mut self.data).poll_next(cx) {
-                    Poll::Ready(Some(cmd)) => {
-                        self.pending.push_back(cmd);
-                        return Poll::Ready(Step::Changed);
+            if watch_queue {
+                match self.peer.queue.poll_nonempty(cx) {
+                    Poll::Ready(true) => return Poll::Ready(Step::Changed),
+                    Poll::Ready(false) => {
+                        self.shutdown = true;
+                        return Poll::Ready(Step::Shutdown);
                     }
-                    Poll::Ready(None) => self.data_closed = true,
                     Poll::Pending => {}
                 }
             }
@@ -356,7 +351,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     async fn drive<F: Future>(&mut self, fut: F) -> Option<F::Output> {
         let mut fut = pin!(fut);
         loop {
-            match self.step(fut.as_mut()).await {
+            match self.step(fut.as_mut(), false).await {
                 Step::Done(value) => return Some(value),
                 Step::Changed => {}
                 Step::Shutdown => return None,
@@ -364,15 +359,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         }
     }
 
-    /// Waits until a connection attempt is due. `false` at shutdown.
+    /// Waits until a connection attempt is due. `false` when the peer is to end: shut down,
+    /// or removed because nothing uses it.
     async fn wait_for_attempt(&mut self) -> bool {
         let rt = self.rt();
         loop {
             if self.shutdown {
                 return false;
             }
+            self.peer.queue.purge_cancelled();
             let now = rt.now();
-            let wanted = self.demand || !self.pending.is_empty();
+            let wanted = self.demand || !self.peer.queue.is_empty();
             let sleep_until;
             if wanted {
                 let at = match self.connect_at {
@@ -389,20 +386,27 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 self.set_phase(PeerPhase::Backoff { until: at });
                 sleep_until = Some(at);
             } else {
+                if self.shared.try_retire(&self.key, &self.peer) {
+                    self.retired = true;
+                    return false;
+                }
                 self.set_phase(PeerPhase::Idle);
-                sleep_until = match (self.probe_at, self.referenced) {
-                    (Some(at), true) if at <= now => {
+                // Only a referenced peer is probed again after a failure.
+                if self.peer.references() <= 0 {
+                    self.probe_at = None;
+                }
+                sleep_until = match self.probe_at {
+                    Some(at) if at <= now => {
                         self.probe_at = None;
                         self.demand = true;
                         continue;
                     }
-                    (Some(at), true) => Some(at),
-                    _ => None,
+                    other => other,
                 };
             }
             let step = match sleep_until {
-                Some(at) => self.step(pin!(rt.sleep_until(at))).await,
-                None => self.step(pin!(std::future::pending::<()>())).await,
+                Some(at) => self.step(pin!(rt.sleep_until(at)), !wanted).await,
+                None => self.step(pin!(std::future::pending::<()>()), !wanted).await,
             };
             if matches!(step, Step::Shutdown) {
                 return false;
@@ -429,10 +433,14 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         });
     }
 
+    /// One `notifyDisconnect` for the end of an attempt or connection.
+    fn notify_disconnect(&self) {
+        self.shared.failures.notify_disconnect(&self.peer.address);
+    }
+
     /// Connects, runs the connection and handles its end. `false` at shutdown.
     async fn attempt(&mut self) -> bool {
         let rt = self.rt();
-        self.demand = false;
         self.connect_at = None;
         self.probe_at = None;
         self.backoff.attempt_started(rt.now());
@@ -440,7 +448,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         let mut tried = vec![announce];
         loop {
             self.set_phase(PeerPhase::Connecting);
-            let dialled = dial(self.shared.clone(), self.address);
+            let dialled = dial(self.shared.clone(), self.peer.address);
             let Some(dialled) = self.drive(dialled).await else {
                 return false;
             };
@@ -450,6 +458,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     self.emit(PeerEvent::ConnectFailed {
                         error: error.clone(),
                     });
+                    self.notify_disconnect();
                     self.record_failure(error);
                     return true;
                 }
@@ -463,18 +472,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     Some(next) if !tried.contains(&next) => {
                         // The cluster runs another version we can speak: announce it now.
                         self.learn_version(next);
-                        self.shared.failures.notify_disconnect(&self.address);
+                        self.notify_disconnect();
                         tried.push(next);
                         announce = next;
                         continue;
                     }
                     Some(_) => {}
                     None => {
-                        let error = PeerError::UnsupportedVersion {
+                        self.notify_disconnect();
+                        self.record_failure(PeerError::UnsupportedVersion {
                             peer: peer_version,
                             supported: self.shared.config.supported_versions.clone(),
-                        };
-                        self.record_failure(error);
+                        });
                         return true;
                     }
                 }
@@ -487,8 +496,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     /// Bookkeeping for a connection that ended.
     fn connection_ended(&mut self, error: ConnectionError) {
         let now = self.shared.rt.now();
-        self.shared.failures.notify_disconnect(&self.address);
+        self.notify_disconnect();
         if error.is_clean() {
+            // A close that says nothing about the peer. If it came before the handshake
+            // completed, the demand that asked for the connection is still there: it is
+            // retried, not forgotten.
             self.backoff.ended(now, true);
             self.first_failure = None;
             self.update(|s| {
@@ -502,22 +514,26 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         }
     }
 
-    /// An attempt or connection failed.
+    /// An attempt or connection failed. (The caller has counted the disconnect.)
     fn record_failure(&mut self, error: PeerError) {
         let shared = self.shared.clone();
         let config = &shared.config;
         let now = shared.rt.now();
-        shared.failures.notify_disconnect(&self.address);
         self.backoff.ended(now, false);
         let first = *self.first_failure.get_or_insert(now);
         if now.saturating_duration_since(first) > config.failure_detection_delay {
-            shared.failures.set_address_failed(&self.address, true, now);
+            shared
+                .failures
+                .set_address_failed(&self.peer.address, true, now);
         }
-        self.fail_pending(SendError::NotSent(error.clone()));
-        // Without anything to send, a failed peer is probed again: sooner if it is already
-        // marked failed (7.4:783-812, 8.0:909-916).
-        self.probe_at = self.referenced.then(|| {
-            now + if shared.failures.is_failed(&self.address) {
+        // The demand that asked for this attempt is answered (with the failure), and so is
+        // everything queued: not just a batch of it, all of it.
+        self.demand = false;
+        self.refuse_queue(&error);
+        // Without anything to send, a failed referenced peer is probed again: sooner if it is
+        // already marked failed (7.4:783-812, 8.0:909-916).
+        self.probe_at = (self.peer.references() > 0).then(|| {
+            now + if shared.failures.is_failed(&self.peer.address) {
                 config.failed_probe_interval
             } else {
                 config.failure_detection_delay
@@ -533,21 +549,22 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         });
     }
 
-    /// The handshake with the peer completed.
+    /// The handshake with the peer completed. Returns the version negotiated.
     fn established(
         &mut self,
         generation: Generation,
         announced: ProtocolVersion,
         version: ProtocolVersion,
-    ) {
+    ) -> ProtocolVersion {
         let now = self.shared.rt.now();
         self.first_failure = None;
+        self.demand = false;
         // The version we speak is the supported one the peer's is compatible with.
         let negotiated = self.shared.supported(version).unwrap_or(announced);
         self.shared.set_cluster_version(negotiated);
         self.shared
             .failures
-            .set_address_failed(&self.address, false, now);
+            .set_address_failed(&self.peer.address, false, now);
         self.update(|s| {
             s.phase = PeerPhase::Connected;
             s.version = Some(negotiated);
@@ -556,88 +573,319 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             s.connected_since = Some(now);
             true
         });
+        negotiated
     }
 
     // ---- a connection --------------------------------------------------------------------
 
-    /// Hands the events of `conn` to the sink. Returns why it ended, if it did.
-    fn drain(
-        &mut self,
-        conn: &mut Connection,
-        generation: Generation,
-        announced: ProtocolVersion,
-        established: &mut bool,
-    ) -> Option<ConnectionError> {
+    /// Hands the events of the connection to their owners, through the registry: replies and
+    /// failures complete their requests, the rest goes to the sink. Returns why the connection
+    /// ended, if it did (after the completions of every request that was on it).
+    fn drain<S>(&mut self, run: &mut Run<'_, R, S>) -> Option<ConnectionError> {
         let mut closed = None;
-        while let Some(event) = conn.poll_event() {
-            let event = match event {
-                Event::Connected { peer } => {
+        while let Some(event) = self.registry.poll_event(&mut run.conn) {
+            match event {
+                RpcEvent::Connected { peer } => {
                     let version = peer.protocol_version.without_flags();
-                    *established = true;
-                    self.established(generation, announced, version);
-                    PeerEvent::Connected {
-                        generation,
-                        version: self.shared.supported(version).unwrap_or(version),
+                    run.established = true;
+                    let negotiated = self.established(run.generation, run.announce, version);
+                    run.negotiated = Some(negotiated);
+                    self.emit(PeerEvent::Connected {
+                        generation: run.generation,
+                        version: negotiated,
                         peer,
-                    }
+                    });
                 }
-                Event::Frame(frame) => PeerEvent::Frame(frame.into_owned()),
-                Event::UnknownToken { token, reported } => {
-                    PeerEvent::UnknownToken { token, reported }
+                RpcEvent::Completion(completion) => self.complete(completion),
+                RpcEvent::EndpointFailed { token, failure } => self.endpoint_failed(token, failure),
+                RpcEvent::Frame(frame) => self.emit(PeerEvent::Frame(frame)),
+                RpcEvent::UnknownToken { token, reported } => {
+                    self.emit(PeerEvent::UnknownToken { token, reported });
                 }
-                Event::EndpointNotFound { token } => {
-                    self.shared
-                        .failures
-                        .endpoint_not_found(&self.address, token);
-                    PeerEvent::EndpointNotFound { token }
-                }
-                Event::UnauthorizedEndpoint { token } => {
-                    self.shared
-                        .failures
-                        .unauthorized_endpoint(&self.address, token);
-                    PeerEvent::UnauthorizedEndpoint { token }
-                }
-                Event::Closed(error) => {
+                RpcEvent::Closed(error) => {
                     self.emit(PeerEvent::Closed {
-                        generation,
+                        generation: run.generation,
                         error: PeerError::Connection(error.clone()),
-                        established: *established,
+                        established: run.established,
                     });
                     closed = Some(error);
-                    continue;
                 }
-            };
-            self.emit(event);
+            }
         }
         closed
     }
 
-    /// Applies the commands that can be applied, oldest first. Stops at the first that meets
-    /// backpressure (it is tried again after the next write) or when the connection ends.
-    fn apply_pending(&mut self, conn: &mut Connection, generation: Generation) {
-        loop {
-            let applied = match self.pending.front() {
-                None => return,
-                Some(cmd) if cmd.is_cancelled() => {
-                    // Its caller gave up before it was applied: it is never sent.
-                    self.pending.pop_front();
-                    continue;
-                }
-                Some(cmd) => apply(conn, cmd),
-            };
-            match applied {
-                Applied::NoRoom | Applied::Closed => return,
-                Applied::Done(result) => {
-                    if let Some(cmd) = self.pending.pop_front() {
-                        cmd.reply(result.map(|()| generation));
-                    }
-                }
+    /// A request finished: hand its caller the result.
+    fn complete(&mut self, completion: Completion<u64>) {
+        if let Some(waiter) = self.waiters.remove(&completion.key) {
+            // The caller may have given up.
+            let _ = waiter.reply.send(completion.result);
+        }
+    }
+
+    /// The registry found an endpoint of this peer failed: tell the failure monitor, which
+    /// keeps the process-wide view, and the observers.
+    fn endpoint_failed(&self, token: Uid, failure: EndpointFailure) {
+        let address = &self.peer.address;
+        match failure {
+            EndpointFailure::Unauthorized => {
+                self.shared.failures.unauthorized_endpoint(address, token);
+                self.emit(PeerEvent::UnauthorizedEndpoint { token });
+            }
+            _ => {
+                self.shared.failures.endpoint_not_found(address, token);
+                self.emit(PeerEvent::EndpointNotFound { token });
             }
         }
     }
 
+    /// After something may have changed the connection: hand out its events, and say whether
+    /// the run is over.
+    fn after<S>(&mut self, run: &mut Run<'_, R, S>) -> Option<RunEnd> {
+        if let Some(error) = self.drain(run) {
+            return Some(RunEnd::Closed(error));
+        }
+        if self.shutdown {
+            return Some(RunEnd::Shutdown);
+        }
+        if run.conn.state() == ConnectionState::Closed {
+            // Its `Closed` event was given already: this is not reached by a connection that
+            // behaves, and must not leave the task waiting for nothing.
+            return Some(RunEnd::Closed(
+                run.conn
+                    .error()
+                    .cloned()
+                    .unwrap_or(ConnectionError::LocalClose),
+            ));
+        }
+        None
+    }
+
+    /// A control message, with a connection running.
+    fn handle_ctrl<S>(&mut self, run: &mut Run<'_, R, S>, ctrl: Ctrl) {
+        match ctrl {
+            Ctrl::Connect => {
+                // An established connection satisfies it; one still handshaking that ends
+                // cleanly must be retried.
+                if !run.established {
+                    self.demand = true;
+                }
+            }
+            Ctrl::RefsChanged | Ctrl::Released => {
+                run.conn
+                    .set_referenced(self.peer.references() != 0, run.rt.now());
+            }
+            Ctrl::Unregister(token) => {
+                run.conn.unregister(token);
+            }
+            Ctrl::Cancel(id) => {
+                if let Some(waiter) = self.waiters.remove(&id) {
+                    // The caller is gone: no completion is owed.
+                    self.registry.cancel(&mut run.conn, waiter.token);
+                }
+            }
+            Ctrl::CloseConnection => run.conn.close(),
+            Ctrl::Shutdown => self.shutdown = true,
+        }
+    }
+
+    /// Applies one command to the established connection.
+    fn apply<S>(&mut self, run: &mut Run<'_, R, S>, cmd: Cmd) {
+        // Established: the version is negotiated.
+        let version = run.negotiated.unwrap_or(run.announce);
+        match cmd {
+            Cmd::Request {
+                id,
+                endpoint,
+                encode,
+                reply,
+            } => {
+                if reply.is_canceled() {
+                    return; // its caller gave up: it is never sent
+                }
+                // The failure monitor is the process-wide truth about endpoints; the
+                // registry's own memory follows it.
+                if let Some(failure) = self
+                    .shared
+                    .failures
+                    .endpoint_failure(&self.peer.address, endpoint)
+                {
+                    let _ = reply.send(Err(match failure {
+                        EndpointFailure::Unauthorized => {
+                            RequestError::Unauthorized { token: endpoint }
+                        }
+                        _ => RequestError::EndpointNotFound {
+                            token: endpoint,
+                            maybe_delivered: false,
+                        },
+                    }));
+                    return;
+                }
+                if self.registry.endpoint_failure(endpoint).is_some() {
+                    self.registry.forget_failed_endpoint(endpoint);
+                }
+                let sent = self
+                    .registry
+                    .send_with(&mut run.conn, endpoint, id, |token, out| {
+                        encode(token, version, out)
+                    });
+                match sent {
+                    Ok(token) => {
+                        self.waiters.insert(id, Waiter { reply, token });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Cmd::Send {
+                token, encode, ack, ..
+            } => {
+                if ack.is_canceled() {
+                    return;
+                }
+                let result = match run.conn.send_with(token, |out| encode(version, out)) {
+                    Ok(()) => Ok(run.generation),
+                    Err(FrameRefused::Frame(e)) => Err(SendError::Frame(e)),
+                    Err(FrameRefused::Payload(e)) => Err(SendError::Encode(e)),
+                    // Closed (the next drain says why), or output full, which the task checks
+                    // before taking a command.
+                    Err(_) => Err(SendError::NotSent(PeerError::Connection(
+                        run.conn
+                            .error()
+                            .cloned()
+                            .unwrap_or(ConnectionError::OutputOverflow(
+                                run.conn.config().max_pending_output,
+                            )),
+                    ))),
+                };
+                let _ = ack.send(result);
+            }
+            Cmd::Register { token, ack, .. } => {
+                if ack.is_canceled() {
+                    return;
+                }
+                let _ = ack.send(if run.conn.register(token) {
+                    Ok(run.generation)
+                } else {
+                    Err(SendError::TokenUnavailable(token))
+                });
+            }
+        }
+    }
+
+    /// One pass over the connection's sources. See the [module documentation](super#tasks-and-channels).
+    fn poll_run<S>(&mut self, run: &mut Run<'_, R, S>, cx: &mut Context<'_>) -> Poll<RunEnd>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        for _ in 0..ROUNDS {
+            let mut progress = false;
+
+            // 1. Write until the socket would block, then flush.
+            progress |= write_stage(run, cx);
+            if let Some(end) = self.after(run) {
+                return Poll::Ready(end);
+            }
+
+            // 2. Read until the socket would block, the connection stops taking input, or
+            // this round's share is used up. Bytes are fed before the timer is looked at.
+            for _ in 0..READS_PER_ROUND {
+                let buf = run.conn.recv_buf(READ_SIZE);
+                if buf.is_empty() {
+                    break;
+                }
+                match Pin::new(&mut run.stream).poll_read(cx, buf) {
+                    Poll::Ready(Ok(0)) => run.conn.recv_eof(run.rt.now()),
+                    Poll::Ready(Ok(n)) => run.conn.recv_commit(n, run.rt.now()),
+                    Poll::Ready(Err(e)) => run.conn.io_error(e.kind(), run.rt.now()),
+                    Poll::Pending => break,
+                }
+                progress = true;
+                if let Some(end) = self.after(run) {
+                    return Poll::Ready(end);
+                }
+            }
+
+            // 3. The connection's deadline.
+            match run.conn.poll_timeout() {
+                None => run.sleep = None,
+                Some(deadline) => {
+                    let mut due = deadline <= run.rt.now();
+                    if !due {
+                        if run.sleep.as_ref().map(|(at, _)| *at) != Some(deadline) {
+                            run.sleep = Some((deadline, Box::pin(run.rt.sleep_until(deadline))));
+                        }
+                        if let Some((_, sleep)) = run.sleep.as_mut() {
+                            due = sleep.as_mut().poll(cx).is_ready();
+                        }
+                    }
+                    if due {
+                        run.sleep = None;
+                        run.conn.handle_timeout(run.rt.now());
+                        progress = true;
+                    }
+                }
+            }
+            if let Some(end) = self.after(run) {
+                return Poll::Ready(end);
+            }
+
+            // 4. Control messages: shutdown must not wait behind traffic.
+            for _ in 0..CTRL_PER_ROUND {
+                match Pin::new(&mut self.ctrl).poll_next(cx) {
+                    Poll::Ready(Some(ctrl)) => {
+                        self.handle_ctrl(run, ctrl);
+                        progress = true;
+                    }
+                    Poll::Ready(None) => {
+                        self.shutdown = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+            if let Some(end) = self.after(run) {
+                return Poll::Ready(end);
+            }
+
+            // 5. Commands, as many as the output has room for. Before the handshake they wait
+            // in the queue: they are encoded for the negotiated version.
+            if run.established {
+                let room = run.conn.config().max_pending_output;
+                for _ in 0..CMDS_PER_ROUND {
+                    if run.conn.pending_output().len() >= room {
+                        break; // the write above is pending: it wakes the task
+                    }
+                    match self.peer.queue.poll_pop(cx) {
+                        Poll::Ready(Some(cmd)) => {
+                            self.apply(run, cmd);
+                            progress = true;
+                        }
+                        Poll::Ready(None) => {
+                            self.shutdown = true;
+                            break;
+                        }
+                        Poll::Pending => break,
+                    }
+                }
+                if let Some(end) = self.after(run) {
+                    return Poll::Ready(end);
+                }
+            }
+
+            if !progress {
+                // Every source was polled and registered its waker.
+                return Poll::Pending;
+            }
+        }
+        // Still busy: let the executor run others, and come back.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
     /// Runs one connection over `stream` until it ends.
-    async fn run_connection<S>(&mut self, mut stream: S, announce: ProtocolVersion) -> RunEnd
+    async fn run_connection<S>(&mut self, stream: S, announce: ProtocolVersion) -> RunEnd
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -650,8 +898,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         });
 
         let config = &self.shared.config;
-        let mut cc = ConnectionConfig::for_version(announce, self.address.is_tls());
-        cc.dialed_port = Some(self.address.port);
+        let mut cc = ConnectionConfig::for_version(announce, self.peer.address.is_tls());
+        cc.dialed_port = Some(self.peer.address.port);
         cc.handshake_timeout = config.handshake_timeout;
         cc.monitor = config.monitor;
         cc.max_pending_output = config.max_pending_output;
@@ -660,172 +908,45 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             cc.seed = self.rng.next_u64();
         }
         let mut conn = Connection::new(cc, rt.now());
-        if !self.referenced {
+        // A peer that was referenced and no longer is: unreferenced (C++ `peerReferences == 0`;
+        // one never referenced, -1, is kept).
+        if self.peer.references() == 0 {
             conn.set_referenced(false, rt.now());
         }
-
-        let mut established = false;
-        let mut needs_flush = false;
-        let mut sleep: Option<(Instant, BoxedSleep<'_>)> = None;
-        let mut data_first = false;
-
-        let end = loop {
-            if let Some(error) = self.drain(&mut conn, generation, announce, &mut established) {
-                break RunEnd::Closed(error);
-            }
-            if self.shutdown {
-                break RunEnd::Shutdown;
-            }
-            if established {
-                self.apply_pending(&mut conn, generation);
-            }
-            if conn.state() == ConnectionState::Closed {
-                continue; // the next drain reports why
-            }
-
-            data_first = !data_first;
-            let wake = poll_fn(|cx| {
-                // Control messages first: shutdown must not wait behind traffic.
-                match Pin::new(&mut self.ctrl).poll_next(cx) {
-                    Poll::Ready(Some(ctrl)) => return Poll::Ready(Wake::Ctrl(ctrl)),
-                    Poll::Ready(None) => return Poll::Ready(Wake::CtrlClosed),
-                    Poll::Pending => {}
-                }
-                // Commands are polled before the socket every other time, so that neither a
-                // busy peer starves them nor they starve the peer.
-                let take_data =
-                    !self.data_closed && self.pending.len() < self.shared.config.command_queue_len;
-                if take_data && data_first {
-                    match Pin::new(&mut self.data).poll_next(cx) {
-                        Poll::Ready(Some(cmd)) => return Poll::Ready(Wake::Data(cmd)),
-                        Poll::Ready(None) => return Poll::Ready(Wake::DataClosed),
-                        Poll::Pending => {}
-                    }
-                }
-
-                // Write.
-                let mut wrote = false;
-                loop {
-                    let result = if conn.pending_output().is_empty() {
-                        break;
-                    } else {
-                        Pin::new(&mut stream).poll_write(cx, conn.pending_output())
-                    };
-                    match result {
-                        Poll::Ready(Ok(0)) => {
-                            conn.io_error(std::io::ErrorKind::WriteZero, rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Ready(Ok(n)) => {
-                            conn.consume_output(n);
-                            wrote = true;
-                            needs_flush = true;
-                        }
-                        Poll::Ready(Err(e)) => {
-                            conn.io_error(e.kind(), rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Pending => break,
-                    }
-                }
-                if needs_flush && conn.pending_output().is_empty() {
-                    match Pin::new(&mut stream).poll_flush(cx) {
-                        Poll::Ready(Ok(())) => needs_flush = false,
-                        Poll::Ready(Err(e)) => {
-                            conn.io_error(e.kind(), rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-                if wrote {
-                    return Poll::Ready(Wake::Progress);
-                }
-
-                // Read, before looking at the clock: bytes in the socket are fed first.
-                let buf = conn.recv_buf(READ_SIZE);
-                if !buf.is_empty() {
-                    match Pin::new(&mut stream).poll_read(cx, buf) {
-                        Poll::Ready(Ok(0)) => {
-                            conn.recv_eof(rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Ready(Ok(n)) => {
-                            conn.recv_commit(n, rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Ready(Err(e)) => {
-                            conn.io_error(e.kind(), rt.now());
-                            return Poll::Ready(Wake::Progress);
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-
-                // The connection's deadline.
-                match conn.poll_timeout() {
-                    None => sleep = None,
-                    Some(deadline) => {
-                        if deadline <= rt.now() {
-                            return Poll::Ready(Wake::Timer);
-                        }
-                        if sleep.as_ref().map(|(at, _)| *at) != Some(deadline) {
-                            sleep = Some((deadline, Box::pin(rt.sleep_until(deadline))));
-                        }
-                        if let Some((_, fut)) = sleep.as_mut() {
-                            if fut.as_mut().poll(cx).is_ready() {
-                                sleep = None;
-                                return Poll::Ready(Wake::Timer);
-                            }
-                        }
-                    }
-                }
-
-                if take_data && !data_first {
-                    match Pin::new(&mut self.data).poll_next(cx) {
-                        Poll::Ready(Some(cmd)) => return Poll::Ready(Wake::Data(cmd)),
-                        Poll::Ready(None) => return Poll::Ready(Wake::DataClosed),
-                        Poll::Pending => {}
-                    }
-                }
-                Poll::Pending
-            })
-            .await;
-
-            match wake {
-                Wake::Progress => {}
-                Wake::Timer => conn.handle_timeout(rt.now()),
-                Wake::Ctrl(Ctrl::Connect) => {}
-                Wake::Ctrl(Ctrl::SetReferenced(referenced)) => {
-                    self.set_referenced(referenced);
-                    conn.set_referenced(referenced, rt.now());
-                }
-                Wake::Ctrl(Ctrl::Unregister(token)) => {
-                    conn.unregister(token);
-                }
-                Wake::Ctrl(Ctrl::CloseConnection) => conn.close(),
-                Wake::Ctrl(Ctrl::Shutdown) | Wake::CtrlClosed => self.shutdown = true,
-                Wake::Data(cmd) => self.pending.push_back(cmd),
-                Wake::DataClosed => self.data_closed = true,
-            }
+        let mut run = Run {
+            rt: &rt,
+            conn,
+            stream,
+            generation,
+            announce,
+            negotiated: None,
+            established: false,
+            needs_flush: false,
+            sleep: None,
         };
 
+        let end = poll_fn(|cx| self.poll_run(&mut run, cx)).await;
+
         if let RunEnd::Shutdown = end {
-            self.fail_pending(SendError::Shutdown);
-            self.close_gracefully(&mut stream, &mut conn).await;
-            conn.close();
-            self.drain(&mut conn, generation, announce, &mut established);
+            // What was sent and not answered completes as cancelled; what was queued is
+            // refused when the task finishes.
+            self.registry.cancel_all(&mut run.conn);
+            self.drain(&mut run);
+            self.close_gracefully(&mut run).await;
+            run.conn.close();
+            self.drain(&mut run);
         }
         end
     }
 
     /// Writes what the connection has queued, bounded by the shutdown timeout, and closes
     /// the stream.
-    async fn close_gracefully<S>(&self, stream: &mut S, conn: &mut Connection)
+    async fn close_gracefully<S>(&self, run: &mut Run<'_, R, S>)
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let rt = self.rt();
+        let Run { conn, stream, .. } = run;
         let work = async {
             while !conn.pending_output().is_empty() {
                 let written =
@@ -841,4 +962,43 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         };
         let _ = timeout(&rt, self.shared.config.shutdown_timeout, work).await;
     }
+}
+
+/// Writes the connection's output until the socket would block, then flushes. Returns whether
+/// anything was written (or the socket failed).
+fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
+    run: &mut Run<'_, R, S>,
+    cx: &mut Context<'_>,
+) -> bool {
+    let mut progress = false;
+    while !run.conn.pending_output().is_empty() {
+        match Pin::new(&mut run.stream).poll_write(cx, run.conn.pending_output()) {
+            Poll::Ready(Ok(0)) => {
+                run.conn
+                    .io_error(std::io::ErrorKind::WriteZero, run.rt.now());
+                return true;
+            }
+            Poll::Ready(Ok(n)) => {
+                run.conn.consume_output(n);
+                run.needs_flush = true;
+                progress = true;
+            }
+            Poll::Ready(Err(e)) => {
+                run.conn.io_error(e.kind(), run.rt.now());
+                return true;
+            }
+            Poll::Pending => return progress,
+        }
+    }
+    if run.needs_flush {
+        match Pin::new(&mut run.stream).poll_flush(cx) {
+            Poll::Ready(Ok(())) => run.needs_flush = false,
+            Poll::Ready(Err(e)) => {
+                run.conn.io_error(e.kind(), run.rt.now());
+                return true;
+            }
+            Poll::Pending => {}
+        }
+    }
+    progress
 }

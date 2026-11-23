@@ -36,7 +36,11 @@ impl PeerKey {
 ///     swap(addresses.address, addresses.secondaryAddress.get());
 /// ```
 ///
-/// A client has a single local address (no secondary), so the rule is: **if the endpoint has
+/// A libfdb_c client never sets a local address (`g_network->getLocalAddresses()` is empty for
+/// it, so it is "not TLS" whatever its TLS configuration), which is why the C++ client always
+/// prefers the plain address of a dual-address server; see
+/// [`PeerManagerConfig::prefer_tls`](super::PeerManagerConfig::prefer_tls) for the knob that
+/// deviates. A client has a single local address (no secondary), so the rule is: **if the endpoint has
 /// a secondary address and its primary's TLS-ness differs from ours, swap them**, so that the
 /// address of our own TLS-ness becomes the primary. (A process that itself listens on both a
 /// plain and a TLS address, where the second half applies, always prefers the TLS address; a

@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use fdb_native_testkit::FdbContainer;
 use fdb_native_transport::ConnectionError;
+use fdb_native_transport::connection::well_known;
 use fdb_native_transport::peer::{
-    EventReceiver, Generation, PeerError, PeerEvent, PeerManager, PeerManagerConfig, PeerPhase,
-    SendError, event_channel,
+    EventReceiver, Generation, PeerError, PeerEvent, PeerHandle, PeerManager, PeerManagerConfig,
+    PeerPhase, ProtocolInfoReply, ProtocolInfoRequest, SendError, event_channel,
 };
+use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::TokioRuntime;
-use fdb_native_wire::{NetworkAddress, ProtocolVersion, Uid};
+use fdb_native_wire::{EncodeError, NetworkAddress, ProtocolVersion, ReplyPromise, Uid};
 
 const IMAGES: [(&str, ProtocolVersion); 2] = [
     ("foundationdb/foundationdb:7.4.10", ProtocolVersion::V7_4),
@@ -29,8 +31,24 @@ fn address(addr: SocketAddr) -> NetworkAddress {
 
 fn drain(events: &mut EventReceiver) -> Vec<PeerEvent> {
     std::iter::from_fn(|| events.try_next())
-        .map(|(_, e)| e)
+        .map(|record| record.event)
         .collect()
+}
+
+/// Asks the server for its protocol version: a `ProtocolInfoRequest` to the well-known
+/// endpoint every fdbserver process serves (token 10), on both releases.
+async fn protocol_info(peer: &PeerHandle) -> Result<ProtocolInfoReply, RequestError> {
+    peer.request_as::<ProtocolInfoReply, _>(
+        well_known::PROTOCOL_INFO,
+        |reply, _version, out| -> Result<(), EncodeError> {
+            let request = ProtocolInfoRequest {
+                reply: ReplyPromise::new(reply),
+            };
+            out.extend_from_slice(&fdb_native_wire::encode(&request)?);
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// The version that is not `right`, among the two supported.
@@ -98,6 +116,31 @@ async fn docker_connect_detect_version_and_shutdown() {
         // The connection is shared and stays: connecting again does not reconnect.
         assert_eq!(mgr.peer(&address).connect().await, Ok(right));
         assert_eq!(peer.status().generation, Generation(2));
+        // A real request: the server answers with the protocol version it speaks.
+        let reply = protocol_info(&peer)
+            .await
+            .unwrap_or_else(|e| panic!("{image}: {e}"));
+        assert_eq!(reply.protocol_version().without_flags(), right, "{image}");
+        assert_eq!(peer.status().generation, Generation(2), "{image}");
+        // Many at once share the connection, each with its own reply token.
+        let mut requests = Vec::new();
+        for _ in 0..32 {
+            let peer = peer.clone();
+            requests.push(tokio::spawn(async move { protocol_info(&peer).await }));
+        }
+        for request in requests {
+            let reply = request
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("{image}: {e}"));
+            assert_eq!(reply.protocol_version().without_flags(), right);
+        }
+        assert_eq!(
+            peer.status().generation,
+            Generation(2),
+            "{image}: no reconnect"
+        );
+
         // A frame to a stream token the server does not have is accepted, and the server
         // answers with endpoint-not-found: the failure monitor learns it.
         let missing = Uid::new(0x5eed_1234_5678_9a00 | 1, 0xfeed_0000_dead_0001);
@@ -124,6 +167,11 @@ async fn docker_connect_detect_version_and_shutdown() {
             "{image}: {seen:?}"
         );
         assert_eq!(peer.send(missing, vec![1]).await, Err(SendError::Shutdown));
+        assert_eq!(
+            protocol_info(&peer).await,
+            Err(RequestError::NotSent(None)),
+            "{image}"
+        );
     }
 }
 

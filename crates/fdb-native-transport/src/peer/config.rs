@@ -18,9 +18,10 @@ pub struct PeerManagerConfig {
     /// empty). A connection to an address nothing is known about announces the first;
     /// see [version detection](super#version-detection). Default: 7.4 and 8.0.
     pub supported_versions: Vec<ProtocolVersion>,
-    /// How long a TCP connect (and, separately, the TLS handshake) may take:
-    /// `CONNECTION_MONITOR_TIMEOUT`, 2 s (`flow/Knobs.cpp` 7.4:109, 8.0:112; used by
-    /// `connectionKeeper` at 7.4:867 and 8.0:943). The FlowTransport handshake that follows
+    /// How long dialing may take, TCP connect **and** TLS handshake together:
+    /// `CONNECTION_MONITOR_TIMEOUT`, 2 s (`flow/Knobs.cpp` 7.4:109, 8.0:112), which bounds
+    /// `INetworkConnections::connect(...)` with a TLS wrapper's handshake included
+    /// (`connectionKeeper` at 7.4:867 and 8.0:943). The FlowTransport handshake that follows
     /// is bounded by [`handshake_timeout`](Self::handshake_timeout).
     pub connect_timeout: Duration,
     /// How long the peer has to send its ConnectPacket once connected
@@ -40,14 +41,25 @@ pub struct PeerManagerConfig {
     /// The connection monitor's timing (pings and idle rules).
     pub monitor: MonitorConfig,
     /// [`ConnectionConfig::max_pending_output`](crate::ConnectionConfig::max_pending_output):
-    /// how much output may wait to be written before [`send`](super::PeerHandle::send) waits.
+    /// how much output may wait to be written before queued commands wait for the socket.
     pub max_pending_output: usize,
     /// [`ConnectionConfig::max_packet_len`](crate::ConnectionConfig::max_packet_len).
     pub max_packet_len: u32,
-    /// How many commands a peer queues, from its handles, before
-    /// [`send`](super::PeerHandle::send) waits for room (and the most it holds while it has no
-    /// connection or is applying backpressure). Default 256.
+    /// How many commands (requests, one-way sends, registrations) a peer queues, from all its
+    /// handles together, before the next waits for room: the queue's own count, so abandoned
+    /// calls free their place when dropped. The task takes one command at a time and applies
+    /// it at once, so this is the whole bound. Default 256.
     pub command_queue_len: usize,
+    /// Whether this client prefers the TLS address of an endpoint that has both
+    /// ([`choose_primary_address`](super::choose_primary_address)). **Default `false`, as in
+    /// C++**: a `libfdb_c` client never sets a local address (the local address stays
+    /// `NetworkAddress()`, which is not TLS), so `Endpoint::choosePrimaryAddress`
+    /// (`FlowTransport.h` 7.4:169-176, 8.0:178-185) always swaps a TLS primary for the plain
+    /// secondary, even in a client configured for TLS. An endpoint with only a TLS address is
+    /// connected to over TLS either way. Set it to prefer the TLS address (this process's
+    /// TLS-ness being the stream wrapper's), a deliberate deviation for a cluster whose plain
+    /// listeners are unreachable or untrusted.
+    pub prefer_tls: bool,
     /// How long a shutdown waits to write what is already queued and to close each socket.
     /// Default 1 s.
     pub shutdown_timeout: Duration,
@@ -77,6 +89,7 @@ impl Default for PeerManagerConfig {
             max_pending_output: DEFAULT_MAX_PENDING_OUTPUT,
             max_packet_len: DEFAULT_PACKET_LIMIT,
             command_queue_len: 256,
+            prefer_tls: false,
             shutdown_timeout: Duration::from_secs(1),
             seed: None,
         }

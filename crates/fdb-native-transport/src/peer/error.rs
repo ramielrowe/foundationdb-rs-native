@@ -3,7 +3,7 @@
 use std::io;
 use std::time::Duration;
 
-use fdb_native_wire::{ProtocolVersion, Uid};
+use fdb_native_wire::{EncodeError, ProtocolVersion, Uid};
 
 use crate::{ConnectionError, FrameError};
 
@@ -11,7 +11,8 @@ use crate::{ConnectionError, FrameError};
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PeerError {
-    /// The TCP connection was not established within the connect timeout.
+    /// TCP connect did not finish within the connect timeout (one bound, shared with the TLS
+    /// handshake: see [`PeerManagerConfig::connect_timeout`](super::PeerManagerConfig::connect_timeout)).
     #[error("connecting timed out after {after:?}")]
     ConnectTimeout {
         /// The timeout.
@@ -24,7 +25,7 @@ pub enum PeerError {
     /// wrapper](super::StreamWrapper) for TLS.
     #[error("the address needs TLS, which is not configured")]
     TlsNotConfigured,
-    /// The TLS handshake did not complete within the connect timeout.
+    /// TCP connect plus TLS handshake did not finish within the single connect timeout.
     #[error("the TLS handshake timed out after {after:?}")]
     TlsTimeout {
         /// The timeout.
@@ -73,11 +74,12 @@ impl PeerError {
     }
 }
 
-/// Why a command to a peer ([`send`](super::PeerHandle::send),
-/// [`register`](super::PeerHandle::register)) was refused. In every case **nothing was sent**
-/// and nothing was registered: a command is either applied, and acknowledged with the
-/// [`Generation`](super::Generation) of the connection it went to, or refused with one of
-/// these.
+/// Why a one-way command to a peer ([`send`](super::PeerHandle::send),
+/// [`send_with`](super::PeerHandle::send_with), [`register`](super::PeerHandle::register)) was
+/// refused. In every case **nothing was sent** and nothing was registered: a command is either
+/// applied, and acknowledged with the [`Generation`](super::Generation) of the connection it
+/// went to, or refused with one of these. (Requests report their own errors: see
+/// [`RequestError`](crate::rpc::RequestError).)
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SendError {
@@ -91,17 +93,20 @@ pub enum SendError {
     /// The frame could not be built: its payload is too large.
     #[error("frame refused: {0}")]
     Frame(FrameError),
+    /// The payload could not be encoded; nothing was sent.
+    #[error("the payload could not be encoded: {0}")]
+    Encode(EncodeError),
     /// The token cannot be registered: it is already registered, well-known, or a ping's.
     #[error("token {0:?} cannot be registered")]
     TokenUnavailable(Uid),
-    /// [`Outgoing::for_version`](super::Outgoing::for_version) asked for a protocol version
-    /// other than the one the connection announces, so the payload was encoded for the wrong
-    /// schema set.
-    #[error("payload is for protocol version {expected} but the connection uses {actual}")]
-    VersionMismatch {
-        /// The version the payload was encoded for.
-        expected: ProtocolVersion,
-        /// The version the connection announced.
-        actual: ProtocolVersion,
-    },
+}
+
+impl PeerError {
+    /// The error of a request that was not sent because of this (connect) failure.
+    pub(crate) fn not_sent(&self) -> crate::rpc::RequestError {
+        crate::rpc::RequestError::NotSent(match self {
+            PeerError::Connection(e) => Some(e.clone()),
+            _ => None,
+        })
+    }
 }
