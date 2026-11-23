@@ -330,6 +330,34 @@ fn get_value_request_reply_token() {
     }
 }
 
+/// Every interface of `info` against the dump of FDB's own message: the request streams
+/// (endpoints and tokens), the provisional flags and the cluster id.
+fn assert_client_db_info_matches(info: &ClientDbInfo, dump: &Value, what: &str) {
+    let grv = vector(member(dump, "grvProxies"));
+    assert_eq!(info.grv_proxies.len(), grv.len(), "{what}");
+    assert!(!grv.is_empty(), "{what}");
+    for (got, want) in info.grv_proxies.iter().zip(grv) {
+        let want_stream = request_stream(member(want, "getConsistentReadVersion"));
+        assert_eq!(got.get_consistent_read_version, want_stream, "{what}");
+        assert_eq!(
+            got.provisional,
+            member(want, "provisional")["value"],
+            "{what}"
+        );
+    }
+    let commit = vector(member(dump, "commitProxies"));
+    assert_eq!(info.commit_proxies.len(), commit.len(), "{what}");
+    for (got, want) in info.commit_proxies.iter().zip(commit) {
+        assert_eq!(got.commit, request_stream(member(want, "commit")), "{what}");
+        assert_eq!(
+            got.provisional,
+            member(want, "provisional")["value"],
+            "{what}"
+        );
+    }
+    assert_eq!(info.id, uid(member(dump, "id")), "{what}");
+}
+
 #[test]
 fn client_db_info_request_streams() {
     for branch in BRANCHES {
@@ -337,24 +365,16 @@ fn client_db_info_request_streams() {
         let bytes = record_bytes(&record);
         let info: ClientDbInfo = decode(&bytes).expect(branch);
         let dump = message(&record);
+        assert_client_db_info_matches(&info, dump, branch);
 
-        let grv = vector(member(dump, "grvProxies"));
-        assert_eq!(info.grv_proxies.len(), grv.len(), "{branch}");
-        assert!(!grv.is_empty(), "{branch}");
-        for (got, want) in info.grv_proxies.iter().zip(grv) {
-            let want = request_stream(member(want, "getConsistentReadVersion"));
-            assert_eq!(got.get_consistent_read_version, want, "{branch}");
-        }
-        let commit = vector(member(dump, "commitProxies"));
-        assert_eq!(info.commit_proxies.len(), commit.len(), "{branch}");
-        for (got, want) in info.commit_proxies.iter().zip(commit) {
-            assert_eq!(
-                got.commit,
-                request_stream(member(want, "commit")),
-                "{branch}"
-            );
-        }
-        assert_eq!(info.id, uid(member(dump, "id")), "{branch}");
+        // Re-encoding what was decoded and decoding that gives the same dump. (Not
+        // byte-identical to FDB's message: the schema stops after `id`, so the slots after
+        // it are written absent, and this writer's layout is its own.)
+        let again = encode(&info).expect("encode");
+        let reread: ClientDbInfo = decode(&again).expect(branch);
+        assert_eq!(reread, info, "{branch}");
+        assert_client_db_info_matches(&reread, dump, &format!("{branch} re-encoded"));
+        assert_ne!(again, bytes, "{branch}");
 
         // The first GRV proxy, spelled out: 10.0.0.1:4500 plain, and fdxx::1 TLS on 4501.
         let endpoint = info.grv_proxies[0].get_consistent_read_version.endpoint();
@@ -375,15 +395,6 @@ fn client_db_info_request_streams() {
         assert_eq!(
             endpoint.token,
             Uid::new(7484982580689764353, 7484982580689764352),
-            "{branch}"
-        );
-
-        // Round trip, and the encoding is a message FDB's reader would take (the fixture
-        // tests of the derive cover that); here the values must survive.
-        let again = encode(&info).expect("encode");
-        assert_eq!(
-            decode::<ClientDbInfo>(&again).expect("decode"),
-            info,
             "{branch}"
         );
     }

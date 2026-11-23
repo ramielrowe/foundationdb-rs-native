@@ -532,3 +532,11 @@ const MAX_PREALLOCATION: usize = 64 * 1024;
 pub(crate) fn preallocation<T>(count: usize) -> usize {
     count.min(MAX_PREALLOCATION / size_of::<T>().max(1))
 }
+
+/// How many elements to reserve in a hash container for a vector of `count` elements.
+/// A hash table allocates its capacity times 8/7 rounded up to a power of two, plus a
+/// control byte per bucket, so this reserves a third of what [`preallocation`] would
+/// (counting the control byte) to keep the allocation within [`MAX_PREALLOCATION`].
+pub(crate) fn hash_preallocation<T>(count: usize) -> usize {
+    count.min(MAX_PREALLOCATION / (3 * (size_of::<T>() + 1)))
+}

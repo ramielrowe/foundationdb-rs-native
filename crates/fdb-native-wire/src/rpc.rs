@@ -10,7 +10,7 @@
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
-use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::ops::{Deref, DerefMut};
 
 use crate::{
@@ -259,8 +259,8 @@ impl NetworkAddress {
     }
 
     /// The socket address.
-    pub fn socket_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::new(self.ip.into(), self.port)
+    pub fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.ip.into(), self.port)
     }
 }
 
@@ -289,6 +289,10 @@ impl Encode for NetworkAddress {
         t.field(&self.from_hostname)?;
         t.finish()
     }
+}
+
+impl FileIdentified for NetworkAddress {
+    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(14_155_727);
 }
 
 impl<'de> Decode<'de> for NetworkAddress {
@@ -348,6 +352,14 @@ impl<'de> Decode<'de> for NetworkAddressList {
 /// FDB's `Endpoint` (`serializer(ar, addresses, token)`): a table. Where a service
 /// listens (an address list) and the token that selects it there.
 ///
+/// `==` and [`Hash`] are derived: they compare the whole address list (both addresses, and
+/// `fromHostname`). C++'s `Endpoint::operator==` and `hash` use only the token and the
+/// primary address's `ip`, `port` and `flags`; use [`Endpoint::same_endpoint`] for those
+/// semantics.
+///
+/// It has file identifier 10618805 (`FlowTransport.h`), as does [`NetworkAddress`]
+/// (14155727, `NetworkAddress.h`); [`IpAddress`] and [`NetworkAddressList`] have none.
+///
 /// Decoding does not apply `Endpoint::choosePrimaryAddress()`, which C++ calls after
 /// reading: it swaps the two addresses when only the secondary matches the local TLS
 /// setting. That depends on the local network, so the transport layer applies it; this is
@@ -366,6 +378,13 @@ impl Endpoint {
         Endpoint { addresses, token }
     }
 
+    /// C++'s `Endpoint::operator==`: the same token and the same primary address (`ip`,
+    /// `port` and `flags`; the secondary address and `from_hostname` are not compared).
+    pub fn same_endpoint(&self, other: &Endpoint) -> bool {
+        let (a, b) = (&self.addresses.address, &other.addresses.address);
+        self.token == other.token && a.ip == b.ip && a.port == b.port && a.flags == b.flags
+    }
+
     /// `Endpoint::wellKnownToken`: `UID(-1, id)`.
     pub const fn well_known_token(id: u64) -> Uid {
         Uid::new(u64::MAX, id)
@@ -373,8 +392,9 @@ impl Endpoint {
 
     /// `Endpoint::getAdjustedEndpoint(index)`: the `index`th endpoint of an interface whose
     /// base endpoint this is. Interfaces serialize only their first endpoint; the others
-    /// are this endpoint with the index added to the low half of the token's second word
-    /// (as a `u32`, wrapping) and shifted into the high half of its first.
+    /// are this endpoint with `index << 32` added to the token's `first` (wrapping `u64`
+    /// addition) and `index` added to the low 32 bits of its `second` (wrapping `u32`
+    /// addition; the high 32 bits of `second` are kept).
     ///
     /// ```
     /// use fdb_native_wire::{Endpoint, Uid};
@@ -406,6 +426,10 @@ impl Encode for Endpoint {
         t.field(&self.token)?;
         t.finish()
     }
+}
+
+impl FileIdentified for Endpoint {
+    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(10_618_805);
 }
 
 impl<'de> Decode<'de> for Endpoint {
@@ -642,13 +666,6 @@ impl<T: FileIdentified> FileIdentified for VectorRef<T> {
     const FILE_IDENTIFIER: FileIdentifier = T::FILE_IDENTIFIER.compose(Wrapper::VectorRef);
 }
 
-/// `StringRef` (and so `Key`, `Value` and every other `Standalone<StringRef>`) has file
-/// identifier 13300811 (`flow/include/flow/Arena.h`). `&[u8]` is the Rust `StringRef`, so
-/// `VectorRef<&[u8]>` composes to `0x03caf44b`. `std::string` has none.
-impl FileIdentified for [u8] {
-    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(13_300_811);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +682,56 @@ mod tests {
             <ReplyPromise<Option<Void>>>::FILE_IDENTIFIER.value(),
             0x141e_ad4a
         );
+    }
+
+    #[test]
+    fn endpoint_identifiers() {
+        assert_eq!(Endpoint::FILE_IDENTIFIER.value(), 10_618_805);
+        assert_eq!(NetworkAddress::FILE_IDENTIFIER.value(), 14_155_727);
+        assert_eq!(
+            <ReplyPromise<Endpoint>>::FILE_IDENTIFIER.value(),
+            (1 << 24) | 10_618_805
+        );
+        assert_eq!(
+            <Vec<NetworkAddress>>::FILE_IDENTIFIER.value(),
+            (5 << 24) | 14_155_727
+        );
+        assert_eq!(
+            <VectorRef<Endpoint>>::FILE_IDENTIFIER.value(),
+            (3 << 24) | 10_618_805
+        );
+        let bytes = encode(&ReplyPromise::<Endpoint>::default()).expect("encode");
+        assert_eq!(&bytes[4..8], &((1u32 << 24) | 10_618_805).to_le_bytes());
+        let addresses = vec![NetworkAddress::default(); 2];
+        let bytes = encode(&addresses).expect("encode");
+        assert_eq!(&bytes[4..8], &((5u32 << 24) | 14_155_727).to_le_bytes());
+        assert_eq!(
+            decode::<Vec<NetworkAddress>>(&bytes).expect("decode"),
+            addresses
+        );
+    }
+
+    #[test]
+    fn same_endpoint_uses_the_primary_address_only() {
+        let a = Endpoint::new(
+            NetworkAddressList {
+                address: NetworkAddress::new(IpAddress::V4(1), 4500, true, false),
+                secondary_address: None,
+            },
+            Uid::new(1, 2),
+        );
+        let mut b = a;
+        b.addresses.secondary_address =
+            Some(NetworkAddress::new(IpAddress::V4(1), 4501, true, true));
+        b.addresses.address.from_hostname = true;
+        assert_ne!(a, b);
+        assert!(a.same_endpoint(&b));
+        let mut c = a;
+        c.addresses.address.port = 4502;
+        assert!(!a.same_endpoint(&c));
+        let mut d = a;
+        d.token.second += 1;
+        assert!(!a.same_endpoint(&d));
     }
 
     #[test]

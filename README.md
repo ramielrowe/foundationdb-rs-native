@@ -43,7 +43,7 @@ Requires [cargo-nextest](https://nexte.st/).
 cargo nextest run --workspace
 
 # Integration tests that need a live FoundationDB (requires Docker)
-cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
+cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
 
 # fdb-native-wire's encoder against FDB's C++ readers (requires tools/golden-vectors to be built)
 FDB_GOLDEN_VECTORS_BIN=$PWD/tools/golden-vectors/build/golden-vectors \
@@ -56,7 +56,7 @@ The `FDB_IMAGE` environment variable selects the server image
 
 ```bash
 FDB_IMAGE=foundationdb/foundationdb:8.0.1 cargo nextest run --workspace --run-ignored only \
-  -E 'not binary(cpp_crosscheck)'
+  -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
 ```
 
 Tests must only target disposable containers started by `fdb-native-testkit`, never a

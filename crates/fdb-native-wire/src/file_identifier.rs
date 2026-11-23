@@ -167,6 +167,13 @@ impl<T: FileIdentified + ?Sized> FileIdentified for Box<T> {
     const FILE_IDENTIFIER: FileIdentifier = T::FILE_IDENTIFIER;
 }
 
+/// `StringRef` (and so `Key`, `Value` and every other `Standalone<StringRef>`) has file
+/// identifier 13300811 (`flow/include/flow/Arena.h`). `&[u8]` is the Rust `StringRef`, so
+/// `VectorRef<&[u8]>` composes to `0x03caf44b`. `std::string` has none.
+impl FileIdentified for [u8] {
+    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(13_300_811);
+}
+
 impl<T: FileIdentified> FileIdentified for Option<T> {
     const FILE_IDENTIFIER: FileIdentifier = T::FILE_IDENTIFIER.compose(Wrapper::Optional);
 }
