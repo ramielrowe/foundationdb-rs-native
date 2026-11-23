@@ -4,8 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use fdb_native_transport::{
-    CHECKSUM_LEN, Checksum, DEFAULT_PACKET_LIMIT, DEFAULT_PACKET_WARNING, FrameConfig,
-    FrameDecoder, FrameError, FrameWriteError, LENGTH_LEN, TOKEN_LEN, parse_frame,
+    CHECKSUM_LEN, Checksum, ConsumeError, DEFAULT_PACKET_LIMIT, DEFAULT_PACKET_WARNING,
+    FrameConfig, FrameDecoder, FrameError, FrameWriteError, LENGTH_LEN, MAX_SPARE, TOKEN_LEN,
+    parse_frame,
 };
 use fdb_native_wire::Uid;
 use proptest::prelude::*;
@@ -1061,13 +1062,152 @@ fn spare_honors_the_limit_and_final_errors() {
     assert_eq!(d.buffered_len(), 0);
     assert_eq!(d.error(), Some(oversize));
 
-    // A commit larger than the room is the room.
+    // A commit of exactly the room is fine.
     let mut d = FrameDecoder::new(plain());
     let room = d.spare(10);
     room[..4].copy_from_slice(&16u32.to_le_bytes());
     let room = room.len();
-    d.commit(room + 1_000_000);
+    d.commit(room);
     assert_eq!(d.buffered_len(), room);
+}
+
+/// A commit larger than the room is a bug in the caller: it trips a debug assertion, and in a
+/// release build is taken to be the room.
+#[test]
+fn a_commit_larger_than_the_room_is_a_caller_bug() {
+    let mut d = FrameDecoder::new(plain());
+    let room = d.spare(10);
+    room[..4].copy_from_slice(&16u32.to_le_bytes());
+    let room = room.len();
+    if cfg!(debug_assertions) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            d.commit(room + 1_000_000);
+        }));
+        assert!(result.is_err(), "no debug assertion");
+    } else {
+        d.commit(room + 1_000_000);
+        assert_eq!(d.buffered_len(), room);
+    }
+}
+
+#[test]
+fn a_huge_min_is_clamped_and_never_panics() {
+    for min in [
+        MAX_SPARE + 1,
+        1 << 30,
+        isize::MAX as usize,
+        isize::MAX as usize + 1,
+        usize::MAX,
+    ] {
+        let mut d = FrameDecoder::new(plain());
+        let room = d.spare(min).len();
+        assert!(room >= MAX_SPARE, "spare({min}) gave {room}");
+        assert!(
+            d.capacity() <= MAX_SPARE + 4096,
+            "capacity {}",
+            d.capacity()
+        );
+
+        // With bytes already held.
+        let mut d = FrameDecoder::new(plain());
+        d.push(&[1, 2, 3, 4, 5]);
+        let room = d.spare(min).len();
+        assert!(room >= MAX_SPARE, "spare({min}) gave {room}");
+        assert!(
+            d.capacity() <= MAX_SPARE + 4096,
+            "capacity {}",
+            d.capacity()
+        );
+    }
+    // A frame pending: the clamp still applies.
+    let mut d = FrameDecoder::new(plain());
+    d.push(&(DEFAULT_PACKET_LIMIT).to_le_bytes());
+    let _ = d.spare(usize::MAX);
+    assert!(
+        d.capacity() <= MAX_SPARE + 4096,
+        "capacity {}",
+        d.capacity()
+    );
+}
+
+/// A push larger than `MAX_SPARE` is taken whole, in pieces.
+#[test]
+fn a_push_larger_than_max_spare_is_kept_whole() {
+    let config = plain();
+    let payload = vec![0x5a; 3 * MAX_SPARE + 17];
+    let mut wire = Vec::new();
+    config
+        .encode_frame(Uid::new(1, 2), &payload, &mut wire)
+        .unwrap();
+    let mut d = FrameDecoder::new(config);
+    d.push(&wire);
+    assert_eq!(d.buffered_len(), wire.len());
+    let frame = d.next_frame().unwrap().unwrap();
+    assert_eq!(frame.payload, payload.as_slice());
+}
+
+/// The capacity changes while a large frame arrives through `spare(4096)`/`commit(1)`: the
+/// buffer grows to the end of the frame plus the room asked for, once, not once per byte near the
+/// end (each of which would copy the whole buffer with an allocator that cannot extend in place).
+#[test]
+fn trickling_the_end_of_a_large_frame_does_not_reallocate_per_byte() {
+    const MIN: usize = 4096;
+    let config = plain().with_max_packet_len(8 << 20);
+    let frames = 3;
+    let mut wire = Vec::new();
+    for i in 0..frames {
+        wire.extend_from_slice(&frame_bytes_for(&config, 4 << 20, i));
+    }
+    let frame_len = wire.len() / frames;
+
+    let mut d = FrameDecoder::new(config);
+    let mut last = d.capacity();
+    let mut changes_total = 0usize;
+    let mut changes_near_end = 0usize;
+    let mut got = 0;
+    for (at, byte) in wire.iter().enumerate() {
+        d.spare(MIN)[0] = *byte;
+        d.commit(1);
+        let cap = d.capacity();
+        if cap != last {
+            changes_total += 1;
+            // In the last `MIN` bytes of a frame (the old code changed it for every byte).
+            if frame_len - at % frame_len <= MIN {
+                changes_near_end += 1;
+            }
+            last = cap;
+        }
+        while let Some(frame) = d.next_frame().unwrap() {
+            assert_eq!(
+                frame.payload.len(),
+                frame_len - config.header_len() - TOKEN_LEN
+            );
+            got += 1;
+        }
+    }
+    assert_eq!(got, frames);
+    // Doubling from 4 KiB to 4 MiB is 10 steps, and one more for the frame end and `MIN`; the
+    // next frames reuse what is there or shrink and grow again, so allow some for each.
+    assert!(
+        changes_near_end <= frames,
+        "{changes_near_end} capacity changes in the last {MIN} bytes of {frames} frames"
+    );
+    assert!(
+        changes_total <= frames * 14,
+        "{changes_total} capacity changes for {frames} frames of {frame_len} bytes"
+    );
+    // The documented bound, with T + m.
+    assert!(d.capacity() <= frame_len + 12 + MIN);
+}
+
+/// A frame of `total` bytes (header included) for the token `(i, i)`.
+fn frame_bytes_for(config: &FrameConfig, total: usize, i: usize) -> Vec<u8> {
+    let payload = vec![i as u8; total - config.header_len() - TOKEN_LEN];
+    let mut out = Vec::new();
+    config
+        .encode_frame(Uid::new(i as u64, i as u64), &payload, &mut out)
+        .unwrap();
+    out
 }
 
 #[test]
@@ -1100,7 +1240,7 @@ fn the_handshake_can_be_read_from_the_same_buffer() {
                 assert!(d.next_frame().unwrap().is_none());
                 if d.peek().len() >= ConnectPacket::SIZE {
                     assert_eq!(&d.peek()[..ConnectPacket::SIZE], hello.as_slice());
-                    d.consume(ConnectPacket::SIZE);
+                    d.consume(ConnectPacket::SIZE).unwrap();
                     seen_hello = true;
                 }
             }
@@ -1120,11 +1260,64 @@ fn the_handshake_can_be_read_from_the_same_buffer() {
             "chunk {chunk_size}"
         );
     }
+}
 
-    // Consuming more than is there is harmless.
+#[test]
+fn consume_is_only_for_the_handshake_and_misuse_is_an_error() {
+    let config = plain();
+    let mut frames = Vec::new();
+    config
+        .encode_frame(Uid::new(6, 7), b"second", &mut frames)
+        .unwrap();
+
+    // A decoder made with `new` has no handshake to consume, and is left as it was.
     let mut d = FrameDecoder::new(config);
-    d.consume(10);
+    d.push(&frames[..10]);
+    assert_eq!(d.consume(3), Err(ConsumeError::NotInHandshake));
+    assert_eq!(d.consume(0), Err(ConsumeError::NotInHandshake));
+    assert_eq!(d.buffered_len(), 10);
+    d.push(&frames[10..]);
+    assert_eq!(d.next_frame().unwrap().unwrap().payload, b"second");
+
+    // More than is buffered: an error, and the decoder still waits for its handshake.
+    let mut d = FrameDecoder::before_handshake(config);
+    d.push(&[0; 10]);
+    assert_eq!(
+        d.consume(100),
+        Err(ConsumeError::PastBuffered {
+            requested: 100,
+            buffered: 10
+        })
+    );
+    assert_eq!(
+        d.consume(usize::MAX),
+        Err(ConsumeError::PastBuffered {
+            requested: usize::MAX,
+            buffered: 10
+        })
+    );
+    assert_eq!(d.buffered_len(), 10);
+    assert!(d.next_frame().unwrap().is_none()); // still the handshake phase
+    d.push(&[0; 34]);
     d.push(&frames);
-    d.consume(usize::MAX);
-    assert_eq!(d.buffered_len(), 0);
+    d.consume(44).unwrap();
+    assert_eq!(d.next_frame().unwrap().unwrap().payload, b"second");
+
+    // A second consume, mid-stream, would cut into the frames.
+    let mut d = FrameDecoder::before_handshake(config);
+    d.push(&[0; 44]);
+    d.push(&frames[..10]);
+    d.consume(44).unwrap();
+    assert_eq!(d.consume(3), Err(ConsumeError::NotInHandshake));
+    assert_eq!(d.buffered_len(), 10);
+    d.push(&frames[10..]);
+    assert_eq!(d.next_frame().unwrap().unwrap().payload, b"second");
+
+    // After a failure.
+    let mut d = FrameDecoder::before_handshake(config);
+    d.push(&[0; 44]);
+    d.push(&u32::MAX.to_le_bytes());
+    d.consume(44).unwrap();
+    assert!(d.error().is_some());
+    assert_eq!(d.consume(0), Err(ConsumeError::NotInHandshake));
 }

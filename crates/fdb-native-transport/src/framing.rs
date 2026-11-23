@@ -139,11 +139,34 @@
 //! bytes are kept for it. The decoder never allocates *from* a declared length: it grows its
 //! buffer in response to bytes the caller pushes or asks room for ([`FrameDecoder::push`],
 //! [`FrameDecoder::spare`]), geometrically, and stops doubling at the end of the frame being
-//! received. Precisely, after any call its capacity is at most
-//! `max(U, T)`, where `U` is the most the caller has had it hold at once (unconsumed bytes pushed
-//! or committed, plus the `min` of a `spare` call) and `T` is the size of the frame at the front
-//! (`header + declared length`, at most `max_packet_len + 12`; zero while fewer than four of its
-//! bytes are in). A consumed prefix is moved out of the way before the buffer would grow
+//! received (plus the room a `spare` call asked for). Precisely, after any call its capacity is
+//! at most `max(U, T + m, MIN_ALLOC)`, where:
+//!
+//! * `U` is the most the caller has had it hold at once (unconsumed bytes pushed or committed,
+//!   plus the `min` of a `spare` call);
+//! * `T` is the size (`header + declared length`, at most `max_packet_len + 12`) of the largest
+//!   frame that has been at the front since the buffer was last cut back, the frame being
+//!   received in the usual case (a frame counts once its length is in, so a frame still
+//!   shorter than four bytes does not, and `T` is zero before any frame);
+//! * `m` is the largest `min` given to [`FrameDecoder::spare`], at most [`MAX_SPARE`] (a `push`
+//!   does not count: it commits all it asks room for);
+//! * `MIN_ALLOC` is 4096 bytes, the floor of the first allocation, which is made even for a
+//!   one-byte push.
+//!
+//! The `T + m` term is there because a read of at most `m` bytes may be asked for while the
+//! frame is almost complete, and `spare(m)` then needs room past the end of the frame. The
+//! buffer grows once, to `T + m`, instead of reallocating for every few bytes committed near
+//! the end of the frame, which would copy up to `m` bytes per committed byte with an allocator
+//! that cannot grow in place.
+//!
+//! While the length of the front frame is not known (fewer than four of its bytes are in, or the
+//! decoder is waiting for the handshake to be consumed) growth is exact, not geometric: the
+//! buffer is made just large enough for the bytes asked for. That is cheap for the four bytes of
+//! a length, and the caller must limit the handshake to the 44 bytes of a `ConnectPacket` (after
+//! which [`FrameDecoder::consume`] ends the phase), since a decoder made with
+//! [`FrameDecoder::before_handshake`] keeps everything it is given until then.
+//!
+//! A consumed prefix is moved out of the way before the buffer would grow
 //! (never doubled over), and a buffer above 256 KiB is cut back to 64 KiB as soon as at most
 //! 64 KiB is held and no large frame is pending, so one large frame does not pin its memory.
 //! For this to hold the caller must call [`FrameDecoder::next_frame`] until it returns `None`
@@ -152,7 +175,11 @@
 //!
 //! **Reading from a socket.** [`FrameDecoder::spare`] and [`FrameDecoder::commit`] let a read go
 //! straight into the decoder's buffer, so the receive path has no intermediate buffer:
-//! `let n = socket.read(decoder.spare(4096))?; decoder.commit(n);`.
+//! `let n = socket.read(decoder.spare(4096))?; decoder.commit(n);`. Pass a constant for `min`:
+//! it must never be computed from what the peer sent (a declared length, say), or the peer would
+//! choose how much memory the decoder allocates. (A `min` above [`MAX_SPARE`] is lowered to it
+//! anyway, so a bad value costs at most that much.) [`FrameDecoder::commit`] takes the number of
+//! bytes the read actually returned, never more than the slice it read into.
 //!
 //! **Encoding.** [`FrameConfig::encode_frame`] copies a payload into the output buffer;
 //! [`FrameConfig::encode_frame_with`] lets the caller write the payload straight into it
@@ -521,6 +548,24 @@ pub fn parse_frame<'a>(
     Ok(Some((frame, parsed.total)))
 }
 
+/// Why [`FrameDecoder::consume`] refused. The decoder is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConsumeError {
+    /// The decoder is not waiting for its handshake to be consumed: it was not made with
+    /// [`FrameDecoder::before_handshake`], or `consume` was called already, or it has failed.
+    #[error("the decoder is not in its handshake phase")]
+    NotInHandshake,
+    /// More bytes were asked for than the decoder holds.
+    #[error("cannot consume {requested} bytes, only {buffered} are buffered")]
+    PastBuffered {
+        /// The `n` passed to `consume`.
+        requested: usize,
+        /// The bytes buffered.
+        buffered: usize,
+    },
+}
+
 /// Takes bytes in chunks of any size and gives back the frames in them.
 ///
 /// ```
@@ -594,6 +639,11 @@ const SHRINK_ABOVE: usize = 256 * 1024;
 const SHRINK_TO: usize = 64 * 1024;
 /// The size of the first allocation.
 const MIN_ALLOC: usize = 4096;
+/// The most room [`FrameDecoder::spare`] makes in one call, 1 MiB: a larger `min` is lowered to
+/// this, so that a wrong or hostile value cannot make the decoder allocate gigabytes. A read into
+/// the slice never needs more; [`FrameDecoder::push`] splits a larger slice into pieces of this
+/// size.
+pub const MAX_SPARE: usize = 1 << 20;
 
 impl FrameDecoder {
     /// A decoder for one connection's frames, with nothing buffered. The bytes pushed to it must
@@ -633,41 +683,65 @@ impl FrameDecoder {
     /// checked here too, so an oversize length is reported on the next call to `next_frame`
     /// even if more bytes follow, and nothing more is kept.
     pub fn push(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let room = self.spare(bytes.len());
-        if let Some(dst) = room.get_mut(..bytes.len()) {
-            dst.copy_from_slice(bytes);
-            self.commit(bytes.len());
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // The room is at most MAX_SPARE beyond what is held, so a huge slice is taken in
+            // pieces; it is empty once the decoder has failed.
+            let room = self.room(rest.len(), false);
+            let n = room.len().min(rest.len());
+            if n == 0 {
+                return;
+            }
+            let (now, later) = rest.split_at(n);
+            if let Some(dst) = room.get_mut(..n) {
+                dst.copy_from_slice(now);
+            }
+            self.commit(n);
+            rest = later;
         }
     }
 
-    /// Room for at least `min` more bytes (at least one), at the end of the buffered data: read
-    /// into the start of the slice and tell the decoder how much with
+    /// Room for at least `min` more bytes (at least one, at most [`MAX_SPARE`]), at the end of
+    /// the buffered data: read into the start of the slice and tell the decoder how much with
     /// [`commit`](FrameDecoder::commit). The slice may be much longer than `min`; it is the
     /// room the decoder already has, never more than it would allocate for a push of `min`
     /// bytes (see the module documentation: it is not sized from a declared length).
     ///
+    /// `min` is clamped to `1..=MAX_SPARE`, so the slice can be shorter than a `min` above
+    /// `MAX_SPARE`. Use a constant: **never derive `min` from data the peer sent**, a declared
+    /// length for one, which would let the peer choose the decoder's allocation (up to
+    /// `MAX_SPARE` here, but the design is that the peer chooses none of it).
+    ///
     /// After an error the slice is empty, so a read into it returns 0; check
     /// [`error`](FrameDecoder::error) or call [`next_frame`](FrameDecoder::next_frame).
     pub fn spare(&mut self, min: usize) -> &mut [u8] {
+        self.room(min, true)
+    }
+
+    /// The room for `min` bytes (clamped to `1..=MAX_SPARE`) after the data. `partial_commits` is
+    /// whether the caller may commit fewer bytes than the room it asked for, as a read into
+    /// [`spare`](FrameDecoder::spare) does: then the buffer is allowed to hold `min` more bytes
+    /// than the frame being received has (see `grow`). A [`push`](FrameDecoder::push) commits
+    /// all it asks room for.
+    fn room(&mut self, min: usize, partial_commits: bool) -> &mut [u8] {
         if self.failed.is_some() {
             return &mut [];
         }
-        let min = min.max(1);
+        let min = min.clamp(1, MAX_SPARE);
         self.trim();
         if self.buf.len() - self.filled < min {
             self.compact();
             if self.buf.len() - self.filled < min {
-                self.grow(min);
+                self.grow(min, if partial_commits { min } else { 0 });
             }
         }
         self.buf.get_mut(self.filled..).unwrap_or(&mut [])
     }
 
-    /// Records that `n` bytes were written to the start of the slice [`spare`] returned. A
-    /// larger `n` than the slice is taken to be the slice's length. The header of the frame
+    /// Records that the first `n` bytes of the slice [`spare`] returned were written. `n` must not
+    /// be larger than that slice (use the count the read returned): a larger `n` is a bug in the
+    /// caller. It panics in a build with debug assertions, and otherwise is taken to be the
+    /// slice's length, which accepts bytes that were never written. The header of the frame
     /// being received is checked now, as in [`push`](FrameDecoder::push).
     ///
     /// [`spare`]: FrameDecoder::spare
@@ -675,7 +749,12 @@ impl FrameDecoder {
         if self.failed.is_some() {
             return;
         }
-        self.filled += n.min(self.buf.len() - self.filled);
+        let room = self.buf.len() - self.filled;
+        debug_assert!(
+            n <= room,
+            "commit({n}) is more than the {room} bytes of room spare() gave"
+        );
+        self.filled += n.min(room);
         self.check_pending();
     }
 
@@ -687,17 +766,30 @@ impl FrameDecoder {
         self.pending()
     }
 
-    /// Removes `n` bytes from the front of the unconsumed bytes (all of them if `n` is larger).
-    /// This ends the handshake phase of a decoder made with
-    /// [`before_handshake`](FrameDecoder::before_handshake): what follows is parsed as frames,
-    /// and the header of the first one is checked now.
-    pub fn consume(&mut self, n: usize) {
-        if self.failed.is_some() {
-            return;
+    /// Removes the first `n` of the unconsumed bytes, the handshake of a decoder made with
+    /// [`before_handshake`](FrameDecoder::before_handshake). This ends the handshake phase: what
+    /// follows is parsed as frames, and the header of the first one is checked now.
+    ///
+    /// It is for that one use. Anywhere else it would cut into the stream and desynchronize
+    /// it, so it fails, and leaves the decoder as it was, if the decoder is not waiting for the
+    /// handshake to be consumed (it was made with [`new`](FrameDecoder::new), the handshake was
+    /// consumed already, or the decoder has failed) or if `n` is more than
+    /// [`buffered_len`](FrameDecoder::buffered_len).
+    pub fn consume(&mut self, n: usize) -> Result<(), ConsumeError> {
+        if !self.handshake {
+            return Err(ConsumeError::NotInHandshake);
         }
-        self.start += n.min(self.filled - self.start);
+        let buffered = self.buffered_len();
+        if n > buffered {
+            return Err(ConsumeError::PastBuffered {
+                requested: n,
+                buffered,
+            });
+        }
+        self.start += n;
         self.handshake = false;
         self.check_pending();
+        Ok(())
     }
 
     /// The next whole frame, if the buffered bytes contain one.
@@ -805,12 +897,20 @@ impl FrameDecoder {
 
     /// Makes room for `min` more bytes after the data, which starts at 0 (`compact` was called).
     ///
-    /// Doubles the buffer, but not past the end of the frame being received (its declared size
-    /// is a limit on growth, never a size to allocate), and never to less than what is needed.
-    fn grow(&mut self, min: usize) {
+    /// Doubles the buffer, but not past the end of the frame being received plus `slack` (its
+    /// declared size is a limit on growth, never a size to allocate), and never to less than what
+    /// is needed. The slack is `min` for a caller that may commit less than the room it asked
+    /// for: stopping at the frame's end exactly would make every `spare(min)` in the last `min`
+    /// bytes of the frame reallocate again, as `needed` is past the end of the buffer until the
+    /// frame is complete. With the slack, a read of up to `min` bytes ending at the frame's end
+    /// fits from the first call. While the frame's length is unknown the growth is exact.
+    fn grow(&mut self, min: usize, slack: usize) {
         let needed = self.filled.saturating_add(min);
         let target = match self.pending_frame_len() {
-            Some(frame) => needed.max(self.buf.len().saturating_mul(2).max(MIN_ALLOC).min(frame)),
+            Some(frame) => {
+                let doubled = self.buf.len().saturating_mul(2).max(MIN_ALLOC);
+                needed.max(doubled.min(frame.saturating_add(slack)))
+            }
             None => needed.max(MIN_ALLOC),
         };
         self.buf.reserve_exact(target - self.buf.len());
