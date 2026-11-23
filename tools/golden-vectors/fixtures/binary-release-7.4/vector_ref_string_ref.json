@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "vector_ref_string_ref",
+  "group": "containers",
+  "kind": "positive",
+  "description": "VectorRef<StringRef>.",
+  "cpp_type": "Standalone<VectorRef<StringRef>>",
+  "type": "vec<bytes>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 18,
+  "bytes": "02000000030000006f6e650300000074776f",
+  "value": ["6f6e65", "74776f"]
+}

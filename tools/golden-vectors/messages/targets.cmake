@@ -29,3 +29,13 @@ target_compile_definitions(
 # The generated gv_table_info specializations name private data members.
 target_compile_options(golden_vectors_messages PRIVATE -fno-access-control -Wno-unused-parameter)
 target_link_libraries(golden_vectors_messages PRIVATE fdbclient)
+
+# The binary-format (BinaryWriter/BinaryReader) vectors: real flow and fdbclient types,
+# written and read back by this release's own code. See binary_vectors.cpp.
+add_executable(golden_vectors_binary "${GV_MESSAGES_DIR}/binary_vectors.cpp")
+target_include_directories(golden_vectors_binary PRIVATE "${GV_MESSAGES_DIR}" "${GV_MESSAGES_DIR}/../src")
+target_compile_definitions(golden_vectors_binary PRIVATE GV_RELEASE_NAME="${GV_RELEASE_NAME}"
+                                                         GV_FDB_VERSION="${FDB_VERSION}")
+# Transaction::tr (the commit request being built) is private.
+target_compile_options(golden_vectors_binary PRIVATE -fno-access-control -Wno-unused-parameter)
+target_link_libraries(golden_vectors_binary PRIVATE fdbclient)

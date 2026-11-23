@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "vector_ref_key_value",
+  "group": "containers",
+  "kind": "positive",
+  "description": "VectorRef<KeyValueRef>: a uint32_t count, then each key and value.",
+  "cpp_type": "Standalone<VectorRef<KeyValueRef>>",
+  "type": "vec<key_value>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 26,
+  "bytes": "02000000020000006b31020000007631020000006b3200000000",
+  "value": [
+    ["6b31", "7631"],
+    ["6b32", ""]
+  ]
+}

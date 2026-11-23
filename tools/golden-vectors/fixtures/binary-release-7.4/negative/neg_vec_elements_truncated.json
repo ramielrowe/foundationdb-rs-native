@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_vec_elements_truncated",
+  "kind": "negative",
+  "description": "A std::vector<int32_t> of count 3 with one element.",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "bytes": "0300000001000000",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

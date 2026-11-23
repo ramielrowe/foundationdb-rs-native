@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "variant_int",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::variant<int32_t, std::string, uint8_t> holding alternative 0: a uint8_t index, then the value.",
+  "cpp_type": "std::variant<int32_t, std::string, uint8_t>",
+  "type": "variant3",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 5,
+  "bytes": "00f7ffffff",
+  "value": {
+    "index": 0,
+    "value": -9
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "vec_u8",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::vector<uint8_t>: a count and the bytes.",
+  "cpp_type": "std::vector<uint8_t>",
+  "type": "vec<u8>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 7,
+  "bytes": "030000000001ff",
+  "value": [0, 1, 255]
+}

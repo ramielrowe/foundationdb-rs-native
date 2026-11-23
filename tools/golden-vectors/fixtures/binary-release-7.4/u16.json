@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "u16",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "uint16_t, little-endian.",
+  "cpp_type": "uint16_t",
+  "type": "u16",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 2,
+  "bytes": "efbe",
+  "value": 48879
+}

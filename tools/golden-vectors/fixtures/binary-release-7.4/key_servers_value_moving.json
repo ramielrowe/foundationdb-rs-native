@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "name": "key_servers_value_moving",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A value for a shard that is moving: both ids follow.",
+  "cpp_type": "keyServersValue",
+  "type": "key_servers_value",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688295399424
+  },
+  "size": 112,
+  "bytes": "00000072b000db0f0200000001000000000011110100000000002222020000000000111102000000000022220200000004000000000011110400000000002222050000000000111105000000000022220a000000000011110a000000000022220b000000000011110b00000000002222",
+  "value": {
+    "protocol_version": 1142507688295399424,
+    "src": [
+      {
+        "first": 1229764173248856065,
+        "second": 2459528346497712129
+      },
+      {
+        "first": 1229764173248856066,
+        "second": 2459528346497712130
+      }
+    ],
+    "dest": [
+      {
+        "first": 1229764173248856068,
+        "second": 2459528346497712132
+      },
+      {
+        "first": 1229764173248856069,
+        "second": 2459528346497712133
+      }
+    ],
+    "src_id": {
+      "first": 1229764173248856074,
+      "second": 2459528346497712138
+    },
+    "dest_id": {
+      "first": 1229764173248856075,
+      "second": 2459528346497712139
+    }
+  }
+}

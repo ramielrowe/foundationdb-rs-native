@@ -8,7 +8,8 @@
 //! format; this crate is tested against the vectors that tool generates from FDB's own
 //! C++ code, and its output against FDB's readers.
 //!
-//! The legacy `BinaryWriter` format is not implemented yet.
+//! The legacy `BinaryWriter`/`BinaryReader` format, which a few places in the protocol still use,
+//! is in the [`binary`] module.
 //!
 //! # Usage
 //!
@@ -191,6 +192,7 @@
 
 #![warn(missing_docs)]
 
+pub mod binary;
 mod codec;
 mod codecs;
 mod collections;

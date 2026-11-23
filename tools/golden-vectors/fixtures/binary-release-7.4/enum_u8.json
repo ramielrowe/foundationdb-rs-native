@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "enum_u8",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "enum class Color : uint8_t: the underlying value.",
+  "cpp_type": "Color",
+  "type": "enum_color",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 1,
+  "bytes": "c8",
+  "value": 200
+}

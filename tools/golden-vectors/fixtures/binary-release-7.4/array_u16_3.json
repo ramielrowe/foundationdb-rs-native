@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "array_u16_3",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::array<uint16_t, 3>: the elements, no count.",
+  "cpp_type": "std::array<uint16_t, 3>",
+  "type": "array<u16;3>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 6,
+  "bytes": "010002000300",
+  "value": [1, 2, 3]
+}

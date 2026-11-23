@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "unversioned_u32",
+  "group": "versioning",
+  "kind": "positive",
+  "description": "Unversioned(): the same integer with no prefix.",
+  "cpp_type": "uint32_t",
+  "type": "u32",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 4,
+  "bytes": "04030201",
+  "value": 16909060
+}

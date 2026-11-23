@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "vec_i32_empty",
+  "group": "containers",
+  "kind": "positive",
+  "description": "Empty std::vector<int32_t>.",
+  "cpp_type": "std::vector<int32_t>",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 4,
+  "bytes": "00000000",
+  "value": []
+}

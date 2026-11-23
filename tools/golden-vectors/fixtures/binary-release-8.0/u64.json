@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "u64",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "uint64_t, little-endian.",
+  "cpp_type": "uint64_t",
+  "type": "u64",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 8,
+  "bytes": "efcdab8967452301",
+  "value": 81985529216486895
+}

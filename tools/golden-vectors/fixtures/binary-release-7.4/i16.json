@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "i16",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "int16_t -2.",
+  "cpp_type": "int16_t",
+  "type": "i16",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 2,
+  "bytes": "feff",
+  "value": -2
+}

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "enum_i32",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "enum Level : int32_t with a negative value: the underlying value, little-endian.",
+  "cpp_type": "Level",
+  "type": "enum_level",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 4,
+  "bytes": "fbffffff",
+  "value": -5
+}

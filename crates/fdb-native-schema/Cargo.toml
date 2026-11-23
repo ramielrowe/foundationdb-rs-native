@@ -12,3 +12,7 @@ workspace = true
 
 [dependencies]
 fdb-native-wire.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }

@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "span_context_unsampled",
+  "group": "usage",
+  "kind": "positive",
+  "description": "An unsampled SpanContext.",
+  "cpp_type": "SpanContext",
+  "type": "span_context",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 33,
+  "bytes": "00000074b000db0f01000000000000000200000000000000030000000000000000",
+  "value": {
+    "trace_id": {
+      "first": 1,
+      "second": 2
+    },
+    "span_id": 3,
+    "flags": 0
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "protocol_version",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "ProtocolVersion with the object-serializer flag: versionWithFlags() as a uint64_t.",
+  "cpp_type": "ProtocolVersion",
+  "type": "protocol_version",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 8,
+  "bytes": "00000074b000db1f",
+  "value": 2295429192935800832
+}

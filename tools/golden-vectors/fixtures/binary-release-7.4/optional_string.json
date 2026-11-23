@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "optional_string",
+  "group": "containers",
+  "kind": "positive",
+  "description": "Optional<std::string>.",
+  "cpp_type": "Optional<std::string>",
+  "type": "optional<string>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 8,
+  "bytes": "01030000006f7074",
+  "value": "opt"
+}

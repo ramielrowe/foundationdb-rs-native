@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "include_version_flagged_struct",
+  "group": "versioning",
+  "kind": "positive",
+  "description": "IncludeVersion(v) with the object-serializer flag set on v, before a struct of two integers; the flag does not change how a type without a file identifier is read.",
+  "cpp_type": "Point3",
+  "type": "point3",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 2295429193137127424
+  },
+  "size": 25,
+  "bytes": "00000080b000db1f0100000002000000000000000100000066",
+  "value": [1, 2, "f"]
+}

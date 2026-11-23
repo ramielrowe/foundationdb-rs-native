@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "string_empty",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::string, empty: an int32_t length of 0.",
+  "cpp_type": "std::string",
+  "type": "string",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 4,
+  "bytes": "00000000",
+  "value": ""
+}

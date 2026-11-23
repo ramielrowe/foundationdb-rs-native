@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "error",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "Error: its code, a uint16_t. (Error::serialize needs a valid protocol version, so AssumeVersion.)",
+  "cpp_type": "Error",
+  "type": "error",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 2,
+  "bytes": "ef03",
+  "value": 1007
+}

@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "variant_string",
+  "group": "containers",
+  "kind": "positive",
+  "description": "The same variant holding alternative 1.",
+  "cpp_type": "std::variant<int32_t, std::string, uint8_t>",
+  "type": "variant3",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 6,
+  "bytes": "010100000076",
+  "value": {
+    "index": 1,
+    "value": "v"
+  }
+}
