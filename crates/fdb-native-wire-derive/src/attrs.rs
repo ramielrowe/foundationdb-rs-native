@@ -8,8 +8,8 @@ use syn::{Attribute, Error, Expr, Lit, LitInt, LitStr, Path, Result};
 pub(crate) struct ContainerAttrs {
     /// `crate = "path"`: the path of the wire crate.
     pub(crate) krate: Option<Path>,
-    /// `file_identifier = expr`.
-    pub(crate) file_identifier: Option<Expr>,
+    /// `file_identifier = expr`, with the span of `file_identifier`.
+    pub(crate) file_identifier: Option<(Span, Expr)>,
     /// `struct`: an inline struct rather than a table.
     pub(crate) inline_struct: Option<Span>,
 }
@@ -62,9 +62,17 @@ pub(crate) fn container(attrs: &[Attribute]) -> Result<ContainerAttrs> {
                 if out.file_identifier.is_some() {
                     return Err(duplicate(span, "file_identifier"));
                 }
-                let expr: Expr = meta.value()?.parse()?;
+                let value = meta.value()?;
+                // syn parses a subset of expressions without its "full" feature; do not
+                // pass its message (which suggests enabling that feature) to the user.
+                let expr: Expr = value.parse().map_err(|e| {
+                    Error::new(
+                        e.span(),
+                        "expected an integer literal or simple constant expression",
+                    )
+                })?;
                 check_file_identifier(&expr)?;
-                out.file_identifier = Some(expr);
+                out.file_identifier = Some((span, expr));
             } else if meta.path.is_ident("struct") {
                 if out.inline_struct.is_some() {
                     return Err(duplicate(span, "struct"));

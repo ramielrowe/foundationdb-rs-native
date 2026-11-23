@@ -83,7 +83,9 @@
 //! FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`], plus `&T` and `Box<T>`.
 //!
 //! Tables, unions and structs are normally derived with
-//! [`#[derive(Wire)]`](derive@Wire) (the `derive` feature, on by default), whose docs are
+#![cfg_attr(feature = "derive", doc = "[`#[derive(Wire)]`](derive@Wire)")]
+#![cfg_attr(not(feature = "derive"), doc = "`#[derive(Wire)]`")]
+//! (the `derive` feature, on by default), whose docs are
 //! the attribute reference. **Field order is `serializer(ar, ...)` argument order.**
 //!
 //! By hand, **tables** are mechanical: one

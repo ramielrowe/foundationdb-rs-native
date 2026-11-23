@@ -357,3 +357,145 @@ fn derived_tables_nest_in_hand_written_ones() {
     assert_eq!(t.field::<Inner<'_>>().unwrap(), Inner { a: 9, b: b"" });
     assert_eq!(t.field::<V2>().unwrap(), V2::F64(1.5));
 }
+
+// ---------------------------------------------------------------------------------------
+// Hygiene.
+
+/// The derive inside a `macro_rules!` whose field types arrive as `ident`, `ty` and `tt`
+/// fragments (review finding: tokens spanned at such a type cannot see the impl's
+/// locals or `self`).
+mod from_macro_rules {
+    use fdb_native_wire::Wire;
+
+    macro_rules! make_ident {
+        ($table:ident, $union:ident, $strukt:ident, $t:ident) => {
+            #[derive(Wire, Debug, PartialEq)]
+            #[fdb(file_identifier = 0x000fdb30)]
+            pub(crate) struct $table {
+                pub(crate) a: $t,
+                pub(crate) b: Vec<$t>,
+            }
+
+            #[derive(Wire, Debug, PartialEq)]
+            pub(crate) enum $union {
+                A($t),
+                B(Vec<$t>),
+            }
+
+            #[derive(Wire, Clone, Copy, Debug, PartialEq)]
+            #[fdb(struct)]
+            pub(crate) struct $strukt {
+                pub(crate) a: $t,
+                pub(crate) b: u8,
+            }
+        };
+    }
+
+    macro_rules! make_ty {
+        ($table:ident, $t:ty) => {
+            #[derive(Wire, Debug, PartialEq)]
+            pub(crate) struct $table {
+                pub(crate) a: $t,
+                pub(crate) b: u8,
+            }
+        };
+    }
+
+    macro_rules! make_tt {
+        ($table:ident, $field:ident, $($t:tt)*) => {
+            #[derive(Wire, Debug, PartialEq)]
+            pub(crate) struct $table {
+                pub(crate) $field: $($t)*,
+            }
+        };
+    }
+
+    make_ident!(Table, Union, Struct, u32);
+    make_ty!(TableTy, Vec<u16>);
+    make_tt!(TableTt, zzz, Option<u64>);
+}
+
+/// Names the generated code must not depend on (it uses absolute paths, and `__fdb_`
+/// locals that cannot collide with field names).
+mod shadowed {
+    #![allow(dead_code, non_camel_case_types)]
+
+    use ::fdb_native_wire::Wire;
+
+    struct Result;
+    struct Ok;
+    struct Err;
+    struct Some;
+    struct None;
+    struct Default;
+    struct Option;
+    struct Box;
+    struct Vec;
+    mod fdb_native_wire {}
+    mod core {}
+
+    #[derive(Wire, Debug, PartialEq)]
+    pub(crate) struct Collide {
+        pub(crate) __fdb_t: u8,
+        pub(crate) __fdb_w: u8,
+        pub(crate) __fdb_r: u8,
+        pub(crate) __fdb_f0: u8,
+        pub(crate) __fdb_at: u8,
+        pub(crate) r#type: u8,
+        #[fdb(skip)]
+        pub(crate) skipped: u8,
+    }
+
+    #[derive(Wire, Debug, PartialEq)]
+    pub(crate) enum Tags {
+        __fdb_v(u8),
+        __fdb_tag(u16),
+    }
+}
+
+#[test]
+fn derive_is_hygienic() {
+    use from_macro_rules::*;
+
+    let t = Table {
+        a: 1,
+        b: vec![2, 3],
+    };
+    assert_eq!(decode::<Table>(&encode(&t).unwrap()).unwrap(), t);
+    for u in [Union::A(4), Union::B(vec![5])] {
+        let bytes = encode_with_identifier(&u, 1).unwrap();
+        let back: Union = Reader::new(&bytes).unwrap().decode_root().unwrap();
+        assert_eq!(back, u);
+    }
+    assert_eq!(<Struct as Wire>::SHAPE, <(u32, u8) as Wire>::SHAPE);
+    let s = Struct { a: 6, b: 7 };
+    let bytes = encode_with_identifier(&vec![s], 1).unwrap();
+    let back: Vec<Struct> = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert_eq!(back, vec![s]);
+
+    let t = TableTy { a: vec![1], b: 2 };
+    let bytes = encode_with_identifier(&t, 1).unwrap();
+    let back: TableTy = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert_eq!(back, t);
+    let t = TableTt { zzz: Some(9) };
+    let bytes = encode_with_identifier(&t, 1).unwrap();
+    let back: TableTt = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert_eq!(back, t);
+
+    let c = shadowed::Collide {
+        __fdb_t: 1,
+        __fdb_w: 2,
+        __fdb_r: 3,
+        __fdb_f0: 4,
+        __fdb_at: 5,
+        r#type: 6,
+        skipped: 0,
+    };
+    let bytes = encode_with_identifier(&c, 1).unwrap();
+    let back: shadowed::Collide = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert_eq!(back, c);
+    let u = shadowed::Tags::__fdb_tag(7);
+    let bytes = encode_with_identifier(&u, 1).unwrap();
+    let back: shadowed::Tags = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert_eq!(back, u);
+}

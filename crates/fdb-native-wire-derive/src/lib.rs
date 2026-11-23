@@ -1,5 +1,13 @@
 //! `#[derive(Wire)]` for `fdb-native-wire`. Use it through the wire crate's re-export,
 //! `fdb_native_wire::Wire` (the `derive` feature, on by default); see [`macro@Wire`].
+//!
+//! The two crates depend on each other: `fdb-native-wire` depends (optionally) on this
+//! crate, and this crate dev-depends on `fdb-native-wire` for its tests and doc examples.
+//! Cargo allows that cycle, but it constrains publishing: this crate must be published
+//! first, and a dev-dependency that carries a version must already exist on the
+//! registry. Make the dev-dependency path-only for that publish (Cargo strips path-only
+//! dev-dependencies from the published manifest), then publish `fdb-native-wire` at the
+//! matching version.
 
 mod attrs;
 mod expand;
@@ -100,7 +108,7 @@ use proc_macro::TokenStream;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use fdb_native_wire::Wire;
 ///
 /// // A struct member must be inline: a string is not.
@@ -112,7 +120,7 @@ use proc_macro::TokenStream;
 /// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use fdb_native_wire::Wire;
 ///
 /// // FDB does not support nested structs.
@@ -125,7 +133,7 @@ use proc_macro::TokenStream;
 /// struct Outer(Inner, u8);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use fdb_native_wire::Wire;
 ///
 /// // ErrorOr<Optional<T>> does not compile in C++ either: use EnsureTable<Option<u8>>.
@@ -142,11 +150,11 @@ use proc_macro::TokenStream;
 ///
 /// | attribute | meaning |
 /// | --- | --- |
-/// | `#[fdb(file_identifier = N)]` | implements `FileIdentified` with `FileIdentifier::new(N)`. `N` is an integer literal or a constant expression below 2^24 (larger fails to compile). Wrappers compose it automatically: `ErrorOr<EnsureTable<T>>`, `Option<T>`, `Vec<T>`, ... |
+/// | `#[fdb(file_identifier = N)]` | tables only (a C++ `std::variant` or `std::tuple` has none). Implements `FileIdentified` with `FileIdentifier::new(N)`. `N` is an integer literal or a constant expression below 2^24 (larger fails to compile). Wrappers compose it automatically: `ErrorOr<EnsureTable<T>>`, `Option<T>`, `Vec<T>`, ... |
 /// | `#[fdb(struct)]` | an inline struct (`std::tuple`) instead of a table. Structs only. |
 /// | `#[fdb(crate = "path")]` | the path of the wire crate in the generated code (default `::fdb_native_wire`); for code that renames the crate or re-exports it. |
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use fdb_native_wire::Wire;
 ///
 /// // Already composed (ErrorOr<Inner>): give the plain identifier, the wrappers compose it.

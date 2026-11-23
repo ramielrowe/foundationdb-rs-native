@@ -66,10 +66,25 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             ));
         }
     };
-    let file_identifier = attrs
-        .file_identifier
-        .as_ref()
-        .map(|expr| expand_file_identifier(&cx, expr));
+    let file_identifier = match &attrs.file_identifier {
+        None => None,
+        // C++ std::variant and std::tuple have no file identifier.
+        Some((span, _)) if matches!(input.data, Data::Enum(_)) => {
+            return Err(Error::new(
+                *span,
+                "a union (std::variant) has no file identifier; put `file_identifier` on a \
+                 table, or wrap the union in one",
+            ));
+        }
+        Some((span, _)) if attrs.inline_struct.is_some() => {
+            return Err(Error::new(
+                *span,
+                "an `#[fdb(struct)]` (std::tuple) has no file identifier; put \
+                 `file_identifier` on a table",
+            ));
+        }
+        Some((_, expr)) => Some(expand_file_identifier(&cx, expr)),
+    };
     Ok(quote! {
         #body
         #file_identifier
@@ -150,10 +165,10 @@ fn expand_table(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         let var = format_ident!("__fdb_f{}", i);
         match f.kind {
             FieldKind::Field => {
-                encode_steps.push(quote_spanned! {ty.span()=>
+                encode_steps.push(quote! {
                     __fdb_t.field::<#ty>(&self.#member)?;
                 });
-                decode_steps.push(quote_spanned! {ty.span()=>
+                decode_steps.push(quote! {
                     let #var: #ty = __fdb_t.field::<#ty>()?;
                 });
                 inits.push(quote!(#member: #var));
@@ -247,17 +262,24 @@ fn expand_struct(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         .collect();
     let tys: Vec<&Type> = members.iter().map(|f| f.ty).collect();
 
-    let assert = (!tys.is_empty()).then(|| {
-        quote! {
+    // One assertion per member, spanned at its type so a failure points at the member.
+    // (Spanned tokens here only name paths and types, never the impl's locals.)
+    let asserts = tys.iter().map(|ty| {
+        quote_spanned! {ty.span()=>
             ::core::assert!(
-                #(!<#tys as #krate::Wire>::STRUCT)&&*,
+                ::core::matches!(<#ty as #krate::Wire>::SHAPE, #krate::Shape::Inline { .. }),
+                "a member of an #[fdb(struct)] must be inline (a scalar, Uid or #[fdb(struct)]); \
+                 tables, strings, vectors and unions cannot be struct members"
+            );
+            ::core::assert!(
+                !<#ty as #krate::Wire>::STRUCT,
                 "a member of an #[fdb(struct)] cannot be a struct (FDB does not support \
                  nested structs)"
             );
         }
     });
     let shape = quote! {{
-        #assert
+        #(#asserts)*
         #krate::Shape::of_struct(&[#(<#tys as #krate::Wire>::SHAPE),*])
     }};
     let wire = impl_wire(
@@ -282,12 +304,12 @@ fn expand_struct(cx: &Cx<'_>, fields: &[Field<'_>]) -> Result<TokenStream> {
         let (member, ty) = (&f.member, f.ty);
         let var = format_ident!("__fdb_f{}", i);
         if f.kind == FieldKind::Field {
-            encode_steps.push(quote_spanned! {ty.span()=>
+            encode_steps.push(quote! {
                 #krate::__private::encode_struct_member::<#ty>(
                     __fdb_out, &__fdb_shapes, #index, &self.#member,
                 )?;
             });
-            decode_steps.push(quote_spanned! {ty.span()=>
+            decode_steps.push(quote! {
                 let #var: #ty = #krate::__private::decode_struct_member::<#ty>(
                     __fdb_bytes, &__fdb_shapes, #index,
                 )?;
@@ -398,11 +420,18 @@ fn expand_union(cx: &Cx<'_>, data: &DataEnum) -> Result<TokenStream> {
     }
 
     let tys: Vec<&Type> = alternatives.iter().map(|(_, ty)| *ty).collect();
+    // One assertion per alternative, spanned at its type (see expand_struct).
+    let asserts = tys.iter().map(|ty| {
+        quote_spanned! {ty.span()=>
+            ::core::assert!(
+                <#ty as #krate::Wire>::SHAPE.is_plain(),
+                "a union alternative cannot be a union or a vector of unions; wrap it in \
+                 EnsureTable"
+            );
+        }
+    });
     let shape = quote! {{
-        ::core::assert!(
-            #(<#tys as #krate::Wire>::SHAPE.is_plain())&&*,
-            "a union alternative cannot be a union or a vector of unions; wrap it in EnsureTable"
-        );
+        #(#asserts)*
         #krate::Shape::Union
     }};
     let wire = impl_wire(cx, &tys, shape, None);
@@ -411,10 +440,10 @@ fn expand_union(cx: &Cx<'_>, data: &DataEnum) -> Result<TokenStream> {
     let mut decode_arms = Vec::new();
     for (index, (variant, ty)) in alternatives.iter().enumerate() {
         let tag = u8::try_from(index + 1).expect("checked above");
-        encode_arms.push(quote_spanned! {ty.span()=>
+        encode_arms.push(quote! {
             Self::#variant(__fdb_v) => __fdb_w.union_value::<#ty>(#tag, __fdb_v),
         });
-        decode_arms.push(quote_spanned! {ty.span()=>
+        decode_arms.push(quote! {
             #tag => __fdb_r.alternative::<#ty>(__fdb_at).map(Self::#variant),
         });
     }
@@ -527,7 +556,7 @@ fn shape_check(cx: &Cx<'_>) -> Option<TokenStream> {
 }
 
 fn default_init(member: &Member, ty: &Type) -> TokenStream {
-    quote_spanned! {ty.span()=>
+    quote! {
         #member: <#ty as ::core::default::Default>::default()
     }
 }
@@ -540,7 +569,7 @@ fn absent_inits(cx: &Cx<'_>, fields: &[Field<'_>]) -> Vec<TokenStream> {
         .map(|f| {
             let (member, ty) = (&f.member, f.ty);
             match f.kind {
-                FieldKind::Field => quote_spanned! {ty.span()=>
+                FieldKind::Field => quote! {
                     #member: <#ty as #krate::Decode<#de>>::absent()
                 },
                 _ => default_init(member, ty),

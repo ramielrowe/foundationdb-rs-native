@@ -9,3 +9,21 @@ error: expected `=`
    |
 11 | #[fdb(file_identifier)]
    |                      ^
+
+error: expected an integer literal or simple constant expression
+  --> tests/ui/file_identifier.rs:17:25
+   |
+17 | #[fdb(file_identifier = if true { 1 } else { 2 })]
+   |                         ^^
+
+error: a union (std::variant) has no file identifier; put `file_identifier` on a table, or wrap the union in one
+  --> tests/ui/file_identifier.rs:24:7
+   |
+24 | #[fdb(file_identifier = 1)]
+   |       ^^^^^^^^^^^^^^^
+
+error: an `#[fdb(struct)]` (std::tuple) has no file identifier; put `file_identifier` on a table
+  --> tests/ui/file_identifier.rs:30:15
+   |
+30 | #[fdb(struct, file_identifier = 1)]
+   |               ^^^^^^^^^^^^^^^

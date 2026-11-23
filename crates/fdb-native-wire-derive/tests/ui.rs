@@ -2,8 +2,22 @@
 //! Regenerate the expected output with `TRYBUILD=overwrite cargo test -p
 //! fdb-native-wire-derive --test ui` and review the diff.
 
+/// Errors the derive itself reports (`compile_error!` with spans): stable across
+/// compilers back to the workspace's rust-version.
 #[test]
-fn ui() {
+fn derive_errors() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/*.rs");
+    t.compile_fail("tests/ui/field_attributes.rs");
+    t.compile_fail("tests/ui/file_identifier.rs");
+    t.compile_fail("tests/ui/unions.rs");
+    t.compile_fail("tests/ui/unknown_attributes.rs");
+}
+
+/// Shape checks that fail during constant evaluation, reported at the offending member.
+/// rustc words const-evaluation panics differently across versions (1.85 says
+/// "evaluation of constant value failed"), so this snapshot is for current stable, which
+/// is what CI tests with.
+#[test]
+fn const_evaluation_errors() {
+    trybuild::TestCases::new().compile_fail("tests/ui/const_checks.rs");
 }

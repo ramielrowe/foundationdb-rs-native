@@ -32,6 +32,17 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The workspace's rust-version; dev-dependencies (trybuild) must resolve to versions
+  # that build on it too.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo check -p fdb-native-wire --no-default-features --all-targets
+
   test:
     runs-on: ubuntu-latest
     steps:
