@@ -100,7 +100,7 @@ impl Slot {
 ///
 /// After an error the writer holds a partial message; call [`Writer::reset`] (or use a
 /// new writer) before writing the next one.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Writer {
     /// The message body is `buf[head..]`.
     buf: Vec<u8>,
@@ -126,6 +126,19 @@ pub struct Writer {
     refs: Vec<ObjectRef>,
     empty_blob: Option<ObjectRef>,
     protocol_version: Option<ProtocolVersion>,
+}
+
+/// Sizes and counts only: a reused writer's buffer still holds the bytes of earlier
+/// messages, which must not end up in logs.
+impl core::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Writer")
+            .field("used", &self.used())
+            .field("capacity", &self.buf.len())
+            .field("vtables", &self.vtables.entries.len())
+            .field("protocol_version", &self.protocol_version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Writer {
@@ -1073,5 +1086,26 @@ mod tests {
         let _ = w.blob(&[0xFF; 300]).unwrap();
         w.reset();
         assert_eq!(message(&mut w, 11), message(&mut Writer::new(), 11));
+    }
+
+    #[test]
+    fn debug_shows_sizes_never_buffer_contents() {
+        let mut w = Writer::new();
+        w.blob(b"TOP-SECRET-PAYLOAD").unwrap();
+        let mut t = w.table();
+        t.field(&0xABCD_EF01u32).unwrap();
+        let shown = format!("{w:?}", w = t.w);
+        assert!(
+            shown.starts_with("Writer {") && shown.contains("used:"),
+            "{shown}"
+        );
+        drop(t);
+        w.reset();
+        // After a reset the buffer still holds the payload; the output must not.
+        assert!(w.buf.windows(10).any(|win| win == b"TOP-SECRET"));
+        let shown = format!("{w:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(shown.contains("used: 0"), "{shown}");
+        assert!(format!("{:?}", w.table()).starts_with("TableWriter"));
     }
 }

@@ -186,14 +186,17 @@
 //!
 //! # Performance
 //!
-//! A vector of integers, floats or `bool`s (so every `Vec<u8>`, string and blob) is written
-//! and read in one pass over its bytes, through the [`Encode::encode_inline_slice`] and
-//! [`Decode::decode_elements`] hooks that the scalar impls override (a stand-in for
-//! specialization); the work-limit charges and bounds checks are those of element-wise
-//! decoding. The writer reuses its buffers between tables, looks vtables up in a hash
-//! index once a message has more than a handful, and clears only memory an earlier message
-//! used. `cargo bench -p fdb-native-wire --bench wire` measures encode and decode of
-//! representative messages.
+//! A vector of integers, floats or `bool`s is written and read in one pass over its bytes,
+//! through the [`Encode::encode_inline_slice`] and [`Decode::decode_elements`] hooks that
+//! the scalar impls override (a stand-in for specialization): a `Vec<u8>` is one copy
+//! to decode, and a `Vec<u8>` or `&[u8]` is one copy to encode. (Decoding a borrowed
+//! `&[u8]` string or blob goes through [`Reader::blob`] and is zero-copy; it needs no
+//! hook.) The work-limit charges and bounds checks are those of element-wise decoding.
+//! The writer reuses its buffers between tables, looks vtables up in a hash index once a
+//! message has more than a handful, and clears only memory an earlier message wrote (so a
+//! new writer, as [`encode`] makes, clears nothing; a reused one clears what its previous
+//! messages used). `cargo bench -p fdb-native-wire --bench wire` measures encode and
+//! decode of representative messages, with a new writer and with a reused one.
 //!
 //! # File identifiers
 //!

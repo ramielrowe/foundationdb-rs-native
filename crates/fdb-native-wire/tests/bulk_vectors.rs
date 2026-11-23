@@ -11,8 +11,8 @@
 use std::fmt::Debug;
 
 use fdb_native_wire::{
-    Decode, DecodeError, Encode, EncodeError, ObjectRef, Reader, Shape, VectorView, Wire, Writer,
-    encode_with_identifier,
+    Decode, DecodeError, Encode, EncodeError, ObjectRef, Reader, Shape, StrictCheck, VectorHeader,
+    VectorView, Wire, Writer, encode_with_identifier,
 };
 use proptest::prelude::*;
 
@@ -359,4 +359,144 @@ fn bulk_decodes_charge_what_element_wise_decodes_charge() {
     same_budget(7i64);
     same_budget(7.5f32);
     same_budget(7.5f64);
+}
+
+// ---------------------------------------------------------------------------------------
+// The contract of `Decode::decode_elements`.
+
+/// A one-byte type whose `decode_elements` returns the wrong number of elements.
+#[derive(Debug)]
+struct Liar<const EXTRA: bool>(#[allow(dead_code)] u8);
+
+impl<const EXTRA: bool> Wire for Liar<EXTRA> {
+    const SHAPE: Shape = Shape::scalar(1);
+}
+
+impl<'de, const EXTRA: bool> Decode<'de> for Liar<EXTRA> {
+    fn absent() -> Self {
+        Liar(0)
+    }
+
+    fn decode_inline(bytes: &'de [u8]) -> Result<Self, DecodeError> {
+        Ok(Liar(bytes[0]))
+    }
+
+    fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
+        let mut items: Vec<Self> = r
+            .inline(header.first(), header.len())?
+            .iter()
+            .map(|&b| Liar(b))
+            .collect();
+        if EXTRA {
+            items.push(Liar(0));
+        } else {
+            items.pop();
+        }
+        Ok(items)
+    }
+}
+
+#[test]
+fn vec_rejects_a_decode_elements_override_of_the_wrong_length() {
+    let bytes = encode_vec(&[1u8, 2, 3]);
+    let decode = |bytes: &[u8]| {
+        let reader = Reader::new(bytes).unwrap();
+        (
+            reader.decode_root::<Vec<Liar<true>>>().map(|v| v.len()),
+            reader.decode_root::<Vec<Liar<false>>>().map(|v| v.len()),
+        )
+    };
+    let wrong = Err(DecodeError::Invalid("decode_elements length"));
+    assert_eq!(decode(&bytes), (wrong.clone(), wrong));
+    // An empty vector is not exempt (a pop on it is a no-op, the push is not).
+    let (extra, _) = decode(&encode_vec::<u8>(&[]));
+    assert_eq!(extra, Err(DecodeError::Invalid("decode_elements length")));
+}
+
+/// Decodes the vector at `at` as `Vec<U>` with the header of a `Vec<H>`.
+struct Mismatched<H, U>(Result<Vec<U>, DecodeError>, std::marker::PhantomData<H>);
+
+impl<H: Wire, U> Wire for Mismatched<H, U> {
+    const SHAPE: Shape = Shape::Object;
+}
+
+impl<'de, H: Wire, U: Decode<'de>> Decode<'de> for Mismatched<H, U> {
+    fn absent() -> Self {
+        Mismatched(Ok(Vec::new()), std::marker::PhantomData)
+    }
+
+    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+        let header = r.vector_header::<H>(at)?;
+        Ok(Mismatched(
+            U::decode_elements(r, &header),
+            std::marker::PhantomData,
+        ))
+    }
+}
+
+#[test]
+fn scalar_decode_elements_reject_a_header_of_another_stride() {
+    fn mismatched<H: Encode + Wire + Default + Copy, U: for<'de> Decode<'de>>()
+    -> Result<usize, DecodeError> {
+        let bytes = encode_vec(&[H::default(); 16]);
+        let reader = Reader::new(&bytes).unwrap();
+        let m: Mismatched<H, U> = reader.decode_root().unwrap();
+        m.0.map(|v| v.len())
+    }
+    let wrong = Err(DecodeError::Invalid("decode_elements stride"));
+    // A `u8` header (16 bytes) given to wider element types would read past what it checked.
+    assert_eq!(mismatched::<u8, u64>(), wrong);
+    assert_eq!(mismatched::<u8, u16>(), wrong);
+    assert_eq!(mismatched::<u8, i32>(), wrong);
+    assert_eq!(mismatched::<u8, f64>(), wrong);
+    // And the reverse: a `u64` header given to byte types.
+    assert_eq!(mismatched::<u64, u8>(), wrong);
+    assert_eq!(mismatched::<u64, i8>(), wrong);
+    assert_eq!(mismatched::<u64, bool>(), wrong);
+    assert_eq!(mismatched::<u32, u64>(), wrong);
+    // The matching stride is fine.
+    assert_eq!(mismatched::<u8, u8>(), Ok(16));
+    assert_eq!(mismatched::<i8, bool>(), Ok(16));
+    assert_eq!(mismatched::<u32, f32>(), Ok(16));
+    assert_eq!(mismatched::<u64, i64>(), Ok(16));
+}
+
+// ---------------------------------------------------------------------------------------
+// `bool`s: only `std::vector<bool>` reads any nonzero byte as true.
+
+#[test]
+fn bools_outside_a_vec_must_be_zero_or_one() {
+    use std::collections::{BTreeSet, HashSet};
+
+    let strict = Some(DecodeError::Strict(StrictCheck::BoolValue));
+    for bad in [2u8, 0x80, 0xff] {
+        let bytes = encode_vec(&[0u8, bad, 1]);
+        let reader = Reader::new(&bytes).unwrap();
+        // `Vec<bool>` and a lazy view of it are `std::vector<bool>`: any nonzero is true.
+        assert_eq!(
+            reader.decode_root::<Vec<bool>>(),
+            Ok(vec![false, true, true])
+        );
+        let view: VectorView<bool> = reader.decode_root().unwrap();
+        assert_eq!(
+            view.iter().collect::<Result<Vec<_>, _>>(),
+            Ok(vec![false, true, true])
+        );
+        // `std::array<bool, N>` and the elements of a set are scalar bools.
+        assert_eq!(reader.decode_root::<[bool; 3]>().err(), strict);
+        assert_eq!(reader.decode_root::<BTreeSet<bool>>().err(), strict);
+        assert_eq!(reader.decode_root::<HashSet<bool>>().err(), strict);
+        // As is a bool in a struct, in a vector of structs and in a field.
+        let pairs = encode_vec(&[(bad, 1u8)]);
+        let reader = Reader::new(&pairs).unwrap();
+        assert_eq!(reader.decode_root::<Vec<(bool, u8)>>().err(), strict);
+    }
+    // 0 and 1 are fine everywhere.
+    let bytes = encode_vec(&[0u8, 1, 1]);
+    let reader = Reader::new(&bytes).unwrap();
+    assert_eq!(reader.decode_root::<[bool; 3]>(), Ok([false, true, true]));
+    assert_eq!(
+        reader.decode_root::<BTreeSet<bool>>(),
+        Ok(BTreeSet::from([false, true]))
+    );
 }

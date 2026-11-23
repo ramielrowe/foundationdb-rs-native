@@ -364,7 +364,11 @@ impl<'de> Reader<'de> {
         })
     }
 
-    /// Decodes a vector of non-union elements whose offset is at position `at`.
+    /// Decodes a vector of non-union elements whose offset is at position `at`, for the
+    /// array and container impls. Inline elements are decoded as scalars of their type
+    /// (so a `bool` must be 0 or 1, as `std::array<bool, N>` and the elements of a
+    /// `std::set<bool>` are in C++: only `std::vector<bool>` is exempt, and that is
+    /// [`Vec<bool>`](Vec), which does not come through here).
     pub(crate) fn vector<T: Decode<'de>, C>(
         &self,
         at: usize,
@@ -376,7 +380,7 @@ impl<'de> Reader<'de> {
         for i in 0..header.len {
             push(
                 &mut out,
-                T::decode_element(self, header.first + i * header.stride)?,
+                self.container_element(header.first + i * header.stride)?,
             );
         }
         Ok(out)
@@ -393,6 +397,15 @@ impl<'de> Reader<'de> {
             out.push(T::decode_element(self, header.first + i * header.stride)?);
         }
         Ok(out)
+    }
+
+    /// Element `pos` of an array or container: the scalar decoding for inline types (not
+    /// [`Decode::decode_element`], which reads a `bool` as `std::vector<bool>` does).
+    fn container_element<T: Decode<'de>>(&self, pos: usize) -> Result<T, DecodeError> {
+        match T::SHAPE {
+            Shape::Inline { size, .. } => T::decode_inline(self.inline(pos, size)?),
+            _ => T::decode_element(self, pos),
+        }
     }
 
     /// Decodes a vector of unions from its tags slot and offsets slot positions.

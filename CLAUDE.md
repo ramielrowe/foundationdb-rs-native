@@ -104,14 +104,15 @@ output (divan has no baseline store; the median column is the stable one):
 
 ```bash
 cargo bench -p fdb-native-wire --bench wire                    # everything (~1 min)
-cargo bench -p fdb-native-wire --bench wire -- commit          # one group: small, kv_reply, kv_table, commit, blob, strings_200, vtables
+cargo bench -p fdb-native-wire --bench wire -- commit          # one group: small, kv_reply, kv_table, commit, blob, strings_200, vtables, reuse
 DIVAN_MIN_TIME=4 perf record -g target/release/deps/wire-<hash> --bench commit::encode_   # profile one (perf is the tool used so far)
 ```
 
 Any change to the writer or reader internals should keep encoder output byte-identical (the fixture
 round-trips and the C++ crosscheck do not catch a layout drift that still decodes) and the work-budget
 charges unchanged (`tools/golden-vectors/strict.h` mirrors them); `tests/bulk_vectors.rs` pins the
-bulk vector paths to the element-wise ones.
+bulk vector paths to the element-wise ones, and `tests/writer_reuse.rs` pins a reused `Writer` to a new one and
+the bytes of seeded messages (digests recorded from the pre-vvh.8 encoder).
 
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.

@@ -13,6 +13,7 @@
 //! | `blob` | a 1 MiB `Vec<u8>` / `&[u8]` | bulk byte decode |
 //! | `strings_200` | a vector of 200 strings | offset vectors of blobs |
 //! | `vtables` | 2000 tables of few or many distinct shapes | vtable deduplication |
+//! | `reuse` | the small, commit, kv_table and blob encodes with one `Writer` kept across iterations | buffer reuse, clearing only stale memory |
 
 use std::hint::black_box;
 
@@ -622,5 +623,83 @@ mod vtables {
     #[divan::bench]
     fn encode_1000_shapes(bencher: Bencher) {
         bench_encode(bencher, 1000);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// reuse
+
+/// The messages of the groups above, encoded with one `Writer` kept across iterations
+/// (what a connection does): the buffer, scratch vectors and vtable index are reused and
+/// only memory an earlier message wrote is cleared. Compare with the `encode_` of the
+/// group of the same message, which uses a new writer each time (`encode`).
+mod reuse {
+    use fdb_native_wire::{Encode, Writer};
+
+    use super::*;
+
+    fn write<T: Encode>(w: &mut Writer, msg: &T, file_identifier: u32) -> Vec<u8> {
+        let mut root = w.table();
+        root.field(msg).unwrap();
+        let root = root.finish().unwrap();
+        w.finish(root, file_identifier).unwrap()
+    }
+
+    fn bench_encode<T: Encode>(bencher: Bencher, msg: &T, file_identifier: u32) {
+        let mut w = Writer::new();
+        let len = write(&mut w, msg, file_identifier).len();
+        bencher
+            .counter(BytesCount::new(len))
+            .bench_local(|| write(&mut w, black_box(msg), file_identifier));
+    }
+
+    #[divan::bench]
+    fn small(bencher: Bencher) {
+        let key = b"\x15users/alice/profile".to_vec();
+        let msg = GetValue {
+            key: &key,
+            version: 123_456_789_012,
+            span: (0x1111_2222_3333_4444, 0x5555_6666_7777_8888),
+            debug_id: Some((7, 8)),
+            flags: 3,
+        };
+        bench_encode(bencher, &msg, 0x000f_db01);
+    }
+
+    #[divan::bench]
+    fn commit(bencher: Bencher) {
+        let data = mutations();
+        let msg = Commit {
+            transaction: Transaction {
+                read_snapshot: 5_000_000,
+                mutations: data
+                    .iter()
+                    .map(|(kind, p1, p2)| Mutation {
+                        kind: *kind,
+                        param1: p1,
+                        param2: p2,
+                    })
+                    .collect(),
+            },
+            flags: 1,
+            debug_id: None,
+        };
+        bench_encode(bencher, &msg, 0x000f_db04);
+    }
+
+    #[divan::bench]
+    fn kv_table(bencher: Bencher) {
+        let pairs = kv_pairs();
+        let msg = KvTable {
+            data: pairs.iter().map(|(k, v)| KeyValueRef::new(k, v)).collect(),
+            version: 99,
+        };
+        bench_encode(bencher, &msg, 0x000f_db03);
+    }
+
+    #[divan::bench]
+    fn blob(bencher: Bencher) {
+        let data = Rng(42).bytes(BLOB_LEN);
+        bench_encode(bencher, &BorrowedBlob { data: &data }, 0x000f_db05);
     }
 }

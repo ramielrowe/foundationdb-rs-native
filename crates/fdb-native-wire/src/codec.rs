@@ -198,9 +198,12 @@ pub trait Decode<'de>: Wire + Sized {
     /// however large the count is. There is no need to override it unless a run of
     /// elements can be decoded faster than one at a time: the integer, float and `bool`
     /// impls do (a `Vec<u8>` is a memcpy), which is the way around the lack of
-    /// specialization. An override must decode exactly what the default would, charge
-    /// nothing more (inline elements are paid for by the header), and not reserve more
-    /// memory than the bytes it reads from the message.
+    /// specialization. An override must decode exactly what the default would, return
+    /// exactly `header.len()` elements (`Vec<T>` fails with [`DecodeError::Invalid`]
+    /// otherwise), charge nothing more (inline elements are paid for by the header), and
+    /// not reserve more memory than the bytes it reads from the message. The header is
+    /// the one [`Reader::vector_header`] returned for `Self`'s vector; the scalar impls
+    /// fail if its stride is not their size.
     fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
         r.decode_elements(header)
     }
@@ -265,6 +268,7 @@ macro_rules! scalar {
             ) -> Result<Vec<Self>, DecodeError> {
                 // The header was checked: `len * size` bytes are in the message, so the
                 // vector is no larger than the bytes it is read from.
+                check_stride(header, size_of::<$t>())?;
                 let bytes = r.inline(header.first(), header.len().saturating_mul(size_of::<$t>()))?;
                 Ok(bytes
                     .chunks_exact(size_of::<$t>())
@@ -314,6 +318,7 @@ impl<'de> Decode<'de> for u8 {
 
     /// A `Vec<u8>` is one copy of bytes the header showed to be in the message.
     fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
+        check_stride(header, 1)?;
         Ok(r.inline(header.first(), header.len())?.to_vec())
     }
 }
@@ -358,6 +363,7 @@ impl<'de> Decode<'de> for bool {
 
     fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
         // As `decode_element`: any nonzero byte is `true`.
+        check_stride(header, 1)?;
         Ok(r.inline(header.first(), header.len())?
             .iter()
             .map(|&b| b != 0)
@@ -557,7 +563,14 @@ impl<'de, T: Decode<'de>> Decode<'de> for Vec<T> {
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
         let header = r.vector_header::<T>(at)?;
-        T::decode_elements(r, &header)
+        let items = T::decode_elements(r, &header)?;
+        // An override that returns another number of elements than the vector has is a
+        // bug in it; do not pass its output on as the message's vector.
+        if items.len() == header.len() {
+            Ok(items)
+        } else {
+            Err(DecodeError::Invalid("decode_elements length"))
+        }
     }
 
     fn decode_union_vector(
@@ -583,6 +596,8 @@ impl<T: Encode, const N: usize> Encode for [T; N] {
     }
 }
 
+/// The count must be `N`. Unlike `Vec<bool>`, the `bool`s of a `[bool; N]` must be 0 or 1
+/// (the `bool_value` strict check), as a scalar `bool` field is.
 impl<'de, T: Decode<'de>, const N: usize> Decode<'de> for [T; N] {
     fn absent() -> Self {
         core::array::from_fn(|_| T::absent())
@@ -638,6 +653,18 @@ impl<'de, T: Decode<'de>> Decode<'de> for Option<T> {
             1 => r.alternative(at).map(Some),
             _ => Ok(None),
         }
+    }
+}
+
+/// Fails unless `header` describes a vector whose elements are `size` bytes apart: the
+/// bulk scalar [`Decode::decode_elements`] impls read `size`-byte elements, and a header
+/// of another type's vector (which only a caller of the hook can pass) would make them
+/// read a different number of bytes than the header showed to be in the message.
+fn check_stride(header: &VectorHeader, size: usize) -> Result<(), DecodeError> {
+    if header.stride() == size {
+        Ok(())
+    } else {
+        Err(DecodeError::Invalid("decode_elements stride"))
     }
 }
 
