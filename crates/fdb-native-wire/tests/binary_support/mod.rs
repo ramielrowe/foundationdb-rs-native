@@ -1,5 +1,5 @@
 //! Support for the binary-format tests: the fixtures of `tools/golden-vectors/fixtures/binary-*`
-//! (written by FDB's own `BinaryWriter`), the Rust types they hold, and a dispatcher from the
+//! (written by FDB's own `Writer`), the Rust types they hold, and a dispatcher from the
 //! fixtures' `type` names to those types.
 
 #![allow(dead_code, unreachable_pub)]
@@ -9,14 +9,12 @@ use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
 use fdb_native_wire::binary::{
-    BinaryDecodeError, BinaryDeserialize, BinaryDeserializeOwned, BinaryEncodeError, BinaryReader,
-    BinarySerialize, BinaryWriter, ConnectPacket, HealthMetrics, IdempotencyEntry,
-    IdempotencyValue, SpanContext, StorageStats, TraceFlags, Versioning, decode_idempotency_key,
-    from_slice, idempotency_key, idempotency_scan_range, self_conflict_key, to_vec,
+    Decode, DecodeError, DecodeOwned, Encode, EncodeError, ReadVersioning, Reader, Versioning,
+    Writer, from_slice, to_vec,
 };
 use fdb_native_wire::{
-    Decode, DecodeError, Encode, EncodeError, FdbError, FileIdentified, FileIdentifier, ObjectRef,
-    ProtocolVersion, Reader, Shape, Uid, Wire, Writer,
+    FdbError, FileIdentified, FileIdentifier, ObjectRef, ProtocolVersion, Shape, Uid, Wire,
+    Writer as FlatWriter,
 };
 use serde_json::{Value, json};
 
@@ -60,6 +58,7 @@ pub fn to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The writer's version option of a record.
 pub fn versioning(record: &Value) -> Versioning {
     let v = &record["versioning"];
     let pv = || ProtocolVersion(v["protocol_version"].as_u64().expect("protocol_version"));
@@ -71,6 +70,26 @@ pub fn versioning(record: &Value) -> Versioning {
     }
 }
 
+/// The release's `minInvalidProtocolVersion`: what its IncludeVersion readers refuse.
+pub fn min_invalid(release: &str) -> ProtocolVersion {
+    ProtocolVersion(
+        read_json(&fixtures_dir(release).join("index.json"))["min_invalid_protocol_version"]
+            .as_u64()
+            .expect("min_invalid_protocol_version"),
+    )
+}
+
+/// The reader's version option of a record.
+pub fn read_versioning(release: &str, record: &Value) -> ReadVersioning {
+    match versioning(record) {
+        Versioning::Unversioned => ReadVersioning::Unversioned,
+        Versioning::Include(_) => ReadVersioning::Include {
+            min_invalid: min_invalid(release),
+        },
+        Versioning::Assume(v) => ReadVersioning::Assume(v),
+    }
+}
+
 pub fn record_bytes(record: &Value) -> Vec<u8> {
     from_hex(record["bytes"].as_str().expect("bytes"))
 }
@@ -78,7 +97,7 @@ pub fn record_bytes(record: &Value) -> Vec<u8> {
 // ---------------------------------------------------------------------------------------
 // Logical values: the JSON each fixture records, for the types the fixtures use.
 
-pub trait Logical: BinarySerialize + BinaryDeserializeOwned + Debug + PartialEq + Sized {
+pub trait Logical: Encode + DecodeOwned + Debug + PartialEq + Sized {
     fn to_json(&self) -> Value;
     fn from_json(v: &Value) -> Self;
 }
@@ -158,14 +177,14 @@ impl Logical for FdbError {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bytes(pub Vec<u8>);
 
-impl BinarySerialize for Bytes {
-    fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+impl Encode for Bytes {
+    fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError> {
         self.0.serialize(w)
     }
 }
 
-impl<'de> BinaryDeserialize<'de> for Bytes {
-    fn deserialize(r: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError> {
+impl<'de> Decode<'de> for Bytes {
+    fn deserialize(r: &mut Reader<'de>) -> Result<Self, DecodeError> {
         Vec::<u8>::deserialize(r).map(Bytes)
     }
 }
@@ -263,7 +282,7 @@ pub enum Color {
     Blue,
 }
 
-fdb_native_wire::binary_enum!(Color: u8 {
+fdb_native_wire::binary::binary_enum!(Color: u8 {
     Color::Red = 1,
     Color::Green = 2,
     Color::Blue = 200,
@@ -295,7 +314,7 @@ pub enum Level {
     High,
 }
 
-fdb_native_wire::binary_enum!(Level: i32 {
+fdb_native_wire::binary::binary_enum!(Level: i32 {
     Level::Low = -5,
     Level::Mid = 0,
     Level::High = 70000,
@@ -327,16 +346,16 @@ pub struct Point3 {
     pub label: String,
 }
 
-impl BinarySerialize for Point3 {
-    fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+impl Encode for Point3 {
+    fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write(&self.x)?;
         w.write(&self.y)?;
         w.write(&self.label)
     }
 }
 
-impl<'de> BinaryDeserialize<'de> for Point3 {
-    fn deserialize(r: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError> {
+impl<'de> Decode<'de> for Point3 {
+    fn deserialize(r: &mut Reader<'de>) -> Result<Self, DecodeError> {
         Ok(Point3 {
             x: r.read()?,
             y: r.read()?,
@@ -366,8 +385,8 @@ pub enum Variant3 {
     Byte(u8),
 }
 
-impl BinarySerialize for Variant3 {
-    fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+impl Encode for Variant3 {
+    fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError> {
         match self {
             Variant3::Int(v) => {
                 w.write_variant_index(0)?;
@@ -385,8 +404,8 @@ impl BinarySerialize for Variant3 {
     }
 }
 
-impl<'de> BinaryDeserialize<'de> for Variant3 {
-    fn deserialize(r: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError> {
+impl<'de> Decode<'de> for Variant3 {
+    fn deserialize(r: &mut Reader<'de>) -> Result<Self, DecodeError> {
         match r.read_variant_index(3)? {
             0 => r.read().map(Variant3::Int),
             1 => r.read().map(Variant3::Str),
@@ -417,20 +436,20 @@ impl Logical for Variant3 {
 
 /// Reads the fixture's bytes as `T` and requires the fixture's logical value; writes the
 /// logical value and requires the fixture's bytes.
-pub fn check_positive<T: Logical>(record: &Value) {
+pub fn check_positive<T: Logical>(release: &str, record: &Value) {
     let name = record["name"].as_str().unwrap_or("?");
-    let versioning = versioning(record);
+    let write = versioning(record);
+    let read = read_versioning(release, record);
     let bytes = record_bytes(record);
     let expected = T::from_json(&record["value"]);
-    let decoded: T =
-        from_slice(&bytes, versioning).unwrap_or_else(|e| panic!("{name}: decode: {e}"));
+    let decoded: T = from_slice(&bytes, read).unwrap_or_else(|e| panic!("{name}: decode: {e}"));
     assert_eq!(decoded, expected, "{name}: decoded value");
     assert_eq!(
         decoded.to_json(),
         record["value"],
         "{name}: json of the decoded value"
     );
-    let encoded = to_vec(&expected, versioning).unwrap_or_else(|e| panic!("{name}: encode: {e}"));
+    let encoded = to_vec(&expected, write).unwrap_or_else(|e| panic!("{name}: encode: {e}"));
     assert_eq!(to_hex(&encoded), to_hex(&bytes), "{name}: encoded bytes");
 }
 
@@ -439,8 +458,8 @@ pub fn check_positive<T: Logical>(record: &Value) {
 pub fn decode_any(
     ty: &str,
     bytes: &[u8],
-    versioning: Versioning,
-) -> Option<Result<(), BinaryDecodeError>> {
+    versioning: ReadVersioning,
+) -> Option<Result<(), DecodeError>> {
     macro_rules! d {
         ($t:ty) => {
             Some(from_slice::<$t>(bytes, versioning).map(drop))
@@ -481,241 +500,66 @@ pub fn decode_any(
         "point3" => d!(Point3),
         "variant3" => d!(Variant3),
         "key_range" => d!((Bytes, Bytes)),
-        "span_context" => d!(SpanContext),
-        "health_metrics" => d!(HealthMetrics),
-        "connect_packet" => Some(ConnectPacket::decode(bytes).map(drop)),
-        "idempotency_value" => Some(IdempotencyValue::decode(bytes).map(drop)),
         _ => None,
     }
 }
 
 /// Checks one positive fixture against the Rust type its `type` names.
-pub fn check_record(record: &Value) {
+pub fn check_record(release: &str, record: &Value) {
     let ty = record["type"].as_str().expect("type");
     match ty {
-        "u8" => check_positive::<u8>(record),
-        "i8" => check_positive::<i8>(record),
-        "u16" => check_positive::<u16>(record),
-        "i16" => check_positive::<i16>(record),
-        "u32" => check_positive::<u32>(record),
-        "i32" => check_positive::<i32>(record),
-        "u64" => check_positive::<u64>(record),
-        "i64" => check_positive::<i64>(record),
-        "f64" => check_positive::<f64>(record),
-        "bool" => check_positive::<bool>(record),
-        "enum_color" => check_positive::<Color>(record),
-        "enum_level" => check_positive::<Level>(record),
-        "uid" => check_positive::<Uid>(record),
-        "protocol_version" => check_positive::<ProtocolVersion>(record),
-        "error" => check_positive::<FdbError>(record),
-        "string" => check_positive::<String>(record),
-        "bytes" => check_positive::<Bytes>(record),
-        "vec<i32>" => check_positive::<Vec<i32>>(record),
-        "vec<u8>" => check_positive::<Vec<u8>>(record),
-        "vec<string>" => check_positive::<Vec<String>>(record),
-        "vec<vec<u16>>" => check_positive::<Vec<Vec<u16>>>(record),
-        "vec<bytes>" => check_positive::<Vec<Bytes>>(record),
-        "vec<key_value>" => check_positive::<Vec<(Bytes, Bytes)>>(record),
-        "array<u16;3>" => check_positive::<[u16; 3]>(record),
-        "array<u8;4>" => check_positive::<[u8; 4]>(record),
-        "set<i32>" => check_positive::<BTreeSet<i32>>(record),
-        "map<string,i64>" => check_positive::<BTreeMap<String, i64>>(record),
-        "map<uid,i64>" => check_positive::<BTreeMap<Uid, i64>>(record),
-        "optional<i32>" => check_positive::<Option<i32>>(record),
-        "optional<string>" => check_positive::<Option<String>>(record),
-        "pair<u8,string>" => check_positive::<(u8, String)>(record),
-        "point3" => check_positive::<Point3>(record),
-        "variant3" => check_positive::<Variant3>(record),
-        "key_range" => check_positive::<(Bytes, Bytes)>(record),
-        "connect_packet" => check_connect_packet(record),
-        "span_context" => check_span_context(record),
-        "health_metrics" => check_health_metrics(record),
-        "idempotency_value" => check_idempotency_value(record),
-        "idempotency_scan_range" => check_idempotency_scan_range(record),
-        "self_conflict_key" => check_self_conflict_key(record),
-        "key_servers_value" => check_key_servers_value(record),
-        "sw_version_value" => check_sw_version_value(record),
+        "u8" => check_positive::<u8>(release, record),
+        "i8" => check_positive::<i8>(release, record),
+        "u16" => check_positive::<u16>(release, record),
+        "i16" => check_positive::<i16>(release, record),
+        "u32" => check_positive::<u32>(release, record),
+        "i32" => check_positive::<i32>(release, record),
+        "u64" => check_positive::<u64>(release, record),
+        "i64" => check_positive::<i64>(release, record),
+        "f64" => check_positive::<f64>(release, record),
+        "bool" => check_positive::<bool>(release, record),
+        "enum_color" => check_positive::<Color>(release, record),
+        "enum_level" => check_positive::<Level>(release, record),
+        "uid" => check_positive::<Uid>(release, record),
+        "protocol_version" => check_positive::<ProtocolVersion>(release, record),
+        "error" => check_positive::<FdbError>(release, record),
+        "string" => check_positive::<String>(release, record),
+        "bytes" => check_positive::<Bytes>(release, record),
+        "vec<i32>" => check_positive::<Vec<i32>>(release, record),
+        "vec<u8>" => check_positive::<Vec<u8>>(release, record),
+        "vec<string>" => check_positive::<Vec<String>>(release, record),
+        "vec<vec<u16>>" => check_positive::<Vec<Vec<u16>>>(release, record),
+        "vec<bytes>" => check_positive::<Vec<Bytes>>(release, record),
+        "vec<key_value>" => check_positive::<Vec<(Bytes, Bytes)>>(release, record),
+        "array<u16;3>" => check_positive::<[u16; 3]>(release, record),
+        "array<u8;4>" => check_positive::<[u8; 4]>(release, record),
+        "set<i32>" => check_positive::<BTreeSet<i32>>(release, record),
+        "map<string,i64>" => check_positive::<BTreeMap<String, i64>>(release, record),
+        "map<uid,i64>" => check_positive::<BTreeMap<Uid, i64>>(release, record),
+        "optional<i32>" => check_positive::<Option<i32>>(release, record),
+        "optional<string>" => check_positive::<Option<String>>(release, record),
+        "pair<u8,string>" => check_positive::<(u8, String)>(release, record),
+        "point3" => check_positive::<Point3>(release, record),
+        "variant3" => check_positive::<Variant3>(release, record),
+        "key_range" => check_positive::<(Bytes, Bytes)>(release, record),
+        "key_servers_value" => check_key_servers_value(release, record),
+        "sw_version_value" => check_sw_version_value(release, record),
+        "protocol_version_compat" => check_protocol_version_compat(record),
         other => panic!("fixture type {other:?} has no Rust check"),
     }
 }
 
 // ---------------------------------------------------------------------------------------
-// Usage-site fixtures.
-
-fn check_connect_packet(record: &Value) {
-    let bytes = record_bytes(record);
-    let v = &record["value"];
-    let expected = ConnectPacket {
-        protocol_version: ProtocolVersion(v["protocol_version"].as_u64().unwrap()),
-        canonical_remote_port: u16::from_json(&v["canonical_remote_port"]),
-        connection_id: v["connection_id"].as_u64().unwrap(),
-        canonical_remote_ip4: u32::from_json(&v["canonical_remote_ip4"]),
-        flags: u16::from_json(&v["flags"]),
-        canonical_remote_ip6: from_hex(v["canonical_remote_ip6"].as_str().unwrap())
-            .try_into()
-            .unwrap(),
-    };
-    assert_eq!(v["connect_packet_length"], ConnectPacket::LENGTH);
-    assert_eq!(v["total_packet_size"], ConnectPacket::SIZE);
-    // A longer buffer is fine: the packet says how long it is.
-    let mut longer = bytes.clone();
-    longer.extend_from_slice(b"next packet");
-    let (decoded, used) = ConnectPacket::decode(&longer).unwrap();
-    assert_eq!((decoded, used), (expected, bytes.len()));
-    assert_eq!(ConnectPacket::decode(&bytes).unwrap().0, expected);
-    assert_eq!(to_hex(&expected.encode().unwrap()), to_hex(&bytes));
-    assert!(expected.protocol_version.has_object_serializer_flag());
-    match expected.canonical_remote_address() {
-        None => {
-            assert!(v["canonical_remote_ip"].is_null());
-            assert_eq!(expected.canonical_remote_port, 0);
-        }
-        Some((ip, port)) => {
-            assert_eq!(v["canonical_remote_ip"].as_str().unwrap(), ip.to_string());
-            assert_eq!(port, expected.canonical_remote_port);
-        }
-    }
-}
-
-fn check_span_context(record: &Value) {
-    let bytes = record_bytes(record);
-    let v = &record["value"];
-    let expected = SpanContext {
-        trace_id: Uid::from_json(&v["trace_id"]),
-        span_id: v["span_id"].as_u64().unwrap(),
-        flags: match v["flags"].as_u64().unwrap() {
-            0 => TraceFlags::Unsampled,
-            1 => TraceFlags::Sampled,
-            other => panic!("flags {other}"),
-        },
-    };
-    assert_eq!(SpanContext::from_option_value(&bytes).unwrap(), expected);
-    let Versioning::Include(version) = versioning(record) else {
-        panic!("SPAN_PARENT values are IncludeVersion");
-    };
-    assert_eq!(
-        to_hex(&expected.to_option_value(version).unwrap()),
-        to_hex(&bytes)
-    );
-}
-
-fn health_metrics_from_json(v: &Value) -> HealthMetrics {
-    HealthMetrics {
-        worst_storage_queue: v["worst_storage_queue"].as_i64().unwrap(),
-        limiting_storage_queue: v["limiting_storage_queue"].as_i64().unwrap(),
-        worst_storage_durability_lag: v["worst_storage_durability_lag"].as_i64().unwrap(),
-        limiting_storage_durability_lag: v["limiting_storage_durability_lag"].as_i64().unwrap(),
-        worst_t_log_queue: v["worst_t_log_queue"].as_i64().unwrap(),
-        tps_limit: v["tps_limit"].as_f64().unwrap(),
-        batch_limited: v["batch_limited"].as_bool().unwrap(),
-        storage_stats: v["storage_stats"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| {
-                let s = &p[1];
-                (
-                    Uid::from_json(&p[0]),
-                    StorageStats {
-                        storage_queue: s["storage_queue"].as_i64().unwrap(),
-                        storage_durability_lag: s["storage_durability_lag"].as_i64().unwrap(),
-                        disk_usage: s["disk_usage"].as_f64().unwrap(),
-                        cpu_usage: s["cpu_usage"].as_f64().unwrap(),
-                    },
-                )
-            })
-            .collect(),
-        t_log_queue: BTreeMap::<Uid, i64>::from_json(&v["t_log_queue"]),
-    }
-}
-
-fn check_health_metrics(record: &Value) {
-    let bytes = record_bytes(record);
-    let expected = health_metrics_from_json(&record["value"]);
-    assert_eq!(HealthMetrics::from_blob(&bytes).unwrap(), expected);
-    let Versioning::Include(version) = versioning(record) else {
-        panic!("the blob is IncludeVersion");
-    };
-    assert_eq!(to_hex(&expected.to_blob(version).unwrap()), to_hex(&bytes));
-}
-
-fn check_idempotency_value(record: &Value) {
-    let bytes = record_bytes(record);
-    let v = &record["value"];
-    let value = IdempotencyValue::decode(&bytes).unwrap();
-    assert_eq!(
-        value.protocol_version.0,
-        v["protocol_version"].as_u64().unwrap()
-    );
-    assert_eq!(value.timestamp, v["timestamp"].as_i64().unwrap());
-    let ids: Vec<(Vec<u8>, u8)> = v["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| {
-            (
-                from_hex(e["id"].as_str().unwrap()),
-                u8::from_json(&e["low_order_batch_index"]),
-            )
-        })
-        .collect();
-    assert_eq!(
-        value.entries,
-        ids.iter()
-            .map(|(id, low)| IdempotencyEntry {
-                id,
-                low_order_batch_index: *low
-            })
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(to_hex(&value.encode().unwrap()), to_hex(&bytes));
-
-    // The key: C++'s makeIdempotencySingleKeyRange(...).begin and decodeIdempotencyKey.
-    let key = from_hex(v["key"].as_str().unwrap());
-    let commit_version = v["commit_version"].as_i64().unwrap();
-    let high = u8::from_json(&v["high_order_batch_index"]);
-    assert_eq!(
-        decode_idempotency_key(&key).unwrap(),
-        (commit_version, high)
-    );
-    assert_eq!(idempotency_key(commit_version, high), key);
-    // kvContainsIdempotencyId: the id is found with the batch index C++ computed.
-    for f in v["found"].as_array().unwrap() {
-        let low = value
-            .find(&from_hex(f["id"].as_str().unwrap()))
-            .expect("id is in the value");
-        assert_eq!(
-            u16::from(high) << 8 | u16::from(low),
-            u16::from_json(&f["batch_index"])
-        );
-        assert_eq!(f["commit_version"].as_i64().unwrap(), commit_version);
-    }
-    assert_eq!(value.find(&[0xee; 16]), None);
-}
-
-fn check_idempotency_scan_range(record: &Value) {
-    let v = &record["value"];
-    let (begin, end) = idempotency_scan_range(
-        v["min_commit_version"].as_i64().unwrap(),
-        v["max_commit_version"].as_i64().unwrap(),
-    )
-    .unwrap();
-    assert_eq!(to_hex(&begin), v["begin"].as_str().unwrap());
-    assert_eq!(to_hex(&end), v["end"].as_str().unwrap());
-    assert_eq!(begin, record_bytes(record));
-}
-
-fn check_self_conflict_key(record: &Value) {
-    let id = Uid::from_json(&record["value"]["unique_id"]);
-    assert_eq!(self_conflict_key(id).unwrap(), record_bytes(record));
-}
+// Fixtures that need more than a type: two usage sites read with the generic codec only (the
+// types for the others are in fdb-native-schema and fdb-native-transport, with their tests),
+// and ProtocolVersion's truth table.
 
 // A `\xff/keyServers/` value: IncludeVersion, then `vector<UID> src, vector<UID> dest,
 // UID srcId` and, when `dest` is not empty, `UID destId`.
-fn check_key_servers_value(record: &Value) {
+fn check_key_servers_value(release: &str, record: &Value) {
     let bytes = record_bytes(record);
     let v = &record["value"];
-    let mut r = BinaryReader::include_version(&bytes).unwrap();
+    let mut r = Reader::include_version(&bytes, min_invalid(release)).unwrap();
     assert_eq!(
         r.protocol_version().unwrap().0,
         v["protocol_version"].as_u64().unwrap()
@@ -737,7 +581,7 @@ fn check_key_servers_value(record: &Value) {
     let Versioning::Include(version) = versioning(record) else {
         panic!("IncludeVersion");
     };
-    let mut w = BinaryWriter::include_version(version).unwrap();
+    let mut w = Writer::include_version(version).unwrap();
     w.write(&src).unwrap();
     w.write(&dest).unwrap();
     w.write(&src_id).unwrap();
@@ -763,8 +607,8 @@ impl Wire for SwVersion {
     const SHAPE: Shape = Shape::Table;
 }
 
-impl Encode for SwVersion {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+impl fdb_native_wire::Encode for SwVersion {
+    fn encode_object(&self, w: &mut FlatWriter) -> Result<ObjectRef, fdb_native_wire::EncodeError> {
         let mut t = w.table();
         t.field(&self.newest)?;
         t.field(&self.last_run)?;
@@ -773,7 +617,7 @@ impl Encode for SwVersion {
     }
 }
 
-impl<'de> Decode<'de> for SwVersion {
+impl<'de> fdb_native_wire::Decode<'de> for SwVersion {
     fn absent() -> Self {
         SwVersion {
             newest: 0,
@@ -782,7 +626,10 @@ impl<'de> Decode<'de> for SwVersion {
         }
     }
 
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+    fn decode_object(
+        r: &fdb_native_wire::Reader<'de>,
+        at: usize,
+    ) -> Result<Self, fdb_native_wire::DecodeError> {
         let mut t = r.table(at)?;
         Ok(SwVersion {
             newest: t.field()?,
@@ -794,7 +641,7 @@ impl<'de> Decode<'de> for SwVersion {
 
 // A value whose IncludeVersion prefix has the object-serializer flag: the binary reader
 // stops after the prefix and the rest is a flatbuffers message.
-fn check_sw_version_value(record: &Value) {
+fn check_sw_version_value(release: &str, record: &Value) {
     let bytes = record_bytes(record);
     let v = &record["value"];
     let expected = SwVersion {
@@ -802,7 +649,7 @@ fn check_sw_version_value(record: &Value) {
         last_run: v["last_run_protocol_version"].as_u64().unwrap(),
         lowest_compatible: v["lowest_compatible_protocol_version"].as_u64().unwrap(),
     };
-    let r = BinaryReader::include_version(&bytes).unwrap();
+    let r = Reader::include_version(&bytes, min_invalid(release)).unwrap();
     let prefix = r.protocol_version().unwrap();
     assert_eq!(prefix.0, v["prefix"].as_u64().unwrap());
     assert!(prefix.has_object_serializer_flag());
@@ -817,12 +664,12 @@ fn check_sw_version_value(record: &Value) {
     );
 
     // The same value written here reads back the same.
-    let mut w = BinaryWriter::include_version(prefix).unwrap();
+    let mut w = Writer::include_version(prefix).unwrap();
     w.write_bytes(&fdb_native_wire::encode(&expected).unwrap())
         .unwrap();
     let written = w.into_bytes();
     assert_eq!(&written[..8], &bytes[..8]);
-    let r = BinaryReader::include_version(&written).unwrap();
+    let r = Reader::include_version(&written, min_invalid(release)).unwrap();
     assert_eq!(
         fdb_native_wire::decode::<SwVersion>(r.remaining()).unwrap(),
         expected
@@ -836,14 +683,14 @@ fn check_sw_version_value(record: &Value) {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Unit;
 
-impl BinarySerialize for Unit {
-    fn serialize(&self, _: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+impl Encode for Unit {
+    fn serialize(&self, _: &mut Writer) -> Result<(), EncodeError> {
         Ok(())
     }
 }
 
-impl<'de> BinaryDeserialize<'de> for Unit {
-    fn deserialize(_: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError> {
+impl<'de> Decode<'de> for Unit {
+    fn deserialize(_: &mut Reader<'de>) -> Result<Self, DecodeError> {
         Ok(Unit)
     }
 }
@@ -854,14 +701,43 @@ pub struct Node {
     pub next: Option<Box<Node>>,
 }
 
-impl BinarySerialize for Node {
-    fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+impl Encode for Node {
+    fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.write(&self.next)
     }
 }
 
-impl<'de> BinaryDeserialize<'de> for Node {
-    fn deserialize(r: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError> {
+impl<'de> Decode<'de> for Node {
+    fn deserialize(r: &mut Reader<'de>) -> Result<Self, DecodeError> {
         Ok(Node { next: r.read()? })
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// ProtocolVersion: C++'s isValid, isCompatible, version() and hasObjectSerializerFlag.
+
+fn check_protocol_version_compat(record: &Value) {
+    let v = &record["value"];
+    for version in v["versions"].as_array().unwrap() {
+        let pv = ProtocolVersion(version["value"].as_u64().unwrap());
+        assert_eq!(pv.version(), version["version"].as_u64().unwrap(), "{pv}");
+        assert_eq!(pv.is_valid(), version["valid"].as_bool().unwrap(), "{pv}");
+        assert_eq!(
+            pv.has_object_serializer_flag(),
+            version["has_object_serializer_flag"].as_bool().unwrap(),
+            "{pv}"
+        );
+    }
+    let pairs = v["pairs"].as_array().unwrap();
+    assert!(pairs.len() >= 100);
+    let mut compatible = 0;
+    for pair in pairs {
+        let a = ProtocolVersion(pair["a"].as_u64().unwrap());
+        let b = ProtocolVersion(pair["b"].as_u64().unwrap());
+        let want = pair["compatible"].as_bool().unwrap();
+        assert_eq!(a.is_compatible(b), want, "{a} vs {b}");
+        compatible += usize::from(want);
+    }
+    // The table has both answers.
+    assert!(compatible > 0 && compatible < pairs.len());
 }

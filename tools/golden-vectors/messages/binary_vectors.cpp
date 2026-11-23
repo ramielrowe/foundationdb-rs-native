@@ -577,20 +577,30 @@ void connectPacketVectors() {
 		        .set("total_packet_size", Json::uinteger(pkt.totalPacketSize()));
 		addPositive(name, "usage", description, "ConnectPacket", "connect_packet", unversioned(), written, std::move(logical));
 	};
+	// A plain client (not the multi-version API): FlowTransport::createInstance(true, transportId = 0, ...)
+	// sends transportId as the connection id, and its local address is 0.0.0.0:0.
 	ConnectPacket client;
-	client.connectionId = 1;
 	client.setCanonicalRemoteIp(IPAddress(0));
 	add("connect_packet_client",
-	    "A client's ConnectPacket (Peer::prependConnectPacket for a mixed TLS/non-TLS connection): port 0, address 0, "
-	    "connectionId 1.",
+	    "A plain client's ConnectPacket (Peer::prependConnectPacket): port 0, address 0, connectionId 0 (the transportId "
+	    "of a client that does not use the multi-version API).",
 	    client);
+	// MultiVersionApi picks a random transportId and adds 2 if it is <= 1; only ids > 1 tie connections together.
+	ConnectPacket multi;
+	multi.connectionId = 0x9e3779b97f4a7c15ULL;
+	multi.setCanonicalRemoteIp(IPAddress(0));
+	add("connect_packet_multi_version_client",
+	    "A multi-version client's ConnectPacket: a random connectionId above 1 shared by its connections.",
+	    multi);
+	// fdbserver and the simulator create the transport with transportId 1.
 	ConnectPacket v4;
 	v4.canonicalRemotePort = 4500;
-	v4.connectionId = 0x0123456789abcdefULL;
+	v4.connectionId = 1;
 	v4.setCanonicalRemoteIp(IPAddress(0x0a000102));
-	add("connect_packet_ipv4", "A server's ConnectPacket listening on 10.0.1.2:4500.", v4);
+	add("connect_packet_ipv4", "A server's ConnectPacket listening on 10.0.1.2:4500 (connectionId 1, as fdbserver sends).", v4);
 	ConnectPacket v6;
 	v6.canonicalRemotePort = 4501;
+	v6.connectionId = 1;
 	IPAddress::IPAddressStore a6{};
 	a6[0] = 0xfd;
 	a6[1] = 0xdb;
@@ -625,19 +635,101 @@ void connectPacketVectors() {
 }
 
 void conflictKeyVectors() {
-	// Transaction::makeSelfConflicting (NativeAPI), with a fixed UID instead of a random one.
-	BinaryWriter wr(Unversioned());
-	wr.serializeBytes("\xFF/SC/"_sr);
-	wr << uid(0x5c);
-	Standalone<StringRef> k = wr.toValue();
+	// The real Transaction::makeSelfConflicting (NativeAPI) on a default-constructed Transaction (the function
+	// only touches the commit request being built), with a seeded random generator so that its random UID, and
+	// so the bytes, are reproducible.
+	setThreadLocalDeterministicRandomSeed(5);
+	Transaction tr;
+	tr.makeSelfConflicting();
+	const auto& reads = tr.tr.transaction.read_conflict_ranges;
+	const auto& writes = tr.tr.transaction.write_conflict_ranges;
+	if (reads.size() != 1 || writes.size() != 1 || reads[0].begin != writes[0].begin || reads[0].end != writes[0].end) {
+		throw std::runtime_error("makeSelfConflicting did not add one range to both conflict lists");
+	}
+	Standalone<StringRef> k(reads[0].begin);
+	const StringRef prefix = "\xFF/SC/"_sr;
+	if (k.size() != prefix.size() + 16 || !k.startsWith(prefix)) {
+		throw std::runtime_error("makeSelfConflicting key is not \\xff/SC/ + a UID");
+	}
+	if (reads[0].end != keyAfter(reads[0].begin)) {
+		throw std::runtime_error("makeSelfConflicting range is not a single key");
+	}
+	UID id;
+	BinaryReader rd(k.begin() + prefix.size(), 16, Unversioned());
+	rd >> id;
+	rd.assertEnd();
 	addPositive("self_conflict_key",
 	            "usage",
-	            "Transaction::makeSelfConflicting(): \\xff/SC/ followed by a UID, written with BinaryWriter(Unversioned()).",
+	            "Transaction::makeSelfConflicting() itself (a seeded UID): \\xff/SC/ followed by a UID, written with "
+	            "BinaryWriter(Unversioned()), added as both a read and a write conflict range.",
 	            "Key",
 	            "self_conflict_key",
 	            unversioned(),
 	            k,
-	            Json::object().set("unique_id", toJson(uid(0x5c))));
+	            Json::object().set("unique_id", toJson(id)));
+
+	// With an idempotency id, Transaction::tryCommit adds \xff/SC/ + the id's raw bytes inline (there is no function
+	// to call), so this vector mirrors those three lines rather than running them.
+	std::string idBytes(16, '\x33');
+	IdempotencyIdRef idRef{ StringRef(idBytes) };
+	BinaryWriter wr(Unversioned());
+	wr.serializeBytes("\xFF/SC/"_sr);
+	wr.serializeBytes(idRef.asStringRefUnsafe());
+	Standalone<StringRef> k2 = wr.toValue();
+	addPositive("self_conflict_key_idempotency_id",
+	            "usage",
+	            "The conflict key of a transaction with an idempotency id (mirrors the inline code of "
+	            "Transaction::tryCommit): \\xff/SC/ followed by the id's raw bytes, not a UID.",
+	            "Key",
+	            "self_conflict_key_id",
+	            unversioned(),
+	            k2,
+	            Json::object().set("idempotency_id", Json::string(hex(idBytes))));
+}
+
+void protocolVersionVectors() {
+	// ProtocolVersion::isCompatible / isValid / version() of this release, over flagged and unflagged versions.
+	const uint64_t flag = 0x1000000000000000ULL;
+	const uint64_t v74 = 0x0FDB00B074000000ULL, v80 = 0x0FDB00B080000000ULL, minValid = 0x0FDB00A200060001ULL;
+	const std::vector<uint64_t> vs = { v74,
+		                               v74 | flag,
+		                               v74 + 1,
+		                               v74 + 0xffff,
+		                               (v74 | flag) + 0x1234,
+		                               v74 + 0x10000,
+		                               v74 - 0x10000,
+		                               v80,
+		                               v80 | flag,
+		                               minValid,
+		                               minValid | flag,
+		                               minValid - 1,
+		                               0,
+		                               flag };
+	Json versions = Json::array();
+	Json pairs = Json::array();
+	for (uint64_t a : vs) {
+		ProtocolVersion pa(a);
+		versions.push(Json::object()
+		                  .set("value", Json::uinteger(a))
+		                  .set("version", Json::uinteger(pa.version()))
+		                  .set("valid", Json::boolean(pa.isValid()))
+		                  .set("has_object_serializer_flag", Json::boolean(pa.hasObjectSerializerFlag())));
+		for (uint64_t b : vs) {
+			pairs.push(Json::object()
+			               .set("a", Json::uinteger(a))
+			               .set("b", Json::uinteger(b))
+			               .set("compatible", Json::boolean(pa.isCompatible(ProtocolVersion(b)))));
+		}
+	}
+	addPositive("protocol_version_compat",
+	            "versioning",
+	            "ProtocolVersion::isCompatible, isValid, version() and hasObjectSerializerFlag() of this release on "
+	            "flagged and unflagged versions (no bytes: the vector is the truth table).",
+	            "ProtocolVersion",
+	            "protocol_version_compat",
+	            unversioned(),
+	            Standalone<StringRef>(),
+	            Json::object().set("versions", versions).set("pairs", pairs));
 }
 
 void spanVectors() {
@@ -723,28 +815,38 @@ void healthMetricsVectors() {
 }
 
 void idempotencyVectors() {
-	// IdempotencyIdKVBuilder::add writes: a timestamp (int64_t(now()), here fixed so that the
-	// bytes are reproducible) once, then for each id a uint8_t length, the id and the low byte of
-	// the batch index. buildAndClear() stores it under makeIdempotencySingleKeyRange(...).begin.
+	// The real IdempotencyIdKVBuilder. It stores int64_t(now()) as the record's timestamp, which is not
+	// reproducible, so that one field (bytes 8..16 of the value) is overwritten with a fixed one; every other
+	// byte, and the key, is the builder's.
 	auto add = [&](const std::string& name,
 	               const std::string& description,
 	               Version commitVersion,
 	               int64_t timestamp,
 	               const std::vector<std::pair<std::string, uint16_t>>& ids) {
-		BinaryWriter value{ IncludeVersion() };
 		uint8_t high = ids[0].second >> 8;
-		value << timestamp;
+		IdempotencyIdKVBuilder builder;
+		builder.setCommitVersion(commitVersion);
+		std::vector<IdempotencyIdRef> refs;
+		refs.reserve(ids.size()); // an id of 16 bytes refers to its own address: no reallocation
 		for (const auto& [id, batchIndex] : ids) {
-			if ((batchIndex >> 8) != high) {
-				throw std::runtime_error("ids of one record share the batch index high byte");
-			}
-			value << uint8_t(id.size());
-			value.serializeBytes(StringRef(id));
-			value << uint8_t(batchIndex);
+			refs.emplace_back(StringRef(id));
+			builder.add(refs.back(), batchIndex);
 		}
+		Optional<KeyValue> built = builder.buildAndClear();
+		if (!built.present()) {
+			throw std::runtime_error("IdempotencyIdKVBuilder built nothing");
+		}
+		std::string raw(reinterpret_cast<const char*>(built.get().value.begin()), built.get().value.size());
+		if (raw.size() < 16) {
+			throw std::runtime_error("idempotency value is too short");
+		}
+		memcpy(&raw[8], &timestamp, sizeof(timestamp)); // little endian, as BinaryWriter wrote the original
+		Standalone<StringRef> stored{ StringRef(raw) };
+		KeyValueRef kv(built.get().key, stored);
 		Arena arena;
-		Value stored = value.toValue();
-		KeyValueRef kv(makeIdempotencySingleKeyRange(arena, commitVersion, high).begin, stored);
+		if (kv.key != makeIdempotencySingleKeyRange(arena, commitVersion, high).begin) {
+			throw std::runtime_error("the builder's key is not makeIdempotencySingleKeyRange(...).begin");
+		}
 		Version decodedVersion;
 		uint8_t decodedHigh;
 		decodeIdempotencyKey(kv.key, decodedVersion, decodedHigh);
@@ -801,7 +903,8 @@ void idempotencyVectors() {
 	addPositive("idempotency_scan_range",
 	            "usage",
 	            "The range determineCommitStatus reads: the idempotencyIdKeys prefix and bigEndian64(version) written "
-	            "with BinaryWriter(Unversioned()). `bytes` is the begin key; the range's two keys are in `value`.",
+	            "with BinaryWriter(Unversioned()) (the actor builds it inline, so this mirrors that code). `bytes` is the "
+	            "begin key; the range's two keys are in `value`.",
 	            "KeyRange",
 	            "idempotency_scan_range",
 	            unversioned(),
@@ -901,6 +1004,7 @@ int generate(const std::string& out, const std::string& fdbRev) {
 	objectPayloadVectors();
 	connectPacketVectors();
 	conflictKeyVectors();
+	protocolVersionVectors();
 	spanVectors();
 	healthMetricsVectors();
 	idempotencyVectors();

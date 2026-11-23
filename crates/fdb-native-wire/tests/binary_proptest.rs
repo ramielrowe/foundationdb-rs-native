@@ -6,10 +6,9 @@ mod binary_support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use binary_support::*;
+use fdb_native_wire::MAX_DEPTH;
 use fdb_native_wire::binary::{
-    BinaryDecodeError, BinaryDeserializeOwned, BinaryReader, BinarySerialize, ConnectPacket,
-    HealthMetrics, IdempotencyEntry, IdempotencyValue, MAX_DEPTH, SpanContext, StorageStats,
-    TraceFlags, Versioning, from_slice, to_vec,
+    DecodeError, DecodeOwned, Encode, ReadVersioning, Reader, Versioning, from_slice, to_vec,
 };
 use fdb_native_wire::{FdbError, ProtocolVersion, Uid};
 use proptest::prelude::*;
@@ -17,16 +16,25 @@ use proptest::prelude::*;
 const V: ProtocolVersion = ProtocolVersion::V7_4;
 const ASSUME: Versioning = Versioning::Assume(V);
 
+/// The reader's option for what `versioning` wrote.
+fn reading(versioning: Versioning) -> ReadVersioning {
+    match versioning {
+        Versioning::Unversioned => ReadVersioning::Unversioned,
+        Versioning::Include(_) => ReadVersioning::INCLUDE_8_0,
+        Versioning::Assume(v) => ReadVersioning::Assume(v),
+    }
+}
+
 fn uid() -> impl Strategy<Value = Uid> {
     (any::<u64>(), any::<u64>()).prop_map(|(a, b)| Uid::new(a, b))
 }
 
 fn round_trip<T>(value: &T, versioning: Versioning) -> Result<Vec<u8>, TestCaseError>
 where
-    T: BinarySerialize + BinaryDeserializeOwned + PartialEq + std::fmt::Debug,
+    T: Encode + DecodeOwned + PartialEq + std::fmt::Debug,
 {
     let bytes = to_vec(value, versioning).expect("encode");
-    let back: T = from_slice(&bytes, versioning).expect("decode");
+    let back: T = from_slice(&bytes, reading(versioning)).expect("decode");
     prop_assert_eq!(&back, value);
     Ok(bytes)
 }
@@ -64,7 +72,7 @@ proptest! {
         let x = f64::from_bits(bits);
         let bytes = to_vec(&x, Versioning::Unversioned).unwrap();
         prop_assert_eq!(&bytes[..], &bits.to_le_bytes());
-        let back: f64 = from_slice(&bytes, Versioning::Unversioned).unwrap();
+        let back: f64 = from_slice(&bytes, ReadVersioning::Unversioned).unwrap();
         prop_assert_eq!(back.to_bits(), bits);
     }
 
@@ -153,69 +161,6 @@ proptest! {
         prop_assert_eq!(&bytes[8..], &to_vec(&v, ASSUME).unwrap()[..]);
     }
 
-    #[test]
-    fn connect_packets(port in any::<u16>(), id in any::<u64>(), ip4 in any::<u32>(),
-                       flags in 0u16..2, ip6 in any::<[u8; 16]>(), later in any::<u64>()) {
-        let packet = ConnectPacket {
-            protocol_version: V.with_object_serializer_flag(),
-            canonical_remote_port: port,
-            connection_id: id,
-            canonical_remote_ip4: ip4,
-            flags,
-            canonical_remote_ip6: ip6,
-        };
-        let mut bytes = packet.encode().unwrap();
-        prop_assert_eq!(bytes.len(), ConnectPacket::SIZE);
-        prop_assert_eq!(&bytes[..4], &40u32.to_le_bytes());
-        bytes.extend_from_slice(&later.to_le_bytes());
-        let (back, used) = ConnectPacket::decode(&bytes).unwrap();
-        prop_assert_eq!((back, used), (packet, ConnectPacket::SIZE));
-    }
-
-    #[test]
-    fn span_contexts(trace in uid(), span in any::<u64>(), sampled in any::<bool>()) {
-        let ctx = SpanContext {
-            trace_id: trace,
-            span_id: span,
-            flags: if sampled { TraceFlags::Sampled } else { TraceFlags::Unsampled },
-        };
-        let bytes = ctx.to_option_value(V).unwrap();
-        prop_assert_eq!(bytes.len(), SpanContext::OPTION_VALUE_LEN);
-        prop_assert_eq!(SpanContext::from_option_value(&bytes).unwrap(), ctx);
-    }
-
-    #[test]
-    fn health_metrics(q in any::<[i64; 5]>(), tps in -1e12f64..1e12, batch in any::<bool>(),
-                     stats in proptest::collection::btree_map(uid(), (any::<i64>(), any::<i64>(), -1e6f64..1e6, 0f64..1.0), 0..4),
-                     tlogs in proptest::collection::btree_map(uid(), any::<i64>(), 0..4)) {
-        let m = HealthMetrics {
-            worst_storage_queue: q[0],
-            limiting_storage_queue: q[1],
-            worst_storage_durability_lag: q[2],
-            limiting_storage_durability_lag: q[3],
-            worst_t_log_queue: q[4],
-            tps_limit: tps,
-            batch_limited: batch,
-            storage_stats: stats.into_iter().map(|(k, (a, b, c, d))| (k, StorageStats {
-                storage_queue: a, storage_durability_lag: b, disk_usage: c, cpu_usage: d })).collect(),
-            t_log_queue: tlogs,
-        };
-        let blob = m.to_blob(V).unwrap();
-        prop_assert_eq!(HealthMetrics::from_blob(&blob).unwrap(), m);
-    }
-
-    #[test]
-    fn idempotency_values(ts in any::<i64>(),
-                          ids in proptest::collection::vec((proptest::collection::vec(any::<u8>(), 16..40), any::<u8>()), 0..5)) {
-        let value = IdempotencyValue {
-            protocol_version: V,
-            timestamp: ts,
-            entries: ids.iter().map(|(id, low)| IdempotencyEntry { id, low_order_batch_index: *low }).collect(),
-        };
-        let bytes = value.encode().unwrap();
-        prop_assert_eq!(IdempotencyValue::decode(&bytes).unwrap(), value);
-    }
-
     // --- hostile input ------------------------------------------------------------------
 
     /// Random bytes never panic any reader, whatever the versioning.
@@ -229,13 +174,12 @@ proptest! {
         };
         for ty in ["u32", "bool", "string", "bytes", "vec<i32>", "vec<string>", "vec<vec<u16>>",
                    "vec<key_value>", "map<string,i64>", "map<uid,i64>", "set<i32>", "optional<string>",
-                   "pair<u8,string>", "point3", "variant3", "enum_color", "enum_level", "key_range",
-                   "span_context", "health_metrics", "connect_packet", "idempotency_value"] {
-            let _ = decode_any(ty, &bytes, versioning).expect("known type");
+                   "pair<u8,string>", "point3", "variant3", "enum_color", "enum_level", "key_range"] {
+            let _ = decode_any(ty, &bytes, reading(versioning)).expect("known type");
         }
-        let _ = from_slice::<Vec<Vec<Vec<Option<(u8, String)>>>>>(&bytes, versioning);
-        let _ = from_slice::<Node>(&bytes, versioning);
-        let _ = from_slice::<Vec<Unit>>(&bytes, versioning);
+        let _ = from_slice::<Vec<Vec<Vec<Option<(u8, String)>>>>>(&bytes, reading(versioning));
+        let _ = from_slice::<Node>(&bytes, reading(versioning));
+        let _ = from_slice::<Vec<Unit>>(&bytes, reading(versioning));
     }
 
     /// Every proper prefix of a valid encoding is rejected (a count or a length would
@@ -245,18 +189,18 @@ proptest! {
             (".{0,5}", proptest::option::of(any::<i64>()), variant3()), 1..5)) {
         let bytes = to_vec(&v, ASSUME).unwrap();
         for cut in 0..bytes.len() {
-            let r = from_slice::<Vec<(String, Option<i64>, Variant3)>>(&bytes[..cut], ASSUME);
+            let r = from_slice::<Vec<(String, Option<i64>, Variant3)>>(&bytes[..cut], reading(ASSUME));
             prop_assert!(r.is_err(), "{cut} of {} bytes decoded", bytes.len());
         }
-        prop_assert!(from_slice::<Vec<(String, Option<i64>, Variant3)>>(&bytes, ASSUME).is_ok());
+        prop_assert!(from_slice::<Vec<(String, Option<i64>, Variant3)>>(&bytes, reading(ASSUME)).is_ok());
     }
 }
 
 // ---------------------------------------------------------------------------------------
 // Targeted hostile input.
 
-fn read<T: BinaryDeserializeOwned>(bytes: &[u8]) -> Result<T, BinaryDecodeError> {
-    from_slice(bytes, ASSUME)
+fn read<T: DecodeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
+    from_slice(bytes, reading(ASSUME))
 }
 
 #[test]
@@ -265,31 +209,31 @@ fn a_huge_count_does_not_allocate() {
     let bytes = 0x7fff_ffffu32.to_le_bytes();
     assert!(matches!(
         read::<Vec<u32>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<Vec<u8>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<String>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<Bytes>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<Vec<Vec<Vec<u64>>>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<BTreeMap<u64, u64>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<BTreeSet<u64>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(read::<[u8; 4]>(&bytes).is_ok());
 }
@@ -300,15 +244,15 @@ fn a_count_above_i32_max_is_refused() {
         let bytes = count.to_le_bytes();
         assert_eq!(
             read::<Vec<u8>>(&bytes),
-            Err(BinaryDecodeError::CountTooLarge(count))
+            Err(DecodeError::CountTooLarge(count))
         );
         assert_eq!(
             read::<String>(&bytes),
-            Err(BinaryDecodeError::CountTooLarge(count))
+            Err(DecodeError::CountTooLarge(count))
         );
         assert_eq!(
             read::<Vec<Unit>>(&bytes),
-            Err(BinaryDecodeError::CountTooLarge(count))
+            Err(DecodeError::CountTooLarge(count))
         );
     }
 }
@@ -320,11 +264,11 @@ fn a_count_larger_than_the_input_is_cut_short_early() {
     bytes.extend_from_slice(&[0; 8]);
     assert!(matches!(
         read::<Vec<u32>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
     assert!(matches!(
         read::<Vec<(u64, u64)>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof { .. })
+        Err(DecodeError::UnexpectedEof { .. })
     ));
 }
 
@@ -333,7 +277,7 @@ fn zero_width_elements_are_bounded() {
     // A vector of a million no-byte values over a 4-byte input: C++ would loop a million
     // times; this reader's work limit (4 x the input + 1024) stops it.
     let bytes = 1_000_000u32.to_le_bytes();
-    assert_eq!(read::<Vec<Unit>>(&bytes), Err(BinaryDecodeError::WorkLimit));
+    assert_eq!(read::<Vec<Unit>>(&bytes), Err(DecodeError::WorkLimit));
     // Within the limit it is fine.
     let bytes = 100u32.to_le_bytes();
     assert_eq!(read::<Vec<Unit>>(&bytes).unwrap().len(), 100);
@@ -341,7 +285,7 @@ fn zero_width_elements_are_bounded() {
     let bytes = 1_000_000u32.to_le_bytes();
     assert_eq!(
         read::<Vec<Option<Unit>>>(&bytes),
-        Err(BinaryDecodeError::UnexpectedEof {
+        Err(DecodeError::UnexpectedEof {
             pos: 4,
             needed: 1,
             remaining: 0
@@ -353,7 +297,7 @@ fn zero_width_elements_are_bounded() {
 fn nesting_is_bounded() {
     // An Optional chain `1 1 1 1 ...` as deep as the input allows.
     let deep = vec![1u8; 100_000];
-    assert_eq!(read::<Node>(&deep), Err(BinaryDecodeError::TooDeep));
+    assert_eq!(read::<Node>(&deep), Err(DecodeError::TooDeep));
     // A shallow chain decodes; the limit counts nested `read`s (several per Node), so
     // somewhere between the two the reader gives up with TooDeep and never anything else.
     let mut last_ok = 0;
@@ -363,7 +307,7 @@ fn nesting_is_bounded() {
         match read::<Node>(&chain) {
             Ok(_) => last_ok = links,
             Err(e) => {
-                assert_eq!(e, BinaryDecodeError::TooDeep, "{links} links");
+                assert_eq!(e, DecodeError::TooDeep, "{links} links");
                 break;
             }
         }
@@ -380,37 +324,34 @@ fn nesting_is_bounded() {
 
 #[test]
 fn invalid_values_are_rejected() {
-    assert_eq!(read::<bool>(&[2]), Err(BinaryDecodeError::InvalidBool(2)));
-    assert_eq!(
-        read::<bool>(&[255]),
-        Err(BinaryDecodeError::InvalidBool(255))
-    );
+    assert_eq!(read::<bool>(&[2]), Err(DecodeError::InvalidBool(2)));
+    assert_eq!(read::<bool>(&[255]), Err(DecodeError::InvalidBool(255)));
     assert!(matches!(
         read::<Option<u8>>(&[2, 0]),
-        Err(BinaryDecodeError::InvalidBool(2))
+        Err(DecodeError::InvalidBool(2))
     ));
     assert!(matches!(
         read::<Color>(&[0]),
-        Err(BinaryDecodeError::InvalidEnum { .. })
+        Err(DecodeError::InvalidEnum { .. })
     ));
     assert!(matches!(
         read::<Color>(&[3]),
-        Err(BinaryDecodeError::InvalidEnum { .. })
+        Err(DecodeError::InvalidEnum { .. })
     ));
     assert!(matches!(
         read::<Level>(&1i32.to_le_bytes()),
-        Err(BinaryDecodeError::InvalidEnum { .. })
+        Err(DecodeError::InvalidEnum { .. })
     ));
     assert!(matches!(
         read::<Variant3>(&[3, 0, 0, 0, 0, 0]),
-        Err(BinaryDecodeError::InvalidVariantIndex {
+        Err(DecodeError::InvalidVariantIndex {
             index: 3,
             alternatives: 3
         })
     ));
     assert_eq!(
         read::<String>(&[1, 0, 0, 0, 0xff]),
-        Err(BinaryDecodeError::InvalidUtf8)
+        Err(DecodeError::InvalidUtf8)
     );
     // The same bytes read as bytes are fine.
     assert_eq!(
@@ -421,19 +362,16 @@ fn invalid_values_are_rejected() {
 
 #[test]
 fn trailing_bytes_are_an_error_and_prefix_reads_are_not() {
-    assert_eq!(
-        read::<u8>(&[1, 2]),
-        Err(BinaryDecodeError::TrailingBytes(1))
-    );
-    let mut r = BinaryReader::assume_version(&[1, 2], V).unwrap();
+    assert_eq!(read::<u8>(&[1, 2]), Err(DecodeError::TrailingBytes(1)));
+    let mut r = Reader::assume_version(&[1, 2], V).unwrap();
     assert_eq!(r.read::<u8>().unwrap(), 1);
     assert_eq!(r.remaining(), &[2]);
-    assert_eq!(r.finish(), Err(BinaryDecodeError::TrailingBytes(1)));
+    assert_eq!(r.finish(), Err(DecodeError::TrailingBytes(1)));
 }
 
 #[test]
 fn include_version_rejects_bad_prefixes() {
-    let include = Versioning::Include(V);
+    let include = ReadVersioning::INCLUDE_8_0;
     for (bytes, ok) in [
         (0u64.to_le_bytes(), false),
         (0x0FDB_00A2_0006_0000u64.to_le_bytes(), false), // just below the first valid version
@@ -452,7 +390,7 @@ fn include_version_rejects_bad_prefixes() {
     for len in 0..8 {
         assert!(matches!(
             from_slice::<u32>(&vec![0xab; len], include),
-            Err(BinaryDecodeError::UnexpectedEof { .. })
+            Err(DecodeError::UnexpectedEof { .. })
         ));
     }
 }
@@ -463,7 +401,7 @@ fn a_flagged_version_is_the_same_version() {
     let flagged = V.with_object_serializer_flag();
     let mut data = flagged.0.to_le_bytes().to_vec();
     data.extend_from_slice(&7u32.to_le_bytes());
-    let mut r = BinaryReader::include_version(&data).unwrap();
+    let mut r = Reader::include_version(&data, ProtocolVersion::MIN_INVALID_8_0).unwrap();
     assert_eq!(r.protocol_version().unwrap(), flagged);
     assert!(flagged.has_object_serializer_flag());
     // The reader still reads the binary rest; handing it to a flatbuffers reader is the caller's job.
@@ -472,28 +410,14 @@ fn a_flagged_version_is_the_same_version() {
 
 #[test]
 fn writer_refuses_invalid_versions() {
-    use fdb_native_wire::binary::{BinaryEncodeError, BinaryWriter};
+    use fdb_native_wire::binary::{EncodeError, Writer};
     assert!(matches!(
-        BinaryWriter::include_version(ProtocolVersion(1)),
-        Err(BinaryEncodeError::InvalidProtocolVersion(1))
+        Writer::include_version(ProtocolVersion(1)),
+        Err(EncodeError::InvalidProtocolVersion(1))
     ));
     assert!(matches!(
-        BinaryWriter::assume_version(ProtocolVersion(0)),
-        Err(BinaryEncodeError::InvalidProtocolVersion(0))
+        Writer::assume_version(ProtocolVersion(0)),
+        Err(EncodeError::InvalidProtocolVersion(0))
     ));
-    assert!(BinaryWriter::unversioned().is_empty());
-}
-
-#[test]
-fn connect_packet_rules() {
-    let mut packet = ConnectPacket::client(V, 9).encode().unwrap();
-    // Too short: the reader needs the whole 44 bytes.
-    for cut in 0..packet.len() {
-        assert!(ConnectPacket::decode(&packet[..cut]).is_err(), "{cut}");
-    }
-    // A length above 40 is refused, below 40 too (this crate reads the 7.4/8.0 form only).
-    for bad in [0u32, 14, 39, 41, 1 << 31, u32::MAX] {
-        packet[..4].copy_from_slice(&bad.to_le_bytes());
-        assert!(ConnectPacket::decode(&packet).is_err(), "{bad}");
-    }
+    assert!(Writer::unversioned().is_empty());
 }

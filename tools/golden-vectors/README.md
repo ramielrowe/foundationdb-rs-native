@@ -1011,10 +1011,24 @@ anything in `src/`: both generators share those headers.
 
 `fixtures/binary-release-7.4/` and `fixtures/binary-release-8.0/` hold what each release's own
 `BinaryWriter` writes (`flow/include/flow/serialize.h`), for the Rust `fdb_native_wire::binary`
-module. They come from the same run as the message vectors: `regen_messages.sh` also builds
-`golden_vectors_binary` (`messages/binary_vectors.cpp`) against the branch's `fdbclient`,
-writes the vectors, and checks them itself (every value is read back by the release's
-`BinaryReader`, and every negative vector must make it throw or assert). Nothing is hand-derived.
+module and the types built on it (`fdb-native-transport`'s `ConnectPacket`; `fdb-native-schema`'s
+`SpanContext`, `HealthMetrics`, idempotency records and conflict keys). They come from the same
+run as the message vectors: `regen_messages.sh` also builds `golden_vectors_binary`
+(`messages/binary_vectors.cpp`) against the branch's `fdbclient`, writes the vectors, and checks
+them itself (every value is read back by the release's `BinaryReader`, and every negative vector
+must make it throw or assert).
+
+The bytes are written by the release's own types and functions wherever there is one to call:
+`ConnectPacket` through `PacketWriter` (a verbatim mirror of the struct, see below),
+`Transaction::makeSelfConflicting` itself (with a seeded random generator), the real
+`IdempotencyIdKVBuilder` (the one field that is `now()`, the record's timestamp, is overwritten
+with a fixed value), `swVersionValue`, `keyServersValue`/`decodeKeyServersValue`,
+`GetHealthMetricsReply` and `BinaryWriter::toValue` for the generic types. Two vectors repeat
+code that C++ has inline in an actor and no function to call, and say so in their
+`description`: the idempotency-id form of the self-conflict key (`tryCommit`), the
+`determineCommitStatus` scan range. The
+`protocol_version_compat` vector has no bytes: it is the release's own `isCompatible`, `isValid`,
+`version()` and `hasObjectSerializerFlag()` over flagged and unflagged versions.
 
 Each file is `{name, group, kind, description, cpp_type, type, versioning, size, bytes, value}`:
 
@@ -1039,6 +1053,13 @@ Each file is `{name, group, kind, description, cpp_type, type, versioning, size,
 The format has no padding, so every vector is canonical; the one exception is
 `sw_version_value`, whose flatbuffers payload depends on the C++ compiler (compare its fields).
 `ConnectPacket` is private to `fdbrpc/FlowTransport`, so the generator mirrors it verbatim;
-`check_mirrors.py` fails the build if the branch's source no longer matches the mirror.
+`check_mirrors.py` fails the build if the branch's struct no longer matches the mirror (it
+ignores comments, spacing and whole `TraceEvent` statements). It also fingerprints
+`Peer::prependConnectPacket` and the `connectionReader` block that reads and validates the
+packet, the code behind `ConnectPacket::check`, the connection-id rules and the client's address
+fields in the Rust docs; when one changes, read the change, update the Rust side if the behavior
+changed, and update the fingerprints (`check_mirrors.py DIR --print`). The connection ids in the
+vectors follow FDB: 0 for a plain client, 1 for fdbserver and the simulator, a random id above 1
+for the multi-version client API.
 FDB's headers cannot write `std::tuple`, `float` or `Void` or read a `std::deque`, and
 `ErrorOr<T>` does not round-trip, so there are no vectors for them.

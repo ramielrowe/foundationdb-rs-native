@@ -8,7 +8,7 @@
 /// or enum) as garbage. This reader rejects all of it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum BinaryDecodeError {
+pub enum DecodeError {
     /// A read needs more bytes than the input has left (`serialization_failed` in C++).
     #[error("read of {needed} bytes at offset {pos} but only {remaining} remain")]
     UnexpectedEof {
@@ -19,7 +19,7 @@ pub enum BinaryDecodeError {
         /// How many bytes the input has left.
         remaining: usize,
     },
-    /// Input remains after the value (`BinaryReader::assertEnd`).
+    /// Input remains after the value (`Reader::assertEnd`).
     #[error("{0} trailing bytes after the value")]
     TrailingBytes(usize),
     /// A `bool` byte that is neither 0 nor 1.
@@ -53,7 +53,7 @@ pub enum BinaryDecodeError {
     /// or `uint32_t` and caps `VectorRef` at 100 MiB; no real value is that large.)
     #[error("count {0} is too large")]
     CountTooLarge(u32),
-    /// Values nest more than [`MAX_DEPTH`](crate::binary::MAX_DEPTH) deep.
+    /// Values nest more than [`MAX_DEPTH`](crate::MAX_DEPTH) deep.
     #[error("values nest too deeply")]
     TooDeep,
     /// The reader decoded too many values that take no bytes (such as elements of a
@@ -72,9 +72,9 @@ pub enum BinaryDecodeError {
 /// Why a value could not be written in the binary format.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum BinaryEncodeError {
+pub enum EncodeError {
     /// A string, vector, map or set with more than `i32::MAX` elements or bytes, or output
-    /// that would exceed `i32::MAX` bytes (`BinaryWriter` keeps its length in an `int`).
+    /// that would exceed `i32::MAX` bytes (`Writer` keeps its length in an `int`).
     #[error("value or output too large")]
     TooLarge,
     /// A protocol version that is not valid (`IncludeVersion` and `AssumeVersion`

@@ -70,6 +70,8 @@ name = "fdb-native-schema"
 version = "0.0.0"
 dependencies = [
  "fdb-native-wire",
+ "proptest",
+ "serde_json",
 ]
 
 [[package]]
@@ -89,6 +91,9 @@ name = "fdb-native-transport"
 version = "0.0.0"
 dependencies = [
  "fdb-native-wire",
+ "proptest",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

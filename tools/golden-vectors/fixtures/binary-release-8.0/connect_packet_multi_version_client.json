@@ -1,0 +1,26 @@
+{
+  "format_version": 1,
+  "name": "connect_packet_multi_version_client",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A multi-version client's ConnectPacket: a random connectionId above 1 shared by its connections.",
+  "cpp_type": "ConnectPacket",
+  "type": "connect_packet",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 44,
+  "bytes": "2800000000000080b000db1f0000157c4a7fb979379e00000000000000000000000000000000000000000000",
+  "value": {
+    "connect_packet_length": 40,
+    "protocol_version": 2295429193137127424,
+    "canonical_remote_port": 0,
+    "connection_id": 11400714819323198485,
+    "canonical_remote_ip4": 0,
+    "flags": 0,
+    "canonical_remote_ip6": "00000000000000000000000000000000",
+    "canonical_remote_ip": null,
+    "total_packet_size": 44
+  }
+}

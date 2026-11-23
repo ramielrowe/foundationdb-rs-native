@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "name": "self_conflict_key_idempotency_id",
+  "group": "usage",
+  "kind": "positive",
+  "description": "The conflict key of a transaction with an idempotency id (mirrors the inline code of Transaction::tryCommit): \\xff/SC/ followed by the id's raw bytes, not a UID.",
+  "cpp_type": "Key",
+  "type": "self_conflict_key_id",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 21,
+  "bytes": "ff2f53432f33333333333333333333333333333333",
+  "value": {
+    "idempotency_id": "33333333333333333333333333333333"
+  }
+}

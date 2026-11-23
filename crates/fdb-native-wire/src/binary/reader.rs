@@ -1,15 +1,9 @@
 //! `BinaryReader`.
 
-use super::error::BinaryDecodeError;
-use super::traits::BinaryDeserialize;
-use super::version::Versioning;
-use crate::ProtocolVersion;
-
-/// How many levels of values [`BinaryReader::read`] nests before it fails with
-/// [`BinaryDecodeError::TooDeep`]. FDB's binary types nest a handful of levels (a vector of
-/// pairs of structs of vectors); this only stops hostile recursion in user types and
-/// `Option<Option<...>>` chains.
-pub const MAX_DEPTH: usize = 64;
+use super::error::DecodeError;
+use super::traits::Decode;
+use super::version::ReadVersioning;
+use crate::{MAX_DEPTH, ProtocolVersion};
 
 /// Zero-width values (`()`, [`Void`](crate::Void), a struct with no fields) a reader decodes
 /// per input byte, on top of [`ZERO_WIDTH_SLACK`]. The budget is what keeps `Vec<()>` with
@@ -24,20 +18,21 @@ const ZERO_WIDTH_SLACK: usize = 1024;
 /// Every read is bounds-checked and returns an error instead of panicking. Container
 /// counts are never trusted for allocation: a `Vec` reserves at most 64 KiB up front and
 /// grows as elements decode, and reading a count that the input cannot satisfy fails at the
-/// first element that is missing. [`read`](BinaryReader::read) bounds nesting
-/// ([`MAX_DEPTH`]) and the number of zero-width values.
+/// first element that is missing. [`read`](Reader::read) bounds nesting
+/// ([`MAX_DEPTH`], the limit of the flatbuffers reader too) and the number of zero-width
+/// values.
 ///
 /// ```
-/// use fdb_native_wire::binary::{BinaryReader, Versioning};
+/// use fdb_native_wire::binary::{ReadVersioning, Reader};
 ///
-/// let mut r = BinaryReader::new(&[7, 0, 1, 2, 0, 0, 0, b'h', b'i'], Versioning::Unversioned)?;
+/// let mut r = Reader::new(&[7, 0, 1, 2, 0, 0, 0, b'h', b'i'], ReadVersioning::Unversioned)?;
 /// assert_eq!(r.read::<u16>()?, 7);
 /// assert_eq!(r.read::<Option<&str>>()?, Some("hi"));
 /// r.finish()?;
-/// # Ok::<(), fdb_native_wire::binary::BinaryDecodeError>(())
+/// # Ok::<(), fdb_native_wire::binary::DecodeError>(())
 /// ```
 #[derive(Clone, Debug)]
-pub struct BinaryReader<'de> {
+pub struct Reader<'de> {
     data: &'de [u8],
     pos: usize,
     version: Option<ProtocolVersion>,
@@ -45,22 +40,21 @@ pub struct BinaryReader<'de> {
     zero_width_budget: usize,
 }
 
-impl<'de> BinaryReader<'de> {
+impl<'de> Reader<'de> {
     /// A reader over `data` with the given version option.
     ///
     /// `Include` reads and checks the 8-byte version prefix like FDB's `IncludeVersion`: it
-    /// must be [valid](ProtocolVersion::is_valid) and below
-    /// [`ProtocolVersion::MIN_INVALID_8_0`]; use
-    /// [`include_version_below`](BinaryReader::include_version_below) for another limit.
-    /// `Assume` must be a valid version, as in C++.
-    pub fn new(data: &'de [u8], versioning: Versioning) -> Result<Self, BinaryDecodeError> {
-        let mut r = BinaryReader::unversioned(data);
+    /// must be [valid](ProtocolVersion::is_valid) and, flags aside, below the limit the
+    /// option names (an `IncludeVersion` reader of a release refuses that release's
+    /// `minInvalidProtocolVersion` and newer). `Assume` must be a valid version, as in C++.
+    pub fn new(data: &'de [u8], versioning: ReadVersioning) -> Result<Self, DecodeError> {
+        let mut r = Reader::unversioned(data);
         match versioning {
-            Versioning::Unversioned => {}
-            Versioning::Include(_) => r.read_version_prefix(ProtocolVersion::MIN_INVALID_8_0)?,
-            Versioning::Assume(v) => {
+            ReadVersioning::Unversioned => {}
+            ReadVersioning::Include { min_invalid } => r.read_version_prefix(min_invalid)?,
+            ReadVersioning::Assume(v) => {
                 if !v.is_valid() {
-                    return Err(BinaryDecodeError::InvalidProtocolVersion(v.0));
+                    return Err(DecodeError::InvalidProtocolVersion(v.0));
                 }
                 r.version = Some(v);
             }
@@ -70,7 +64,7 @@ impl<'de> BinaryReader<'de> {
 
     /// `BinaryReader(data, Unversioned())`.
     pub fn unversioned(data: &'de [u8]) -> Self {
-        BinaryReader {
+        Reader {
             data,
             pos: 0,
             version: None,
@@ -82,43 +76,30 @@ impl<'de> BinaryReader<'de> {
         }
     }
 
-    /// `BinaryReader(data, IncludeVersion())`: see [`new`](BinaryReader::new).
-    pub fn include_version(data: &'de [u8]) -> Result<Self, BinaryDecodeError> {
-        BinaryReader::new(data, Versioning::Include(ProtocolVersion(0)))
-    }
-
     /// `BinaryReader(data, IncludeVersion())` for a release whose
-    /// `minInvalidProtocolVersion` is `min_invalid` (see
-    /// [`ProtocolVersion::MIN_INVALID_7_4`]): a version at or above it is
-    /// [`FutureProtocolVersion`](BinaryDecodeError::FutureProtocolVersion).
-    pub fn include_version_below(
+    /// `minInvalidProtocolVersion` is `min_invalid` ([`ProtocolVersion::MIN_INVALID_7_4`] or
+    /// [`ProtocolVersion::MIN_INVALID_8_0`]): a version at or above it is
+    /// [`FutureProtocolVersion`](DecodeError::FutureProtocolVersion).
+    pub fn include_version(
         data: &'de [u8],
         min_invalid: ProtocolVersion,
-    ) -> Result<Self, BinaryDecodeError> {
-        let mut r = BinaryReader::unversioned(data);
-        r.read_version_prefix(min_invalid)?;
-        Ok(r)
+    ) -> Result<Self, DecodeError> {
+        Reader::new(data, ReadVersioning::Include { min_invalid })
     }
 
     /// `BinaryReader(data, AssumeVersion(version))`.
-    pub fn assume_version(
-        data: &'de [u8],
-        version: ProtocolVersion,
-    ) -> Result<Self, BinaryDecodeError> {
-        BinaryReader::new(data, Versioning::Assume(version))
+    pub fn assume_version(data: &'de [u8], version: ProtocolVersion) -> Result<Self, DecodeError> {
+        Reader::new(data, ReadVersioning::Assume(version))
     }
 
     /// `_IncludeVersion::read`.
-    fn read_version_prefix(
-        &mut self,
-        min_invalid: ProtocolVersion,
-    ) -> Result<(), BinaryDecodeError> {
+    fn read_version_prefix(&mut self, min_invalid: ProtocolVersion) -> Result<(), DecodeError> {
         let v = ProtocolVersion(self.read_u64()?);
         if !v.is_valid() {
-            return Err(BinaryDecodeError::InvalidProtocolVersion(v.0));
+            return Err(DecodeError::InvalidProtocolVersion(v.0));
         }
         if v.version() >= min_invalid.version() {
-            return Err(BinaryDecodeError::FutureProtocolVersion(v.0));
+            return Err(DecodeError::FutureProtocolVersion(v.0));
         }
         self.version = Some(v);
         Ok(())
@@ -133,11 +114,11 @@ impl<'de> BinaryReader<'de> {
     /// Reads one value (`ar >> value`).
     ///
     /// Types that read their fields should do it through this method, not by calling
-    /// [`BinaryDeserialize::deserialize`] directly: it is what enforces [`MAX_DEPTH`] and
+    /// [`Decode::deserialize`] directly: it is what enforces [`MAX_DEPTH`] and
     /// the zero-width work limit.
-    pub fn read<T: BinaryDeserialize<'de>>(&mut self) -> Result<T, BinaryDecodeError> {
+    pub fn read<T: Decode<'de>>(&mut self) -> Result<T, DecodeError> {
         if self.depth >= MAX_DEPTH {
-            return Err(BinaryDecodeError::TooDeep);
+            return Err(DecodeError::TooDeep);
         }
         let start = self.pos;
         self.depth += 1;
@@ -148,13 +129,13 @@ impl<'de> BinaryReader<'de> {
             self.zero_width_budget = self
                 .zero_width_budget
                 .checked_sub(1)
-                .ok_or(BinaryDecodeError::WorkLimit)?;
+                .ok_or(DecodeError::WorkLimit)?;
         }
         Ok(value)
     }
 
     /// Reads `len` raw bytes, borrowed from the input (`readBytes`).
-    pub fn read_bytes(&mut self, len: usize) -> Result<&'de [u8], BinaryDecodeError> {
+    pub fn read_bytes(&mut self, len: usize) -> Result<&'de [u8], DecodeError> {
         match self
             .pos
             .checked_add(len)
@@ -164,7 +145,7 @@ impl<'de> BinaryReader<'de> {
                 self.pos += len;
                 Ok(bytes)
             }
-            None => Err(BinaryDecodeError::UnexpectedEof {
+            None => Err(DecodeError::UnexpectedEof {
                 pos: self.pos,
                 needed: len as u64,
                 remaining: self.remaining_len(),
@@ -173,7 +154,7 @@ impl<'de> BinaryReader<'de> {
     }
 
     /// Reads `N` bytes as an array.
-    pub fn read_array<const N: usize>(&mut self) -> Result<[u8; N], BinaryDecodeError> {
+    pub fn read_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
         let bytes = self.read_bytes(N)?;
         let mut out = [0u8; N];
         out.copy_from_slice(bytes);
@@ -181,42 +162,42 @@ impl<'de> BinaryReader<'de> {
     }
 
     /// Reads one byte.
-    pub fn read_u8(&mut self) -> Result<u8, BinaryDecodeError> {
+    pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.read_array::<1>()?[0])
     }
 
     /// Reads a little-endian `u16`.
-    pub fn read_u16(&mut self) -> Result<u16, BinaryDecodeError> {
+    pub fn read_u16(&mut self) -> Result<u16, DecodeError> {
         self.read_array().map(u16::from_le_bytes)
     }
 
     /// Reads a little-endian `u32`.
-    pub fn read_u32(&mut self) -> Result<u32, BinaryDecodeError> {
+    pub fn read_u32(&mut self) -> Result<u32, DecodeError> {
         self.read_array().map(u32::from_le_bytes)
     }
 
     /// Reads a little-endian `u64`.
-    pub fn read_u64(&mut self) -> Result<u64, BinaryDecodeError> {
+    pub fn read_u64(&mut self) -> Result<u64, DecodeError> {
         self.read_array().map(u64::from_le_bytes)
     }
 
     /// Reads the 4-byte count of a string, vector, map or set. A count above `i32::MAX` is
     /// an error. The count is not checked against the bytes left, because elements can be
     /// zero-width; whoever reads the elements fails at the first one that is missing.
-    pub fn read_count(&mut self) -> Result<usize, BinaryDecodeError> {
+    pub fn read_count(&mut self) -> Result<usize, DecodeError> {
         let count = self.read_u32()?;
         if count > i32::MAX as u32 {
-            return Err(BinaryDecodeError::CountTooLarge(count));
+            return Err(DecodeError::CountTooLarge(count));
         }
         Ok(count as usize)
     }
 
     /// Reads the index of a `std::variant` alternative and checks it is below
     /// `alternatives`; the alternative's value follows.
-    pub fn read_variant_index(&mut self, alternatives: usize) -> Result<u8, BinaryDecodeError> {
+    pub fn read_variant_index(&mut self, alternatives: usize) -> Result<u8, DecodeError> {
         let index = self.read_u8()?;
         if usize::from(index) >= alternatives {
-            return Err(BinaryDecodeError::InvalidVariantIndex {
+            return Err(DecodeError::InvalidVariantIndex {
                 index,
                 alternatives,
             });
@@ -227,7 +208,7 @@ impl<'de> BinaryReader<'de> {
     /// The input not read yet, without consuming it. After an `IncludeVersion` prefix with
     /// the [object-serializer flag](ProtocolVersion::has_object_serializer_flag), this is a
     /// flatbuffers-dialect message: give it to [`Reader::new`](crate::Reader::new) (C++'s
-    /// `BinaryReader` hands it to an `ObjectReader` the same way).
+    /// `Reader` hands it to an `ObjectReader` the same way).
     pub fn remaining(&self) -> &'de [u8] {
         self.data.get(self.pos..).unwrap_or_default()
     }
@@ -255,21 +236,21 @@ impl<'de> BinaryReader<'de> {
     }
 
     /// Fails if input is left (`assertEnd()`).
-    pub fn finish(&self) -> Result<(), BinaryDecodeError> {
+    pub fn finish(&self) -> Result<(), DecodeError> {
         match self.remaining_len() {
             0 => Ok(()),
-            n => Err(BinaryDecodeError::TrailingBytes(n)),
+            n => Err(DecodeError::TrailingBytes(n)),
         }
     }
 }
 
 /// `BinaryReader::fromStringRef<T>(bytes, versioning)`, except that unread bytes are an
 /// error (C++ ignores them): reads one value and requires the input to end there.
-pub fn from_slice<'de, T: BinaryDeserialize<'de>>(
+pub fn from_slice<'de, T: Decode<'de>>(
     bytes: &'de [u8],
-    versioning: Versioning,
-) -> Result<T, BinaryDecodeError> {
-    let mut r = BinaryReader::new(bytes, versioning)?;
+    versioning: ReadVersioning,
+) -> Result<T, DecodeError> {
+    let mut r = Reader::new(bytes, versioning)?;
     let value = r.read()?;
     r.finish()?;
     Ok(value)

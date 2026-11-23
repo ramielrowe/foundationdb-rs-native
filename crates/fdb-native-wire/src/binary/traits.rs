@@ -1,20 +1,20 @@
 //! The traits of the binary format, and the macro for enums.
 
-use super::error::{BinaryDecodeError, BinaryEncodeError};
-use super::reader::BinaryReader;
-use super::writer::BinaryWriter;
+use super::error::{DecodeError, EncodeError};
+use super::reader::Reader;
+use super::writer::Writer;
 
 /// A type FDB's `BinaryWriter` can write: C++'s `save(ar, value)`.
 ///
 /// Implement it for a C++ struct with `serialize(Ar&) { serializer(ar, a, b, c); }` by
-/// writing the fields in `serializer` argument order, each with [`BinaryWriter::write`]
+/// writing the fields in `serializer` argument order, each with [`Writer::write`]
 /// (skipping `Arena`, which writes nothing). The format has no framing or alignment, so a
 /// struct is just its fields back to back.
 ///
 /// ```
 /// use fdb_native_wire::binary::{
-///     from_slice, to_vec, BinaryDecodeError, BinaryDeserialize, BinaryEncodeError,
-///     BinaryReader, BinarySerialize, BinaryWriter, Versioning,
+///     from_slice, to_vec, DecodeError, Decode, EncodeError,
+///     ReadVersioning, Reader, Encode, Writer, Versioning,
 /// };
 ///
 /// // struct Point { int32_t x; int32_t y; std::string label;
@@ -26,16 +26,16 @@ use super::writer::BinaryWriter;
 ///     label: String,
 /// }
 ///
-/// impl BinarySerialize for Point {
-///     fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError> {
+/// impl Encode for Point {
+///     fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError> {
 ///         w.write(&self.x)?;
 ///         w.write(&self.y)?;
 ///         w.write(&self.label)
 ///     }
 /// }
 ///
-/// impl BinaryDeserialize<'_> for Point {
-///     fn deserialize(r: &mut BinaryReader<'_>) -> Result<Self, BinaryDecodeError> {
+/// impl Decode<'_> for Point {
+///     fn deserialize(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
 ///         Ok(Point { x: r.read()?, y: r.read()?, label: r.read()? })
 ///     }
 /// }
@@ -43,17 +43,17 @@ use super::writer::BinaryWriter;
 /// let p = Point { x: -1, y: 2, label: "a".into() };
 /// let bytes = to_vec(&p, Versioning::Unversioned)?;
 /// assert_eq!(bytes, [0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 1, 0, 0, 0, b'a']);
-/// assert_eq!(from_slice::<Point>(&bytes, Versioning::Unversioned)?, p);
+/// assert_eq!(from_slice::<Point>(&bytes, ReadVersioning::Unversioned)?, p);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub trait BinarySerialize {
+pub trait Encode {
     /// Writes `self` to `w`.
-    fn serialize(&self, w: &mut BinaryWriter) -> Result<(), BinaryEncodeError>;
+    fn serialize(&self, w: &mut Writer) -> Result<(), EncodeError>;
 
     /// Writes `items` back to back, with no count. A hook so that `[u8]` (a `StringRef`,
     /// a `std::string`, a `std::vector<uint8_t>`) is one copy; no other type overrides it.
     #[doc(hidden)]
-    fn serialize_elements(items: &[Self], w: &mut BinaryWriter) -> Result<(), BinaryEncodeError>
+    fn serialize_elements(items: &[Self], w: &mut Writer) -> Result<(), EncodeError>
     where
         Self: Sized,
     {
@@ -66,26 +66,23 @@ pub trait BinarySerialize {
 
 /// A type FDB's `BinaryReader` can read: C++'s `load(ar, value)`.
 ///
-/// Implement it like [`BinarySerialize`]: read the fields in `serializer` order with
-/// [`BinaryReader::read`] (not by calling `deserialize` directly, which skips the reader's
+/// Implement it like [`Encode`]: read the fields in `serializer` order with
+/// [`Reader::read`] (not by calling `deserialize` directly, which skips the reader's
 /// depth and work limits). `'de` is the lifetime of the input, for types that borrow from
 /// it (`&'de [u8]`, `&'de str`).
 ///
-/// An implementation can read the [`BinaryReader::protocol_version`] to pick the layout of
+/// An implementation can read the [`Reader::protocol_version`] to pick the layout of
 /// the version that wrote the value, as FDB's `serialize` functions do with
 /// `ar.protocolVersion().hasXxx()`.
-pub trait BinaryDeserialize<'de>: Sized {
+pub trait Decode<'de>: Sized {
     /// Reads a value from `r`.
-    fn deserialize(r: &mut BinaryReader<'de>) -> Result<Self, BinaryDecodeError>;
+    fn deserialize(r: &mut Reader<'de>) -> Result<Self, DecodeError>;
 
     /// Reads `count` values. The default reserves at most 64 KiB before the first element,
     /// whatever `count` says; `u8` overrides it to copy once, after checking the input has
     /// the bytes.
     #[doc(hidden)]
-    fn deserialize_elements(
-        r: &mut BinaryReader<'de>,
-        count: usize,
-    ) -> Result<Vec<Self>, BinaryDecodeError> {
+    fn deserialize_elements(r: &mut Reader<'de>, count: usize) -> Result<Vec<Self>, DecodeError> {
         let mut items = Vec::with_capacity(crate::codec::preallocation::<Self>(count));
         for _ in 0..count {
             items.push(r.read()?);
@@ -95,19 +92,19 @@ pub trait BinaryDeserialize<'de>: Sized {
 }
 
 /// A type that can be read from input of any lifetime (it owns its data).
-pub trait BinaryDeserializeOwned: for<'de> BinaryDeserialize<'de> {}
+pub trait DecodeOwned: for<'de> Decode<'de> {}
 
-impl<T> BinaryDeserializeOwned for T where T: for<'de> BinaryDeserialize<'de> {}
+impl<T> DecodeOwned for T where T: for<'de> Decode<'de> {}
 
-/// Implements [`BinarySerialize`] and [`BinaryDeserialize`] for a fieldless enum, as FDB
+/// Implements [`Encode`] and [`Decode`] for a fieldless enum, as FDB
 /// does for any `enum` (`Serializer<Archive, T, enable_if_t<is_enum_v<T>>>`): the value of
 /// the enum's underlying type, little-endian.
 ///
 /// The enum is listed with its values; reading any other value is
-/// [`BinaryDecodeError::InvalidEnum`] (C++ would take the value as is).
+/// [`DecodeError::InvalidEnum`] (C++ would take the value as is).
 ///
 /// ```
-/// use fdb_native_wire::binary::{from_slice, to_vec, Versioning};
+/// use fdb_native_wire::binary::{from_slice, to_vec, ReadVersioning, Versioning};
 ///
 /// // enum class TraceFlags : uint8_t { unsampled = 0, sampled = 1 };
 /// #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,25 +113,26 @@ impl<T> BinaryDeserializeOwned for T where T: for<'de> BinaryDeserialize<'de> {}
 ///     Sampled,
 /// }
 ///
-/// fdb_native_wire::binary_enum!(TraceFlags: u8 {
+/// fdb_native_wire::binary::binary_enum!(TraceFlags: u8 {
 ///     TraceFlags::Unsampled = 0,
 ///     TraceFlags::Sampled = 1,
 /// });
 ///
 /// let bytes = to_vec(&TraceFlags::Sampled, Versioning::Unversioned)?;
 /// assert_eq!(bytes, [1]);
-/// assert_eq!(from_slice::<TraceFlags>(&bytes, Versioning::Unversioned)?, TraceFlags::Sampled);
-/// assert!(from_slice::<TraceFlags>(&[2], Versioning::Unversioned).is_err());
+/// assert_eq!(from_slice::<TraceFlags>(&bytes, ReadVersioning::Unversioned)?, TraceFlags::Sampled);
+/// assert!(from_slice::<TraceFlags>(&[2], ReadVersioning::Unversioned).is_err());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+#[doc(hidden)]
 #[macro_export]
-macro_rules! binary_enum {
+macro_rules! __binary_enum {
     ($ty:ty : $repr:ty { $($variant:path = $value:expr),+ $(,)? }) => {
-        impl $crate::binary::BinarySerialize for $ty {
+        impl $crate::binary::Encode for $ty {
             fn serialize(
                 &self,
-                w: &mut $crate::binary::BinaryWriter,
-            ) -> ::core::result::Result<(), $crate::binary::BinaryEncodeError> {
+                w: &mut $crate::binary::Writer,
+            ) -> ::core::result::Result<(), $crate::binary::EncodeError> {
                 let value: $repr = match self {
                     $($variant => $value,)+
                 };
@@ -142,17 +140,17 @@ macro_rules! binary_enum {
             }
         }
 
-        impl<'de> $crate::binary::BinaryDeserialize<'de> for $ty {
+        impl<'de> $crate::binary::Decode<'de> for $ty {
             fn deserialize(
-                r: &mut $crate::binary::BinaryReader<'de>,
-            ) -> ::core::result::Result<Self, $crate::binary::BinaryDecodeError> {
+                r: &mut $crate::binary::Reader<'de>,
+            ) -> ::core::result::Result<Self, $crate::binary::DecodeError> {
                 let value: $repr = r.read()?;
                 $(
                     if value == $value {
                         return Ok($variant);
                     }
                 )+
-                Err($crate::binary::BinaryDecodeError::InvalidEnum {
+                Err($crate::binary::DecodeError::InvalidEnum {
                     ty: stringify!($ty),
                     value: value as u64,
                 })
@@ -160,3 +158,8 @@ macro_rules! binary_enum {
         }
     };
 }
+
+// `#[macro_export]` puts a macro at the crate root whatever the module it is written in. The
+// exported macro has a hidden name, and this re-export is the path to use:
+// `fdb_native_wire::binary::binary_enum!`.
+pub use crate::__binary_enum as binary_enum;

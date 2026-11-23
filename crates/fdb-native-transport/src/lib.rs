@@ -2,6 +2,10 @@
 //!
 //! A `Runtime` trait and a tokio adapter will live here.
 
+mod connect_packet;
+
+pub use connect_packet::{ConnectPacket, ConnectPacketError};
+
 #[cfg(test)]
 mod tests {
     #[test]
