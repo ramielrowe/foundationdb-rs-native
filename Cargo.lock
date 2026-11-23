@@ -409,6 +409,7 @@ version = "0.0.0"
 name = "fdb-native-testkit"
 version = "0.0.0"
 dependencies = [
+ "rcgen",
  "tempfile",
  "thiserror",
 ]
