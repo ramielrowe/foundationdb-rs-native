@@ -184,6 +184,20 @@
 //! offset, about `size_of::<T>() / 4` times the message size. Bound the size of
 //! untrusted messages before decoding them.
 //!
+//! # Performance
+//!
+//! A vector of integers, floats or `bool`s is written and read in one pass over its bytes,
+//! through the [`Encode::encode_inline_slice`] and [`Decode::decode_elements`] hooks that
+//! the scalar impls override (a stand-in for specialization): a `Vec<u8>` is one copy
+//! to decode, and a `Vec<u8>` or `&[u8]` is one copy to encode. (Decoding a borrowed
+//! `&[u8]` string or blob goes through [`Reader::blob`] and is zero-copy; it needs no
+//! hook.) The work-limit charges and bounds checks are those of element-wise decoding.
+//! The writer reuses its buffers between tables, looks vtables up in a hash index once a
+//! message has more than a handful, and clears only memory an earlier message wrote (so a
+//! new writer, as [`encode`] makes, clears nothing; a reused one clears what its previous
+//! messages used). `cargo bench -p fdb-native-wire --bench wire` measures encode and
+//! decode of representative messages, with a new writer and with a reused one.
+//!
 //! # File identifiers
 //!
 //! [`encode`] writes `T::FILE_IDENTIFIER` and [`decode`] checks it; use

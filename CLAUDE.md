@@ -95,6 +95,25 @@ FDB_GOLDEN_MESSAGES_BIN_8_0=$MSG/build-release-8.0/bin/golden_vectors_messages \
   cargo nextest run -p fdb-native-wire --run-ignored only -E 'test(cpp_crosscheck_release_readers)'
 ```
 
+`fdb-native-wire` has [divan](https://docs.rs/divan) benchmarks of encode and decode (eager and
+`VectorView`) for representative messages: a small request, a `GetKeyValuesReply`-like 1000-pair
+reply, a 1000-mutation commit, a 1 MiB `Vec<u8>`, 200 strings, and vtable-heavy tables. They are a
+dev-dependency only (divan's MSRV, 1.80, is below the workspace's 1.85) and `cargo bench` is not
+part of CI. Run them in release mode, filter by name after `--`, and compare runs by saving the
+output (divan has no baseline store; the median column is the stable one):
+
+```bash
+cargo bench -p fdb-native-wire --bench wire                    # everything (~1 min)
+cargo bench -p fdb-native-wire --bench wire -- commit          # one group: small, kv_reply, kv_table, commit, blob, strings_200, vtables, reuse
+DIVAN_MIN_TIME=4 perf record -g target/release/deps/wire-<hash> --bench commit::encode_   # profile one (perf is the tool used so far)
+```
+
+Any change to the writer or reader internals should keep encoder output byte-identical (the fixture
+round-trips and the C++ crosscheck do not catch a layout drift that still decodes) and the work-budget
+charges unchanged (`tools/golden-vectors/strict.h` mirrors them); `tests/bulk_vectors.rs` pins the
+bulk vector paths to the element-wise ones, and `tests/writer_reuse.rs` pins a reused `Writer` to a new one and
+the bytes of seeded messages (digests recorded from the pre-vvh.8 encoder).
+
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.
 

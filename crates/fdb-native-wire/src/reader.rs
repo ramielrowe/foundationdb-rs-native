@@ -39,7 +39,10 @@ pub const MAX_DEPTH: usize = 64;
 /// absent values, so a message of `n` bytes can decode into about `n / 4 ×
 /// size_of::<T>()` bytes of `T` (about 128 × `n` for a 512-byte `T`). Bound the size of untrusted messages before decoding them. Vectors
 /// reserve at most 64 KiB before their elements are decoded, so a large count in a
-/// malformed message does not allocate by itself.
+/// malformed message does not allocate by itself. (A vector of integers, floats or
+/// `bool`s is decoded in one pass over bytes the header showed to be in the message, and
+/// is allocated at its final size, never more than the message holds of it: a `Vec<u8>`
+/// of a 1 MiB blob is one 1 MiB copy.)
 ///
 /// The budget is shared with the [`VectorView`](crate::VectorView)s a decode creates: a
 /// view charges it as its elements are read, after the decode that created it has
@@ -361,7 +364,11 @@ impl<'de> Reader<'de> {
         })
     }
 
-    /// Decodes a vector of non-union elements whose offset is at position `at`.
+    /// Decodes a vector of non-union elements whose offset is at position `at`, for the
+    /// array and container impls. Inline elements are decoded as scalars of their type
+    /// (so a `bool` must be 0 or 1, as `std::array<bool, N>` and the elements of a
+    /// `std::set<bool>` are in C++: only `std::vector<bool>` is exempt, and that is
+    /// [`Vec<bool>`](Vec), which does not come through here).
     pub(crate) fn vector<T: Decode<'de>, C>(
         &self,
         at: usize,
@@ -373,10 +380,32 @@ impl<'de> Reader<'de> {
         for i in 0..header.len {
             push(
                 &mut out,
-                T::decode_element(self, header.first + i * header.stride)?,
+                self.container_element(header.first + i * header.stride)?,
             );
         }
         Ok(out)
+    }
+
+    /// Decodes the elements of the vector `header` describes one at a time: the default of
+    /// [`Decode::decode_elements`].
+    pub(crate) fn decode_elements<T: Decode<'de>>(
+        &self,
+        header: &VectorHeader,
+    ) -> Result<Vec<T>, DecodeError> {
+        let mut out = Vec::with_capacity(crate::codec::preallocation::<T>(header.len));
+        for i in 0..header.len {
+            out.push(T::decode_element(self, header.first + i * header.stride)?);
+        }
+        Ok(out)
+    }
+
+    /// Element `pos` of an array or container: the scalar decoding for inline types (not
+    /// [`Decode::decode_element`], which reads a `bool` as `std::vector<bool>` does).
+    fn container_element<T: Decode<'de>>(&self, pos: usize) -> Result<T, DecodeError> {
+        match T::SHAPE {
+            Shape::Inline { size, .. } => T::decode_inline(self.inline(pos, size)?),
+            _ => T::decode_element(self, pos),
+        }
     }
 
     /// Decodes a vector of unions from its tags slot and offsets slot positions.
