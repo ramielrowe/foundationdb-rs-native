@@ -3,8 +3,8 @@
 //! [`Runtime`] bundles the four things the transport needs from an async
 //! executor: TCP connect, timers (with a monotonic clock), task spawning, and
 //! DNS resolution. No executor-specific type appears in it, so the transport
-//! can run on any executor that has an adapter. The tokio adapter lives in
-//! the `tokio` submodule behind the default-on `tokio` cargo feature.
+//! can run on any executor that has an adapter. The tokio adapter,
+//! `TokioRuntime`, is behind the default-on `tokio` cargo feature.
 //!
 //! # Design
 //!
@@ -17,9 +17,13 @@
 //!   async I/O traits that smol, async-std and `futures-rustls` all speak.
 //!   M7 can wrap a stream in a TLS session without touching this trait.
 //!   tokio's own I/O traits are adapted inside the tokio adapter's stream.
-//! * **Own [`Instant`].** The clock is a plain [`Duration`] since an arbitrary
-//!   origin so that virtual clocks (tokio's paused time, [`ManualClock`]) are
-//!   representable. See [`Instant`].
+//! * **Own [`Instant`].** The clock is a plain [`Duration`] since a
+//!   process-wide epoch so that virtual clocks (tokio's paused time,
+//!   [`ManualClock`]) are representable and every runtime in the process
+//!   agrees on time. See [`Instant`].
+//! * **`Send` executors only.** Futures are `Send`, so thread-local (`!Send`)
+//!   executors such as `tokio::task::LocalSet` or smol's `LocalExecutor` are
+//!   not supported.
 //!
 //! # Contract
 //!
@@ -48,10 +52,19 @@
 //!
 //! Dropping a [`TaskHandle`] **detaches** the task: it keeps running to
 //! completion. Cancelling a task requires an explicit [`TaskHandle::abort`].
-//! (Adapters for executors whose handles cancel on drop, such as smol's
-//! `Task`, must detach in their handle's `Drop`.) An aborted task is dropped
-//! at its next suspension point: destructors run, but no further code from
-//! the task body does.
+//! An aborted task is dropped at its next suspension point: destructors run,
+//! but no further code from the task body does.
+//!
+//! Notes for adapter authors:
+//!
+//! * An adapter whose native task cancels on drop (smol's `Task`) must
+//!   detach in its handle's `Drop`.
+//! * `abort` takes `&self`, but such native handles consume `self` to cancel.
+//!   Wrap the task in an abortable future (an abort flag or channel the body
+//!   observes) rather than relying on the native handle.
+//! * A panic in the task must be caught (`catch_unwind`, or the executor's own
+//!   mechanism) and surface as [`JoinError::Panicked`] when the handle is
+//!   awaited; it must not tear down the executor or the awaiting task.
 //!
 //! ## Clocks
 //!
@@ -64,6 +77,10 @@
 //! completes before its deadline on that clock; it may complete somewhat
 //! later (tokio, for instance, rounds up to a millisecond). A deadline in the
 //! past completes at once.
+//!
+//! Sleeps drift if chained: `sleep(period)` in a loop adds the loop body's
+//! run time to every cycle. Schedule periodic work from deadlines instead:
+//! `next += period; sleep_until(next)`.
 //!
 //! ## Testing against virtual time
 //!
@@ -93,9 +110,11 @@ use futures_io::{AsyncRead, AsyncWrite};
 mod time;
 
 #[cfg(feature = "tokio")]
-pub mod tokio;
+mod tokio_rt;
 
 pub use time::{Instant, ManualClock};
+#[cfg(feature = "tokio")]
+pub use tokio_rt::{TokioRuntime, TokioStream, TokioTask};
 
 /// Capabilities the transport needs from an async executor.
 ///
@@ -138,12 +157,17 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// races this against [`sleep`](Runtime::sleep).
     fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 
-    /// Resolves `host_port`, in `host:port` form (`localhost:4500`,
-    /// `10.0.0.1:4500`, `[::1]:4500`), to every address the name maps to, in
-    /// resolver order. Callers should treat an empty `Vec` as "no addresses".
+    /// Resolves `host` to every address it maps to, each paired with `port`,
+    /// in resolver order. `host` is a DNS name or an IP literal *without*
+    /// brackets (`localhost`, `10.0.0.1`, `::1`). Callers should treat an empty
+    /// `Vec` as "no addresses".
     ///
-    /// Literal IP addresses resolve without I/O.
-    fn resolve(&self, host_port: &str) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send;
+    /// IP literals resolve without I/O.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send;
 }
 
 /// A handle to a spawned task.
@@ -270,7 +294,7 @@ mod tests {
         async fn connect(&self, _: SocketAddr) -> io::Result<NullStream> {
             Ok(NullStream)
         }
-        async fn resolve(&self, _: &str) -> io::Result<Vec<SocketAddr>> {
+        async fn resolve(&self, _: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
             Ok(Vec::new())
         }
     }
@@ -281,6 +305,18 @@ mod tests {
         rt.connect(addr).await
     }
 
+    /// Generic code of the shape the transport will have: spawns a task that
+    /// owns the runtime handle and a stream. This fails to compile if the
+    /// trait's `Send`/`'static` bounds regress.
+    pub(crate) fn spawn_connection<R: Runtime>(rt: R, addr: SocketAddr) -> R::Task<()> {
+        let rt2 = rt.clone();
+        rt.spawn(async move {
+            let stream = rt2.connect(addr).await.unwrap();
+            rt2.sleep(Duration::from_millis(1)).await;
+            drop(stream);
+        })
+    }
+
     #[test]
     fn trait_is_implementable_without_tokio() {
         let rt = NullRuntime::default();
@@ -288,6 +324,8 @@ mod tests {
         futures_lite::future::block_on(async {
             backoff_then_connect(&rt, addr).await.unwrap();
             let task = rt.spawn(async { 7_u8 });
+            assert_eq!(task.await, Err(JoinError::Aborted));
+            let task = spawn_connection(rt.clone(), addr);
             assert_eq!(task.await, Err(JoinError::Aborted));
         });
         assert_eq!(rt.now(), Instant::from_origin(Duration::from_millis(50)));
