@@ -1,9 +1,23 @@
+# Docker-backed tests each start their own FDB container (~4s each). Cap how many run at once
+# so the Docker daemon is not overloaded. Convention: Docker tests live in an integration-test
+# binary named `docker`, or have a name starting with `docker_`.
+[test-groups]
+docker = { max-threads = 4 }
+
 [profile.default]
 fail-fast = true
+
+[[profile.default.overrides]]
+filter = 'binary(docker) | test(/(^|::)docker_/)'
+test-group = 'docker'
 
 [profile.ci]
 fail-fast = false
 retries = 0
+
+[[profile.ci.overrides]]
+filter = 'binary(docker) | test(/(^|::)docker_/)'
+test-group = 'docker'
 
 [profile.ci.junit]
 path = "junit.xml"

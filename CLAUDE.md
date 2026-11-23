@@ -92,6 +92,9 @@ targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crate
 - **Docker-backed tests**: tests that need a live FDB container are marked
   `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`.
   The `FDB_IMAGE` env var selects the image (default `foundationdb/foundationdb:7.4.10`).
+  Docker tests live in an integration-test binary named `docker` (or are named `docker_*`) so the
+  nextest `docker` test group in `.config/nextest.toml` caps them at 4 concurrent containers.
+  The testkit API is blocking; start containers outside an async runtime or via `spawn_blocking`.
 - **Safety rule**: tests must only ever target disposable containers started by
   `fdb-native-testkit`, never a shared or long-lived cluster. A malformed packet can make an
   FDB 7.4/8.0 server process exit.

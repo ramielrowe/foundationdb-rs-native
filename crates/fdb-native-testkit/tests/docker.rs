@@ -1,6 +1,8 @@
 //! Docker-backed integration tests. Run with `cargo nextest run --run-ignored only`.
 //!
-//! Every test only touches containers created by the test itself.
+//! Every test only touches containers created by the test itself. This binary is named
+//! `docker`, which puts its tests in the nextest `docker` test group (see
+//! `.config/nextest.toml`).
 
 use std::fs;
 use std::process::Command;
@@ -8,14 +10,42 @@ use std::time::Duration;
 
 use fdb_native_testkit::{Error, FdbContainer};
 
-/// Returns whether `docker inspect <id-or-name>` succeeds (i.e. the container exists).
-fn container_exists(id_or_name: &str) -> bool {
+fn docker_output(args: &[&str]) -> std::process::Output {
     Command::new("docker")
-        .args(["inspect", id_or_name])
+        .args(args)
         .output()
         .expect("docker must be installed")
-        .status
-        .success()
+}
+
+/// Returns whether `docker inspect <id-or-name>` succeeds (i.e. the container exists).
+fn container_exists(id_or_name: &str) -> bool {
+    docker_output(&["inspect", id_or_name]).status.success()
+}
+
+fn is_running(id: &str) -> bool {
+    let out = docker_output(&["inspect", "-f", "{{.State.Running}}", id]);
+    String::from_utf8_lossy(&out.stdout).trim() == "true"
+}
+
+/// Names of the volumes mounted in the container.
+fn volume_names(id: &str) -> Vec<String> {
+    let out = docker_output(&[
+        "inspect",
+        "-f",
+        "{{range .Mounts}}{{.Name}}{{\"\\n\"}}{{end}}",
+        id,
+    ]);
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn volume_exists(name: &str) -> bool {
+    docker_output(&["volume", "inspect", name]).status.success()
 }
 
 #[test]
@@ -46,15 +76,23 @@ fn starts_ready_container_and_removes_it_on_drop() {
     );
 
     // The container carries our label.
-    let labels = Command::new("docker")
-        .args(["inspect", "-f", "{{json .Config.Labels}}", &id])
-        .output()
-        .expect("docker inspect");
+    let labels = docker_output(&["inspect", "-f", "{{json .Config.Labels}}", &id]);
     assert!(String::from_utf8_lossy(&labels.stdout).contains("\"fdb-native-testkit\":\"1\""));
+
+    // The image declares VOLUME /var/fdb/data, so there is an anonymous volume to clean up.
+    let volumes = volume_names(&id);
+    assert!(!volumes.is_empty(), "expected an anonymous data volume");
+    assert!(volumes.iter().all(|v| volume_exists(v)));
 
     drop(fdb);
 
     assert!(!container_exists(&id), "container must be gone after drop");
+    for v in &volumes {
+        assert!(
+            !volume_exists(v),
+            "volume {v} must be removed with the container"
+        );
+    }
     assert!(
         !cluster_file.exists(),
         "cluster file must be gone after drop"
@@ -97,11 +135,41 @@ fn failed_startup_returns_error_and_leaks_nothing() {
 #[ignore = "requires docker"]
 fn readiness_timeout_returns_error_and_removes_container() {
     let name = format!("fdb-native-test-timeout-{}", std::process::id());
+    // The server needs seconds to come up and readiness takes several polling steps, so this
+    // short but real timeout is always exceeded, after at least one polling iteration.
     let err = FdbContainer::builder()
         .name(name.clone())
-        .startup_timeout(Duration::from_millis(1))
+        .startup_timeout(Duration::from_millis(500))
         .start()
-        .expect_err("a 1ms deadline cannot be met");
+        .expect_err("a 500ms readiness deadline cannot be met");
     assert!(matches!(err, Error::NotReady { .. }), "got {err:?}");
     assert!(!container_exists(&name), "container must be removed");
+}
+
+#[test]
+#[ignore = "requires docker"]
+fn name_collision_fails_without_touching_the_existing_container() {
+    let name = format!("fdb-native-test-collision-{}", std::process::id());
+    let first = FdbContainer::builder()
+        .name(name.clone())
+        .start()
+        .expect("first container");
+    let first_id = first.id().to_owned();
+
+    let err = FdbContainer::builder()
+        .name(name)
+        .start()
+        .expect_err("a duplicate name must fail");
+    assert!(matches!(err, Error::Docker { .. }), "got {err:?}");
+
+    assert!(container_exists(&first_id));
+    assert!(
+        is_running(&first_id),
+        "first container must still be running"
+    );
+    let status = first.fdbcli("status minimal").expect("first still serves");
+    assert!(status.contains("The database is available"));
+
+    drop(first);
+    assert!(!container_exists(&first_id));
 }
