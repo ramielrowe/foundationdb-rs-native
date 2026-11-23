@@ -120,6 +120,28 @@ impl ClusterInfo {
         Some(&self.commit_proxies)
     }
 
+    /// The ids of the GRV proxies the client uses, in order.
+    pub fn grv_proxy_ids(&self) -> Vec<Uid> {
+        self.grv_proxies.iter().map(|p| p.proxy.id()).collect()
+    }
+
+    /// The ids of the commit proxies the client uses, in order.
+    pub fn commit_proxy_ids(&self) -> Vec<Uid> {
+        self.commit_proxies.iter().map(|p| p.proxy.id()).collect()
+    }
+
+    /// The first commit proxy of the full list the coordinator sent, with its endpoints: C++'s
+    /// `firstCommitProxy` (kept when `shrinkProxyList` sampled the list), which
+    /// `commitOnFirstProxy` transactions commit to. It need not be one of
+    /// [`commit_proxies`](Self::commit_proxies). `None` while there are no commit proxies.
+    pub fn first_commit_proxy(&self) -> Option<CommitProxyEndpoints> {
+        self.client_info
+            .commit_proxies
+            .first()
+            .cloned()
+            .map(CommitProxyEndpoints::new)
+    }
+
     /// Whether both proxy kinds are available.
     pub fn has_proxies(&self, use_provisional: bool) -> bool {
         self.available_grv_proxies(use_provisional).is_some()
@@ -137,6 +159,15 @@ pub(crate) struct ProxySampler {
 }
 
 impl ProxySampler {
+    /// Whether no sample is cached (for tests).
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.commit_ids.is_empty()
+            && self.commit.is_empty()
+            && self.grv_ids.is_empty()
+            && self.grv.is_empty()
+    }
+
     /// The proxies to use from `info`.
     pub(crate) fn sample(
         &mut self,

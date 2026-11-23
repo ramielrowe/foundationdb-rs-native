@@ -28,6 +28,18 @@ pub const CLUSTER_FILE_HEADER: &str =
 ///   the file is atomically replaced with the new string.
 /// * [`file`](ConnectionRecord::file) is `ClusterConnectionFile(filename, contents)`: a file
 ///   that is to hold `connection_string`; it is written once a coordinator has answered.
+///
+/// **Blocking I/O.** The file is read before every request and written after a move with
+/// plain synchronous `std::fs` calls on the monitor's task, as C++ does on its network
+/// thread: the file is small (at most 60000 bytes) and this happens once per long-poll
+/// reply or failed attempt, but on a slow or network file system it briefly blocks the
+/// executor thread the monitor runs on. Use [`memory`](ConnectionRecord::memory) to avoid
+/// any file access. The write cannot be interrupted half-way: it has no suspension point.
+///
+/// **Ownership and mode.** Replacing the file keeps its owner, group and permission bits,
+/// as C++'s `atomicReplace` does (`flow/Platform.actor.cpp` 7.4:2370-2405): the temporary
+/// file is `fchown`ed and `chmod`ed to match before it is written and renamed over the old
+/// one, and the write fails (leaving the old file) if either cannot be done.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionRecord {
     pub(crate) connection_string: ClusterConnectionString,
@@ -141,22 +153,43 @@ impl From<ClusterFile> for ConnectionRecord {
     }
 }
 
-/// `atomicReplace`: writes a sibling temporary file, syncs it, and renames it over `path`.
-fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// `atomicReplace` (`flow/Platform.actor.cpp` 7.4:2370-2440): writes a sibling temporary
+/// file with the owner, group and mode of the file it replaces (if that exists), syncs it,
+/// and renames it over `path`. Fails, removing the temporary file and leaving `path` alone,
+/// if the old file cannot be examined (other than not existing) or its owner or mode cannot
+/// be copied, as C++ does.
+pub(crate) fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
     let mut name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
         .to_os_string();
+    let old = match fs::metadata(path) {
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     name.push(format!(".{}-{n}.part", std::process::id()));
     let temp = path.with_file_name(name);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
     let result = (|| {
-        let mut file = fs::File::create(&temp)?;
+        if let Some(old) = &old {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()))?;
+            }
+            file.set_permissions(old.permissions())?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temp, path)
     })();
+    drop(file);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }

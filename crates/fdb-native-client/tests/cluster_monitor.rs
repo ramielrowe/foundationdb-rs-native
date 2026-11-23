@@ -148,7 +148,7 @@ async fn first_info_then_long_poll() {
     let call = coord.next_call().await;
     assert_eq!(call.request.known_client_info_id, info2.id);
     call.reply(&info2);
-    let got = monitor.changed().await.unwrap();
+    let got = monitor.changed_since(&got).await.unwrap();
     assert_eq!((got.id(), got.sequence), (info2.id, 3));
 
     let status = monitor.status();
@@ -163,7 +163,9 @@ async fn first_info_then_long_poll() {
     let _outstanding = coord.next_call().await;
     monitor.shutdown().await;
     assert!(monitor.is_closed());
-    assert_eq!(monitor.changed().await, Err(MonitorClosed));
+    assert_eq!(monitor.changed_after(3).await, Err(MonitorClosed));
+    // Infos already published are still returned.
+    assert_eq!(monitor.changed_after(2).await.unwrap().sequence, 3);
     // The watch still gets what it has not seen, then the end.
     assert_eq!(watch.changed().await.unwrap().sequence, 3);
     assert_eq!(watch.changed().await, Err(MonitorClosed));
@@ -234,7 +236,7 @@ async fn failover_between_coordinators() {
     );
     let info2 = info(2, 1, 1, SchemaVersion::V7_4);
     call.reply(&info2);
-    let got = monitor.changed().await.unwrap();
+    let got = monitor.changed_after(1).await.unwrap();
     assert_eq!(got.id(), info2.id);
     assert_eq!(got.coordinator.addr, coords[c].addr);
 
@@ -257,7 +259,7 @@ async fn failover_between_coordinators() {
     }
     call.reply(&info(3, 1, 1, SchemaVersion::V7_4));
     assert_eq!(
-        monitor.changed().await.unwrap().coordinator.addr,
+        monitor.changed_after(2).await.unwrap().coordinator.addr,
         coords[d].addr
     );
     assert!(
@@ -433,7 +435,7 @@ async fn cluster_file_changes_are_reported_then_adopted() {
     assert!(call.request.issues.is_empty());
     std::fs::write(&path, "test:abc@10.0.0.2:4500\n").unwrap();
     call.reply(&info(2, 1, 1, SchemaVersion::V7_4));
-    monitor.changed().await.unwrap();
+    monitor.changed_after(1).await.unwrap();
     let call = old.next_call().await;
     assert_eq!(
         call.request.issues,
@@ -441,7 +443,7 @@ async fn cluster_file_changes_are_reported_then_adopted() {
     );
     // As long as a coordinator answers, the file is not adopted.
     call.reply(&info(3, 1, 1, SchemaVersion::V7_4));
-    monitor.changed().await.unwrap();
+    monitor.changed_after(2).await.unwrap();
     let call = old.next_call().await;
     assert_eq!(
         call.request.issues,
@@ -459,7 +461,10 @@ async fn cluster_file_changes_are_reported_then_adopted() {
         format!("{CLUSTER_FILE_HEADER}test:abc@10.0.0.2:4500\n")
     );
     call.reply(&info(4, 1, 1, SchemaVersion::V7_4));
-    assert_eq!(monitor.changed().await.unwrap().coordinator.addr, new.addr);
+    assert_eq!(
+        monitor.changed_after(3).await.unwrap().coordinator.addr,
+        new.addr
+    );
     monitor.shutdown().await;
 }
 
@@ -528,7 +533,7 @@ async fn recovery_without_proxies_then_provisional_then_recovered() {
         cp.provisional = true;
     }
     coord.next_call().await.reply(&provisional);
-    let got = monitor.changed().await.unwrap();
+    let got = monitor.changed_since(&got).await.unwrap();
     assert!(got.is_provisional());
     assert!(got.available_grv_proxies(false).is_none());
     assert_eq!(got.available_grv_proxies(true).unwrap().len(), 1);
