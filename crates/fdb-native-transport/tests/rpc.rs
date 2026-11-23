@@ -275,7 +275,7 @@ fn send_with_writes_the_callers_encoding() {
         })
         .unwrap_err();
     assert_eq!(err, RequestError::Encode(EncodeError::TooLarge));
-    assert!(err.is_retryable() && !err.maybe_delivered());
+    assert!(err.certainly_not_delivered() && !err.should_retry() && !err.maybe_delivered());
     assert_eq!(registry.len(), 1);
     assert!(server.read(&mut conn).is_empty());
 }
@@ -294,7 +294,7 @@ fn a_server_error_reply_maps_to_an_fdb_error() {
     let err = decode_reply::<EchoReply>(c.result.as_ref().unwrap()).unwrap_err();
     assert_eq!(err, RequestError::Fdb(FdbError::new(1020)));
     assert_eq!(err.fdb_code(), 1020);
-    assert!(!err.is_retryable() && !err.maybe_delivered());
+    assert!(!err.certainly_not_delivered() && !err.should_retry() && !err.maybe_delivered());
     // An error reply does not fail the endpoint.
     assert_eq!(registry.endpoint_failure(EP_A), None);
     assert!(send_echo(&mut registry, &mut conn, EP_A, 2, 0).is_ok());
@@ -313,6 +313,19 @@ fn a_reply_with_another_file_identifier_is_a_decode_error() {
         })
     );
     assert_eq!(err.fdb_code(), error_code::SERIALIZATION_FAILED);
+    assert!(err.maybe_committed() && !err.certainly_not_delivered());
+    // A reply whose ErrorOr has no arm set decodes as default_error_or: maybe delivered.
+    let empty = fdb_native_wire::encode_with_identifier(
+        &fdb_native_wire::Void,
+        <ErrorOr<EnsureTable<EchoReply>>>::FILE_IDENTIFIER.value(),
+    )
+    .unwrap();
+    let err = decode_reply::<EchoReply>(&empty).unwrap_err();
+    assert_eq!(
+        err,
+        RequestError::Fdb(FdbError::new(error_code::DEFAULT_ERROR_OR))
+    );
+    assert!(err.maybe_committed() && !err.certainly_not_delivered());
     // The error arm is checked too: it travels with the reply type's identifier.
     let envelope: ErrorOr<EnsureTable<OtherReply>> = Err(FdbError::new(1020));
     let bytes = fdb_native_wire::encode(&envelope).unwrap();
@@ -412,7 +425,7 @@ fn endpoint_not_found_fails_every_request_to_that_endpoint() {
         pending_error.fdb_code(),
         error_code::REQUEST_MAYBE_DELIVERED
     );
-    assert!(pending_error.maybe_delivered() && !pending_error.is_retryable());
+    assert!(pending_error.maybe_delivered() && !pending_error.certainly_not_delivered());
     assert!(!conn.is_registered(a1) && !conn.is_registered(a2));
     assert!(conn.is_registered(b));
     assert_eq!(registry.len(), 1);
@@ -434,7 +447,7 @@ fn endpoint_not_found_fails_every_request_to_that_endpoint() {
             maybe_delivered: false
         }
     );
-    assert!(err.is_retryable() && !err.maybe_delivered());
+    assert!(err.should_retry() && err.certainly_not_delivered() && !err.maybe_delivered());
     assert!(server.read(&mut conn).is_empty());
 
     // A repeated notice is not reported again.
@@ -497,7 +510,7 @@ fn an_unauthorized_endpoint_fails_its_requests() {
         ]
     );
     assert_eq!(err.fdb_code(), error_code::UNAUTHORIZED_ATTEMPT);
-    assert!(!err.is_retryable() && !err.maybe_delivered());
+    assert!(err.certainly_not_delivered() && !err.should_retry() && !err.maybe_delivered());
     assert_eq!(
         send_echo(&mut registry, &mut conn, EP_A, 3, 0),
         Err(err.clone())
@@ -551,8 +564,9 @@ fn a_broken_promise_reply_fails_the_endpoint() {
     );
     let err = decode_reply::<EchoReply>(&error_reply(1100)).unwrap_err();
     assert_eq!(err, RequestError::BrokenPromise);
-    assert_eq!(err.fdb_code(), error_code::BROKEN_PROMISE);
-    assert!(err.maybe_committed() && !err.is_retryable());
+    // tryGetReply reports a broken promise as request_maybe_delivered.
+    assert_eq!(err.fdb_code(), error_code::REQUEST_MAYBE_DELIVERED);
+    assert!(err.maybe_committed() && !err.certainly_not_delivered());
     assert_eq!(registry.state(b), Some(RequestState::Sent));
     assert!(!conn.is_registered(a2));
 
@@ -602,7 +616,7 @@ fn a_connection_lost_before_the_handshake_did_not_send() {
         ]
     );
     assert_eq!(not_sent.fdb_code(), error_code::CONNECTION_FAILED);
-    assert!(not_sent.is_retryable() && !not_sent.maybe_committed());
+    assert!(not_sent.should_retry() && !not_sent.maybe_committed());
     assert!(registry.is_empty());
 }
 
@@ -641,9 +655,10 @@ fn a_connection_lost_after_sending_may_have_delivered() {
     // Queued before the handshake, sent when it completes.
     let a = send_echo(&mut registry, &mut conn, EP_A, 1, 0).unwrap();
     conn.recv(&server_hello(), t(10));
-    // Sent between the handshake and the draining of its event: already sent.
+    // Sent between the handshake and the draining of its event: already sent, and the
+    // connection says the held request was released, so it is sent too.
     let b = send_echo(&mut registry, &mut conn, EP_B, 2, 0).unwrap();
-    assert_eq!(registry.state(a), Some(RequestState::Queued));
+    assert_eq!(registry.state(a), Some(RequestState::Sent));
     assert_eq!(registry.state(b), Some(RequestState::Sent));
     let events = drain(&mut registry, &mut conn);
     assert!(matches!(events[..], [RpcEvent::Connected { .. }]));
@@ -662,9 +677,9 @@ fn a_connection_lost_after_sending_may_have_delivered() {
     );
     for c in done {
         let err = c.result.as_ref().unwrap_err();
-        assert_eq!(err, &RequestError::MaybeDelivered(error.clone()));
+        assert_eq!(err, &RequestError::MaybeDelivered(Some(error.clone())));
         assert_eq!(err.fdb_code(), error_code::REQUEST_MAYBE_DELIVERED);
-        assert!(err.maybe_committed() && !err.is_retryable());
+        assert!(err.maybe_committed() && !err.certainly_not_delivered());
     }
     assert_eq!(events.last(), Some(&RpcEvent::Closed(error)));
     assert!(registry.is_empty());
@@ -801,7 +816,7 @@ fn the_pending_count_is_capped() {
     assert_eq!(server.requests(&mut conn).len(), 3);
     let err = send_echo(&mut registry, &mut conn, EP_A, 3, 0).unwrap_err();
     assert_eq!(err, RequestError::TooManyPending { limit: 3 });
-    assert!(err.is_retryable() && !err.maybe_delivered());
+    assert!(err.should_retry() && !err.maybe_delivered());
     assert!(server.read(&mut conn).is_empty());
     // A completion makes room.
     conn.recv(&frame(first, &ok_reply(0)), t(20));
@@ -826,7 +841,7 @@ fn backpressure_is_passed_on_and_sends_nothing() {
     };
     assert!(sent > 0);
     assert_eq!(err, RequestError::Backpressure);
-    assert!(err.is_retryable() && !err.maybe_delivered());
+    assert!(err.should_retry() && !err.maybe_delivered());
     assert_eq!(registry.len(), sent as usize);
     // Writing the output makes room again.
     let n = conn.pending_output().len();
@@ -859,67 +874,105 @@ fn a_request_larger_than_a_frame_is_refused() {
 #[test]
 fn error_classification() {
     let conn_err = ConnectionError::Idle;
-    let cases: Vec<(RequestError, u16, bool, bool)> = vec![
-        (RequestError::Fdb(FdbError::new(1020)), 1020, false, false),
-        (RequestError::Fdb(FdbError::new(1021)), 1021, false, true),
-        (RequestError::Fdb(FdbError::new(1030)), 1030, false, true),
-        (RequestError::BrokenPromise, 1100, false, true),
+    let ep_pending = RequestError::EndpointNotFound {
+        token: EP_A,
+        maybe_delivered: true,
+    };
+    let ep_refused = RequestError::EndpointNotFound {
+        token: EP_A,
+        maybe_delivered: false,
+    };
+    let cases: Vec<(RequestError, u16, bool, bool, bool)> = vec![
         (
-            RequestError::MaybeDelivered(conn_err.clone()),
-            1030,
+            RequestError::Fdb(FdbError::new(1020)),
+            1020,
+            false,
+            false,
+            false,
+        ),
+        (
+            RequestError::Fdb(FdbError::new(1021)),
+            1021,
+            false,
             false,
             true,
         ),
-        (RequestError::NotSent(Some(conn_err)), 1026, true, false),
-        (RequestError::NotSent(None), 1026, true, false),
         (
-            RequestError::EndpointNotFound {
-                token: EP_A,
-                maybe_delivered: true,
-            },
+            RequestError::Fdb(FdbError::new(1030)),
             1030,
+            false,
             false,
             true,
         ),
+        // An ErrorOr with no arm set: delivered, outcome unknown.
         (
-            RequestError::EndpointNotFound {
-                token: EP_A,
-                maybe_delivered: false,
-            },
+            RequestError::Fdb(FdbError::new(1035)),
+            1035,
+            false,
+            false,
+            true,
+        ),
+        (RequestError::BrokenPromise, 1030, false, false, true),
+        (
+            RequestError::MaybeDelivered(Some(conn_err.clone())),
             1030,
+            false,
+            false,
+            true,
+        ),
+        (RequestError::MaybeDelivered(None), 1030, false, false, true),
+        (
+            RequestError::NotSent(Some(conn_err)),
+            1026,
+            true,
             true,
             false,
         ),
+        (RequestError::NotSent(None), 1026, true, true, false),
+        (ep_pending, 1030, false, false, true),
+        (ep_refused, 1030, true, true, false),
         (
             RequestError::Unauthorized { token: EP_A },
             6001,
+            true,
             false,
             false,
         ),
+        // A reply came but cannot be read: delivered, outcome unknown.
         (
             RequestError::Decode(DecodeError::TooShort { len: 0 }),
             1044,
             false,
             false,
+            true,
         ),
         (
             RequestError::Encode(EncodeError::TooLarge),
             4100,
             true,
             false,
+            false,
         ),
-        (RequestError::Cancelled, 1101, false, true),
-        (RequestError::Backpressure, 1026, true, false),
-        (RequestError::TooManyPending { limit: 1 }, 1026, true, false),
+        (RequestError::Cancelled, 1101, false, false, true),
+        (RequestError::Backpressure, 1026, true, true, false),
+        (
+            RequestError::TooManyPending { limit: 1 },
+            1026,
+            true,
+            true,
+            false,
+        ),
     ];
-    for (err, code, retryable, maybe) in cases {
+    for (err, code, not_delivered, retry, maybe) in cases {
         assert_eq!(err.fdb_code(), code, "{err:?}");
         assert_eq!(err.fdb_error(), FdbError::new(code), "{err:?}");
-        assert_eq!(err.is_retryable(), retryable, "{err:?}");
+        assert_eq!(err.certainly_not_delivered(), not_delivered, "{err:?}");
+        assert_eq!(err.should_retry(), retry, "{err:?}");
         assert_eq!(err.maybe_delivered(), maybe, "{err:?}");
         assert_eq!(err.maybe_committed(), maybe, "{err:?}");
-        // Never both: a retryable error is one that was certainly not delivered.
-        assert!(!(retryable && maybe), "{err:?}");
+        // Never both; and only what was certainly not delivered is retried.
+        assert!(!(not_delivered && maybe), "{err:?}");
+        assert!(!retry || not_delivered, "{err:?}");
         assert!(!err.to_string().is_empty());
     }
     assert_eq!(
@@ -1049,7 +1102,8 @@ fn run(ops: &[Op]) -> Vec<RpcEvent<u32>> {
                         _ => (ok_reply(u64::from(key)), None),
                     };
                     conn.recv(&frame(m.token, &payload), t(now));
-                    expect.insert(key, Ok(code));
+                    // broken_promise decodes as BrokenPromise, whose code is 1030.
+                    expect.insert(key, Ok(code.map(|c| if c == 1100 { 1030 } else { c })));
                     if code == Some(1100) && !failed.contains_key(&m.endpoint) {
                         failed.insert(m.endpoint, EndpointFailure::NotFound);
                         fail_endpoint(&mut pending, &mut expect, m.endpoint, |token| {
@@ -1099,7 +1153,7 @@ fn run(ops: &[Op]) -> Vec<RpcEvent<u32>> {
                         expect.insert(
                             key,
                             Err(if m.sent {
-                                RequestError::MaybeDelivered(ConnectionError::LocalClose)
+                                RequestError::MaybeDelivered(Some(ConnectionError::LocalClose))
                             } else {
                                 RequestError::NotSent(Some(ConnectionError::LocalClose))
                             }),
@@ -1183,5 +1237,472 @@ proptest! {
         let first = run(&ops);
         // Deterministic: the same operations give the same events.
         prop_assert_eq!(run(&ops), first);
+    }
+}
+
+// ---- review reproductions ------------------------------------------------------------------
+
+/// Runs a call that misuses the registry: it `debug_assert`s in a debug build (and still
+/// leaves the registry consistent), and goes through otherwise.
+fn misuse<R>(f: impl FnOnce() -> R) -> Option<R> {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    assert_eq!(
+        r.is_err(),
+        cfg!(debug_assertions),
+        "debug_assert in debug builds only"
+    );
+    r.ok()
+}
+
+/// Every reply token in any request frame the client wrote.
+#[derive(Default)]
+struct Wiretap {
+    dec: Option<FrameDecoder>,
+    hello: bool,
+    seen: HashSet<Uid>,
+}
+
+impl Wiretap {
+    fn write(&mut self, conn: &mut Connection) {
+        let out = conn.pending_output().to_vec();
+        conn.consume_output(out.len());
+        let dec = self
+            .dec
+            .get_or_insert_with(|| FrameDecoder::before_handshake(frame_config()));
+        dec.push(&out);
+        if !self.hello {
+            match ConnectPacket::decode(dec.peek()) {
+                Ok((_, n)) => {
+                    self.hello = true;
+                    dec.consume(n).unwrap();
+                }
+                Err(_) => return,
+            }
+        }
+        while let Some(f) = dec.next_frame().expect("framing") {
+            if f.token == well_known::PING_PACKET {
+                continue;
+            }
+            let r: EchoRequest = fdb_native_wire::decode(f.payload).expect("echo");
+            self.seen.insert(r.reply.token());
+        }
+    }
+}
+
+#[test]
+fn a_connection_dropped_undrained_fails_its_requests_as_maybe_delivered() {
+    let mut reg = Registry::new(registry_config(1));
+    let mut a = Connection::new(conn_config(), t(0));
+    let mut tap = Wiretap::default();
+    let tok = send_echo(&mut reg, &mut a, EP_A, 1, 0).unwrap();
+    assert_eq!(reg.state(tok), Some(RequestState::Queued));
+    a.recv(&server_hello(), t(1)); // established: the held frame is now output
+    tap.write(&mut a); // and the server has it
+    assert!(tap.seen.contains(&tok));
+    // Driver bug: `a` is dropped without draining it through the registry.
+    drop(a);
+    let mut b = Connection::new(conn_config(), t(2));
+    b.io_error(std::io::ErrorKind::ConnectionRefused, t(3));
+    let mut events = misuse(|| drain(&mut reg, &mut b)).unwrap_or_default();
+    events.extend(drain(&mut reg, &mut b));
+    assert_eq!(
+        events,
+        vec![
+            RpcEvent::Completion(Completion {
+                key: 1,
+                reply_token: tok,
+                endpoint: EP_A,
+                result: Err(RequestError::MaybeDelivered(None)),
+            }),
+            RpcEvent::Closed(ConnectionError::Io(std::io::ErrorKind::ConnectionRefused)),
+        ]
+    );
+    let err = RequestError::MaybeDelivered(None);
+    assert!(err.maybe_committed() && !err.certainly_not_delivered());
+}
+
+#[test]
+fn the_registry_is_bound_to_its_connection() {
+    let mut reg = Registry::new(registry_config(1));
+    let mut a = Connection::new(conn_config(), t(0));
+    let tok = send_echo(&mut reg, &mut a, EP_A, 1, 0).unwrap();
+    let mut b = Connection::new(conn_config(), t(0));
+    assert_ne!(a.id(), b.id());
+    // Cancelling through the wrong connection fails the request instead (its state on `a`
+    // is unknown) and returns nothing.
+    assert_eq!(misuse(|| reg.cancel(&mut b, tok)).flatten(), None);
+    assert!(reg.is_empty());
+    assert_eq!(
+        completions(&drain(&mut reg, &mut b))
+            .iter()
+            .map(|c| (c.key, c.result.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, Err(RequestError::MaybeDelivered(None)))]
+    );
+    // The token is still registered on `a` until the registry sees `a` again.
+    assert!(a.is_registered(tok));
+    assert_eq!(reg.poll_event(&mut a), None);
+    assert!(!a.is_registered(tok), "token leaked on the real connection");
+}
+
+#[test]
+fn a_close_consumed_elsewhere_still_completes_the_requests() {
+    let mut reg = Registry::new(registry_config(1));
+    let (mut conn, mut server) = connected(&mut reg);
+    let tok = send_echo(&mut reg, &mut conn, EP_A, 1, 0).unwrap();
+    server.requests(&mut conn);
+    conn.io_error(std::io::ErrorKind::ConnectionReset, t(20));
+    // Someone polls the connection directly and takes its Closed.
+    while conn.poll_event().is_some() {}
+    let error = ConnectionError::Io(std::io::ErrorKind::ConnectionReset);
+    assert_eq!(
+        drain(&mut reg, &mut conn),
+        vec![RpcEvent::Completion(Completion {
+            key: 1,
+            reply_token: tok,
+            endpoint: EP_A,
+            result: Err(RequestError::MaybeDelivered(Some(error))),
+        })]
+    );
+    assert!(reg.is_empty());
+}
+
+#[test]
+fn a_connected_event_consumed_elsewhere_still_counts_the_handshake() {
+    let mut reg = Registry::new(registry_config(1));
+    let mut conn = Connection::new(conn_config(), t(0));
+    let mut tap = Wiretap::default();
+    let tok = send_echo(&mut reg, &mut conn, EP_A, 1, 0).unwrap();
+    conn.recv(&server_hello(), t(1));
+    // Someone takes the Connected event; the held request goes out.
+    while conn.poll_event().is_some() {}
+    assert!(conn.was_established());
+    tap.write(&mut conn);
+    assert!(tap.seen.contains(&tok));
+    conn.io_error(std::io::ErrorKind::ConnectionReset, t(2));
+    let events = drain(&mut reg, &mut conn);
+    let done = completions(&events);
+    assert!(
+        matches!(
+            done[..],
+            [Completion {
+                result: Err(RequestError::MaybeDelivered(Some(_))),
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_broken_promise_with_another_file_identifier_is_maybe_delivered() {
+    let mut reg = Registry::new(registry_config(1));
+    let (mut conn, mut server) = connected(&mut reg);
+    let tok = send_echo(&mut reg, &mut conn, EP_A, 1, 0).unwrap();
+    server.requests(&mut conn);
+    let env: ErrorOr<EnsureTable<OtherReply>> = Err(FdbError::new(1100));
+    conn.recv(&frame(tok, &fdb_native_wire::encode(&env).unwrap()), t(20));
+    let events = drain(&mut reg, &mut conn);
+    // The endpoint is failed (the envelope says broken_promise)...
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RpcEvent::EndpointFailed { .. }))
+    );
+    // ...and the request, whose reply cannot be decoded, is maybe delivered.
+    let c = completions(&events);
+    let err = decode_reply::<EchoReply>(c[0].result.as_ref().unwrap()).unwrap_err();
+    assert!(matches!(err, RequestError::Decode(_)), "{err:?}");
+    assert!(err.maybe_committed() && !err.certainly_not_delivered());
+}
+
+#[test]
+fn a_send_between_the_handshake_and_its_event_is_sent() {
+    let mut reg = Registry::new(registry_config(1));
+    let mut conn = Connection::new(conn_config(), t(0));
+    conn.recv(&server_hello(), t(1));
+    let tok = send_echo(&mut reg, &mut conn, EP_A, 1, 0).unwrap();
+    assert_eq!(reg.state(tok), Some(RequestState::Sent));
+}
+
+#[test]
+fn the_failed_endpoint_cap_clears_like_cpp() {
+    let mut c = registry_config(1);
+    c.max_failed_endpoints = 2;
+    let mut reg = Registry::new(c);
+    let (mut conn, _s) = connected(&mut reg);
+    let mut now = 20;
+    let mut notice = |reg: &mut Registry, conn: &mut Connection, wk: Uid, i: u64| {
+        now += 1;
+        conn.recv(&frame(wk, &uid_payload(Uid::new(0x10 | 1, i))), t(now));
+        drain(reg, conn);
+    };
+    // C++ clears when size() > limit, before inserting: 3 are kept with a limit of 2.
+    for i in 0..3 {
+        notice(&mut reg, &mut conn, well_known::ENDPOINT_NOT_FOUND, i);
+    }
+    assert_eq!(reg.failed_endpoints().count(), 3);
+    // An unauthorized notice never clears.
+    notice(&mut reg, &mut conn, well_known::UNAUTHORIZED_ENDPOINT, 3);
+    assert_eq!(reg.failed_endpoints().count(), 4);
+    // The next not-found does.
+    notice(&mut reg, &mut conn, well_known::ENDPOINT_NOT_FOUND, 4);
+    assert_eq!(reg.failed_endpoints().count(), 1);
+}
+
+#[test]
+fn unauthorized_is_recorded_for_a_well_known_endpoint() {
+    let mut reg = Registry::new(registry_config(1));
+    let (mut conn, _s) = connected(&mut reg);
+    let wk = Uid::new(u64::MAX, 7);
+    conn.recv(
+        &frame(well_known::UNAUTHORIZED_ENDPOINT, &uid_payload(wk)),
+        t(20),
+    );
+    drain(&mut reg, &mut conn);
+    assert_eq!(
+        reg.endpoint_failure(wk),
+        Some(EndpointFailure::Unauthorized)
+    );
+}
+
+#[derive(Clone, Debug)]
+enum WireOp {
+    Send(usize),
+    Hello,
+    HelloPartial,
+    HelloRest,
+    Incompatible,
+    Garbage,
+    Eof,
+    Io,
+    Close,
+    Timeout,
+    Write,
+    Drain,
+    Reply(usize),
+    Broken(usize),
+    NotFound(usize),
+    Cancel(usize),
+    CancelAll,
+    Reconnect,
+}
+
+fn wire_op() -> impl Strategy<Value = WireOp> {
+    prop_oneof![
+        5 => (0..3usize).prop_map(WireOp::Send),
+        2 => Just(WireOp::Hello),
+        1 => Just(WireOp::HelloPartial),
+        1 => Just(WireOp::HelloRest),
+        1 => Just(WireOp::Incompatible),
+        1 => Just(WireOp::Garbage),
+        1 => Just(WireOp::Eof),
+        1 => Just(WireOp::Io),
+        1 => Just(WireOp::Close),
+        1 => Just(WireOp::Timeout),
+        4 => Just(WireOp::Write),
+        3 => Just(WireOp::Drain),
+        3 => any::<usize>().prop_map(WireOp::Reply),
+        1 => any::<usize>().prop_map(WireOp::Broken),
+        1 => (0..3usize).prop_map(WireOp::NotFound),
+        1 => any::<usize>().prop_map(WireOp::Cancel),
+        1 => Just(WireOp::CancelAll),
+        1 => Just(WireOp::Reconnect),
+    ]
+}
+
+/// A driver that writes and drains in arbitrary orders, with the server's wire tap.
+struct Harness {
+    reg: Registry,
+    conn: Connection,
+    tap: Wiretap,
+    now: u64,
+    /// Requests sent and not completed or cancelled: key → reply token.
+    live: BTreeMap<u32, Uid>,
+    done: HashSet<u32>,
+    /// Requests completed as certainly not delivered.
+    not_delivered: Vec<(u32, Uid, RequestError)>,
+    /// Every reply token any server ever received.
+    written: HashSet<Uid>,
+    next_key: u32,
+    hello_half: bool,
+}
+
+impl Harness {
+    fn new() -> Harness {
+        let mut c = registry_config(5);
+        c.max_pending = 6;
+        Harness {
+            reg: Registry::new(c),
+            conn: Connection::new(conn_config(), t(0)),
+            tap: Wiretap::default(),
+            now: 0,
+            live: BTreeMap::new(),
+            done: HashSet::new(),
+            not_delivered: Vec::new(),
+            written: HashSet::new(),
+            next_key: 0,
+            hello_half: false,
+        }
+    }
+
+    fn write(&mut self) {
+        self.tap.write(&mut self.conn);
+        self.written.extend(self.tap.seen.iter().copied());
+    }
+
+    fn drain(&mut self) {
+        while let Some(e) = self.reg.poll_event(&mut self.conn) {
+            match e {
+                RpcEvent::Completion(c) => {
+                    assert!(self.done.insert(c.key), "completed twice: {}", c.key);
+                    assert_eq!(self.live.remove(&c.key), Some(c.reply_token));
+                    assert!(!self.conn.is_registered(c.reply_token));
+                    if let Err(e) = &c.result {
+                        assert!(!(e.certainly_not_delivered() && e.maybe_delivered()));
+                        if e.certainly_not_delivered() {
+                            self.not_delivered.push((c.key, c.reply_token, e.clone()));
+                        }
+                    }
+                }
+                RpcEvent::Closed(_) => {
+                    assert!(self.live.is_empty(), "Closed with live requests");
+                    assert!(!self.reg.has_queued_events());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        if self.conn.has_undrained_input() {
+            self.drain();
+        }
+        self.now += 1;
+        self.conn.recv(bytes, t(self.now));
+    }
+
+    fn step(&mut self, op: &WireOp) {
+        match *op {
+            WireOp::Send(i) => {
+                let key = self.next_key;
+                self.next_key += 1;
+                if let Ok(tok) = send_echo(&mut self.reg, &mut self.conn, ENDPOINTS[i], key, 0) {
+                    self.live.insert(key, tok);
+                }
+            }
+            WireOp::Hello => self.feed(&server_hello()),
+            WireOp::HelloPartial => {
+                if !self.hello_half {
+                    self.hello_half = true;
+                    self.feed(&server_hello()[..10]);
+                }
+            }
+            WireOp::HelloRest => {
+                if self.hello_half {
+                    self.hello_half = false;
+                    self.feed(&server_hello()[10..]);
+                }
+            }
+            WireOp::Incompatible => self.feed(
+                &ConnectPacket::server(
+                    ProtocolVersion::V8_0,
+                    format!("10.0.0.1:{PORT}").parse().unwrap(),
+                )
+                .encode()
+                .unwrap(),
+            ),
+            WireOp::Garbage => self.feed(&[0xff; 64]),
+            WireOp::Eof => {
+                self.now += 1;
+                self.conn.recv_eof(t(self.now));
+            }
+            WireOp::Io => {
+                self.now += 1;
+                self.conn
+                    .io_error(std::io::ErrorKind::ConnectionReset, t(self.now));
+            }
+            WireOp::Close => self.conn.close(),
+            WireOp::Timeout => {
+                self.now += 100_000;
+                self.conn.handle_timeout(t(self.now));
+            }
+            WireOp::Write => self.write(),
+            WireOp::Drain => self.drain(),
+            WireOp::Reply(n) | WireOp::Broken(n) => {
+                let candidates: Vec<Uid> = self
+                    .live
+                    .values()
+                    .copied()
+                    .filter(|t| self.tap.seen.contains(t))
+                    .collect();
+                if !candidates.is_empty() {
+                    let tok = candidates[n % candidates.len()];
+                    let payload = if matches!(op, WireOp::Broken(_)) {
+                        error_reply(1100)
+                    } else {
+                        ok_reply(0)
+                    };
+                    self.feed(&frame(tok, &payload));
+                }
+            }
+            WireOp::NotFound(i) => {
+                if self.tap.hello {
+                    self.feed(&frame(
+                        well_known::ENDPOINT_NOT_FOUND,
+                        &uid_payload(ENDPOINTS[i]),
+                    ));
+                }
+            }
+            WireOp::Cancel(n) => {
+                if !self.live.is_empty() {
+                    let key = *self.live.keys().nth(n % self.live.len()).unwrap();
+                    let tok = self.live[&key];
+                    if let Some(k) = self.reg.cancel(&mut self.conn, tok) {
+                        assert_eq!(k, key);
+                        self.live.remove(&key);
+                        assert!(self.done.insert(key));
+                        assert!(!self.conn.is_registered(tok));
+                    }
+                }
+            }
+            WireOp::CancelAll => self.reg.cancel_all(&mut self.conn),
+            WireOp::Reconnect => {
+                // A correct driver: close and drain the old connection before replacing it.
+                self.conn.close();
+                self.drain();
+                assert!(self.reg.is_empty());
+                self.conn = Connection::new(conn_config(), t(self.now));
+                self.tap = Wiretap::default();
+                self.hello_half = false;
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// No request completed as certainly not delivered ever reached a server, whatever order
+    /// the driver writes and drains in; and every request completes exactly once.
+    #[test]
+    fn certainly_not_delivered_requests_were_never_written(
+        ops in proptest::collection::vec(wire_op(), 0..80),
+    ) {
+        let mut h = Harness::new();
+        for op in &ops {
+            h.step(op);
+            for (key, tok, e) in &h.not_delivered {
+                prop_assert!(!h.written.contains(tok), "key {key} {e:?} written after {op:?}");
+            }
+        }
+        h.write();
+        h.conn.close();
+        h.drain();
+        h.write();
+        for (key, tok, e) in &h.not_delivered {
+            prop_assert!(!h.written.contains(tok), "key {key} {e:?} written at the end");
+        }
+        prop_assert!(h.live.is_empty() && h.reg.is_empty());
     }
 }

@@ -14,6 +14,9 @@ pub mod error_code {
     pub const CONNECTION_FAILED: u16 = 1026;
     /// `request_maybe_delivered` (1030; 57 / 57).
     pub const REQUEST_MAYBE_DELIVERED: u16 = 1030;
+    /// `default_error_or` (1035; 62 / 62): what a reply whose `ErrorOr` has no arm set decodes
+    /// to.
+    pub const DEFAULT_ERROR_OR: u16 = 1035;
     /// `serialization_failed` (1044; 71 / 71).
     pub const SERIALIZATION_FAILED: u16 = 1044;
     /// `broken_promise` (1100; 113 / 112).
@@ -33,26 +36,31 @@ use error_code::*;
 /// Why a request sent through a [`ReplyRegistry`](super::ReplyRegistry) did not produce a
 /// reply. See the [module documentation](super) for the C++ behaviour each case follows.
 ///
-/// Three questions classify every case:
+/// Four questions classify every case:
 ///
 /// * [`fdb_code`](Self::fdb_code): the FDB error a C++ client would see (or the closest one).
-/// * [`is_retryable`](Self::is_retryable): the request was **certainly not delivered**, so it
-///   can be sent again (on a new connection, after the output drains, or to another
-///   alternative) without risking a second execution.
+/// * [`certainly_not_delivered`](Self::certainly_not_delivered): the **safety predicate**. The
+///   request never reached the endpoint, so sending it again (on a new connection, after the
+///   output drains, or to another alternative) cannot execute it twice.
+/// * [`should_retry`](Self::should_retry): certainly not delivered **and** a resend can
+///   succeed (the failure was transient: not an encoding error, an oversized request, or an
+///   unauthorized endpoint). **A load balancer retries automatically on `should_retry` only.**
 /// * [`maybe_delivered`](Self::maybe_delivered) (alias
 ///   [`maybe_committed`](Self::maybe_committed)): the request may have reached the server and
 ///   been acted on, and nothing says what became of it. A commit that ends this way is
 ///   `commit_unknown_result`; a non-idempotent request must not be resent blindly.
 ///
-/// An error that is neither (a server error reply, `Unauthorized`, a decode error) is a
-/// definite answer: the request was handled (or refused) and resending it changes nothing.
-/// An idempotent request (a read) may still be retried after a `maybe_delivered` error, as
-/// `loadBalance` does when it is not `AtMostOnce`.
+/// `certainly_not_delivered` and `maybe_delivered` are never both true. An error that is
+/// neither (a server error reply with a definite meaning) is an answer: the request was
+/// handled and resending it changes nothing. An idempotent request (a read) may still be
+/// retried after a `maybe_delivered` error, as `loadBalance` does when it is not `AtMostOnce`.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RequestError {
     /// The server replied with an FDB error (the `Error` arm of the reply's `ErrorOr`), other
-    /// than `broken_promise`.
+    /// than `broken_promise`. A reply whose `ErrorOr` has neither arm set decodes as
+    /// `default_error_or` (1035), as in C++: the request was delivered and its outcome is
+    /// unknown.
     #[error("the server replied with FDB error {}", .0.code)]
     Fdb(FdbError),
     /// The server replied `broken_promise` (1100): the request was delivered, and the server
@@ -62,9 +70,14 @@ pub enum RequestError {
     #[error("the server dropped the request's reply promise (broken_promise)")]
     BrokenPromise,
     /// The connection ended after the request was put on it (`request_maybe_delivered`,
-    /// 1030). The request may or may not have reached the server.
-    #[error("request may have been delivered; the connection ended: {0}")]
-    MaybeDelivered(ConnectionError),
+    /// 1030). The request may or may not have reached the server. The error is `None` when
+    /// the connection's end was not seen by the registry (it was moved to another connection,
+    /// see [`ReplyRegistry`](super::ReplyRegistry)).
+    #[error("request may have been delivered; the connection ended{}", match .0 {
+        Some(e) => format!(": {e}"),
+        None => String::new(),
+    })]
+    MaybeDelivered(Option<ConnectionError>),
     /// The request was never written: the connection ended before its handshake completed
     /// (requests sent then are held, see the [connection documentation](crate::connection#sending)),
     /// or it had already ended (`None` when only the peer's side has closed). Safe to resend.
@@ -92,14 +105,16 @@ pub enum RequestError {
         /// The remote endpoint's token.
         token: Uid,
     },
-    /// The reply could not be decoded, or has another file identifier than the expected
-    /// reply's (`serialization_failed`, 1044). The request was handled.
+    /// A reply came but could not be decoded, or has another file identifier than the
+    /// expected reply's (`serialization_failed`, 1044). The request **was delivered** and its
+    /// outcome is unknown.
     #[error("the reply could not be decoded: {0}")]
     Decode(DecodeError),
-    /// The request could not be encoded. Nothing was sent.
+    /// The request could not be encoded. Nothing was sent; it would fail again.
     #[error("the request could not be encoded: {0}")]
     Encode(EncodeError),
-    /// The request does not fit in a frame (`PACKET_LIMIT`). Nothing was sent.
+    /// The request does not fit in a frame (`PACKET_LIMIT`). Nothing was sent; it would fail
+    /// again.
     #[error("the request is too large: {0}")]
     TooLarge(FrameError),
     /// The request was abandoned locally
@@ -132,12 +147,13 @@ impl RequestError {
         }
     }
 
-    /// The FDB error code a C++ client would get in the same situation, or the closest one.
+    /// The FDB error code a C++ client would get from `tryGetReply` in the same situation, or
+    /// the closest one.
     ///
     /// | variant | code | C++ |
     /// | --- | --- | --- |
     /// | `Fdb(e)` | `e.code` | the error the server sent |
-    /// | `BrokenPromise` | 1100 `broken_promise` | `getReply` throws it; `tryGetReply` turns it into 1030 |
+    /// | `BrokenPromise` | 1030 `request_maybe_delivered` | see below |
     /// | `MaybeDelivered` | 1030 `request_maybe_delivered` | `tryGetReply` on a disconnect |
     /// | `NotSent` | 1026 `connection_failed` | (C++ cannot tell; it reports 1030) |
     /// | `EndpointNotFound` | 1030 `request_maybe_delivered` | `tryGetReply` once the endpoint is failed |
@@ -147,13 +163,19 @@ impl RequestError {
     /// | `TooLarge` | 1500 `platform_error` | (C++ logs `PacketLimitExceeded` and sends anyway) |
     /// | `Cancelled` | 1101 `operation_cancelled` | |
     /// | `Backpressure`, `TooManyPending` | 1026 `connection_failed` | (no C++ limit: not sent, like `NotSent`) |
+    ///
+    /// **`BrokenPromise` is 1030, not 1100.** `tryGetReply`'s `waitValueOrSignal` catches the
+    /// `broken_promise`, marks the endpoint failed and returns `request_maybe_delivered`
+    /// (`fdbrpc/include/fdbrpc/genericactors.actor.h` 7.4:398-403, `genericactors.h`
+    /// 8.0:401-406), and `tryCommit` wraps its direct `tryGetReply` in
+    /// `brokenPromiseToMaybeDelivered`. Only `getReply` lets 1100 through. Match on the
+    /// variant to tell the two apart.
     pub fn fdb_code(&self) -> u16 {
         match self {
             RequestError::Fdb(e) => e.code,
-            RequestError::BrokenPromise => BROKEN_PROMISE,
-            RequestError::MaybeDelivered(_) | RequestError::EndpointNotFound { .. } => {
-                REQUEST_MAYBE_DELIVERED
-            }
+            RequestError::BrokenPromise
+            | RequestError::MaybeDelivered(_)
+            | RequestError::EndpointNotFound { .. } => REQUEST_MAYBE_DELIVERED,
             RequestError::NotSent(_)
             | RequestError::Backpressure
             | RequestError::TooManyPending { .. } => CONNECTION_FAILED,
@@ -170,52 +192,70 @@ impl RequestError {
         FdbError::new(self.fdb_code())
     }
 
-    /// Whether the request was certainly not delivered, so that sending it again cannot
-    /// execute it twice: `NotSent`, `Backpressure`, `TooManyPending`, `Encode`, `TooLarge`
-    /// (though those two will fail again), and `EndpointNotFound` for a request refused
-    /// because the endpoint was already known to be gone (send it to the endpoint's
-    /// replacement, not to the same one).
-    pub fn is_retryable(&self) -> bool {
+    /// Whether the request certainly never reached the endpoint, so that sending it again
+    /// cannot execute it twice: `NotSent`, `Backpressure`, `TooManyPending`, `Encode`,
+    /// `TooLarge`, `Unauthorized` (the peer refuses delivery), and `EndpointNotFound` for a
+    /// request refused because the endpoint was already known to be gone. This is the
+    /// at-most-once safety predicate; whether a resend can succeed is
+    /// [`should_retry`](Self::should_retry).
+    pub fn certainly_not_delivered(&self) -> bool {
         match self {
             RequestError::NotSent(_)
             | RequestError::Backpressure
             | RequestError::TooManyPending { .. }
             | RequestError::Encode(_)
-            | RequestError::TooLarge(_) => true,
+            | RequestError::TooLarge(_)
+            | RequestError::Unauthorized { .. } => true,
             RequestError::EndpointNotFound {
                 maybe_delivered, ..
             } => !maybe_delivered,
             RequestError::Fdb(_)
             | RequestError::BrokenPromise
             | RequestError::MaybeDelivered(_)
-            | RequestError::Unauthorized { .. }
             | RequestError::Decode(_)
             | RequestError::Cancelled => false,
         }
     }
 
-    /// Whether the request may have been delivered and acted on without a reply saying so:
-    /// `MaybeDelivered`, `BrokenPromise`, `Cancelled`, `EndpointNotFound` for a request that
-    /// was pending, and a server error reply of `commit_unknown_result`,
-    /// `request_maybe_delivered` or `broken_promise`. These are the errors `loadBalance` calls
-    /// `maybeDelivered` (`fdbrpc/include/fdbrpc/LoadBalance.actor.h` 7.4:591,
-    /// `LoadBalance.h` 8.0:206) and, with `AtMostOnce`, throws as `request_maybe_delivered`
-    /// instead of retrying (7.4:616-618 and 1108-1115, 8.0:232 and 735-741).
+    /// Whether a load balancer should resend the request automatically: it was
+    /// [certainly not delivered](Self::certainly_not_delivered) and the failure is transient
+    /// (`NotSent`, `Backpressure`, `TooManyPending`, and `EndpointNotFound` refused at once,
+    /// which calls for the endpoint's replacement or another alternative). `Encode`, `TooLarge`
+    /// and `Unauthorized` would fail the same way again.
+    pub fn should_retry(&self) -> bool {
+        self.certainly_not_delivered()
+            && !matches!(
+                self,
+                RequestError::Encode(_)
+                    | RequestError::TooLarge(_)
+                    | RequestError::Unauthorized { .. }
+            )
+    }
+
+    /// Whether the request may have been delivered and acted on without a reply saying what
+    /// became of it: `MaybeDelivered`, `BrokenPromise`, `Cancelled`, `Decode` (a reply came,
+    /// but cannot be read), `EndpointNotFound` for a request that was pending, and a server
+    /// error reply of `commit_unknown_result`, `request_maybe_delivered`, `default_error_or`
+    /// (a reply with no arm set) or `broken_promise`. `broken_promise` and
+    /// `request_maybe_delivered` are the errors `loadBalance` calls `maybeDelivered`
+    /// (`fdbrpc/include/fdbrpc/LoadBalance.actor.h` 7.4:591, `LoadBalance.h` 8.0:206) and, with
+    /// `AtMostOnce`, throws as `request_maybe_delivered` instead of retrying (7.4:616-618 and
+    /// 1108-1115, 8.0:232 and 735-741).
     pub fn maybe_delivered(&self) -> bool {
         match self {
             RequestError::Fdb(e) => matches!(
                 e.code,
-                COMMIT_UNKNOWN_RESULT | REQUEST_MAYBE_DELIVERED | BROKEN_PROMISE
+                COMMIT_UNKNOWN_RESULT | REQUEST_MAYBE_DELIVERED | DEFAULT_ERROR_OR | BROKEN_PROMISE
             ),
             RequestError::BrokenPromise
             | RequestError::MaybeDelivered(_)
+            | RequestError::Decode(_)
             | RequestError::Cancelled => true,
             RequestError::EndpointNotFound {
                 maybe_delivered, ..
             } => *maybe_delivered,
             RequestError::NotSent(_)
             | RequestError::Unauthorized { .. }
-            | RequestError::Decode(_)
             | RequestError::Encode(_)
             | RequestError::TooLarge(_)
             | RequestError::Backpressure

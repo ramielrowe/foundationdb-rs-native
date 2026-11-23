@@ -31,8 +31,9 @@ pub struct RegistryConfig {
     /// [`RequestError::TooManyPending`]. FDB has no such limit. Default
     /// [`DEFAULT_MAX_PENDING`].
     pub max_pending: usize,
-    /// The most failed endpoints remembered; when one more would exceed it, all are forgotten
-    /// (as C++ does). Default [`DEFAULT_MAX_FAILED_ENDPOINTS`].
+    /// The most failed endpoints remembered: an endpoint-not-found that finds more than this
+    /// many remembered forgets them all first, as C++'s `endpointNotFound` does (`size() >
+    /// 100000`; an unauthorized notice never clears). Default [`DEFAULT_MAX_FAILED_ENDPOINTS`].
     pub max_failed_endpoints: usize,
     /// Seed of the reply-token generator. [`RegistryConfig::new`] draws one; set it for a
     /// reproducible run.
@@ -186,10 +187,27 @@ impl Rng {
 /// `K` is whatever the caller wants back with a request's [`Completion`]: a request id, a
 /// waker slot, a oneshot sender.
 ///
+/// # Binding to a connection
+///
 /// One registry serves one connection at a time and may outlive it: once a connection's
 /// [`Closed`](RpcEvent::Closed) has been drained, nothing is pending and the next connection to
 /// the same peer can use the registry, keeping its failed endpoints (endpoint tokens are
 /// random per server process, so a failed one never comes back).
+///
+/// The registry is bound to the connection ([`Connection::id`]) it was last called with.
+/// Calling it with another connection while requests are pending is a driver bug: it
+/// `debug_assert`s, and (in any build) fails every pending request, `Queued` ones included,
+/// with [`MaybeDelivered(None)`](RequestError::MaybeDelivered), since what became of them on
+/// the old connection is unknown. Their tokens stay registered on the old connection until
+/// the registry is next called with it, which unregisters them. If the connection has ended
+/// and someone else consumed its [`Event::Closed`], [`poll_event`](Self::poll_event) still
+/// fails the pending requests (without giving `Closed` again), so no waiter is left hanging.
+///
+/// # Dropping
+///
+/// Dropping a registry with requests pending drops their keys without completions. Whoever
+/// holds the waiters must then fail them as **maybe delivered** (like
+/// [`RequestError::MaybeDelivered`]), never as retryable.
 #[derive(Debug)]
 pub struct ReplyRegistry<K> {
     config: RegistryConfig,
@@ -201,6 +219,13 @@ pub struct ReplyRegistry<K> {
     failed: HashMap<Uid, EndpointFailure>,
     /// Events to give before polling the connection again.
     queue: VecDeque<RpcEvent<K>>,
+    /// The [`Connection::id`] the registry is bound to.
+    bound: Option<u64>,
+    /// How many pending requests are `Queued`.
+    queued: usize,
+    /// Reply tokens left registered on a connection the registry was moved away from with
+    /// requests pending, unregistered if the registry sees that connection again.
+    orphaned: Option<(u64, Vec<Uid>)>,
 }
 
 impl<K> ReplyRegistry<K> {
@@ -214,6 +239,9 @@ impl<K> ReplyRegistry<K> {
             by_endpoint: HashMap::new(),
             failed: HashMap::new(),
             queue: VecDeque::new(),
+            bound: None,
+            queued: 0,
+            orphaned: None,
         }
     }
 
@@ -234,7 +262,8 @@ impl<K> ReplyRegistry<K> {
         self.pending.is_empty()
     }
 
-    /// Where the request with this reply token is, if it is pending.
+    /// Where the request with this reply token is, if it is pending (as of the last call that
+    /// was given the connection).
     pub fn state(&self, reply_token: Uid) -> Option<RequestState> {
         self.pending.get(&reply_token).map(|p| p.state)
     }
@@ -343,8 +372,52 @@ impl<K> ReplyRegistry<K> {
         self.finish_send(conn, endpoint, key, token, sent)
     }
 
+    /// Binds the registry to `conn` (see [Binding](Self#binding-to-a-connection)), and marks
+    /// queued requests sent if the connection's handshake has completed.
+    fn bind(&mut self, conn: &mut Connection) {
+        let id = conn.id();
+        if self.bound != Some(id) {
+            if let Some((old, tokens)) = self.orphaned.take() {
+                if old == id {
+                    for token in tokens {
+                        conn.unregister(token);
+                    }
+                } else {
+                    self.orphaned = Some((old, tokens));
+                }
+            }
+            let moved = !self.pending.is_empty();
+            if moved {
+                let tokens: Vec<Uid> = self.pending.keys().copied().collect();
+                if let Some(old) = self.bound {
+                    self.orphaned = Some((old, tokens.clone()));
+                }
+                self.fail(None, tokens, |_| RequestError::MaybeDelivered(None));
+            }
+            self.bound = Some(id);
+            debug_assert!(
+                !moved,
+                "a ReplyRegistry with pending requests was used with another connection \
+                 (drain the old connection's Closed through the registry first)"
+            );
+        }
+        self.sync_established(conn);
+    }
+
+    /// Queued requests are sent once the connection's handshake has completed (its held frames
+    /// were then released to the output).
+    fn sync_established(&mut self, conn: &Connection) {
+        if self.queued > 0 && conn.was_established() {
+            for pending in self.pending.values_mut() {
+                pending.state = RequestState::Sent;
+            }
+            self.queued = 0;
+        }
+    }
+
     /// Checks that a request to `endpoint` may be sent, and mints and registers its token.
     fn prepare(&mut self, conn: &mut Connection, endpoint: Uid) -> Result<Uid, RequestError> {
+        self.bind(conn);
         if self.pending.len() >= self.config.max_pending {
             return Err(RequestError::TooManyPending {
                 limit: self.config.max_pending,
@@ -387,6 +460,9 @@ impl<K> ReplyRegistry<K> {
             ConnectionState::Established => RequestState::Sent,
             _ => RequestState::Queued,
         };
+        if state == RequestState::Queued {
+            self.queued += 1;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.pending.insert(
@@ -409,7 +485,14 @@ impl<K> ReplyRegistry<K> {
     /// Returns its key, or `None` if it is not pending. Nothing is sent to the peer, and a
     /// request still held by the connection is not withdrawn: as in C++, cancelling says
     /// nothing about whether the request is delivered.
+    ///
+    /// The key comes back **without a completion**. If a waiter is still attached to it, the
+    /// caller must complete it as maybe delivered (a `Queued` request is still written once the
+    /// handshake completes), as C++'s `tryCommit` throws `request_maybe_delivered` when it
+    /// abandons a commit on `onProxiesChanged` (`fdbclient/NativeAPI.actor.cpp` 7.4:6976-6979,
+    /// `NativeAPI.cpp` 8.0:4656-4659).
     pub fn cancel(&mut self, conn: &mut Connection, reply_token: Uid) -> Option<K> {
+        self.bind(conn);
         let pending = self.remove(reply_token)?;
         conn.unregister(reply_token);
         Some(pending.key)
@@ -419,8 +502,9 @@ impl<K> ReplyRegistry<K> {
     /// peer is being shut down) and unregisters their tokens. The completions come from
     /// [`poll_event`](Self::poll_event).
     pub fn cancel_all(&mut self, conn: &mut Connection) {
+        self.bind(conn);
         let tokens: Vec<Uid> = self.pending.keys().copied().collect();
-        self.fail(conn, tokens, |_| RequestError::Cancelled);
+        self.fail(Some(conn), tokens, |_| RequestError::Cancelled);
     }
 
     // ---- events --------------------------------------------------------------------------
@@ -439,16 +523,28 @@ impl<K> ReplyRegistry<K> {
     ///   C++ ignores it. [`Event::UnauthorizedEndpoint`]: the same, with
     ///   [`RequestError::Unauthorized`]. Each gives [`RpcEvent::EndpointFailed`] the first time.
     /// * [`Event::Closed`]: every pending request fails, [`NotSent`](RequestError::NotSent) if
-    ///   it was still [`Queued`](RequestState::Queued) and
-    ///   [`MaybeDelivered`](RequestError::MaybeDelivered) if it was
-    ///   [`Sent`](RequestState::Sent); then [`RpcEvent::Closed`].
+    ///   the connection's handshake never completed
+    ///   ([`Connection::was_established`]) and [`MaybeDelivered`](RequestError::MaybeDelivered)
+    ///   otherwise; then [`RpcEvent::Closed`].
     /// * Other frames and unknown tokens are passed on.
+    ///
+    /// If the connection has ended, its events are exhausted and requests are still pending
+    /// (someone else consumed `Closed`), they fail as on `Closed`, without a second `Closed`.
     pub fn poll_event(&mut self, conn: &mut Connection) -> Option<RpcEvent<K>> {
+        self.bind(conn);
         loop {
             if let Some(event) = self.queue.pop_front() {
                 return Some(event);
             }
-            let event = match conn.poll_event()? {
+            let Some(event) = conn.poll_event() else {
+                if conn.state() == ConnectionState::Closed && !self.pending.is_empty() {
+                    let error = conn.error().cloned();
+                    self.close_all(conn, error, false);
+                    continue;
+                }
+                return None;
+            };
+            let event = match event {
                 Event::Connected { peer } => Owned::Connected(peer),
                 Event::Frame(frame) if self.pending.contains_key(&frame.token) => {
                     Owned::Reply(frame.token, frame.payload.to_vec())
@@ -461,9 +557,7 @@ impl<K> ReplyRegistry<K> {
             };
             match event {
                 Owned::Connected(peer) => {
-                    for pending in self.pending.values_mut() {
-                        pending.state = RequestState::Sent;
-                    }
+                    self.sync_established(conn);
                     return Some(RpcEvent::Connected { peer });
                 }
                 Owned::Reply(token, payload) => {
@@ -486,7 +580,7 @@ impl<K> ReplyRegistry<K> {
                     self.endpoint_failed(conn, token, EndpointFailure::Unauthorized);
                 }
                 Owned::Closed(error) => {
-                    self.closed(conn, error);
+                    self.close_all(conn, Some(error), true);
                 }
             }
         }
@@ -519,40 +613,50 @@ impl<K> ReplyRegistry<K> {
 
     /// Marks `endpoint` failed (unless it is already) and fails the requests pending to it.
     fn endpoint_failed(&mut self, conn: &mut Connection, endpoint: Uid, failure: EndpointFailure) {
+        let known = self.failed.contains_key(&endpoint);
+        // `endpointNotFound` clears the whole map when it holds more than the limit
+        // (`size() > 100000`); `unauthorizedEndpoint` does not.
+        if failure == EndpointFailure::NotFound
+            && self.failed.len() > self.config.max_failed_endpoints
+        {
+            self.failed.clear();
+        }
         // C++ `emplace`s: a recorded reason is kept.
-        let failure = if let Some(&known) = self.failed.get(&endpoint) {
-            known
-        } else {
-            if self.failed.len() >= self.config.max_failed_endpoints {
-                self.failed.clear();
-            }
-            if let Entry::Vacant(v) = self.failed.entry(endpoint) {
-                v.insert(failure);
-            }
+        let failure = *self.failed.entry(endpoint).or_insert(failure);
+        if !known {
             self.queue.push_back(RpcEvent::EndpointFailed {
                 token: endpoint,
                 failure,
             });
-            failure
-        };
+        }
         let tokens: Vec<Uid> = self
             .by_endpoint
             .get(&endpoint)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
-        self.fail(conn, tokens, |_| failure.error(endpoint, true));
+        self.fail(Some(conn), tokens, |_| failure.error(endpoint, true));
     }
 
-    /// The connection ended: every pending request fails, then `Closed` is given.
-    fn closed(&mut self, conn: &mut Connection, error: ConnectionError) {
+    /// The connection ended: every pending request fails, then `Closed` is given (if
+    /// `give_closed`). A request was sent if the handshake ever completed: frames held before
+    /// it were then released to the output.
+    fn close_all(
+        &mut self,
+        conn: &mut Connection,
+        error: Option<ConnectionError>,
+        give_closed: bool,
+    ) {
+        let established = conn.was_established();
         let mut all: Vec<(Uid, Pending<K>)> = self.pending.drain().collect();
         self.by_endpoint.clear();
+        self.queued = 0;
         all.sort_by_key(|(_, p)| p.seq);
         for (token, pending) in all {
             conn.unregister(token);
-            let result = Err(match pending.state {
-                RequestState::Queued => RequestError::NotSent(Some(error.clone())),
-                RequestState::Sent => RequestError::MaybeDelivered(error.clone()),
+            let result = Err(if established || pending.state == RequestState::Sent {
+                RequestError::MaybeDelivered(error.clone())
+            } else {
+                RequestError::NotSent(error.clone())
             });
             self.queue.push_back(RpcEvent::Completion(Completion {
                 key: pending.key,
@@ -561,13 +665,16 @@ impl<K> ReplyRegistry<K> {
                 result,
             }));
         }
-        self.queue.push_back(RpcEvent::Closed(error));
+        if let (true, Some(error)) = (give_closed, error) {
+            self.queue.push_back(RpcEvent::Closed(error));
+        }
     }
 
-    /// Fails the pending requests with these tokens, in the order they were sent.
+    /// Fails the pending requests with these tokens, in the order they were sent, and
+    /// unregisters them from `conn`.
     fn fail(
         &mut self,
-        conn: &mut Connection,
+        mut conn: Option<&mut Connection>,
         tokens: Vec<Uid>,
         error: impl Fn(&Pending<K>) -> RequestError,
     ) {
@@ -577,7 +684,9 @@ impl<K> ReplyRegistry<K> {
             .collect();
         failed.sort_by_key(|(_, p)| p.seq);
         for (token, pending) in failed {
-            conn.unregister(token);
+            if let Some(conn) = conn.as_deref_mut() {
+                conn.unregister(token);
+            }
             let result = Err(error(&pending));
             self.queue.push_back(RpcEvent::Completion(Completion {
                 key: pending.key,
@@ -590,6 +699,9 @@ impl<K> ReplyRegistry<K> {
 
     fn remove(&mut self, token: Uid) -> Option<Pending<K>> {
         let pending = self.pending.remove(&token)?;
+        if pending.state == RequestState::Queued {
+            self.queued -= 1;
+        }
         if let Entry::Occupied(mut set) = self.by_endpoint.entry(pending.endpoint) {
             set.get_mut().remove(&token);
             if set.get().is_empty() {

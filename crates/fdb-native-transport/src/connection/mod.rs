@@ -230,6 +230,7 @@ mod error;
 mod messages;
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fdb_native_wire::{
@@ -368,6 +369,8 @@ impl Rng {
 /// A sans-IO FlowTransport client connection. See the [module documentation](self).
 #[derive(Debug)]
 pub struct Connection {
+    /// This connection's [`id`](Connection::id).
+    id: u64,
     /// The receive buffer. Kept apart from the rest so that a frame borrowed from it can be
     /// returned while the rest of the state changes.
     decoder: FrameDecoder,
@@ -417,6 +420,8 @@ struct Core {
     /// `lastDataPacketSentTime`.
     last_data_sent: Instant,
     referenced: bool,
+    /// The handshake completed at some point (the state may since be `Closed`).
+    was_established: bool,
     writer: Writer,
 }
 
@@ -451,6 +456,7 @@ impl Connection {
             opened_at: now,
             last_data_sent: now,
             referenced: true,
+            was_established: false,
             writer: Writer::new(),
             config,
         };
@@ -459,6 +465,7 @@ impl Connection {
             Err(e) => core.fail(ConnectionError::InternalEncode(e.to_string())),
         }
         Connection {
+            id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             decoder: FrameDecoder::before_handshake(frame_config),
             decoder_released: false,
             core,
@@ -470,6 +477,20 @@ impl Connection {
     /// Where the connection is.
     pub fn state(&self) -> ConnectionState {
         self.core.state
+    }
+
+    /// An identifier of this connection, unique in the process (a counter): it tells one
+    /// connection from the next, for instance to the
+    /// [`ReplyRegistry`](crate::rpc::ReplyRegistry) bound to it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Whether the handshake completed at some point, even if the connection has ended since.
+    /// Frames [sent](Self::send) before the handshake were then released to the output (and
+    /// may have been written); if it never completed, they were discarded unwritten.
+    pub fn was_established(&self) -> bool {
+        self.core.was_established
     }
 
     /// The configuration.
@@ -927,6 +948,9 @@ fn empty_payload(token: Uid) -> ConnectionError {
     }
 }
 
+/// The next [`Connection::id`].
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Capacity above which an emptied output buffer is released.
 const SHRINK_ABOVE: usize = 256 * 1024;
 
@@ -973,6 +997,7 @@ impl Core {
     /// The handshake succeeded.
     fn established(&mut self, packet: ConnectPacket) {
         self.state = ConnectionState::Established;
+        self.was_established = true;
         self.events.push_back(Queued::Connected(packet));
         let held = std::mem::take(&mut self.held);
         self.out.extend_from_slice(&held);

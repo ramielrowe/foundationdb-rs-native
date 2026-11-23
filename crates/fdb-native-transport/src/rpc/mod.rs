@@ -14,7 +14,10 @@
 //! token as a `ReplyPromise` ([`send_message`](ReplyRegistry::send_message) builds one from the
 //! token; [`send_with`](ReplyRegistry::send_with) lets an encoder such as
 //! `fdb_native_schema::Request::encode_request_into` write it), and a reply is decoded by the
-//! caller, who knows its type.
+//! caller, who knows its type. The typed, asynchronous API
+//! (`send::<Req>(endpoint, req) -> impl Future<Output = Result<Req::Reply, RequestError>>`) is
+//! not here: it is built on this layer when it is wired into the peer manager, which owns the
+//! connection and the waiters.
 //!
 //! # What C++ does
 //!
@@ -60,14 +63,22 @@
 //! the address (7.4:1073, 8.0:1165; `FailureMonitor` 7.4:150-154, 8.0:148-152).
 //!
 //! **This layer implements `tryGetReply`**: at most once, no resend. Any retry is the
-//! caller's (a load balancer's) decision, made from [`RequestError::is_retryable`] and
+//! caller's (a load balancer's) decision, made from [`RequestError::should_retry`] (automatic
+//! retries), [`RequestError::certainly_not_delivered`] (the at-most-once safety predicate) and
 //! [`RequestError::maybe_delivered`]. It refines C++ in one place: C++ cannot tell an unsent
 //! packet from a sent one and reports `request_maybe_delivered` for both; here a request sent
 //! before the handshake completed is held by the connection and never written if the
 //! handshake fails (see the [connection documentation](crate::connection#sending)), so it
 //! fails with [`RequestError::NotSent`], which is safe to retry. A request put on an
 //! established connection fails with [`RequestError::MaybeDelivered`] when the connection
-//! ends, even if its bytes were still in the output buffer: conservative, as C++ is.
+//! ends, even if its bytes were still in the output buffer: conservative, as C++ is. Whether
+//! the handshake completed is the connection's own record
+//! ([`Connection::was_established`]), not only what the event stream showed.
+//!
+//! **Undecodable replies.** A reply that came but cannot be decoded (a wrong file identifier, a
+//! malformed table) proves the request was delivered without saying what became of it:
+//! [`RequestError::Decode`] is maybe delivered. So is a reply whose `ErrorOr` has no arm set,
+//! which decodes as `default_error_or` (1035), as in C++.
 //!
 //! **Endpoint not found.** A server that gets a packet for a stream token it does not have
 //! answers on `WLTOKEN_ENDPOINT_NOT_FOUND` with the token (`deliver`, `FlowTransport`
@@ -111,19 +122,23 @@
 //!
 //! # Errors
 //!
-//! | [`RequestError`] | when | code | retryable | maybe delivered |
-//! | --- | --- | --- | --- | --- |
-//! | `Fdb(e)` | the server replied with an error | `e.code` | no | for 1021, 1030, 1100 |
-//! | `BrokenPromise` | the server replied `broken_promise` | 1100 | no | yes |
-//! | `MaybeDelivered` | the connection ended after the request was sent | 1030 | no | yes |
-//! | `NotSent` | the connection ended before the handshake, or had ended | 1026 | yes | no |
-//! | `EndpointNotFound` | the endpoint is gone (pending / refused) | 1030 | no / yes | yes / no |
-//! | `Unauthorized` | the peer refuses the endpoint | 6001 | no | no |
-//! | `Decode` | malformed reply, or wrong file identifier | 1044 | no | no |
-//! | `Encode`, `TooLarge` | the request could not be framed; nothing sent | 4100, 1500 | yes | no |
-//! | `Cancelled` | [`ReplyRegistry::cancel_all`] | 1101 | no | yes |
-//! | `Backpressure` | the connection's output is full; nothing sent | 1026 | yes | no |
-//! | `TooManyPending` | [`RegistryConfig::max_pending`] reached; nothing sent | 1026 | yes | no |
+//! | [`RequestError`] | when | code | certainly not delivered | should retry | maybe delivered |
+//! | --- | --- | --- | --- | --- | --- |
+//! | `Fdb(e)` | the server replied with an error | `e.code` | no | no | for 1021, 1030, 1035, 1100 |
+//! | `BrokenPromise` | the server replied `broken_promise` | 1030 (see [`RequestError::fdb_code`]) | no | no | yes |
+//! | `MaybeDelivered` | the connection ended after the request was sent | 1030 | no | no | yes |
+//! | `NotSent` | the connection ended before the handshake, or had ended | 1026 | yes | yes | no |
+//! | `EndpointNotFound` | the endpoint is gone (pending / refused) | 1030 | no / yes | no / yes | yes / no |
+//! | `Unauthorized` | the peer refuses the endpoint | 6001 | yes | no | no |
+//! | `Decode` | a reply came but cannot be decoded (wrong file identifier, malformed) | 1044 | no | no | yes |
+//! | `Encode`, `TooLarge` | the request could not be framed; nothing sent | 4100, 1500 | yes | no | no |
+//! | `Cancelled` | [`ReplyRegistry::cancel_all`] | 1101 | no | no | yes |
+//! | `Backpressure` | the connection's output is full; nothing sent | 1026 | yes | yes | no |
+//! | `TooManyPending` | [`RegistryConfig::max_pending`] reached; nothing sent | 1026 | yes | yes | no |
+//!
+//! A load balancer retries automatically on [`should_retry`](RequestError::should_retry); with
+//! `AtMostOnce` it must otherwise surface a [`maybe_delivered`](RequestError::maybe_delivered)
+//! error (a commit's `commit_unknown_result`), and without it may also retry those.
 //!
 //! # Driving
 //!
@@ -140,7 +155,8 @@
 //!                        send   → match registry.send_with(&mut conn, endpoint.token, key, encode)
 //!                                   Ok(reply_token) → remember key ↔ reply_token (to cancel)
 //!                                   Err(e)          → complete key with e (nothing pending)
-//!                        cancel → registry.cancel(&mut conn, reply_token)
+//!                        cancel → registry.cancel(&mut conn, reply_token); a waiter still attached
+//!                                 to the returned key is completed as maybe delivered
 //!         2. drain     while let Some(ev) = registry.poll_event(&mut conn):
 //!                        Completion(c)              → complete c.key with c.result
 //!                        EndpointFailed { token, .. } → per-endpoint failure state
@@ -155,9 +171,13 @@
 //!   event, but a pending input might) and after [`Connection::close`]: the
 //!   [`Closed`](RpcEvent::Closed) event is what fails the pending requests, and comes after
 //!   their completions.
-//! * Never drop a connection without draining its `Closed` through the registry: its pending
-//!   requests would never complete. To shut a peer down, call
-//!   [`cancel_all`](ReplyRegistry::cancel_all) (or `conn.close()`) and drain.
+//! * Drain a connection's `Closed` through the registry before using the registry with the
+//!   next connection. The registry is bound to one connection ([`Connection::id`]): used with
+//!   another while requests are pending, it `debug_assert`s and fails them all as
+//!   [`MaybeDelivered`](RequestError::MaybeDelivered) (see
+//!   [Binding](ReplyRegistry#binding-to-a-connection)). To shut a peer down, call
+//!   [`cancel_all`](ReplyRegistry::cancel_all) (or `conn.close()`) and drain; if the registry
+//!   is dropped instead, fail its waiters as maybe delivered.
 //! * While the peer has no connection (connecting, or backing off), hold requests and send
 //!   them once a connection exists (they are then [`Queued`](RequestState::Queued) until the
 //!   handshake), or fail them with [`RequestError::NotSent`]: C++'s `tryGetReply` fails at
