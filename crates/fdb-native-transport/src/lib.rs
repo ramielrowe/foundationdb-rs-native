@@ -4,6 +4,7 @@
 
 mod connect_packet;
 mod framing;
+pub mod runtime;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError};
 pub use framing::{
