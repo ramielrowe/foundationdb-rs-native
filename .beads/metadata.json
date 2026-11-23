@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "foundationdb_rs_native",
+  "project_id": "3567e286-d761-4be1-bffd-f03b96ad0220"
+}
