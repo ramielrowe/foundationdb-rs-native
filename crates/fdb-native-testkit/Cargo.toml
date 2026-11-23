@@ -10,3 +10,7 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+tempfile = "3.27.0"
+thiserror = "2.0.21"
