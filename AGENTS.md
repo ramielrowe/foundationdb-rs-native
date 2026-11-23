@@ -134,7 +134,7 @@ cargo fmt --all --check                                        # formatting
 cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings are errors in CI)
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
-cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'  # Docker-backed integration tests
+cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'  # Docker-backed integration tests
 cargo test --doc --workspace                                   # doc tests (nextest skips them)
 ```
 
@@ -149,6 +149,19 @@ FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check   # or: make
 GV=$PWD/tools/golden-vectors/build
 FDB_GOLDEN_VECTORS_BIN=$GV/golden-vectors:$GV/rel-release-7.4/golden-vectors:$GV/rel-release-8.0/golden-vectors \
   cargo nextest run -p fdb-native-wire --run-ignored only -E 'binary(cpp_crosscheck)'
+```
+
+The blob codecs (`KeyValueVectorRef`, `VersionVector`, `TagSetRef`, `IdempotencyIdRef`) have the same
+kind of check in `tests/blob_codecs.rs`: `cpp_crosscheck_release_readers_decode_reencoded_blobs` sends the
+re-encoded blob fields of the message fixtures to each release's own reader. It is ignored (and
+excluded from the Docker CI job by the `test(cpp_crosscheck)` filter) and needs the message decoders
+built by `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh` (docker, ~5 min):
+
+```bash
+MSG=$PWD/tools/golden-vectors/build/msg
+FDB_GOLDEN_MESSAGES_BIN_7_4=$MSG/build-release-7.4/bin/golden_vectors_messages \
+FDB_GOLDEN_MESSAGES_BIN_8_0=$MSG/build-release-8.0/bin/golden_vectors_messages \
+  cargo nextest run -p fdb-native-wire --run-ignored only -E 'test(cpp_crosscheck_release_readers)'
 ```
 
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
