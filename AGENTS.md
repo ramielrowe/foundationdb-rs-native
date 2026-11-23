@@ -221,6 +221,12 @@ The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/bin
   Docker tests live in an integration-test binary named `docker` (or are named `docker_*`) so the
   nextest `docker` test group in `.config/nextest.toml` caps them at 4 concurrent containers.
   The testkit API is blocking; start containers outside an async runtime or via `spawn_blocking`.
+- **Multi-process clusters** (fault tests): `fdb_native_testkit::FdbCluster` starts 3-5 `fdbserver`
+  containers on a dedicated, labelled docker network with static IPs (so restarts keep their
+  addresses), `double` redundancy, and has by-ID helpers: `kill`/`stop`/`start_process`/`restart`,
+  `pause`/`unpause`, `exclude`/`include`, `set_coordinators`, `write_keys` + `small_shards()` for
+  shard splits/moves, `status_json`/`wait_healthy`. A start takes ~40 s. Its tests live in the
+  `cluster` integration-test binary (nextest `cluster` group, max 2 at a time).
 - **Safety rule**: tests must only ever target disposable containers started by
   `fdb-native-testkit`, never a shared or long-lived cluster. A malformed packet can make an
   FDB 7.4/8.0 server process exit.
