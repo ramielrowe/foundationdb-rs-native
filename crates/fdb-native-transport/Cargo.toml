@@ -14,8 +14,17 @@ workspace = true
 default = ["tokio"]
 # Adapter for the tokio runtime (`runtime::TokioRuntime`).
 tokio = ["dep:tokio"]
-# TLS client layer (`tls` module): rustls with the `ring` crypto provider.
-tls = ["dep:rustls", "dep:futures-rustls", "dep:rustls-pki-types", "dep:pkcs8", "dep:zeroize"]
+# TLS client layer (`tls` module): rustls with the `ring` crypto provider, and FDB's
+# `verify_peers` rules (`tls::verify_peers`).
+tls = [
+    "dep:rustls",
+    "dep:futures-rustls",
+    "dep:rustls-pki-types",
+    "dep:rustls-webpki",
+    "dep:x509-parser",
+    "dep:pkcs8",
+    "dep:zeroize",
+]
 # Use `aws-lc-rs` instead of `ring` as the rustls crypto provider. Additive:
 # `ring` stays compiled in, but `aws-lc-rs` is the one the connector uses.
 tls-aws-lc-rs = ["tls", "rustls/aws_lc_rs"]
@@ -31,6 +40,8 @@ futures-rustls = { version = "0.26.0", default-features = false, features = ["tl
 rustls-pki-types = { version = "1.16.0", optional = true }
 pkcs8 = { version = "0.10.2", default-features = false, features = ["alloc", "pem", "encryption", "3des", "sha1-insecure"], optional = true }
 zeroize = { version = "1.9", optional = true }
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"], optional = true }
+x509-parser = { version = "0.18.1", optional = true }
 
 [dev-dependencies]
 fdb-native-testkit = { path = "../fdb-native-testkit" }

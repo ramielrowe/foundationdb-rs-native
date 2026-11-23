@@ -3,6 +3,8 @@
 use std::io;
 use std::path::PathBuf;
 
+use super::verify_peers::{ParseError, RootError};
+
 /// Why TLS configuration could not be loaded or a connector could not be
 /// built.
 ///
@@ -103,16 +105,17 @@ pub enum TlsError {
     ///
     /// FoundationDB has no default trust store either; a client with no CA
     /// rejects every server. Supply `TLS_ca_path` / `TLS_ca_bytes` /
-    /// `FDB_TLS_CA_FILE`, or install a custom verifier with
-    /// [`TlsConnector::with_verifier`](super::TlsConnector::with_verifier).
+    /// `FDB_TLS_CA_FILE`.
     #[error("no TLS CA certificates are configured; servers cannot be validated")]
     NoTrustAnchors,
-    /// A CA certificate was rejected by the trust-anchor parser.
-    #[error("invalid TLS CA certificate: {0}")]
-    InvalidCa(#[source] rustls::Error),
-    /// The default verifier could not be built.
-    #[error("cannot build the TLS certificate verifier: {0}")]
-    Verifier(#[from] rustls::client::VerifierBuilderError),
+    /// The CA certificates cannot be used: one does not parse, or none of them
+    /// is a self-signed root that can anchor a chain (an intermediate CA
+    /// certificate alone cannot; include the root).
+    #[error("invalid TLS CA certificates: {0}")]
+    InvalidCa(#[source] RootError),
+    /// The configured `verify_peers` rules do not parse.
+    #[error("invalid TLS verify_peers setting: {0}")]
+    VerifyPeers(#[source] ParseError),
     /// rustls rejected the configuration (for example a key that does not
     /// match the certificate).
     #[error("invalid TLS configuration: {0}")]

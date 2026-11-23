@@ -29,11 +29,14 @@
 //! * [`TlsConnector`] is built from that and wraps a connected stream in a
 //!   [`TlsStream`], which implements `futures_io::{AsyncRead, AsyncWrite}`
 //!   and so drops in wherever the transport uses a `Runtime::Stream`.
-//! * Server certificates are checked by a pluggable
-//!   [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier). The
-//!   default, [`ChainVerifier`], validates the chain to the configured CA and
-//!   nothing else. FoundationDB's `verify_peers` rules plug in through
-//!   [`TlsConnector::with_verifier`].
+//! * Server certificates are checked the way FoundationDB checks them, by
+//!   [`verify_peers::VerifyPeersVerifier`]: the chain must validate against the
+//!   configured CA, and then the configured `verify_peers` rules
+//!   ([`LoadedTlsConfig::verify_peers`], default `Check.Valid=1`) must accept
+//!   the peer's certificates. [`TlsConnector::new`] builds it; the rule
+//!   language is documented in [`verify_peers`]. An extra
+//!   [`PeerPolicy`](verify_peers::PeerPolicy) can add checks through
+//!   [`TlsConnector::with_policy`].
 //!
 //! # Crypto provider
 //!
@@ -129,8 +132,7 @@
 //!   HTTP client for blob stores and KMS), never for FDB peers. On 8.0 that
 //!   path also bypasses the verify-peers policy and checks the hostname.
 //! * This module sets `enable_sni = false` and passes rustls a placeholder
-//!   server name that the verifier ignores; [`ChainVerifier`] treats
-//!   `NotValidForName` as success.
+//!   server name that the verifier ignores.
 //!
 //! ## What a client presents and how files are handled
 //!
@@ -228,8 +230,9 @@
 //!   (`TLSConfig.actor.cpp` 63-74 / `TLSConfig.cpp` 62-73; `tls.rst`,
 //!   "Default Peer Verification"). That is one rule with no field criteria, so
 //!   it accepts any peer whose chain OpenSSL validated against the CA. This
-//!   is exactly what [`ChainVerifier`] does. The configured string is
-//!   available as [`LoadedTlsConfig::verify_peers`] for a rule-aware verifier.
+//!   is exactly the chain check of [`verify_peers::VerifyPeersVerifier`]. The
+//!   configured string is resolved once, by [`TlsConfig::load`], and available
+//!   as [`LoadedTlsConfig::verify_peers`].
 //! * **Both ends check, but servers do not demand a client certificate.**
 //!   `ConfigureSSLContext` sets `verify_peer`, plus `verify_fail_if_no_peer_cert`
 //!   unless the endpoint type is `SERVER` (lines 124-129 / 123-128): *a client
@@ -257,20 +260,21 @@
 //!
 //! # Differences from OpenSSL
 //!
-//! Chain validation uses `rustls-webpki`, which is stricter than OpenSSL in
-//! ways that can reject a certificate FoundationDB accepts:
+//! Chain validation uses `rustls-webpki`, shaped to follow OpenSSL's use of its
+//! trust store (see [`verify_peers::VerifyPeersVerifier`] for the exact rules:
+//! which CA-file certificates are trust anchors, validity periods, `ssl_server`
+//! purpose, the self-signed `openssl req -x509` setup). Where webpki is
+//! stricter than OpenSSL, a certificate FoundationDB accepts is rejected, with
+//! an error that says what to change
+//! ([`verify_peers::CertificateRejected`]):
 //!
 //! * no SHA-1 or MD5 signatures, no RSA keys under 2048 bits (the FDB docs'
 //!   example uses `rsa:2048`; older sample commands used SHA-1);
-//! * X.509 v3 only; an end-entity certificate must not be a CA
-//!   (`basicConstraints CA:TRUE`), and a present `extendedKeyUsage` must
-//!   include `serverAuth`;
-//! * a self-signed server certificate is accepted only if it is itself in the
-//!   CA bundle (it then acts as its own trust anchor), and only if it is not
-//!   flagged `CA:TRUE`: the self-signed example in FoundationDB's `tls.rst`
-//!   (`openssl req -x509`) is flagged `CA:TRUE` and is rejected as
-//!   `CaUsedAsEndEntity`. Fixing this is planned together with the verify-peers
-//!   verifier (an ignored test records the case);
+//! * X.509 v3 only for end-entity and intermediate certificates (a self-signed
+//!   v1 root in the CA file is fine), and an end-entity certificate must not be
+//!   a CA (`basicConstraints CA:TRUE`) unless it is itself a self-signed
+//!   certificate in the CA file, as with `openssl req -x509` and
+//!   `--tls_ca_file` pointing at the same file;
 //! * **ECDSA P-521 is not supported with the default `ring` provider**, for
 //!   either a server certificate signature or a client private key
 //!   ([`TlsError::InvalidKey`] for the latter). It works with the
@@ -300,8 +304,9 @@
 mod config;
 mod error;
 mod pem;
+mod provider;
 mod stream;
-mod verifier;
+pub mod verify_peers;
 
 pub use config::{
     DEFAULT_CERTIFICATE_FILE_NAME, DEFAULT_KEY_FILE_NAME, DEFAULT_VERIFY_PEERS, ENV_CA_FILE,
@@ -309,8 +314,8 @@ pub use config::{
     ENV_VERIFY_PEERS, LoadedTlsConfig, MAX_FILE_SIZE, TlsConfig, default_config_dir,
 };
 pub use error::TlsError;
+pub use provider::crypto_provider;
 pub use stream::{TlsConnector, TlsStream, rustls_error};
-pub use verifier::{ChainVerifier, crypto_provider};
 
 /// The rustls this module is built on, re-exported so a custom
 /// [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier) uses

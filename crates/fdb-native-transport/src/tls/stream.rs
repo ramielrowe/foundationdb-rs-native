@@ -8,18 +8,18 @@ use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use rustls::client::Resumption;
-use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::CertificateDer;
 use rustls::{CipherSuite, ClientConfig, ProtocolVersion};
 
 use super::config::LoadedTlsConfig;
 use super::error::TlsError;
-use super::verifier::{ChainVerifier, crypto_provider, placeholder_server_name};
+use super::provider::{crypto_provider, placeholder_server_name};
+use super::verify_peers::{PeerPolicy, VerifyPeers, VerifyPeersVerifier};
 
 /// Starts TLS client sessions over byte streams, the FoundationDB way.
 ///
 /// A connector is built once from a [`LoadedTlsConfig`] (client certificate,
-/// CA bundle) and a certificate verifier, then used for every outgoing
+/// CA bundle, verify-peers rules), then used for every outgoing
 /// connection: [`connect`](Self::connect) runs the handshake over any
 /// `futures-io` stream, typically a `Runtime::Stream` freshly connected to a
 /// `host:port:tls` address. It is cheap to clone and `Send + Sync`.
@@ -34,36 +34,48 @@ pub struct TlsConnector {
 }
 
 impl TlsConnector {
-    /// A connector that validates server chains against the CA bundle of
-    /// `config` with [`ChainVerifier`].
+    /// A connector that verifies servers the way FoundationDB does: the chain
+    /// must validate against the CA bundle of `config`, and then the
+    /// `verify_peers` rules of `config` ([`LoadedTlsConfig::verify_peers`],
+    /// by default `Check.Valid=1`, which is the chain check alone) must accept
+    /// the peer's certificates. See [`VerifyPeersVerifier`].
     ///
-    /// Errors if there is no CA (the same as FoundationDB, which then
-    /// rejects every server), or if the client certificate or key cannot be
-    /// loaded.
+    /// Errors if there is no CA ([`TlsError::NoTrustAnchors`], the same as
+    /// FoundationDB, which then rejects every server), if the CA bundle holds
+    /// no usable trust anchor ([`TlsError::InvalidCa`]), if the rules do not
+    /// parse ([`TlsError::VerifyPeers`]), or if the client certificate or key
+    /// cannot be loaded.
     pub fn new(config: &LoadedTlsConfig) -> Result<Self, TlsError> {
-        let verifier = ChainVerifier::from_config(config)?;
-        Self::with_verifier(config, Arc::new(verifier))
+        Self::build(config, None)
     }
 
-    /// A connector that delegates server certificate verification to
-    /// `verifier` instead of the default [`ChainVerifier`].
-    ///
-    /// This is the hook for FoundationDB's `verify_peers` rules. `verifier`
-    /// replaces chain validation entirely, so it must perform it (for
-    /// example by wrapping a [`ChainVerifier`]). The CA bundle in `config`
-    /// is not consulted.
-    ///
-    /// The `server_name` rustls passes to the verifier is a placeholder and
-    /// must be ignored.
-    pub fn with_verifier(
+    /// Like [`new`](Self::new), with an extra [`PeerPolicy`] that must also
+    /// accept the peer. It runs after the chain validation and the rules, which
+    /// it cannot bypass.
+    pub fn with_policy(
         config: &LoadedTlsConfig,
-        verifier: Arc<dyn ServerCertVerifier>,
+        policy: Arc<dyn PeerPolicy>,
     ) -> Result<Self, TlsError> {
+        Self::build(config, Some(policy))
+    }
+
+    fn build(
+        config: &LoadedTlsConfig,
+        policy: Option<Arc<dyn PeerPolicy>>,
+    ) -> Result<Self, TlsError> {
+        let rules = VerifyPeers::parse_all(config.verify_peers()).map_err(TlsError::VerifyPeers)?;
+        let provider = crypto_provider();
+        let roots = config.ca_certificates()?;
+        let mut verifier =
+            VerifyPeersVerifier::new(rules, roots, &provider).map_err(TlsError::InvalidCa)?;
+        if let Some(policy) = policy {
+            verifier = verifier.with_policy(policy);
+        }
         let identity = config.client_identity()?;
-        let builder = ClientConfig::builder_with_provider(crypto_provider())
+        let builder = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)?
             .dangerous()
-            .with_custom_certificate_verifier(verifier);
+            .with_custom_certificate_verifier(Arc::new(verifier));
         let client_certificate = identity.is_some();
         let mut client_config = match identity {
             Some((chain, key)) => {

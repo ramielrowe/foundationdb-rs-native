@@ -11,20 +11,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fdb_native_transport::runtime::{Runtime, TokioRuntime, TokioStream};
-use fdb_native_transport::tls::rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
 use fdb_native_transport::tls::rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
 };
 use fdb_native_transport::tls::rustls::server::WebPkiClientVerifier;
 use fdb_native_transport::tls::rustls::{
-    self, CertificateError, DigitallySignedStruct, HandshakeKind, ProtocolVersion, RootCertStore,
-    ServerConfig, SignatureScheme, SupportedProtocolVersion,
+    self, CertificateError, HandshakeKind, ProtocolVersion, RootCertStore, ServerConfig,
+    SupportedProtocolVersion,
 };
+use fdb_native_transport::tls::verify_peers::{PeerPolicy, PeerRejected};
 use fdb_native_transport::tls::{
-    ChainVerifier, LoadedTlsConfig, TlsConfig, TlsConnector, TlsError, TlsStream, crypto_provider,
-    rustls_error,
+    ENV_VERIFY_PEERS, LoadedTlsConfig, TlsConfig, TlsConnector, TlsError, TlsStream,
+    crypto_provider, rustls_error,
 };
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use rcgen::{
@@ -527,7 +525,7 @@ async fn a_certificate_without_a_key_is_a_configuration_error() {
 }
 
 #[tokio::test]
-async fn a_connector_needs_a_ca_unless_a_verifier_is_supplied() {
+async fn a_connector_needs_a_ca() {
     let error = TlsConnector::new(&loaded(TlsConfig::new())).unwrap_err();
     assert!(matches!(error, TlsError::NoTrustAnchors), "{error:?}");
 }
@@ -560,134 +558,283 @@ async fn key_and_certificate_can_be_read_from_files() {
     assert_eq!(server.next_seen().await.peer_certs.unwrap()[0], client.cert);
 }
 
-/// A verifier that counts calls, records what it was shown, and defers to
-/// `ChainVerifier` unless told to reject.
-struct SpyVerifier {
-    inner: Option<ChainVerifier>,
+/// A policy that counts calls, records what it was shown, and rejects on demand.
+#[derive(Debug)]
+struct SpyPolicy {
     reject: bool,
     calls: AtomicUsize,
     seen: std::sync::Mutex<Option<(CertificateDer<'static>, usize)>>,
 }
 
-impl std::fmt::Debug for SpyVerifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SpyVerifier")
-    }
-}
-
-impl SpyVerifier {
-    fn new(inner: Option<ChainVerifier>, reject: bool) -> Arc<Self> {
+impl SpyPolicy {
+    fn new(reject: bool) -> Arc<Self> {
         Arc::new(Self {
-            inner,
             reject,
             calls: AtomicUsize::new(0),
             seen: std::sync::Mutex::new(None),
         })
     }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
 }
 
-impl ServerCertVerifier for SpyVerifier {
-    fn verify_server_cert(
+impl PeerPolicy for SpyPolicy {
+    fn check(
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
+    ) -> Result<(), rustls::Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen.lock().unwrap() = Some((end_entity.clone().into_owned(), intermediates.len()));
         if self.reject {
             return Err(rustls::Error::General("rejected by spy".into()));
         }
-        match &self.inner {
-            Some(chain) => {
-                chain.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            }
-            None => Ok(ServerCertVerified::assertion()),
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &crypto_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &crypto_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        Ok(())
     }
 }
 
 #[tokio::test]
-async fn the_custom_verifier_is_invoked_with_the_presented_chain() {
+async fn the_policy_is_invoked_with_the_presented_chain() {
     let root = new_ca("Root");
     let intermediate = new_intermediate("Intermediate", &root);
     let leaf = server_leaf(&intermediate, &["server.example"]);
     let server = Server::start(ServerOptions::new(&leaf, &[intermediate.der().clone()])).await;
 
     let config = loaded(ca_config(&root));
-    let spy = SpyVerifier::new(Some(ChainVerifier::from_config(&config).unwrap()), false);
-    let connector = TlsConnector::with_verifier(&config, spy.clone()).unwrap();
+    let spy = SpyPolicy::new(false);
+    let connector = TlsConnector::with_policy(&config, spy.clone()).unwrap();
     let _stream = connect(&connector, server.addr).await.unwrap();
 
-    assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(spy.calls(), 1);
     let (end_entity, intermediates) = spy.seen.lock().unwrap().clone().unwrap();
     assert_eq!(end_entity, leaf.cert);
     assert_eq!(intermediates, 1);
 }
 
 #[tokio::test]
-async fn a_custom_verifier_can_reject_a_chain_the_ca_accepts() {
+async fn a_policy_can_reject_a_chain_the_ca_accepts() {
     let ca = new_ca("Test CA");
     let leaf = server_leaf(&ca, &["server.example"]);
     let server = Server::start(ServerOptions::new(&leaf, &[])).await;
 
-    let config = loaded(ca_config(&ca));
-    let spy = SpyVerifier::new(Some(ChainVerifier::from_config(&config).unwrap()), true);
-    let connector = TlsConnector::with_verifier(&config, spy.clone()).unwrap();
+    let spy = SpyPolicy::new(true);
+    let connector = TlsConnector::with_policy(&loaded(ca_config(&ca)), spy.clone()).unwrap();
     let error = connect(&connector, server.addr).await.unwrap_err();
     assert!(
         matches!(rustls_error(&error), Some(rustls::Error::General(m)) if m == "rejected by spy"),
         "unexpected error: {error:?}"
     );
-    assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(spy.calls(), 1);
 }
 
+/// A policy cannot replace chain validation: it never runs for a chain that does not validate
+/// (and a connector always needs a CA).
 #[tokio::test]
-async fn a_custom_verifier_replaces_chain_validation_and_needs_no_ca() {
+async fn a_policy_does_not_run_for_an_untrusted_chain_and_needs_a_ca() {
+    let trusted = new_ca("Trusted CA");
     let rogue = new_ca("Rogue CA");
     let leaf = server_leaf(&rogue, &["server.example"]);
     let server = Server::start(ServerOptions::new(&leaf, &[])).await;
 
-    let spy = SpyVerifier::new(None, false);
-    let connector = TlsConnector::with_verifier(&loaded(TlsConfig::new()), spy.clone()).unwrap();
-    let _stream = connect(&connector, server.addr).await.unwrap();
-    assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
+    let spy = SpyPolicy::new(false);
+    let connector = TlsConnector::with_policy(&loaded(ca_config(&trusted)), spy.clone()).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    assert!(
+        matches!(
+            rustls_error(&error),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(spy.calls(), 0);
+
+    let error = TlsConnector::with_policy(&loaded(TlsConfig::new()), spy).unwrap_err();
+    assert!(matches!(error, TlsError::NoTrustAnchors), "{error:?}");
+}
+
+// ------------------------------------------------- verify_peers rules
+
+fn rules_config(ca: &Ca, rules: &str) -> TlsConfig {
+    ca_config(ca).verify_peers(rules)
+}
+
+/// A server whose certificate is `CN=<cn>` and has a DNS name.
+fn server_named(issuer: &Ca, cn: &str) -> Leaf {
+    leaf_with(
+        issuer,
+        KeyPair::generate().unwrap(),
+        &["server.example"],
+        ExtendedKeyUsagePurpose::ServerAuth,
+        |params| {
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params.distinguished_name.push(DnType::CommonName, cn);
+            params
+                .distinguished_name
+                .push(DnType::OrganizationName, "FDB Test");
+        },
+    )
+}
+
+fn peer_rejected(error: &std::io::Error) -> &PeerRejected {
+    match rustls_error(error) {
+        Some(rustls::Error::InvalidCertificate(CertificateError::Other(other))) => other
+            .0
+            .downcast_ref::<PeerRejected>()
+            .unwrap_or_else(|| panic!("not a PeerRejected: {other:?}")),
+        other => panic!("expected a verify_peers rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_peers_subject_rules_accept_and_reject_through_the_connector() {
+    let ca = new_ca("Test CA");
+    let leaf = server_named(&ca, "node-1");
+    let server = Server::start(ServerOptions::new(&leaf, &[])).await;
+
+    for rules in [
+        "S.CN=node-1",
+        "S.CN=node-1,S.O=FDB Test,I.CN=Test CA,R.CN=Test CA",
+        "S.CN=other|S.CN=node-1",
+        "S.subjectAltName=DNS:server.example",
+        "Check.Valid=0",
+        "Check.Valid=1",
+    ] {
+        let connector = TlsConnector::new(&loaded(rules_config(&ca, rules))).unwrap();
+        connect(&connector, server.addr)
+            .await
+            .unwrap_or_else(|e| panic!("{rules}: {e:?}"));
+    }
+
+    for rules in ["S.CN=node-2", "S.CN=node-1,I.CN=Other CA", "R.CN=Elsewhere"] {
+        let connector = TlsConnector::new(&loaded(rules_config(&ca, rules))).unwrap();
+        let error = connect(&connector, server.addr).await.unwrap_err();
+        let rejected = peer_rejected(&error);
+        assert_eq!(rejected.failures.len(), rules.split('|').count(), "{rules}");
+    }
+}
+
+/// `Check.Valid=0` skips the rules, not the chain validation (FDB: `verify_peer` rejects a
+/// failed `preverified` first).
+#[tokio::test]
+async fn check_valid_zero_does_not_skip_chain_validation() {
+    let trusted = new_ca("Trusted CA");
+    let rogue = new_ca("Rogue CA");
+    let leaf = server_named(&rogue, "node-1");
+    let server = Server::start(ServerOptions::new(&leaf, &[])).await;
+    let connector = TlsConnector::new(&loaded(rules_config(&trusted, "Check.Valid=0"))).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    assert!(
+        matches!(
+            rustls_error(&error),
+            Some(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))
+        ),
+        "{error:?}"
+    );
+}
+
+/// A CA file of root plus intermediate, with a peer that sends only its leaf: the
+/// intermediate completes the chain, and `R.` sees the self-signed root, not the intermediate.
+#[tokio::test]
+async fn root_criteria_with_a_root_and_intermediate_bundle() {
+    let root = new_ca("Test Root");
+    let intermediate = new_intermediate("Test Intermediate", &root);
+    let leaf = server_named(&intermediate, "node-1");
+    // The server sends only its leaf.
+    let server = Server::start(ServerOptions::new(&leaf, &[])).await;
+    let bundle = format!("{}{}", root.pem(), intermediate.pem());
+
+    let config = |rules: &str| {
+        TlsConfig::new()
+            .ca_bytes(bundle.clone())
+            .verify_peers(rules)
+    };
+    let connector =
+        TlsConnector::new(&loaded(config("R.CN=Test Root,I.CN=Test Intermediate"))).unwrap();
+    connect(&connector, server.addr).await.unwrap();
+
+    let connector = TlsConnector::new(&loaded(config("R.CN=Test Intermediate"))).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    assert!(
+        peer_rejected(&error).failures[0]
+            .reason
+            .contains("RootCert.Subject.Name.NameMismatch"),
+        "{error:?}"
+    );
+
+    // The intermediate alone cannot anchor a chain.
+    let error =
+        TlsConnector::new(&loaded(TlsConfig::new().ca_bytes(intermediate.pem()))).unwrap_err();
+    assert!(matches!(error, TlsError::InvalidCa(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn verify_peers_from_the_environment_is_used_unless_set_explicitly() {
+    let ca = new_ca("Test CA");
+    let leaf = server_named(&ca, "node-1");
+    let server = Server::start(ServerOptions::new(&leaf, &[])).await;
+    let load = |config: TlsConfig, rules: &'static str| {
+        config
+            .load_with(
+                move |name| (name == ENV_VERIFY_PEERS).then(|| rules.into()),
+                None,
+            )
+            .unwrap()
+    };
+
+    // FDB_TLS_VERIFY_PEERS applies when nothing is set explicitly...
+    let connector = TlsConnector::new(&load(ca_config(&ca), "S.CN=node-1")).unwrap();
+    connect(&connector, server.addr).await.unwrap();
+    let connector = TlsConnector::new(&load(ca_config(&ca), "S.CN=node-2")).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    peer_rejected(&error);
+    // ...and the explicit option beats it.
+    let connector =
+        TlsConnector::new(&load(rules_config(&ca, "S.CN=node-1"), "S.CN=node-2")).unwrap();
+    connect(&connector, server.addr).await.unwrap();
+    // Repeated options are joined with `|`.
+    let both = ca_config(&ca)
+        .verify_peers("S.CN=node-2")
+        .add_verify_peers("S.CN=node-1");
+    let connector = TlsConnector::new(&loaded(both)).unwrap();
+    connect(&connector, server.addr).await.unwrap();
+}
+
+#[tokio::test]
+async fn unparseable_verify_peers_is_an_error_when_building_the_connector() {
+    let ca = new_ca("Test CA");
+    for rules in ["S.CN=a,Check.Valid=10", "S.XX=a", "S.CN"] {
+        let error = TlsConnector::new(&loaded(rules_config(&ca, rules))).unwrap_err();
+        assert!(
+            matches!(error, TlsError::VerifyPeers(_)),
+            "{rules}: {error:?}"
+        );
+        assert!(error.to_string().contains("verify_peers"), "{error}");
+    }
+    // The environment's value is checked the same way.
+    let config = ca_config(&ca)
+        .load_with(
+            |name| (name == ENV_VERIFY_PEERS).then(|| "S.CN=a,junk".into()),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        TlsConnector::new(&config),
+        Err(TlsError::VerifyPeers(_))
+    ));
+    // The default is exactly the parsed `Check.Valid=1`.
+    assert_eq!(
+        fdb_native_transport::tls::verify_peers::VerifyPeers::default(),
+        fdb_native_transport::tls::verify_peers::VerifyPeers::parse(
+            fdb_native_transport::tls::DEFAULT_VERIFY_PEERS
+        )
+        .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -822,28 +969,66 @@ async fn a_server_certificate_for_client_auth_only_is_rejected() {
     );
 }
 
-#[tokio::test]
-#[ignore = "TODO(vdb.2 unification): the default verifier uses rustls-webpki, which rejects a \
-            CA:TRUE end-entity certificate (what FDB's tls.rst `openssl req -x509` example \
-            produces). Enable when ChainVerifier is unified with the verify_peers verifier."]
-async fn a_self_signed_ca_flagged_server_certificate_is_accepted_when_trusted() {
-    let key = KeyPair::generate().unwrap();
-    let mut params = ca_params("self-signed-ca-server");
+/// The FDB docs' own setup (`openssl req -x509`: a self-signed certificate with `CA:TRUE` and
+/// no key usage, used as its own CA file).
+fn req_x509_params(common_name: &str) -> CertificateParams {
+    let mut params = ca_params(common_name);
+    params.key_usages = Vec::new();
     params.subject_alt_names = vec![rcgen::SanType::DnsName(
         "server.example".try_into().unwrap(),
     )];
+    params
+}
+
+fn serve_self_signed(params: CertificateParams) -> (KeyPair, rcgen::Certificate) {
+    let key = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
-    let server = Server::start(ServerOptions {
+    (key, cert)
+}
+
+fn self_signed_options(key: &KeyPair, cert: &rcgen::Certificate) -> ServerOptions {
+    ServerOptions {
         chain: vec![cert.der().clone()],
         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
         client_ca: None,
         allow_anonymous: false,
         versions: rustls::DEFAULT_VERSIONS,
         alpn: Vec::new(),
-    })
-    .await;
+    }
+}
+
+#[tokio::test]
+async fn a_self_signed_ca_flagged_server_certificate_is_accepted_when_trusted() {
+    let (key, cert) = serve_self_signed(req_x509_params("self-signed-ca-server"));
+    let server = Server::start(self_signed_options(&key, &cert)).await;
+    let rules = TlsConfig::new()
+        .ca_bytes(cert.pem())
+        .verify_peers("R.CN=self-signed-ca-server,S.CN=self-signed-ca-server");
+    let connector = TlsConnector::new(&loaded(rules)).unwrap();
+    connect(&connector, server.addr).await.unwrap();
     let connector = TlsConnector::new(&loaded(TlsConfig::new().ca_bytes(cert.pem()))).unwrap();
     connect(&connector, server.addr).await.unwrap();
+
+    // Without being in the CA file it is just an untrusted self-signed certificate.
+    let other = new_ca("Other CA");
+    let connector = TlsConnector::new(&loaded(ca_config(&other))).unwrap();
+    assert!(connect(&connector, server.addr).await.is_err());
+}
+
+/// A CA-flagged self-signed certificate whose key usage is only `keyCertSign` is not a TLS
+/// server certificate to OpenSSL either (`ssl_server` purpose).
+#[tokio::test]
+async fn a_self_signed_certificate_with_only_cert_sign_usage_is_not_a_server_certificate() {
+    let mut params = req_x509_params("cert-sign-only");
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let (key, cert) = serve_self_signed(params);
+    let server = Server::start(self_signed_options(&key, &cert)).await;
+    let connector = TlsConnector::new(&loaded(TlsConfig::new().ca_bytes(cert.pem()))).unwrap();
+    let error = connect(&connector, server.addr).await.unwrap_err();
+    assert!(
+        format!("{error:?}").contains("keyUsage"),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[tokio::test]
