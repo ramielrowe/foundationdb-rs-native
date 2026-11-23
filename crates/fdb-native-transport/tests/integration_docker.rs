@@ -257,6 +257,7 @@ async fn protocol_info_request(peer: &PeerHandle, endpoint: Uid) -> Result<Vec<u
         },
     )
     .await
+    .map(|reply| reply.payload)
 }
 
 /// Asks the server for its protocol version on the well-known endpoint every fdbserver process
