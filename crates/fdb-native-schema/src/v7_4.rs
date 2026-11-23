@@ -25,8 +25,8 @@
 use std::collections::BTreeMap;
 
 use fdb_native_wire::{
-    Decode, DecodeError, Encode, EncodeError, IdempotencyIdRef, ObjectRef, Reader, ReplyPromise,
-    RequestStream, Shape, TagSet, TagSetRef, Uid, VersionVector, Void, Wire, Writer,
+    IdempotencyIdRef, ReplyPromise, RequestStream, TagSet, TagSetRef, Uid, VersionVector, Void,
+    Wire,
 };
 
 pub use crate::common::{
@@ -62,6 +62,8 @@ pub const COMMIT_PROXY_STREAMS: CommitProxyStreams<u32> = CommitProxyStreams {
 
 /// `WipedString` (`serializer(ar, ws, arena)`; `ws` is a local copy of the string): a
 /// tenant's authorization token.
+///
+/// Absent: `WipedString() = default`, an empty string (zero).
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WipedString<'a> {
     /// `ws`.
@@ -74,54 +76,27 @@ pub struct WipedString<'a> {
 /// `TenantInfo` (`serializable_traits<TenantInfo>`: `serializer(ar, tenantId, token,
 /// arena)`).
 ///
-/// Written by hand rather than derived for one reason: an *absent* `TenantInfo` table (a
-/// missing slot) is `TenantInfo()`, [`TenantInfo::NONE`], because C++'s `LoadMember`
-/// default-constructs a missing member (`member = std::decay_t<decltype(member)>{}`,
-/// `flow/include/flow/flat_buffers.h`) and `TenantInfo()` sets `tenantId = INVALID_TENANT`. A
-/// present table with a missing `tenantId` slot still reads 0, like any scalar. [`Default`] is
-/// also [`TenantInfo::NONE`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Absent: an *absent* `TenantInfo` table (a missing slot) is `TenantInfo()`,
+/// [`TenantInfo::NONE`], because C++'s `LoadMember` default-constructs a missing member
+/// (`member = std::decay_t<decltype(member)>{}`, `flow/include/flow/flat_buffers.h`) and
+/// `TenantInfo()` sets `tenantId = INVALID_TENANT` (`fdbrpc/include/fdbrpc/TenantInfo.h`),
+/// hence `#[fdb(absent = "default")]` and [`Default`] being [`TenantInfo::NONE`]. A *present*
+/// table with a missing `tenantId` slot still reads 0, like any scalar.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+#[fdb(absent = "default")]
 pub struct TenantInfo<'a> {
     /// `tenantId` ([`TenantInfo::INVALID_TENANT`] for none).
     pub tenant_id: i64,
     /// `token`.
     pub token: Option<WipedString<'a>>,
     /// `arena`.
+    #[fdb(arena)]
     pub arena: (),
 }
 
 impl Default for TenantInfo<'_> {
     fn default() -> Self {
         TenantInfo::NONE
-    }
-}
-
-impl Wire for TenantInfo<'_> {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl Encode for TenantInfo<'_> {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let mut t = w.table();
-        t.field(&self.tenant_id)?;
-        t.field(&self.token)?;
-        // `arena` takes no slot.
-        t.finish()
-    }
-}
-
-impl<'de: 'a, 'a> Decode<'de> for TenantInfo<'a> {
-    fn absent() -> Self {
-        TenantInfo::NONE
-    }
-
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        let mut t = r.table(at)?;
-        Ok(TenantInfo {
-            tenant_id: t.field()?,
-            token: t.field()?,
-            arena: (),
-        })
     }
 }
 
@@ -138,6 +113,8 @@ impl TenantInfo<'_> {
 }
 
 /// `TenantMode` (`serializer(ar, mode)`): 0 disabled, 1 optional, 2 required.
+///
+/// Absent: `TenantMode() : mode(DISABLED)`, zero.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TenantMode {
     /// `mode`.
@@ -149,6 +126,8 @@ pub struct TenantMode {
 
 /// `EncryptKeyProxyInterface` (`serializer(ar, locality, myId, waitFailure)`; its other
 /// streams are adjusted endpoints 1 to 5 of `waitFailure`).
+///
+/// Absent: `EncryptKeyProxyInterface() {}`: zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 1303419)]
 pub struct EncryptKeyProxyInterface<'a> {
@@ -163,6 +142,9 @@ pub struct EncryptKeyProxyInterface<'a> {
 /// `ClientDBInfo` on 7.4 (`serializer(ar, grvProxies, commitProxies, id, forward, history,
 /// tenantMode, encryptKeyProxy, clusterId, clusterType, metaclusterName)`), the reply to
 /// [`OpenDatabaseCoordRequest`].
+///
+/// Absent: `ClientDBInfo() {}` with `clusterType = STANDALONE` (0) and `TenantMode()`
+/// `DISABLED` (0): zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 5355080)]
 pub struct ClientDBInfo<'a> {
@@ -233,8 +215,11 @@ impl<'a> From<&'a domain::ClientDbInfo> for ClientDBInfo<'a> {
 
 /// `GetReadVersionRequest` on 7.4 (`serializer(ar, transactionCount, flags, tags, debugID,
 /// reply, spanContext, maxVersion)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 838566)]
+///
+/// Absent: `GetReadVersionRequest() : transactionCount(1), flags(0), maxVersion(invalidVersion)`,
+/// so `transaction_count` is 1 and `max_version` -1. [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 838566, absent = "default")]
 pub struct GetReadVersionRequest<'a> {
     /// `transactionCount`.
     pub transaction_count: u32,
@@ -250,6 +235,21 @@ pub struct GetReadVersionRequest<'a> {
     pub span_context: SpanContext,
     /// `maxVersion`.
     pub max_version: i64,
+}
+
+impl Default for GetReadVersionRequest<'_> {
+    /// `GetReadVersionRequest()`: one transaction, `maxVersion = invalidVersion`.
+    fn default() -> Self {
+        GetReadVersionRequest {
+            transaction_count: 1,
+            flags: 0,
+            tags: BTreeMap::new(),
+            debug_id: None,
+            reply: ReplyPromise::default(),
+            span_context: SpanContext::default(),
+            max_version: domain::INVALID_VERSION,
+        }
+    }
 }
 
 impl<'a> GetReadVersionRequest<'a> {
@@ -285,8 +285,12 @@ impl From<GetReadVersionRequest<'_>> for domain::GetReadVersion {
 /// `GetReadVersionReply` on 7.4 (`serializer(ar, BasicLoadBalancedReply::processBusyTime,
 /// version, locked, metadataVersion, tagThrottleInfo, midShardSize, rkDefaultThrottled,
 /// rkBatchThrottled, ssVersionVectorDelta, proxyId, proxyTagThrottledDuration)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq)]
-#[fdb(file_identifier = 15709388)]
+///
+/// Absent: `GetReadVersionReply() : version(invalidVersion), locked(false)` over
+/// `BasicLoadBalancedReply() : processBusyTime(0)`, so `version` is -1. [`Default`] is that
+/// too.
+#[derive(Wire, Clone, Debug, PartialEq)]
+#[fdb(file_identifier = 15709388, absent = "default")]
 pub struct GetReadVersionReply<'a> {
     /// `processBusyTime`.
     pub process_busy_time: i32,
@@ -310,6 +314,25 @@ pub struct GetReadVersionReply<'a> {
     pub proxy_id: Uid,
     /// `proxyTagThrottledDuration`.
     pub proxy_tag_throttled_duration: f64,
+}
+
+impl Default for GetReadVersionReply<'_> {
+    /// `GetReadVersionReply()`: `version = invalidVersion`.
+    fn default() -> Self {
+        GetReadVersionReply {
+            process_busy_time: 0,
+            version: domain::INVALID_VERSION,
+            locked: false,
+            metadata_version: None,
+            tag_throttle_info: BTreeMap::new(),
+            mid_shard_size: 0,
+            rk_default_throttled: false,
+            rk_batch_throttled: false,
+            ss_version_vector_delta: VersionVector::default(),
+            proxy_id: Uid::default(),
+            proxy_tag_throttled_duration: 0.0,
+        }
+    }
 }
 
 impl<'a> GetReadVersionReply<'a> {
@@ -361,8 +384,12 @@ impl<'a> GetReadVersionReply<'a> {
 
 /// `GetKeyServerLocationsRequest` on 7.4 (`serializer(ar, begin, end, limit, reverse, reply,
 /// spanContext, tenant, minTenantVersion, arena)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 9144680)]
+///
+/// Absent: `GetKeyServerLocationsRequest() : limit(0), reverse(false),
+/// minTenantVersion(latestVersion)` with `tenant` a `TenantInfo()`: `min_tenant_version` is
+/// -2 and `tenant` is [`TenantInfo::NONE`]. [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 9144680, absent = "default")]
 pub struct GetKeyServerLocationsRequest<'a> {
     /// `begin`.
     pub begin: &'a [u8],
@@ -383,6 +410,23 @@ pub struct GetKeyServerLocationsRequest<'a> {
     /// `arena`.
     #[fdb(arena)]
     pub arena: (),
+}
+
+impl Default for GetKeyServerLocationsRequest<'_> {
+    /// `GetKeyServerLocationsRequest()`: `minTenantVersion = latestVersion` (-2), no tenant.
+    fn default() -> Self {
+        GetKeyServerLocationsRequest {
+            begin: b"",
+            end: None,
+            limit: 0,
+            reverse: false,
+            reply: ReplyPromise::default(),
+            span_context: SpanContext::default(),
+            tenant: TenantInfo::NONE,
+            min_tenant_version: domain::LATEST_VERSION,
+            arena: (),
+        }
+    }
 }
 
 impl<'a> GetKeyServerLocationsRequest<'a> {
@@ -420,7 +464,12 @@ impl From<GetKeyServerLocationsRequest<'_>> for domain::GetKeyServerLocations {
 
 /// `ReadOptions` on 7.4 (`serializer(ar, type, cacheResult, debugID,
 /// consistencyCheckStartVersion, lockAware)`); `type` is an `int32_t` enum.
-#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Absent: `ReadOptions(Optional<UID> debugID = {}, ReadType type = ReadType::NORMAL,
+/// CacheResult cache = CacheResult::True, ...)` called with no arguments: `read_type` is
+/// `NORMAL` (3) and `cache_result` `true`. [`Default`] is that too.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+#[fdb(absent = "default")]
 pub struct ReadOptions {
     /// `type` (`ReadType`).
     pub read_type: i32,
@@ -432,6 +481,19 @@ pub struct ReadOptions {
     pub consistency_check_start_version: Option<i64>,
     /// `lockAware`.
     pub lock_aware: bool,
+}
+
+impl Default for ReadOptions {
+    /// `ReadOptions()`: `ReadType::NORMAL`, `CacheResult::True`.
+    fn default() -> Self {
+        ReadOptions {
+            read_type: domain::ReadOptions::NORMAL as i32,
+            cache_result: true,
+            debug_id: None,
+            consistency_check_start_version: None,
+            lock_aware: false,
+        }
+    }
 }
 
 impl From<&domain::ReadOptions> for ReadOptions {
@@ -461,6 +523,9 @@ impl From<ReadOptions> for domain::ReadOptions {
 
 /// `GetValueRequest` on 7.4 (`serializer(ar, key, version, tags, reply, spanContext,
 /// tenantInfo, options, ssLatestCommitVersions)`).
+///
+/// Absent: `GetValueRequest() {}`: zero, `tenantInfo` a `TenantInfo()` (composed by the
+/// field's own absent value).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8454530)]
 pub struct GetValueRequest<'a> {
@@ -516,6 +581,9 @@ impl From<GetValueRequest<'_>> for domain::GetValue {
 
 /// `CommitTransactionRequest` on 7.4 (`serializer(ar, transaction, reply, flags, debugID,
 /// commitCostEstimation, tagSet, spanContext, tenantInfo, idempotencyId, arena)`).
+///
+/// Absent: `CommitTransactionRequest() : flags(0)`, zero, `tenantInfo` a `TenantInfo()`
+/// (composed by the field's own absent value).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 93948)]
 pub struct CommitTransactionRequest<'a> {

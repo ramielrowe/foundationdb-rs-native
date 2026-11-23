@@ -29,6 +29,9 @@ use crate::{
 /// identifier, which is `T`'s with [`Wrapper::ReplyPromise`] (code 1), so
 /// `ReplyPromise<Inner>` with `Inner` = `0x000fdb0a` is `0x010fdb0a`.
 ///
+/// Absent: `ReplyPromise()`, whose endpoint token is the zero [`Uid`] (it is only set when
+/// the promise is made a request's reply).
+///
 /// ```
 /// use fdb_native_wire::{FileIdentified, ReplyPromise, Uid, Void};
 ///
@@ -129,6 +132,8 @@ impl<T: FileIdentified> FileIdentified for ReplyPromise<T> {
 /// FDB's `IPAddress`: a table with one slot holding `std::variant<uint32_t,
 /// std::array<uint8_t, 16>>` (tag 1 IPv4, tag 2 IPv6).
 ///
+/// Absent: `IPAddress() : addr(uint32_t(0))`, IPv4 `0.0.0.0` (7.4 and 8.0).
+///
 /// The IPv4 `u32` is the address as a number (10.0.0.1 is `0x0a000001`); the IPv6 bytes
 /// are in network order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -218,6 +223,11 @@ impl<'de> Decode<'de> for IpAddress {
 }
 
 /// FDB's `NetworkAddress` (`serializer(ar, ip, port, flags, fromHostname)`): a table.
+///
+/// Absent: `NetworkAddress() : ip(IPAddress(0)), port(0), flags(FLAG_PRIVATE)` (7.4 and
+/// 8.0), so [`FLAG_PRIVATE`](NetworkAddress::FLAG_PRIVATE) is set, which is [`Default`]. A
+/// present table with a missing `flags` slot reads 0. Written by hand rather than derived
+/// with `#[fdb(absent = "default")]` only because it predates the attribute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NetworkAddress {
     /// The IP address.
@@ -314,6 +324,9 @@ impl<'de> Decode<'de> for NetworkAddress {
 }
 
 /// FDB's `NetworkAddressList` (`serializer(ar, address, secondaryAddress)`): a table.
+///
+/// Absent: `NetworkAddressList() {}`: a default `NetworkAddress` (private) and no secondary
+/// address, which is [`Default`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NetworkAddressList {
     /// The primary address.
@@ -351,6 +364,9 @@ impl<'de> Decode<'de> for NetworkAddressList {
 
 /// FDB's `Endpoint` (`serializer(ar, addresses, token)`): a table. Where a service
 /// listens (an address list) and the token that selects it there.
+///
+/// Absent: `Endpoint() {}`: a default [`NetworkAddressList`] and the zero token, which is
+/// [`Default`].
 ///
 /// `==` and [`Hash`] are derived: they compare the whole address list (both addresses, and
 /// `fromHostname`). C++'s `Endpoint::operator==` and `hash` use only the token and the
@@ -459,6 +475,8 @@ impl<'de> Decode<'de> for Endpoint {
 /// their first stream; the others are [`Endpoint::adjusted`].
 ///
 /// `ReplyPromiseStream<T>` (streaming replies) is not implemented.
+///
+/// Absent: `RequestStream()`: the default [`Endpoint`].
 ///
 /// ```
 /// use fdb_native_wire::{Endpoint, RequestStream};

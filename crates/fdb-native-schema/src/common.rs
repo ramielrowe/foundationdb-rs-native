@@ -122,6 +122,7 @@ impl Encode for KeyRangeRef<'_> {
 }
 
 impl<'de: 'a, 'a> Decode<'de> for KeyRangeRef<'a> {
+    /// `KeyRangeRef()`: both keys empty (C++ `KeyRangeRef() = default`, 7.4 and 8.0).
     fn absent() -> Self {
         KeyRangeRef::default()
     }
@@ -177,6 +178,9 @@ pub struct MutationRef<'a> {
 impl<'a> MutationRef<'a> {
     /// `ClearRange`.
     pub const CLEAR_RANGE: u8 = 1;
+    /// `MAX_ATOMIC_OP`: the type of a default-constructed `MutationRef()`, one past the last
+    /// mutation type (24 on both 7.4 and 8.0).
+    pub const MAX_ATOMIC_OP: u8 = 24;
     /// `CHECKSUM_FLAG_MASK`: the type bit that says `param2` ends in a 4-byte checksum.
     pub const CHECKSUM_FLAG: u8 = 0x80;
     /// `ACCUMULATIVE_CHECKSUM_INDEX_FLAG_MASK`: the type bit that says `param2` ends in a
@@ -285,8 +289,10 @@ impl Encode for MutationRef<'_> {
 }
 
 impl<'de: 'a, 'a> Decode<'de> for MutationRef<'a> {
+    /// `MutationRef()`: `type(MAX_ATOMIC_OP)`, empty parameters, no checksum (7.4 and 8.0).
+    /// Not [`MutationRef::default`], whose type is 0 (`SetValue`).
     fn absent() -> Self {
-        MutationRef::default()
+        MutationRef::new(Self::MAX_ATOMIC_OP, b"", b"")
     }
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
@@ -334,6 +340,8 @@ impl From<MutationRef<'_>> for domain::Mutation {
 // Interfaces.
 
 /// `LocalityData` (`serializer(ar, _data)`): a `std::map<Key, Optional<Value>>`.
+///
+/// Absent: `LocalityData() {}`, an empty map (zero).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocalityData<'a> {
     /// `_data`.
@@ -363,6 +371,8 @@ impl From<LocalityData<'_>> for domain::Locality {
 /// `GrvProxyInterface` (`serializer(ar, processId, provisional, getConsistentReadVersion)`).
 /// The other streams are [adjusted endpoints](crate::streams) of
 /// `getConsistentReadVersion`.
+///
+/// Absent: no constructor, so value-initialized (zero): no process id, not provisional.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8743216)]
 pub struct GrvProxyInterface<'a> {
@@ -397,6 +407,8 @@ impl From<GrvProxyInterface<'_>> for domain::GrvProxy {
 /// `CommitProxyInterface` (`serializer(ar, processId, provisional, commit)`). The layout is
 /// the same on 7.4 and 8.0, but the [adjusted-endpoint indices](crate::streams) of the other
 /// streams are not, so [`CommitProxyInterface::to_domain`] takes the version.
+///
+/// Absent: no constructor, so value-initialized (zero).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8954922)]
 pub struct CommitProxyInterface<'a> {
@@ -433,6 +445,10 @@ impl<'a> From<&'a domain::CommitProxy> for CommitProxyInterface<'a> {
 /// `StorageServerInterface` (`serializer(ar, uniqueID, locality, getValue, tssPairID,
 /// acceptingRequests)`). The other streams are [adjusted endpoints](crate::streams) of
 /// `getValue`.
+///
+/// Absent: `StorageServerInterface()` sets `acceptingRequests = false` and a *random*
+/// `uniqueID` (`deterministicRandom()->randomUniqueID()`); this is the zero id, the one value
+/// a reader cannot reproduce.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 15302073)]
 pub struct StorageServerInterface<'a> {
@@ -476,6 +492,9 @@ impl From<StorageServerInterface<'_>> for domain::StorageServer {
 // Coordinator.
 
 /// `VersionHistory` (`serializer(ar, mutations, version)`).
+///
+/// Absent: `VersionHistory()`; `version` is uninitialized on 7.4 (`VersionHistory() {}`) and
+/// zero on 8.0 (`= default`), so zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 5863456)]
 pub struct VersionHistory<'a> {
@@ -508,7 +527,11 @@ impl From<VersionHistory<'_>> for domain::VersionHistory {
 }
 
 /// `ClientVersionRef` (`serializer(ar, clientVersion, sourceVersion, protocolVersion)`).
-#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Absent: `ClientVersionRef() { initUnknown(); }`, all three strings `"Unknown"` (7.4 and
+/// 8.0). [`Default`] is that too.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+#[fdb(absent = "default")]
 pub struct ClientVersionRef<'a> {
     /// `clientVersion`.
     pub client_version: &'a [u8],
@@ -519,6 +542,8 @@ pub struct ClientVersionRef<'a> {
 }
 
 /// `Hostname` (`serializer(ar, host, service, isTLS)`).
+///
+/// Absent: `Hostname() : host(""), service(""), isTLS(false)`, zero.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hostname<'a> {
     /// `host`.
@@ -529,13 +554,28 @@ pub struct Hostname<'a> {
     pub is_tls: bool,
 }
 
+impl Default for ClientVersionRef<'_> {
+    /// `ClientVersionRef()`: `"Unknown"` for all three.
+    fn default() -> Self {
+        ClientVersionRef {
+            client_version: b"Unknown",
+            source_version: b"Unknown",
+            protocol_version: b"Unknown",
+        }
+    }
+}
+
 /// `OpenDatabaseCoordRequest` (`serializer(ar, issues, supportedVersions, traceLogGroup,
 /// knownClientInfoID, clusterKey, coordinators, reply, hostnames, internal)`).
 ///
 /// The reply is declared `ReplyPromise<CachedSerialization<ClientDBInfo>>`, but it arrives
 /// exactly as `ErrorOr<EnsureTable<ClientDBInfo>>`, with the version's `ClientDBInfo`.
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 214728)]
+///
+/// Absent: `bool internal{ true }` is its only non-zero member initializer (7.4 and 8.0), so
+/// [`Default`] and an absent table have `internal` set; a *present* table without the `internal`
+/// slot reads `false`.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 214728, absent = "default")]
 pub struct OpenDatabaseCoordRequest<'a> {
     /// `issues`.
     pub issues: Vec<&'a [u8]>,
@@ -555,6 +595,24 @@ pub struct OpenDatabaseCoordRequest<'a> {
     pub hostnames: Vec<Hostname<'a>>,
     /// `internal`.
     pub internal: bool,
+}
+
+impl Default for OpenDatabaseCoordRequest<'_> {
+    /// `OpenDatabaseCoordRequest()`: everything empty or zero except `internal`, which is
+    /// `true`.
+    fn default() -> Self {
+        OpenDatabaseCoordRequest {
+            issues: Vec::new(),
+            supported_versions: Vec::new(),
+            trace_log_group: b"",
+            known_client_info_id: Uid::default(),
+            cluster_key: b"",
+            coordinators: Vec::new(),
+            reply: ReplyPromise::default(),
+            hostnames: Vec::new(),
+            internal: true,
+        }
+    }
 }
 
 impl<'a> OpenDatabaseCoordRequest<'a> {
@@ -630,6 +688,9 @@ impl From<OpenDatabaseCoordRequest<'_>> for domain::OpenDatabaseCoord {
 /// reader sets `expiration = now() + duration` on its own clock). The domain
 /// [`TagThrottleLimits`](domain::TagThrottleLimits) keeps the duration as received and turns
 /// it into a deadline with the receive time.
+///
+/// Absent: `ClientTagThrottleLimits() : tpsRate(0), expiration(0)`, so a zero rate that expired
+/// long ago: zero here (an expired duration).
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ClientTagThrottleLimits {
     /// `tpsRate`.
@@ -670,6 +731,8 @@ pub type KeyServerLocation<'a> = Pair<KeyRangeRef<'a>, Vec<StorageServerInterfac
 /// shard (and its interfaces, borrowed from the message) only as it is converted, with no
 /// intermediate vector; a reply built to be encoded uses a `Vec`
 /// ([`GetKeyServerLocationsReply::from_domain`]). Both have the same wire form.
+///
+/// Absent: no constructor, so value-initialized: every vector empty (zero).
 #[derive(Wire, Clone, Debug)]
 #[fdb(file_identifier = 10636023)]
 pub struct GetKeyServerLocationsReply<'a, R = VectorView<'a, KeyServerLocation<'a>>> {
@@ -774,8 +837,11 @@ fn tags_to_domain(mapping: Vec<Pair<Uid, Tag>>) -> Vec<(Uid, Tag)> {
 /// `GetValueReply` (`serializer(ar, LoadBalancedReply::penalty, LoadBalancedReply::error,
 /// value, cached)`). The value borrows from the message. [`Default`] is `GetValueReply()`:
 /// penalty 1.0 (`LoadBalancedReply()`), no error, no value.
+///
+/// Absent: `GetValueReply()`, that is, `penalty = 1.0` (7.4 and 8.0), not zero. A present reply
+/// whose `penalty` slot is missing reads `0.0`.
 #[derive(Wire, Clone, Copy, Debug, PartialEq)]
-#[fdb(file_identifier = 1378929)]
+#[fdb(file_identifier = 1378929, absent = "default")]
 pub struct GetValueReply<'a> {
     /// `penalty`.
     pub penalty: f64,
@@ -825,6 +891,8 @@ impl<'a> From<&domain::GetValueReply<'a>> for GetValueReply<'a> {
 
 /// `ClientTrCommitCostEstimation` (`serializer(ar, opsCount, writeCosts, clearIdxCosts,
 /// expensiveCostEstCount)`); `clearIdxCosts` is a `std::deque<std::pair<int, uint64_t>>`.
+///
+/// Absent: every member has a `= 0` initializer or is empty: zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClientTrCommitCostEstimation {
     /// `opsCount`.
@@ -870,6 +938,9 @@ impl From<ClientTrCommitCostEstimation> for domain::CommitCostEstimation {
 /// `CommitTransactionRef` (the flatbuffers branch: `serializer(ar, read_conflict_ranges,
 /// write_conflict_ranges, mutations, read_snapshot, report_conflicting_keys, lock_aware,
 /// spanContext, tenantIds)`).
+///
+/// Absent: `CommitTransactionRef() = default` with `read_snapshot = 0` and `false` flags
+/// (7.4 and 8.0): zero.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitTransactionRef<'a> {
     /// `read_conflict_ranges`.
@@ -936,8 +1007,11 @@ impl CommitTransactionRef<'_> {
 
 /// `CommitID` (`serializer(ar, version, txnBatchId, metadataVersion,
 /// conflictingKRIndices)`).
-#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
-#[fdb(file_identifier = 14254927)]
+///
+/// Absent: `CommitID() : version(invalidVersion), txnBatchId(0)` (7.4 and 8.0): `version` is
+/// -1, not zero. [`Default`] is that too.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+#[fdb(file_identifier = 14254927, absent = "default")]
 pub struct CommitID<'a> {
     /// `version`.
     pub version: i64,
@@ -947,6 +1021,18 @@ pub struct CommitID<'a> {
     pub metadata_version: Option<&'a [u8]>,
     /// `conflictingKRIndices`.
     pub conflicting_kr_indices: Option<Vec<i32>>,
+}
+
+impl Default for CommitID<'_> {
+    /// `CommitID()`: `version = invalidVersion` (-1).
+    fn default() -> Self {
+        CommitID {
+            version: domain::INVALID_VERSION,
+            txn_batch_id: 0,
+            metadata_version: None,
+            conflicting_kr_indices: None,
+        }
+    }
 }
 
 impl<'a> From<&'a domain::CommitId> for CommitID<'a> {

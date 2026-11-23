@@ -7,6 +7,7 @@
 #[test]
 fn derive_errors() {
     let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/absent.rs");
     t.compile_fail("tests/ui/field_attributes.rs");
     t.compile_fail("tests/ui/file_identifier.rs");
     t.compile_fail("tests/ui/unions.rs");
