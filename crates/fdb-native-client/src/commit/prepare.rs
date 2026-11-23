@@ -126,20 +126,24 @@ pub(crate) fn intersects(lhs: &mut [KeyRange], rhs: &mut [KeyRange]) -> Option<K
 ///    is sent (C++ returns at once, `committedVersion = invalidVersion`).
 /// 3. `readOnly` with writes: `transaction_read_only`.
 /// 4. The size (`getSize()`, before anything is added) over the limit:
-///    `transaction_too_large`.
+///    `transaction_too_large`. Then the `extraConflictRanges` (the read conflict ranges of
+///    `getKey` and `getRange`, `extra_read_conflicts`) join the read conflict ranges, as
+///    they are (not counted, not shortened; empty ones dropped).
 /// 5. Unless `causal_write_risky`, if no write conflict range intersects a read conflict
 ///    range, `makeSelfConflicting`: a random `\xff/SC/<uid>` key as a read and a write
 ///    conflict range.
 /// 6. The flags and `report_conflicting_keys`.
 ///
-/// Not ported: `extraConflictRanges` (the read-your-writes layer's), idempotency ids (they
+/// Not ported: idempotency ids (they
 /// need the idempotency-record read path), `checkWrites`, transaction tags and cost
 /// estimation, tenants.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
     read_version: i64,
     mutations: Vec<Mutation>,
     read_conflicts: Vec<KeyRange>,
     write_conflicts: Vec<KeyRange>,
+    extra_read_conflicts: Vec<KeyRange>,
     options: &CommitOptions,
     limits: &CommitLimits,
     self_conflict_id: impl FnOnce() -> Uid,
@@ -166,6 +170,8 @@ pub(crate) fn prepare(
     if size > options.size_limit {
         return Err(error::transaction_too_large(size, options.size_limit));
     }
+    // `extraConflictRanges`, after the size check (NativeAPI 7.4:7166-7172, 8.0:4863-4867).
+    read_conflicts.extend(extra_read_conflicts.into_iter().filter(|r| r.begin < r.end));
 
     if !options.causal_write_risky
         && intersects(&mut write_conflicts, &mut read_conflicts).is_none()

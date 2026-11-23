@@ -196,6 +196,62 @@
 //!   lookup invalidates the cached range containing the key (not the one before it), as C++
 //!   does (`getKeyLocation`, 7.4:3381, 8.0:1365).
 //!
+//! ## Ranges
+//!
+//! [`Reader::get_range_with_limits`] is NativeAPI's `Transaction::getRange` (snapshot);
+//! [`Reader::get_range`] adds `fdb_c`'s parameters ([`RangeOptions`]).
+//!
+//! * **`fdb_c`** (`validate_and_update_parameters`, `bindings/c/fdb_c.cpp` 7.4:977-1033,
+//!   8.0:1006-1062): a limit or byte target of 0 is none; `EXACT` without a limit is
+//!   `exact_mode_without_limits`; the [`StreamingMode`]'s byte target (`SMALL` 256, `MEDIUM`
+//!   1000, `LARGE` 4096, `SERIAL`/`WANT_ALL` 80 000 on 7.4 and 120 000 on 8.0, `ITERATOR`
+//!   4096 growing by 1.5 per iteration to 120 000 from the tenth, iteration 0 being
+//!   `client_invalid_operation`) replaces no byte target or lowers a larger one. The release
+//!   is the cluster's (the client a multi-version C++ client would load).
+//! * **`GetRangeLimits`** (`FDBTypes.h` 7.4:725-755; NativeAPI 7.4:3071-3137,
+//!   8.0:1086-1137): rows, bytes and `minRows` (1). A batch costs its keys and values plus 8
+//!   bytes a row; the limits are reached at 0 rows, or 0 bytes once `minRows` rows were
+//!   read. `transformRangeLimits` (7.4:4517-4536, 8.0:2330-2349) asks each request for at
+//!   most `REPLY_BYTE_LIMIT` (80 000) rows and bytes, or `minRows` rows when no bytes are
+//!   left. A storage server (`getKeyValuesQ`/`readRange`, `storageserver.actor.cpp`
+//!   7.4:4730-4950, 4273-4524; `storageserver.cpp` 8.0:3621-3830, 3178-3412) adds rows while
+//!   it has bytes left (counting `sizeof(KeyValueRef)` a row), so the row that crosses the
+//!   byte limit is included, and says `more` when it stopped at a limit
+//!   (`limit == 0 || limitBytes <= 0`, even if nothing is left).
+//! * **`getRange`** (NativeAPI 7.4:4903-5208, 8.0:2709-3026): `orEqual` selectors become
+//!   `(keyAfter(key), false, offset)` and an inverted range is empty (`getRangeInternal`).
+//!   A begin at `""` with offset below 1 sets `readToBegin`. Then shard by shard: locate the
+//!   begin key (forward) or the end key (reverse; the shard before it if `end - 1` is
+//!   backward), cut the request's selectors at the shard (`firstGreaterOrEqual` of its
+//!   boundary when the selector is definitely beyond it: `modifiedSelectors`), and
+//!   `loadBalance` a `GetKeyValuesRequest` (8.0 sends `taskID` `DefaultEndpoint`, 5000). The
+//!   batch is finished when a limit is reached, when an unmodified request has no `more`, or
+//!   once the soft byte limit has its `minRows` (a byte limit returns after the first shard
+//!   that had rows); `more` is then `modifiedSelectors || reached || rep.more`, and a read
+//!   that stopped at a boundary sets `readThrough` to it. Otherwise the read goes on after the
+//!   last row (`firstGreaterThan(last)` forward, `firstGreaterOrEqual(last)` reverse), or at
+//!   the boundary.
+//! * **`getRangeFallback`** (7.4:4761-4837, 8.0:2572-2647): on `wrong_shard_server` (the
+//!   server cannot resolve a selector: an end in another shard, an offset that leaves the
+//!   shard), or a modified request that returned nothing, the location is invalidated and the
+//!   read starts over: both selectors are resolved with `getKey` (`resolveKey`: none for
+//!   `firstGreaterOrEqual`/`firstGreaterThan`), then `getExactRange` (7.4:4549-4749,
+//!   8.0:2362-2560) reads the keys between, `GET_RANGE_SHARD_LIMIT` (2) shard locations at a
+//!   time (`getKeyRangeLocations`: the cache if it has them all, else a ranged
+//!   `GetKeyServerLocationsRequest`), with `wrong_shard_server` and `all_alternatives_failed`
+//!   invalidating the rest of the range and retrying after `WRONG_SHARD_SERVER_DELAY`. It
+//!   sets `readToBegin` if the begin resolved to `""` and `readThroughEnd` if the end resolved
+//!   to `\xff\xff` (and nothing was cut on that side). `all_alternatives_failed` in
+//!   `getRange` itself invalidates and retries the same step after the delay.
+//! * **Read conflict ranges** (`getRangeFinished`, 7.4:4849-4895, 8.0:2650-2702) are the
+//!   transaction's ([`Transaction::get_range`](crate::Transaction::get_range)).
+//! * **Not ported:** mapped ranges (`getMappedRange`), `getRangeStream`, the tenant prefix,
+//!   the version vector, tags, read options, BUGGIFY's random truncation, and trace events.
+//!   Not in C++: a forward read whose begin resolves at the end of the key space returns
+//!   what it has (C++ would look up the shard of `\xff\xff`), and a reverse one whose end
+//!   does reads up to `\xff\xff`. A reply with `more` but no rows, or with more rows than
+//!   asked, is `internal_error` (C++ asserts).
+//!
 //! ## Deliberate differences
 //!
 //! * **No second requests.** C++'s `loadBalance` sends a speculative second request to the
@@ -242,11 +298,14 @@ mod balance;
 mod grv;
 mod key;
 mod location;
+mod range;
 pub(crate) mod util;
 mod watch_lb;
 
 pub use grv::{Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
+pub use range::{RangeLimits, RangeOptions, RangeRead, StreamingMode};
+pub(crate) use range::{key_after, read_conflict_range, remove_or_equal};
 pub use watch_lb::WatchTimings;
 
 use grv::Batcher;
@@ -754,6 +813,30 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         use_provisional: bool,
         reverse: bool,
     ) -> Result<(KeyRange, Arc<Location>), Error> {
+        let results = self
+            .fetch_key_locations(key, None, 100, reverse, version, use_provisional)
+            .await?;
+        // C++ asserts exactly one result.
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::new(INTERNAL_ERROR))
+    }
+
+    /// `getKeyLocation_internal` (`end` `None`: the shard of `begin`, the first result only)
+    /// and `getKeyRangeLocations_internal` (NativeAPI 7.4:3435-3497, 8.0:1415-1491; `end`
+    /// set: at most `limit` shards of `[begin, end)`, from its end if `reverse`): asks a
+    /// commit proxy and caches the shards of the reply, which it returns whole (not
+    /// intersected with the range).
+    pub(crate) async fn fetch_key_locations(
+        &self,
+        begin: &[u8],
+        end: Option<&[u8]>,
+        limit: i32,
+        reverse: bool,
+        version: i64,
+        use_provisional: bool,
+    ) -> Result<Vec<(KeyRange, Arc<Location>)>, Error> {
         loop {
             self.check_open()?;
             let backoff = lock(&self.state).location_backoff;
@@ -776,9 +859,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 continue;
             }
             let request = GetKeyServerLocations {
-                begin: key.to_vec(),
-                end: None,
-                limit: 100,
+                begin: begin.to_vec(),
+                end: end.map(<[u8]>::to_vec),
+                limit,
                 reverse,
                 span_context: Default::default(),
                 min_tenant_version: version,
@@ -797,12 +880,19 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             match race(reply, changed).await {
                 Either::Left(Ok(reply)) => {
                     self.update_location_backoff(true);
-                    let Some((range, servers)) = reply.results.into_iter().next() else {
-                        // C++ asserts exactly one result.
-                        return Err(Error::new(INTERNAL_ERROR));
-                    };
-                    let location = self.cache_location(&range, &servers);
-                    return Ok((range, location));
+                    // A single key's lookup caches its first result only (C++ asserts there
+                    // is exactly one).
+                    let take = if end.is_some() { usize::MAX } else { 1 };
+                    let results = reply
+                        .results
+                        .into_iter()
+                        .take(take)
+                        .map(|(range, servers)| {
+                            let location = self.cache_location(&range, &servers);
+                            (range, location)
+                        })
+                        .collect();
+                    return Ok(results);
                 }
                 Either::Left(Err(e)) if e.code() == COMMIT_PROXY_MEMORY_LIMIT_EXCEEDED => {
                     self.update_location_backoff(false);
@@ -857,7 +947,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let bound = 2 * lock(&self.locations).server_entries() + 64;
         let endpoints = lock(&self.state).failed_endpoints.len();
         let model = lock(&self.model).len();
-        if endpoints <= bound && model <= bound {
+        // A server has an endpoint failure record per stream (`live_targets`: four).
+        if endpoints <= 4 * bound && model <= bound {
             return;
         }
         let live = lock(&self.locations).live_targets();

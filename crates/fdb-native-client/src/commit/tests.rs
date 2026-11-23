@@ -5,7 +5,7 @@ use fdb_native_schema::domain::{Commit, KeyRange, Mutation, MutationType};
 use fdb_native_wire::Uid;
 
 use super::limits::{KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, expected_size};
-use super::prepare::{intersects, prepare};
+use super::prepare::intersects;
 use super::*;
 use crate::error::Error;
 use crate::error::codes as error_code;
@@ -18,9 +18,22 @@ fn uid() -> Uid {
     Uid::new(1, 2)
 }
 
+/// `prepare` without extra read conflict ranges.
+fn prepare(
+    read_version: i64,
+    m: Vec<Mutation>,
+    r: Vec<KeyRange>,
+    w: Vec<KeyRange>,
+    options: &CommitOptions,
+    limits: &CommitLimits,
+    uid: impl FnOnce() -> Uid,
+) -> Result<Option<Commit>, Error> {
+    super::prepare::prepare(read_version, m, r, w, Vec::new(), options, limits, uid)
+}
+
 fn build(buffer: CommitBuffer, options: &CommitOptions) -> Result<Option<Commit>, Error> {
-    let (m, r, w) = buffer.into_parts();
-    prepare(100, m, r, w, options, &limits(), uid)
+    let (m, r, w, extra) = buffer.into_parts_with_extra();
+    super::prepare::prepare(100, m, r, w, extra, options, &limits(), uid)
 }
 
 fn r(begin: &str, end: &str) -> KeyRange {
@@ -235,6 +248,18 @@ fn transaction_size() {
     assert_eq!(build(b.clone(), &small).unwrap_err().code(), 2101);
     small.size_limit = 102;
     assert!(build(b.clone(), &small).unwrap().is_some());
+    // `getKey` / `getRange` conflict ranges do not count (C++'s `extraConflictRanges`), and
+    // are sent as they are, after the others; an empty one is left out.
+    let mut extra = b.clone();
+    extra.add_extra_read_conflict_range(r("a", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+    extra.add_extra_read_conflict_range(r("q", "q"));
+    let c = build(extra.clone(), &small).unwrap().unwrap();
+    assert_eq!(
+        c.read_conflict_ranges,
+        vec![r("a", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")]
+    );
+    // `into_parts` hands them over with the others (counted by `Committer::commit`).
+    assert_eq!(extra.into_parts().1.len(), 1);
     small.size_limit = 31;
     assert_eq!(build(b.clone(), &small).unwrap_err().code(), 2006);
     small.size_limit = 10_000_001;

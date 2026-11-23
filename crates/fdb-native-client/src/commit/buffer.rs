@@ -36,6 +36,8 @@ pub struct CommitBuffer {
     mutations: Vec<Mutation>,
     read_conflicts: Vec<KeyRange>,
     write_conflicts: Vec<KeyRange>,
+    /// C++'s `extraConflictRanges`: the read conflict ranges of `getKey` and `getRange`.
+    extra_read_conflicts: Vec<KeyRange>,
 }
 
 impl CommitBuffer {
@@ -46,6 +48,7 @@ impl CommitBuffer {
             mutations: Vec::new(),
             read_conflicts: Vec::new(),
             write_conflicts: Vec::new(),
+            extra_read_conflicts: Vec::new(),
         }
     }
 
@@ -144,6 +147,16 @@ impl CommitBuffer {
         Ok(())
     }
 
+    /// A read conflict range of a `getKey` or `getRange` (C++'s `extraConflictRanges`,
+    /// NativeAPI 7.4:7166-7172, 8.0:4863-4867): sent as is (keys not shortened), and not
+    /// counted in the transaction's size (C++ adds these after its size check). An empty
+    /// range is left out.
+    pub fn add_extra_read_conflict_range(&mut self, range: KeyRange) {
+        if range.begin < range.end {
+            self.extra_read_conflicts.push(range);
+        }
+    }
+
     /// `Transaction::addWriteConflictRange`.
     pub fn add_write_conflict_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
         self.write_conflicts
@@ -168,9 +181,27 @@ impl CommitBuffer {
         &self.mutations
     }
 
-    /// The mutations, the read conflict ranges and the write conflict ranges, for
-    /// [`Committer::commit`](super::Committer::commit).
+    /// The mutations, the read conflict ranges (the
+    /// [extra ones](Self::add_extra_read_conflict_range) last) and the write conflict
+    /// ranges, for [`Committer::commit`](super::Committer::commit) (which counts all of them
+    /// in the size; [`Committer::commit_buffer`](super::Committer::commit_buffer) does not
+    /// count the extra ones).
     pub fn into_parts(self) -> (Vec<Mutation>, Vec<KeyRange>, Vec<KeyRange>) {
-        (self.mutations, self.read_conflicts, self.write_conflicts)
+        let (mutations, mut reads, writes, extra) = self.into_parts_with_extra();
+        reads.extend(extra);
+        (mutations, reads, writes)
+    }
+
+    /// The mutations, the read conflict ranges, the write conflict ranges and the extra read
+    /// conflict ranges.
+    pub(crate) fn into_parts_with_extra(
+        self,
+    ) -> (Vec<Mutation>, Vec<KeyRange>, Vec<KeyRange>, Vec<KeyRange>) {
+        (
+            self.mutations,
+            self.read_conflicts,
+            self.write_conflicts,
+            self.extra_read_conflicts,
+        )
     }
 }

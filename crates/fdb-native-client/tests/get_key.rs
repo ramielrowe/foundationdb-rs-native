@@ -865,8 +865,9 @@ async fn transaction_read_conflict_ranges_follow_cpp() {
             // Before the first key: from `""`.
             (llt(b"a"), b"", Some(range(b"", b"a"))),
             // Past the last key: `\xff\xff` from the storage servers, clamped to `\xff` for
-            // the caller; the conflict range is C++'s, unclamped.
-            (fgt(b"x"), b"\xff", Some(range(b"x\x00", b"\xff\xff\x00"))),
+            // the caller; the conflict range is C++'s, unclamped (`keyAfter(\xff\xff)` is
+            // `\xff\xff`).
+            (fgt(b"x"), b"\xff", Some(range(b"x\x00", b"\xff\xff"))),
             // An empty range is not added.
             (llt(b""), b"", None),
         ];

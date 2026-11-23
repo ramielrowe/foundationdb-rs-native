@@ -282,13 +282,21 @@ impl LocationCache {
         info
     }
 
-    /// The `getValue` targets of the servers that cached ranges (or reads in progress)
-    /// still use.
+    /// The targets of the servers that cached ranges (or reads in progress) still use, on
+    /// every stream the read path sends to and records endpoint failures of (`getValue`,
+    /// `getKey`, `getKeyValues`, `watchValue`).
     pub(crate) fn live_targets(&self) -> HashSet<(NetworkAddress, Uid)> {
+        let streams = &fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
+        let indices = [
+            streams.get_value,
+            streams.get_key,
+            streams.get_key_values,
+            streams.watch_value,
+        ];
         self.servers
             .values()
             .filter_map(Weak::upgrade)
-            .map(|s| s.target())
+            .flat_map(|s| indices.map(|i| s.target_for(i)))
             .collect()
     }
 
@@ -579,8 +587,9 @@ mod tests {
             let begin = i.to_be_bytes();
             let end = (i + 1).to_be_bytes();
             cache.insert(&range(&begin, &end), location, &mut rng);
+            // Four streams per live server.
             let live = cache.live_targets().len();
-            assert!(live <= 10, "{live}");
+            assert!(live <= 4 * 10, "{live}");
             assert!(
                 cache.server_entries() <= 2 * 10 + 64 + 1,
                 "{}",
