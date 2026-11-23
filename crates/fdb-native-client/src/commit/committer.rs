@@ -8,12 +8,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
 use fdb_native_schema::domain::{
-    Commit, CommitId, CommitProxy, GetReadVersion, GrvProxy, INVALID_VERSION, KeyRange, Mutation,
+    Commit, CommitId, GetReadVersion, INVALID_VERSION, KeyRange, Mutation,
 };
 use fdb_native_schema::{Request, SchemaVersion};
-use fdb_native_transport::peer::{
-    NoTls, PeerHandle, PeerManager, PeerRef, Reply, StreamWrapper,
-};
+use fdb_native_transport::peer::{NoTls, PeerHandle, PeerManager, PeerRef, Reply, StreamWrapper};
 use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::{DecodeError, EncodeError, Uid};
@@ -24,7 +22,7 @@ use super::limits::CommitLimits;
 use super::options::{CommitOptions, CommitterConfig};
 use super::prepare::{intersects, prepare};
 use super::rng::Rng;
-use crate::cluster::{ClusterInfo, ClusterMonitor, CommitProxyEndpoints, MonitorClosed};
+use crate::cluster::{ClusterMonitor, CommitProxyEndpoints, MonitorClosed};
 
 /// What a successful [`Committer::commit`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,10 +211,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         if !options.causal_write_risky {
             let mut writes = request.write_conflict_ranges.clone();
             let mut reads = request.read_conflict_ranges.clone();
-            if let Some(range) = intersects(&mut writes, &mut reads)
-                && let Err(e) = self.commit_dummy(range.begin, options, limits).await
-            {
-                return e;
+            if let Some(range) = intersects(&mut writes, &mut reads) {
+                if let Err(e) = self.commit_dummy(range.begin, options, limits).await {
+                    return e;
+                }
             }
         }
         CommitError::CommitUnknownResult
@@ -279,7 +277,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             vec![range.clone()],
             options,
             limits,
-            || Uid::default(),
+            Uid::default,
         )?
         .ok_or_else(|| CommitError::Internal("the dummy transaction is empty".into()))?;
         match self.send_commit(&Arc::new(commit), options).await {
@@ -376,11 +374,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             .map_err(|MonitorClosed| Attempt::Error(CommitError::Closed))?;
         let alternatives: Vec<CommitProxyEndpoints> = if options.commit_on_first_proxy {
             // `firstCommitProxy`, or `proxies[0]` of the list.
-            info.client_info
-                .commit_proxies
-                .first()
-                .map(|p| vec![CommitProxyEndpoints::new(p.clone())])
-                .unwrap_or_default()
+            info.first_commit_proxy().into_iter().collect()
         } else {
             info.available_commit_proxies(options.use_provisional_proxies)
                 .map(<[CommitProxyEndpoints]>::to_vec)
@@ -393,9 +387,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         }
 
         // choose { when(onProxiesChanged) {...} when(reply) {...} }, the first listed first.
-        let changed = pin!(proxies_changed(&self.monitor, &info));
-        let send = pin!(self.balance(&alternatives, request, options.commit_on_first_proxy));
-        let (mut changed, mut send) = (changed, send);
+        let mut changed = pin!(self.monitor.proxies_changed(&info));
+        let mut send = pin!(self.balance(&alternatives, request, options.commit_on_first_proxy));
         let sent = poll_fn(|cx| {
             if changed.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(None);
@@ -471,7 +464,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             .iter()
             .map(|a| {
                 let endpoint = a.streams.commit;
-                (*self.peers.peer_for_endpoint(&endpoint).address(), endpoint.token)
+                (
+                    *self.peers.peer_for_endpoint(&endpoint).address(),
+                    endpoint.token,
+                )
             })
             .collect();
         let monitor = self.peers.failure_monitor().clone();
@@ -503,28 +499,6 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
     }
 }
 
-/// `onProxiesChanged()` (C++: `monitorClientDBInfoChange`, `NativeAPI.actor.cpp`
-/// 7.4:1010-1052): resolves once an info newer than `since` has other commit or GRV proxies
-/// (their ids, in order, of the full lists) than `since`. Also resolves when the monitor is
-/// shut down. Kept in one place so the monitor's own `proxies_changed` can replace it.
-async fn proxies_changed<R: Runtime>(monitor: &ClusterMonitor<R>, since: &ClusterInfo) {
-    let sequence = since.sequence;
-    let commit = proxy_ids(&since.client_info.commit_proxies, CommitProxy::id);
-    let grv = proxy_ids(&since.client_info.grv_proxies, GrvProxy::id);
-    let _ = monitor
-        .wait_for(move |info| {
-            (info.sequence > sequence
-                && (proxy_ids(&info.client_info.commit_proxies, CommitProxy::id) != commit
-                    || proxy_ids(&info.client_info.grv_proxies, GrvProxy::id) != grv))
-                .then_some(())
-        })
-        .await;
-}
-
-fn proxy_ids<T>(proxies: &[T], id: impl Fn(&T) -> Uid) -> Vec<Uid> {
-    proxies.iter().map(id).collect()
-}
-
 fn schema_for(version: fdb_native_wire::ProtocolVersion) -> Result<SchemaVersion, EncodeError> {
     SchemaVersion::for_protocol_version(version).ok_or(EncodeError::Invalid(
         "no schema set for the proxy's protocol version",
@@ -553,9 +527,9 @@ async fn send_commit_request(
     request: &Arc<Commit>,
 ) -> Result<CommitId, RequestError> {
     let reply = send_request(peer, token, request.clone()).await?;
-    let schema = SchemaVersion::for_protocol_version(reply.version).ok_or(
-        RequestError::Decode(DecodeError::Invalid("unsupported protocol version")),
-    )?;
+    let schema = SchemaVersion::for_protocol_version(reply.version).ok_or(RequestError::Decode(
+        DecodeError::Invalid("unsupported protocol version"),
+    ))?;
     match Commit::decode_reply(schema, &reply.payload) {
         Ok(Ok(id)) => Ok(id),
         Ok(Err(error)) => Err(RequestError::from_reply_error(error)),
@@ -564,9 +538,9 @@ async fn send_commit_request(
 }
 
 fn decode_grv(reply: &Reply) -> Result<i64, RequestError> {
-    let schema = SchemaVersion::for_protocol_version(reply.version).ok_or(
-        RequestError::Decode(DecodeError::Invalid("unsupported protocol version")),
-    )?;
+    let schema = SchemaVersion::for_protocol_version(reply.version).ok_or(RequestError::Decode(
+        DecodeError::Invalid("unsupported protocol version"),
+    ))?;
     match GetReadVersion::decode_reply(schema, &reply.payload) {
         Ok(Ok(rv)) => Ok(rv.version),
         Ok(Err(error)) => Err(RequestError::from_reply_error(error)),

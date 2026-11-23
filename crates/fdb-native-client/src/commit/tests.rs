@@ -173,7 +173,10 @@ fn key_and_value_limits() {
     sys.resize(30_000, b'k');
     assert!(b.set(&sys, b"v").is_ok());
     sys.push(b'k');
-    assert_eq!(b.set(&sys, b"v").unwrap_err().code(), error_code::KEY_TOO_LARGE);
+    assert_eq!(
+        b.set(&sys, b"v").unwrap_err().code(),
+        error_code::KEY_TOO_LARGE
+    );
     assert!(b.set(b"k", &vec![0; 100_000]).is_ok());
     let e = b.set(b"k", &vec![0; 100_001]).unwrap_err();
     assert_eq!(e.code(), error_code::VALUE_TOO_LARGE);
@@ -297,10 +300,15 @@ fn flags() {
     let c = build(b, &options).unwrap().unwrap();
     assert_eq!(
         c.flags,
-        Commit::FLAG_IS_LOCK_AWARE | Commit::FLAG_FIRST_IN_BATCH | Commit::FLAG_BYPASS_STORAGE_QUOTA
+        Commit::FLAG_IS_LOCK_AWARE
+            | Commit::FLAG_FIRST_IN_BATCH
+            | Commit::FLAG_BYPASS_STORAGE_QUOTA
     );
     assert!(c.report_conflicting_keys);
-    assert!(!c.lock_aware, "transaction.lock_aware is not set by a client");
+    assert!(
+        !c.lock_aware,
+        "transaction.lock_aware is not set by a client"
+    );
 }
 
 #[test]
@@ -373,11 +381,11 @@ fn versionstamp_is_big_endian() {
         txn_batch_id: 0x0a0b,
         ..CommitId::default()
     };
-    assert_eq!(
-        versionstamp(&id),
-        [1, 2, 3, 4, 5, 6, 7, 8, 0x0a, 0x0b]
-    );
+    assert_eq!(versionstamp(&id), [1, 2, 3, 4, 5, 6, 7, 8, 0x0a, 0x0b]);
     assert_eq!(CommitOutcome::NothingToCommit.version(), -1);
     assert_eq!(CommitOutcome::NothingToCommit.versionstamp(), None);
-    assert_eq!(CommitOutcome::Committed(id).version(), 0x0102_0304_0506_0708);
+    assert_eq!(
+        CommitOutcome::Committed(id).version(),
+        0x0102_0304_0506_0708
+    );
 }

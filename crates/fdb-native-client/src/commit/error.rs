@@ -247,9 +247,3 @@ impl CommitError {
         }
     }
 }
-
-impl From<fdb_native_wire::EncodeError> for CommitError {
-    fn from(e: fdb_native_wire::EncodeError) -> CommitError {
-        CommitError::Internal(e.to_string())
-    }
-}

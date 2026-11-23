@@ -165,7 +165,8 @@ pub(crate) fn prepare(
         && intersects(&mut write_conflicts, &mut read_conflicts).is_none()
     {
         // makeSelfConflicting
-        let key = self_conflict_key(self_conflict_id())?;
+        let key = self_conflict_key(self_conflict_id())
+            .map_err(|e| CommitError::Internal(e.to_string()))?;
         let range = KeyRange::single_key(&key);
         read_conflicts.push(range.clone());
         write_conflicts.push(range);
