@@ -4,8 +4,9 @@ use x509_parser::asn1_rs::Class;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::FromDer;
-use x509_parser::x509::{X509Name, X509Version};
+use x509_parser::x509::{AttributeTypeAndValue, X509Name, X509Version};
 
+use super::profile::{self, Akid, NameConstraintsInfo};
 use super::rules::{Field, MatchType};
 
 /// The [`AsnString::tag`] of a value that is not a universal, primitive ASN.1 type.
@@ -40,6 +41,13 @@ impl AsnString {
     ///
     /// An empty result is also a failure, since FDB requires a length of at least one.
     pub fn to_utf8(&self) -> Option<Vec<u8>> {
+        self.to_utf8_allowing_empty().filter(|out| !out.is_empty())
+    }
+
+    /// [`to_utf8`](Self::to_utf8) without the FDB length requirement: an empty string converts
+    /// (to nothing), as `ASN1_STRING_to_UTF8` does. Only a type that has no conversion, or a
+    /// malformed value, is `None`.
+    pub(super) fn to_utf8_allowing_empty(&self) -> Option<Vec<u8>> {
         let out = match self.tag {
             12 => std::str::from_utf8(&self.bytes).ok()?.as_bytes().to_vec(),
             18 | 19 | 20 | 22 | 23 | 24 | 26 => latin1_to_utf8(&self.bytes),
@@ -69,7 +77,7 @@ impl AsnString {
             }
             _ => return None,
         };
-        (!out.is_empty()).then_some(out)
+        Some(out)
     }
 }
 
@@ -138,7 +146,7 @@ pub enum AltName {
 
 /// An extension of a certificate, as far as policy checks care.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ext<T> {
+pub(super) enum Ext<T> {
     Absent,
     Present(T),
     /// Present but unparseable, or duplicated.
@@ -154,25 +162,41 @@ struct KeyUsageBits {
     key_cert_sign: bool,
 }
 
-/// What OpenSSL's `X509_check_purpose` looks at, extracted once.
+/// What OpenSSL's `X509_check_purpose` and chain checks look at, extracted once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Profile {
     v1: bool,
+    /// Whether the certificate is X.509 version 3, the only version webpki (and so rustls)
+    /// accepts for a certificate it validates.
+    v3: bool,
     /// basicConstraints `cA`.
     ca: Ext<bool>,
+    /// basicConstraints `pathLenConstraint`, if `cA` is true and it is present.
+    path_len: Option<u32>,
     key_usage: Ext<KeyUsageBits>,
-    /// Whether the extendedKeyUsage allows a TLS server: it lists `serverAuth`,
-    /// `anyExtendedKeyUsage` or one of the legacy server-gated-crypto OIDs.
+    /// Whether the extendedKeyUsage allows a TLS server: it lists `serverAuth` or one of the
+    /// legacy server-gated-crypto OIDs. `anyExtendedKeyUsage` alone does not (see
+    /// [`profile`]).
     eku_allows_server: Ext<bool>,
+    /// Whether the Netscape certificate type (`nsCertType`) has the `sslServer` bit.
+    ns_ssl_server: Ext<bool>,
+    /// Some extension marked critical is outside OpenSSL's `X509_supported_extension` list.
+    unsupported_critical: bool,
+    name_constraints: Ext<NameConstraintsInfo>,
 }
 
 impl Profile {
     #[cfg(test)]
     const ABSENT: Profile = Profile {
         v1: false,
+        v3: true,
         ca: Ext::Absent,
+        path_len: None,
         key_usage: Ext::Absent,
         eku_allows_server: Ext::Absent,
+        ns_ssl_server: Ext::Absent,
+        unsupported_critical: false,
+        name_constraints: Ext::Absent,
     };
 }
 
@@ -187,8 +211,22 @@ pub struct PeerCert {
     alt_names: Option<Vec<AltName>>,
     not_before: i64,
     not_after: i64,
+    /// The subject and issuer names are byte-identical (OpenSSL's `EXFLAG_SI`).
+    self_issued: bool,
+    /// Self-issued and the authority key identifier, if any, does not contradict the
+    /// certificate's own identity (OpenSSL's `EXFLAG_SS`).
     self_signed: bool,
     profile: Profile,
+    /// subjectKeyIdentifier.
+    skid: Ext<Vec<u8>>,
+    /// authorityKeyIdentifier.
+    akid: Ext<Akid>,
+    /// The serial number's content octets, leading zero octets removed.
+    serial: Vec<u8>,
+    /// The issuer name's DER.
+    issuer_raw: Vec<u8>,
+    /// The subject's `emailAddress` attributes.
+    subject_emails: Vec<AsnString>,
 }
 
 /// A certificate that could not be parsed.
@@ -229,7 +267,7 @@ impl PeerCert {
             }
             _ => None,
         };
-        PeerCert {
+        let mut out = PeerCert {
             subject: name_entries(cert.subject()),
             issuer: name_entries(cert.issuer()),
             subject_display: display_name(cert.subject()),
@@ -237,9 +275,19 @@ impl PeerCert {
             alt_names,
             not_before: cert.validity().not_before.timestamp(),
             not_after: cert.validity().not_after.timestamp(),
-            self_signed: cert.subject().as_raw() == cert.issuer().as_raw(),
+            self_issued: cert.subject().as_raw() == cert.issuer().as_raw(),
+            self_signed: false,
             profile: profile(cert),
-        }
+            skid: profile::subject_key_identifier(cert),
+            akid: profile::authority_key_identifier(cert),
+            serial: profile::trim_leading_zeros(cert.raw_serial()).to_vec(),
+            issuer_raw: cert.issuer().as_raw().to_vec(),
+            subject_emails: email_entries(cert.subject()),
+        };
+        // OpenSSL's `ossl_x509v3_cache_extensions`: a self-issued certificate is also
+        // self-signed unless its authority key identifier names somebody else.
+        out.self_signed = out.self_issued && profile::akid_allows(&out.akid, &out);
+        out
     }
 
     /// Whether OpenSSL's `check_ca` would call this a CA certificate: a keyUsage extension,
@@ -259,10 +307,25 @@ impl PeerCert {
         }
     }
 
-    /// Whether this certificate can be a trust anchor under OpenSSL's rules: self-signed (by
-    /// name) and [CA-capable](Self::is_ca_capable).
+    /// Whether this certificate can be a trust anchor under OpenSSL 3's rules, which check
+    /// every certificate of the chain, the anchor included:
+    ///
+    /// * self-signed ([`is_self_signed`](Self::is_self_signed));
+    /// * [CA-capable](Self::is_ca_capable);
+    /// * no critical extension outside OpenSSL's supported list (`unhandled critical
+    ///   extension`, error 34);
+    /// * an `extendedKeyUsage`, if present, must allow `serverAuth` (`unsuitable
+    ///   certificate purpose`, error 26). OpenSSL 1.1.1 checked only the certificates that
+    ///   came from the peer, so a CA file certificate with, say, `clientAuth` alone anchored
+    ///   a chain there; 3.x does not accept it.
     pub(super) fn can_be_anchor(&self) -> bool {
-        self.self_signed && self.is_ca_capable()
+        self.self_signed
+            && self.is_ca_capable()
+            && !self.profile.unsupported_critical
+            && matches!(
+                self.profile.eku_allows_server,
+                Ext::Absent | Ext::Present(true)
+            )
     }
 
     /// OpenSSL's `ssl_server` purpose for an end-entity certificate
@@ -270,6 +333,14 @@ impl PeerCert {
     /// server, and the keyUsage, if present, must include `digitalSignature`,
     /// `keyEncipherment` or `keyAgreement`. Returns what is wrong.
     pub(super) fn tls_server_purpose_problem(&self) -> Option<&'static str> {
+        // `ns_reject(x, NS_SSL_SERVER)`: a Netscape certificate type without `sslServer`.
+        match self.profile.ns_ssl_server {
+            Ext::Invalid => return Some("its nsCertType extension is malformed"),
+            Ext::Present(false) => {
+                return Some("its nsCertType (Netscape certificate type) lacks sslServer");
+            }
+            _ => {}
+        }
         match self.profile.eku_allows_server {
             Ext::Invalid => return Some("its extendedKeyUsage extension is malformed"),
             Ext::Present(false) => {
@@ -320,8 +391,14 @@ impl PeerCert {
             alt_names,
             not_before: 0,
             not_after: i64::MAX,
+            self_issued: false,
             self_signed: false,
             profile: Profile::ABSENT,
+            skid: Ext::Absent,
+            akid: Ext::Absent,
+            serial: Vec::new(),
+            issuer_raw: Vec::new(),
+            subject_emails: Vec::new(),
         }
     }
 
@@ -335,9 +412,61 @@ impl PeerCert {
         self.not_after
     }
 
-    /// Whether the subject and issuer names are byte-identical.
+    /// Whether OpenSSL would call this certificate self-signed (`EXFLAG_SS`): the subject and
+    /// issuer names are byte-identical, and the authority key identifier, if there is one,
+    /// does not contradict the certificate itself (`X509_check_akid`: a key identifier that
+    /// differs from the subject key identifier, or an issuer name or serial number that
+    /// differs from the certificate's own).
+    ///
+    /// The signature is not looked at.
     pub fn is_self_signed(&self) -> bool {
         self.self_signed
+    }
+
+    /// Whether the subject and issuer names are byte-identical (`EXFLAG_SI`), which is
+    /// all OpenSSL asks of a key-rollover certificate in the middle of a chain.
+    pub(super) fn is_self_issued(&self) -> bool {
+        self.self_issued
+    }
+
+    /// Whether the certificate is X.509 version 3.
+    pub(super) fn is_v3(&self) -> bool {
+        self.profile.v3
+    }
+
+    /// Whether the certificate has a critical extension that OpenSSL does not support (see
+    /// [`profile::is_supported_extension`]) and so would refuse it for.
+    pub(super) fn has_unsupported_critical_extension(&self) -> bool {
+        self.profile.unsupported_critical
+    }
+
+    /// The `pathLenConstraint` of a CA certificate, if it has one.
+    pub(super) fn path_len(&self) -> Option<u32> {
+        self.profile.path_len
+    }
+
+    pub(super) fn name_constraints(&self) -> &Ext<NameConstraintsInfo> {
+        &self.profile.name_constraints
+    }
+
+    pub(super) fn subject_key_identifier(&self) -> &Ext<Vec<u8>> {
+        &self.skid
+    }
+
+    pub(super) fn authority_key_identifier(&self) -> &Ext<Akid> {
+        &self.akid
+    }
+
+    pub(super) fn serial(&self) -> &[u8] {
+        &self.serial
+    }
+
+    pub(super) fn issuer_raw(&self) -> &[u8] {
+        &self.issuer_raw
+    }
+
+    pub(super) fn subject_emails(&self) -> &[AsnString] {
+        &self.subject_emails
     }
 
     /// The subject's recognised attributes, in certificate order.
@@ -380,11 +509,13 @@ fn profile(cert: &X509Certificate<'_>) -> Profile {
         Ok(None) => Ext::Absent,
         Err(_) => Ext::Invalid,
     };
-    // nsSGC and msSGC: the "server gated crypto" OIDs OpenSSL still honours.
+    // nsSGC and msSGC: the "server gated crypto" OIDs OpenSSL still honours. A bare
+    // anyExtendedKeyUsage does not count: `xku_reject` looks for the server bits only, and
+    // OpenSSL 3.5 (`openssl verify -purpose sslserver`) refuses a leaf, an intermediate and a
+    // trust anchor whose only EKU is anyExtendedKeyUsage, as webpki does.
     let eku_allows_server = match cert.extended_key_usage() {
         Ok(Some(eku)) => Ext::Present(
-            eku.value.any
-                || eku.value.server_auth
+            eku.value.server_auth
                 || eku.value.other.iter().any(|oid| {
                     let id = oid.to_id_string();
                     id == "2.16.840.1.113730.4.1" || id == "1.3.6.1.4.1.311.10.3.3"
@@ -393,11 +524,23 @@ fn profile(cert: &X509Certificate<'_>) -> Profile {
         Ok(None) => Ext::Absent,
         Err(_) => Ext::Invalid,
     };
+    let path_len = match cert.basic_constraints() {
+        Ok(Some(bc)) if bc.value.ca => bc.value.path_len_constraint,
+        _ => None,
+    };
     Profile {
         v1: cert.version() == X509Version::V1,
+        v3: cert.version() == X509Version::V3,
         ca,
+        path_len,
         key_usage,
         eku_allows_server,
+        ns_ssl_server: profile::ns_cert_type_ssl_server(cert),
+        unsupported_critical: cert
+            .extensions()
+            .iter()
+            .any(|ext| ext.critical && !profile::is_supported_extension(&ext.oid.to_id_string())),
+        name_constraints: profile::name_constraints(cert),
     }
 }
 
@@ -416,22 +559,34 @@ fn name_entries(name: &X509Name<'_>) -> Vec<NameEntry> {
         .filter_map(|attr| {
             let oid = attr.attr_type().to_id_string();
             let field = FIELDS.into_iter().find(|f| f.oid() == oid)?;
-            let any = attr.attr_value();
-            // Only a universal, primitive string converts; anything else is an attribute
-            // whose value can never match.
-            let tag = if any.class() == Class::Universal && !any.header.is_constructed() {
-                any.tag().0
-            } else {
-                NOT_A_STRING
-            };
             Some(NameEntry {
                 field,
-                value: AsnString {
-                    tag,
-                    bytes: any.data.to_vec(),
-                },
+                value: asn_string(attr),
             })
         })
+        .collect()
+}
+
+/// An attribute's value as the tag and bytes OpenSSL's `ASN1_STRING_to_UTF8` sees. Only a
+/// universal, primitive string converts; anything else is a value that can never match.
+fn asn_string(attr: &AttributeTypeAndValue<'_>) -> AsnString {
+    let any = attr.attr_value();
+    let tag = if any.class() == Class::Universal && !any.header.is_constructed() {
+        any.tag().0
+    } else {
+        NOT_A_STRING
+    };
+    AsnString {
+        tag,
+        bytes: any.data.to_vec(),
+    }
+}
+
+/// The values of the `emailAddress` attributes (PKCS#9, `1.2.840.113549.1.9.1`) of a name.
+fn email_entries(name: &X509Name<'_>) -> Vec<AsnString> {
+    name.iter_attributes()
+        .filter(|attr| attr.attr_type().to_id_string() == "1.2.840.113549.1.9.1")
+        .map(asn_string)
         .collect()
 }
 

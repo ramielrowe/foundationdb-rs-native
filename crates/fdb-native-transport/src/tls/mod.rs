@@ -260,25 +260,48 @@
 //!
 //! # Differences from OpenSSL
 //!
-//! Chain validation uses `rustls-webpki`, shaped to follow OpenSSL's use of its
-//! trust store (see [`verify_peers::VerifyPeersVerifier`] for the exact rules:
-//! which CA-file certificates are trust anchors, validity periods, `ssl_server`
-//! purpose, the self-signed `openssl req -x509` setup). Where webpki is
-//! stricter than OpenSSL, a certificate FoundationDB accepts is rejected, with
-//! an error that says what to change
-//! ([`verify_peers::CertificateRejected`]):
+//! FoundationDB validates with OpenSSL (`X509_verify_cert`, purpose `sslserver`). Chain
+//! validation here uses `rustls-webpki`, with OpenSSL's remaining checks added to it (see
+//! [`verify_peers::VerifyPeersVerifier`] for the exact rules: which CA-file certificates are
+//! trust anchors, validity periods, `ssl_server` purpose, the self-signed `openssl req -x509`
+//! setup). The aim is that no chain is accepted that OpenSSL 3 rejects. Two kinds of
+//! difference remain.
+//!
+//! **Stricter than OpenSSL**: a certificate FoundationDB accepts is rejected, with an error that
+//! says what to change where it can ([`verify_peers::CertificateRejected`]):
 //!
 //! * no SHA-1 or MD5 signatures, no RSA keys under 2048 bits (the FDB docs'
 //!   example uses `rsa:2048`; older sample commands used SHA-1);
-//! * X.509 v3 only for end-entity and intermediate certificates (a self-signed
-//!   v1 root in the CA file is fine), and an end-entity certificate must not be
-//!   a CA (`basicConstraints CA:TRUE`) unless it is itself a self-signed
-//!   certificate in the CA file, as with `openssl req -x509` and
-//!   `--tls_ca_file` pointing at the same file;
+//! * X.509 v3 only for end-entity and intermediate certificates, and an end-entity
+//!   certificate must not be a CA (`basicConstraints CA:TRUE`). The exception is a
+//!   self-signed certificate in the CA file used as its own server certificate (as with
+//!   `openssl req -x509` and `--tls_ca_file` pointing at the same file), which must itself be
+//!   version 3: a self-signed v1 root is a fine trust anchor but is refused as the server's
+//!   certificate, because rustls parses that with webpki and the handshake could not complete;
+//! * a certificate in the CA file whose subject equals its issuer but whose own signature
+//!   does not verify is not treated as a self-signed root (OpenSSL never checks the
+//!   signature of a trusted self-signed certificate);
+//! * a `directoryName` name constraint, permitted or excluded, on any CA of the path makes
+//!   every certificate below it fail, even one whose subject satisfies it: webpki does not
+//!   implement directory-name subtrees and rejects instead, where OpenSSL evaluates them;
+//! * a critical extension that webpki does not process, such as `certificatePolicies` on an
+//!   intermediate, is an error; OpenSSL has `certificatePolicies`, `policyConstraints`,
+//!   `policyMappings`, `inhibitAnyPolicy` and `nsCertType` on its list of supported
+//!   extensions and accepts them;
 //! * **ECDSA P-521 is not supported with the default `ring` provider**, for
 //!   either a server certificate signature or a client private key
 //!   ([`TlsError::InvalidKey`] for the latter). It works with the
 //!   `tls-aws-lc-rs` feature. P-256 and P-384 work with both.
+//!
+//! **Path building** (accepted): OpenSSL builds one path, choosing each issuer by name and, if
+//! the certificates carry them, key identifiers; webpki backtracks over every candidate with a
+//! matching name. So a chain can be accepted here that OpenSSL fails to build: two roots with
+//! one subject and no `subjectKeyIdentifier`/`authorityKeyIdentifier` when OpenSSL tries the
+//! wrong one first (a signature error there), or a cross-signed intermediate sent in both
+//! forms with only one leading to a configured root (`unable to get local issuer`). Every
+//! path accepted still ends at a configured, in-date, CA-capable trust anchor and has passed
+//! all the checks described on [`verify_peers::VerifyPeersVerifier`], so this adds no
+//! certificate that is not rooted in the CA file; it only finds a valid path in more cases.
 //!
 //! # Closing, truncation and flushing
 //!

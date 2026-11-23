@@ -116,6 +116,16 @@ pub enum TlsError {
     /// The configured `verify_peers` rules do not parse.
     #[error("invalid TLS verify_peers setting: {0}")]
     VerifyPeers(#[source] ParseError),
+    /// `FDB_TLS_VERIFY_PEERS` is set to a value that is not valid UTF-8.
+    ///
+    /// FDB reads the variable as bytes. This crate parses the rules as text and
+    /// will not guess: a lossy conversion would replace each invalid byte with
+    /// U+FFFD and so change what the rule matches. Write non-ASCII bytes of a
+    /// rule as `\XX` escapes instead.
+    #[error(
+        "FDB_TLS_VERIFY_PEERS is not valid UTF-8; write non-ASCII bytes of a rule as \\XX escapes"
+    )]
+    VerifyPeersNotUtf8,
     /// rustls rejected the configuration (for example a key that does not
     /// match the certificate).
     #[error("invalid TLS configuration: {0}")]
