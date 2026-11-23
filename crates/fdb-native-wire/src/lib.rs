@@ -125,6 +125,25 @@
 //! shape [`Shape::Object`] that write with [`Writer::blob_with`] and read their payload
 //! from [`Reader::blob`]; they are always written by hand.
 //!
+//! # FDB types with their own serializers
+//!
+//! A few FDB types are single string-framed blobs written by custom code; each is a blob
+//! codec here, identical on 7.4 and 8.0. Borrowed types are `XRef<'de>` and owned types
+//! plain `X`, as in FDB (`into_owned` and `borrowed` convert):
+//!
+//! | C++ | Rust |
+//! | --- | --- |
+//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` (`GetKeyValuesReply::data`) | [`KeyValueVectorRef`] / [`KeyValueVector`] |
+//! | `VersionVector` (with `Tag`) | [`VersionVector`] ([`Tag`]) |
+//! | `TagSet` | [`TagSetRef`] / [`TagSet`] |
+//! | `IdempotencyIdRef` | [`IdempotencyIdRef`] / [`IdempotencyId`] |
+//!
+//! [`KeyValueRef`] / [`KeyValue`] are the plain `{key, value}` tables. Their decoders
+//! check every length against the blob first (FDB's `ASSERT`s come after the read), reject
+//! trailing bytes and never allocate from an unchecked count. Memory: the KV views and
+//! `IdempotencyIdRef` borrow the blob; a decoded `VersionVector` takes at most 8 times
+//! its blob and a `TagSetRef` at most 16 times (see their docs).
+//!
 //! # Writer
 //!
 //! [`Writer`] builds a message back to front, as FDB does, so every child is at a higher
@@ -169,6 +188,7 @@
 #![warn(missing_docs)]
 
 mod codec;
+mod codecs;
 mod collections;
 mod error;
 mod file_identifier;
@@ -184,6 +204,11 @@ mod writer;
 pub mod __private;
 
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
+pub use codecs::{
+    INVALID_VERSION, IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId, KeyValue, KeyValueIter,
+    KeyValueRef, KeyValueVector, KeyValueVectorRef, TAG_LOCALITY_INVALID, Tag, TagSet, TagSetRef,
+    Version, VersionVector,
+};
 pub use error::{DecodeError, EncodeError, StrictCheck};
 #[cfg(feature = "derive")]
 pub use fdb_native_wire_derive::Wire;

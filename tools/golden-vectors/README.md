@@ -754,8 +754,9 @@ share a dump name only if their fields are identical (`reply_promise`, `request_
 little-endian, `size_t` is 8 bytes): u64 count of distinct tag localities; per locality run,
 in `Tag` order, i8 locality and u16 run length; if there is at least one entry, u8 tag-id
 width (1 if every id is at most 255, else 2), u8 version-delta width (1, 2, 4 or 8: the
-smallest that holds the largest minus the smallest entry version; the minimum and maximum are
-taken over the entries only, not over the trailing `maxVersion` field), i64 min version (the
+smallest that holds the largest minus the smallest entry version; the minimum is taken over the
+entries only, not over the trailing `maxVersion` field, and the maximum starts at -1, so it is the
+largest entry version or -1 if every entry is below -1), i64 min version (the
 smallest entry version), u64 entry count, then
 per entry the tag id and (version minus min version) in those widths; finally i64
 `maxVersion`. The vectors cover the empty form and the width pairs 1/1, 1/2, 1/4 and 2/8.
