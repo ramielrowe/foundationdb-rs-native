@@ -901,7 +901,8 @@ Group `transport`:
 Not covered: malformed-input vectors for message types (the release readers have no bounds
 checks; the engine corpora cover the reader rules), `MutationRef` checksum forms, streams
 (`GetKeyValuesStreamRequest`, `ReplyPromiseStream`), mapped range reads, tenant management
-and metacluster requests, and FDB's binary (non-flatbuffers) serializer.
+and metacluster requests. (FDB's binary, non-flatbuffers serializer has its own vectors: see
+[Binary-format vectors](#binary-format-vectors).)
 
 ## How the tool is put together
 
@@ -924,6 +925,8 @@ and metacluster requests, and FDB's binary (non-flatbuffers) serializer.
 | `messages/real_types.h` | the real types behind the names the dumper uses, leaf dumps (`tag_set`, `version_vector`, ...), template table names, the `PingRequest` mirror |
 | `messages/extract_fields.py` | generates `gv_table_info` (field names, member addresses, file identifier checks) from the branch's headers |
 | `messages/message_vectors.cpp` | the message catalog, and the FDB network setup the real types need |
+| `messages/binary_vectors.cpp` | the binary-format (`BinaryWriter`) catalog; its own `main`, built as `golden_vectors_binary` |
+| `messages/connect_packet.h`, `messages/check_mirrors.py` | a verbatim mirror of `ConnectPacket` (a type private to `FlowTransport`), and the check that it still matches each branch's source |
 
 Only `flow/include/flow/flat_buffers.h`, `FileIdentifier.h` and `ObjectSerializerTraits.h`
 are compiled from `FDB_SRC`; the real Boost `flat_map` header is used. If a release changes
@@ -938,3 +941,39 @@ To add a message vector, build the value in `messages/message_vectors.cpp` and c
 `messages/extract_fields.py` (until then the build fails with the `type_name` static
 assertion). Run `./regen_messages.sh --check`, and `./regen.sh --check` too if you changed
 anything in `src/`: both generators share those headers.
+
+## Binary-format vectors
+
+`fixtures/binary-release-7.4/` and `fixtures/binary-release-8.0/` hold what each release's own
+`BinaryWriter` writes (`flow/include/flow/serialize.h`), for the Rust `fdb_native_wire::binary`
+module. They come from the same run as the message vectors: `regen_messages.sh` also builds
+`golden_vectors_binary` (`messages/binary_vectors.cpp`) against the branch's `fdbclient`,
+writes the vectors, and checks them itself (every value is read back by the release's
+`BinaryReader`, and every negative vector must make it throw or assert). Nothing is hand-derived.
+
+Each file is `{name, group, kind, description, cpp_type, type, versioning, size, bytes, value}`:
+
+- `bytes` is hex, the exact `BinaryWriter` output. `versioning` is `{mode, protocol_version}`:
+  `unversioned`, `include` (`IncludeVersion(v)`: the 8-byte version is part of `bytes`), or
+  `assume` (`AssumeVersion(v)`: no prefix, the version only enables `Serializer`).
+- `type` names the Rust type the test decodes it as (`u32`, `vec<string>`, `map<uid,i64>`,
+  `connect_packet`, `health_metrics`, ...); `value` is its logical value: integers, bools and
+  `std::string` as JSON numbers, booleans and strings, `StringRef` as hex, `UID` as
+  `{first, second}`, containers as arrays, maps as arrays of `[key, value]`, `Optional` as null
+  or the value, `std::variant` as `{index, value}`.
+- Groups: `primitives`, `containers`, `versioning`, and `usage` (the places the 7.4/8.0 protocol
+  uses the format, built with the real functions: `ConnectPacket` through `PacketWriter`,
+  `swVersionValue`, `keyServersValue`, `GetHealthMetricsReply::serialized`, `SpanContext`,
+  the idempotency-id record and its key range, `Transaction::makeSelfConflicting`).
+- `negative/` records add `expect: "reject"`, `cpp_reason` (`serialization_failed`,
+  `incompatible_protocol_version` or `internal_error` for the variant `ASSERT`) and
+  `cpp_error_code`.
+- `index.json` carries `current_protocol_version` and `min_invalid_protocol_version` (the
+  release's `IncludeVersion` read limit).
+
+The format has no padding, so every vector is canonical; the one exception is
+`sw_version_value`, whose flatbuffers payload depends on the C++ compiler (compare its fields).
+`ConnectPacket` is private to `fdbrpc/FlowTransport`, so the generator mirrors it verbatim;
+`check_mirrors.py` fails the build if the branch's source no longer matches the mirror.
+FDB's headers cannot write `std::tuple`, `float` or `Void` or read a `std::deque`, and
+`ErrorOr<T>` does not round-trip, so there are no vectors for them.

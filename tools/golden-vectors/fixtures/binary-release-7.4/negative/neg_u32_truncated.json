@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_u32_truncated",
+  "kind": "negative",
+  "description": "Three bytes where a uint32_t needs four.",
+  "type": "u32",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "bytes": "010203",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

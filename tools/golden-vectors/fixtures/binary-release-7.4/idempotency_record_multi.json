@@ -1,0 +1,44 @@
+{
+  "format_version": 1,
+  "name": "idempotency_record_multi",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A record with two ids of different lengths in one commit batch.",
+  "cpp_type": "IdempotencyIdKVBuilder record",
+  "type": "idempotency_value",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 56,
+  "bytes": "00000074b000db0f7bf1536500000000101111111111111111111111111111111101142222222222222222222222222222222222222222ff",
+  "value": {
+    "protocol_version": 1142507688328953856,
+    "timestamp": 1700000123,
+    "entries": [
+      {
+        "id": "11111111111111111111111111111111",
+        "low_order_batch_index": 1
+      },
+      {
+        "id": "2222222222222222222222222222222222222222",
+        "low_order_batch_index": 255
+      }
+    ],
+    "key": "ff022f69646d702f0000065dd083707b02",
+    "commit_version": 7000000000123,
+    "high_order_batch_index": 2,
+    "found": [
+      {
+        "id": "11111111111111111111111111111111",
+        "commit_version": 7000000000123,
+        "batch_index": 513
+      },
+      {
+        "id": "2222222222222222222222222222222222222222",
+        "commit_version": 7000000000123,
+        "batch_index": 767
+      }
+    ]
+  }
+}

@@ -106,6 +106,7 @@ wire-format details and the decoder strictness policy the `wire` codec follows.
 Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check`.
 The message-level fixtures (`fixtures/release-7.4/`, `fixtures/release-8.0/`) come from
 `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh --check` (needs docker).
+The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/binary-release-8.0/`) are written by the same command.
 
 ## Conventions & Patterns
 

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "assume_version_vec",
+  "group": "versioning",
+  "kind": "positive",
+  "description": "AssumeVersion(): the same vector with no prefix.",
+  "cpp_type": "std::vector<int32_t>",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 12,
+  "bytes": "020000000100000002000000",
+  "value": [1, 2]
+}

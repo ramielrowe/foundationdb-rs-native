@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "name": "self_conflict_key",
+  "group": "usage",
+  "kind": "positive",
+  "description": "Transaction::makeSelfConflicting(): \\xff/SC/ followed by a UID, written with BinaryWriter(Unversioned()).",
+  "cpp_type": "Key",
+  "type": "self_conflict_key",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 21,
+  "bytes": "ff2f53432f5c000000000011115c00000000002222",
+  "value": {
+    "unique_id": {
+      "first": 1229764173248856156,
+      "second": 2459528346497712220
+    }
+  }
+}

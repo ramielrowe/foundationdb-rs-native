@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_variant_index_out_of_range",
+  "kind": "negative",
+  "description": "A std::variant index of 3 for 3 alternatives: load() asserts.",
+  "type": "variant3",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "bytes": "0300000000",
+  "expect": "reject",
+  "cpp_reason": "internal_error",
+  "cpp_error_code": 4100
+}

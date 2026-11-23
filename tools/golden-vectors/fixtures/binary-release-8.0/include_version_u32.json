@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "include_version_u32",
+  "group": "versioning",
+  "kind": "positive",
+  "description": "IncludeVersion(): the current protocol version as a uint64_t, then the value.",
+  "cpp_type": "uint32_t",
+  "type": "u32",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 12,
+  "bytes": "00000080b000db0f04030201",
+  "value": 16909060
+}

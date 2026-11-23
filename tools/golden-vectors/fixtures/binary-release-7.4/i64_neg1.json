@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "i64_neg1",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "int64_t -1.",
+  "cpp_type": "int64_t",
+  "type": "i64",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 8,
+  "bytes": "ffffffffffffffff",
+  "value": -1
+}

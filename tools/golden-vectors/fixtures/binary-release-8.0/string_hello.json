@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "string_hello",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::string: an int32_t length, then the bytes.",
+  "cpp_type": "std::string",
+  "type": "string",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 9,
+  "bytes": "0500000068656c6c6f",
+  "value": "hello"
+}

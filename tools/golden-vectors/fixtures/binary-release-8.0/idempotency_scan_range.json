@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "name": "idempotency_scan_range",
+  "group": "usage",
+  "kind": "positive",
+  "description": "The range determineCommitStatus reads: the idempotencyIdKeys prefix and bigEndian64(version) written with BinaryWriter(Unversioned()). `bytes` is the begin key; the range's two keys are in `value`.",
+  "cpp_type": "KeyRange",
+  "type": "idempotency_scan_range",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 16,
+  "bytes": "ff022f69646d702f00000574fbde6000",
+  "value": {
+    "min_commit_version": 6000000000000,
+    "max_commit_version": 6000000099999,
+    "begin": "ff022f69646d702f00000574fbde6000",
+    "end": "ff022f69646d702f00000574fbdfe6a0"
+  }
+}

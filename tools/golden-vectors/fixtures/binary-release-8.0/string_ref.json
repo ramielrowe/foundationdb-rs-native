@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "string_ref",
+  "group": "containers",
+  "kind": "positive",
+  "description": "StringRef holding NUL and high bytes: a uint32_t length, then the bytes.",
+  "cpp_type": "Standalone<StringRef>",
+  "type": "bytes",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 9,
+  "bytes": "0500000000ff610080",
+  "value": "00ff610080"
+}

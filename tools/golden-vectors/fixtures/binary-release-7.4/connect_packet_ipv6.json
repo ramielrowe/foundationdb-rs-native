@@ -1,0 +1,26 @@
+{
+  "format_version": 1,
+  "name": "connect_packet_ipv6",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A ConnectPacket listening on an IPv6 address: the FLAG_IPV6 bit and 16 address bytes.",
+  "cpp_type": "ConnectPacket",
+  "type": "connect_packet",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 44,
+  "bytes": "2800000000000074b000db1f95110000000000000000000000000100fddb0000000000000000000000000001",
+  "value": {
+    "connect_packet_length": 40,
+    "protocol_version": 2295429192935800832,
+    "canonical_remote_port": 4501,
+    "connection_id": 0,
+    "canonical_remote_ip4": 0,
+    "flags": 1,
+    "canonical_remote_ip6": "fddb0000000000000000000000000001",
+    "canonical_remote_ip": "fddb::1",
+    "total_packet_size": 44
+  }
+}

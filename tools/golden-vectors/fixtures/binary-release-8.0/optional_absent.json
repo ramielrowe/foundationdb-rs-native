@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "optional_absent",
+  "group": "containers",
+  "kind": "positive",
+  "description": "Optional<int32_t> without a value: a bool, 0.",
+  "cpp_type": "Optional<int32_t>",
+  "type": "optional<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 1,
+  "bytes": "00",
+  "value": null
+}

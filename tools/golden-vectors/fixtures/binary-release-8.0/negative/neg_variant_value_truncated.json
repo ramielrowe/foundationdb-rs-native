@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_variant_value_truncated",
+  "kind": "negative",
+  "description": "A variant holding an int32_t with two bytes.",
+  "type": "variant3",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "bytes": "000100",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

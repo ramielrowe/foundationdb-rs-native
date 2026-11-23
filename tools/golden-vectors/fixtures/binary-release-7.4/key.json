@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "key",
+  "group": "containers",
+  "kind": "positive",
+  "description": "Key (Standalone<StringRef>): the same bytes as a StringRef.",
+  "cpp_type": "Key",
+  "type": "bytes",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 9,
+  "bytes": "05000000612f6b6579",
+  "value": "612f6b6579"
+}

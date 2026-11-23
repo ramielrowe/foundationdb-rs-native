@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "bool_false",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "bool false: one byte, 0.",
+  "cpp_type": "bool",
+  "type": "bool",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 1,
+  "bytes": "00",
+  "value": false
+}

@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "vec_i32",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::vector<int32_t>: an int count, then the elements.",
+  "cpp_type": "std::vector<int32_t>",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 16,
+  "bytes": "0300000001000000feffffffe0930400",
+  "value": [1, -2, 300000]
+}

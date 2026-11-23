@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "name": "idempotency_record_single",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A record with one 16-byte id: IncludeVersion(), the timestamp, then length, id and batch index.",
+  "cpp_type": "IdempotencyIdKVBuilder record",
+  "type": "idempotency_value",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 34,
+  "bytes": "00000074b000db0f00f1536500000000101111111111111111111111111111111105",
+  "value": {
+    "protocol_version": 1142507688328953856,
+    "timestamp": 1700000000,
+    "entries": [
+      {
+        "id": "11111111111111111111111111111111",
+        "low_order_batch_index": 5
+      }
+    ],
+    "key": "ff022f69646d702f00000574fbde61f401",
+    "commit_version": 6000000000500,
+    "high_order_batch_index": 1,
+    "found": [
+      {
+        "id": "11111111111111111111111111111111",
+        "commit_version": 6000000000500,
+        "batch_index": 261
+      }
+    ]
+  }
+}

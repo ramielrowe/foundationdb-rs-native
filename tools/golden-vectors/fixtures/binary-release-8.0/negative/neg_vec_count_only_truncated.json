@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_vec_count_only_truncated",
+  "kind": "negative",
+  "description": "A count with only 3 of its 4 bytes.",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "bytes": "030000",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

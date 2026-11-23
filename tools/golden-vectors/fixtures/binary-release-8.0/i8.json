@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "i8",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "int8_t -2.",
+  "cpp_type": "int8_t",
+  "type": "i8",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 1,
+  "bytes": "fe",
+  "value": -2
+}
