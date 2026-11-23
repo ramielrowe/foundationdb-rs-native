@@ -32,6 +32,7 @@ rustls-pki-types = { version = "1.16.0", optional = true }
 pkcs8 = { version = "0.10.2", default-features = false, features = ["alloc", "pem", "encryption"], optional = true }
 
 [dev-dependencies]
+fdb-native-testkit = { path = "../fdb-native-testkit" }
 futures-lite = "2.6.1"
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util", "sync", "time"] }
 proptest = "1.11.0"

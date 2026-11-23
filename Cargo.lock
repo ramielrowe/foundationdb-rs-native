@@ -408,6 +408,7 @@ dependencies = [
 name = "fdb-native-transport"
 version = "0.0.0"
 dependencies = [
+ "fdb-native-testkit",
  "fdb-native-wire",
  "futures-io",
  "futures-lite",

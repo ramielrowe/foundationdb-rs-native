@@ -255,6 +255,370 @@ fn unions_use_index_plus_one_and_read_unknown_tags_as_absent() {
 }
 
 // ---------------------------------------------------------------------------------------
+// `absent = "default"`: what C++ default-constructs for an absent table.
+
+/// C++ `struct Config { double penalty = 1.0; int64_t version = -1; bool enabled = true; ...
+/// serializer(ar, penalty, version, enabled, name); }`: a default-constructed `Config` is
+/// not all zeros.
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb40, absent = "default")]
+struct Defaulted<'a> {
+    penalty: f64,
+    version: i64,
+    enabled: bool,
+    name: Option<&'a [u8]>,
+}
+
+impl Default for Defaulted<'_> {
+    fn default() -> Self {
+        Defaulted {
+            penalty: 1.0,
+            version: -1,
+            enabled: true,
+            name: None,
+        }
+    }
+}
+
+/// The reader: `held` is a table member, `serializer(ar, before, held, after)`.
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb41)]
+struct Holder<'a> {
+    before: u8,
+    held: Defaulted<'a>,
+    after: u8,
+}
+
+/// A writer that leaves `held`'s slot absent.
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb41)]
+#[allow(dead_code)] // written, never read
+struct HolderWithoutHeld {
+    before: u8,
+    #[fdb(skip_slots = 1)]
+    held: (),
+    after: u8,
+}
+
+/// A table that has only `Defaulted`'s first slot (a shorter vtable: the other slots are
+/// missing from a *present* table).
+#[derive(Wire)]
+struct OnlyPenalty {
+    penalty: f64,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb41)]
+struct HolderWithShortHeld {
+    before: u8,
+    held: OnlyPenalty,
+    after: u8,
+}
+
+/// A present table with no slots at all.
+#[derive(Wire)]
+#[allow(dead_code)] // written, never read
+struct NoSlots {
+    #[fdb(arena)]
+    arena: (),
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb41)]
+struct HolderWithEmptyHeld {
+    before: u8,
+    held: NoSlots,
+    after: u8,
+}
+
+#[test]
+fn absent_default_applies_to_an_absent_table() {
+    // `LoadMember` default-constructs the member of a missing slot: `Config()`.
+    let bytes = encode(&HolderWithoutHeld {
+        before: 1,
+        held: (),
+        after: 2,
+    })
+    .unwrap();
+    let holder: Holder = decode(&bytes).unwrap();
+    assert_eq!(holder.held, Defaulted::default());
+    assert_eq!(holder.held.penalty, 1.0);
+    assert_eq!((holder.before, holder.after), (1, 2));
+
+    assert_eq!(Defaulted::absent(), Defaulted::default());
+    // A table that holds one: `absent()` of the container composes.
+    assert_eq!(
+        Holder::absent(),
+        Holder {
+            before: 0,
+            held: Defaulted::default(),
+            after: 0,
+        }
+    );
+}
+
+#[test]
+fn absent_default_leaves_missing_scalar_slots_of_a_present_table_at_zero() {
+    // The table is present; its vtable is shorter than `Defaulted`'s. C++ assigns
+    // `T{}` of the scalar (0) to each missing slot, not the member initializer.
+    let bytes = encode(&HolderWithShortHeld {
+        before: 1,
+        held: OnlyPenalty { penalty: 0.25 },
+        after: 2,
+    })
+    .unwrap();
+    let holder: Holder = decode(&bytes).unwrap();
+    assert_eq!(
+        holder.held,
+        Defaulted {
+            penalty: 0.25,
+            version: 0,
+            enabled: false,
+            name: None,
+        }
+    );
+
+    // A present table with no slots reads all zeros, too: the attribute only changes an
+    // absent *table*.
+    let bytes = encode(&HolderWithEmptyHeld {
+        before: 1,
+        held: NoSlots { arena: () },
+        after: 2,
+    })
+    .unwrap();
+    let holder: Holder = decode(&bytes).unwrap();
+    assert_eq!(
+        holder.held,
+        Defaulted {
+            penalty: 0.0,
+            version: 0,
+            enabled: false,
+            name: None,
+        }
+    );
+}
+
+/// A union's absent value is its first alternative's, so it follows that alternative's
+/// default.
+#[derive(Wire, Debug, PartialEq)]
+enum DefaultedOrByte<'a> {
+    Config(Defaulted<'a>),
+    Byte(u8),
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb42)]
+struct UnionHolder<'a> {
+    value: DefaultedOrByte<'a>,
+    after: u8,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb42)]
+#[allow(dead_code)] // written, never read
+struct UnionHolderWithoutValue {
+    #[fdb(skip_slots = 2)]
+    value: (),
+    after: u8,
+}
+
+#[test]
+fn absent_default_reaches_a_union_through_its_first_alternative() {
+    assert_eq!(
+        DefaultedOrByte::absent(),
+        DefaultedOrByte::Config(Defaulted::default())
+    );
+    let bytes = encode(&UnionHolderWithoutValue {
+        value: (),
+        after: 3,
+    })
+    .unwrap();
+    let holder: UnionHolder = decode(&bytes).unwrap();
+    assert_eq!(
+        holder,
+        UnionHolder {
+            value: DefaultedOrByte::Config(Defaulted::default()),
+            after: 3,
+        }
+    );
+}
+
+/// An inline struct (`std::tuple`), `Point() : x(7), y(-7)`.
+#[derive(Wire, Clone, Copy, Debug, PartialEq)]
+#[fdb(struct, absent = "default")]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Default for Point {
+    fn default() -> Self {
+        Point { x: 7, y: -7 }
+    }
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb43)]
+struct PointHolder {
+    before: u8,
+    point: Point,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb43)]
+#[allow(dead_code)] // written, never read
+struct PointHolderWithoutPoint {
+    before: u8,
+    #[fdb(skip_slots = 1)]
+    point: (),
+}
+
+#[test]
+fn absent_default_applies_to_structs() {
+    assert_eq!(Point::absent(), Point { x: 7, y: -7 });
+    let bytes = encode(&PointHolderWithoutPoint {
+        before: 4,
+        point: (),
+    })
+    .unwrap();
+    assert_eq!(
+        decode::<PointHolder>(&bytes).unwrap(),
+        PointHolder {
+            before: 4,
+            point: Point { x: 7, y: -7 },
+        }
+    );
+    // Present is read as written.
+    let present = PointHolder {
+        before: 4,
+        point: Point { x: 0, y: 1 },
+    };
+    assert_eq!(
+        decode::<PointHolder>(&encode(&present).unwrap()).unwrap(),
+        present
+    );
+}
+
+/// Generic types: the bound is `Self: Default`, nothing more.
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(absent = "default")]
+struct DefaultedGeneric<T> {
+    items: Vec<T>,
+    count: u32,
+    #[fdb(skip)]
+    local: u8,
+}
+
+impl<T> Default for DefaultedGeneric<T> {
+    fn default() -> Self {
+        DefaultedGeneric {
+            items: Vec::new(),
+            count: 5,
+            local: 9,
+        }
+    }
+}
+
+#[test]
+fn absent_default_on_generic_types() {
+    assert_eq!(
+        DefaultedGeneric::<u16>::absent(),
+        DefaultedGeneric {
+            items: vec![],
+            count: 5,
+            local: 9
+        }
+    );
+    // Without the attribute `absent()` is field-wise: zeros.
+    assert_eq!(Generic::<u8, 2>::absent().fixed, [0, 0]);
+}
+
+// The boundary of the attribute: it changes the absent *table* only. An `Option` of an
+// attributed table is not a table slot (its absent value is `None`), a vector element is
+// always present, and only a union-vector element with tag 0 is an absent union.
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb45)]
+struct OptionHolder<'a> {
+    value: Option<Defaulted<'a>>,
+    after: u8,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb45)]
+#[allow(dead_code)] // written, never read
+struct OptionHolderWithout {
+    #[fdb(skip_slots = 2)]
+    value: (),
+    after: u8,
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb46)]
+struct VecHolder<'a> {
+    items: Vec<Defaulted<'a>>,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb46)]
+struct VecOfShortHolder {
+    items: Vec<OnlyPenalty>,
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb47)]
+struct UnionVecHolder<'a> {
+    items: Vec<DefaultedOrByte<'a>>,
+}
+
+#[test]
+fn absent_default_does_not_reach_options_or_vector_elements() {
+    // `Optional<Config>` absent is nullopt, never `Some(Config())`.
+    let bytes = encode(&OptionHolderWithout {
+        value: (),
+        after: 1,
+    })
+    .unwrap();
+    let holder: OptionHolder = decode(&bytes).unwrap();
+    assert_eq!(holder.value, None);
+    assert_eq!(<Option<Defaulted>>::absent(), None);
+
+    // A vector element is a present table: its missing scalar slots read zero.
+    let bytes = encode(&VecOfShortHolder {
+        items: vec![OnlyPenalty { penalty: 0.5 }, OnlyPenalty { penalty: 2.0 }],
+    })
+    .unwrap();
+    let holder: VecHolder = decode(&bytes).unwrap();
+    let zeroed = |penalty| Defaulted {
+        penalty,
+        version: 0,
+        enabled: false,
+        name: None,
+    };
+    assert_eq!(holder.items, vec![zeroed(0.5), zeroed(2.0)]);
+}
+
+#[test]
+fn a_union_vector_element_with_tag_zero_reads_the_unions_absent_value() {
+    let written = UnionVecHolder {
+        items: vec![DefaultedOrByte::Byte(9)],
+    };
+    let mut bytes = encode(&written).unwrap();
+    assert_eq!(decode::<UnionVecHolder>(&bytes).unwrap(), written);
+    // The tags vector is `count = 1` then the tag, 2 for `Byte`: make it 0.
+    let needle = [1u8, 0, 0, 0, 2];
+    let at: Vec<usize> = (0..bytes.len() - needle.len())
+        .filter(|&i| bytes[i..i + needle.len()] == needle)
+        .collect();
+    assert_eq!(at.len(), 1, "{bytes:02x?}");
+    bytes[at[0] + 4] = 0;
+    assert_eq!(
+        decode::<UnionVecHolder>(&bytes).unwrap().items,
+        vec![DefaultedOrByte::Config(Defaulted::default())]
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Generics.
 
 #[derive(Wire, Debug, PartialEq)]
@@ -446,6 +810,19 @@ mod shadowed {
         pub(crate) skipped: u8,
     }
 
+    /// `absent = "default"` with `Default`, `Self` and `core` shadowed.
+    #[derive(Wire, Debug, PartialEq)]
+    #[fdb(absent = "default")]
+    pub(crate) struct DefaultedCollide {
+        pub(crate) a: u8,
+    }
+
+    impl ::core::default::Default for DefaultedCollide {
+        fn default() -> Self {
+            DefaultedCollide { a: 3 }
+        }
+    }
+
     #[derive(Wire, Debug, PartialEq)]
     pub(crate) enum Tags {
         __fdb_v(u8),
@@ -494,6 +871,10 @@ fn derive_is_hygienic() {
     let bytes = encode_with_identifier(&c, 1).unwrap();
     let back: shadowed::Collide = Reader::new(&bytes).unwrap().decode_root().unwrap();
     assert_eq!(back, c);
+    assert_eq!(
+        <shadowed::DefaultedCollide as Decode>::absent(),
+        shadowed::DefaultedCollide { a: 3 }
+    );
     let u = shadowed::Tags::__fdb_tag(7);
     let bytes = encode_with_identifier(&u, 1).unwrap();
     let back: shadowed::Tags = Reader::new(&bytes).unwrap().decode_root().unwrap();
