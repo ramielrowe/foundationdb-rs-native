@@ -100,6 +100,38 @@
 //! is unverified here. `FDB_COORDINATOR` is not a public-address setting: it is a hostname of
 //! an existing coordinator to join. Only the Linux path is implemented today.
 //!
+//! # TLS clusters
+//!
+//! [`FdbContainerBuilder::tls`] starts the same single-process server with TLS on. The
+//! certificates come from [`TestPki`] (a CA, a server certificate and a client certificate,
+//! generated in process), are written to a temporary directory and bind-mounted **read-only**
+//! at [`CONTAINER_TLS_DIR`] (`/etc/fdb-tls`). The server is configured with environment
+//! variables on `docker create`, which the container's `fdbcli` (run by `docker exec`) inherits:
+//!
+//! | Variable | Value |
+//! |----------|-------|
+//! | `FDB_PORT` | `4500:tls` |
+//! | `FDB_TLS_CERTIFICATE_FILE` | `/etc/fdb-tls/server-cert.pem` |
+//! | `FDB_TLS_KEY_FILE` | `/etc/fdb-tls/server-key.pem` |
+//! | `FDB_TLS_CA_FILE` | `/etc/fdb-tls/ca.pem` |
+//! | `FDB_TLS_VERIFY_PEERS` | only if [`FdbContainerBuilder::tls_verify_peers`] is set |
+//!
+//! `FDB_PORT` is the only switch that matters: both images' `fdb.bash` use it verbatim in
+//! `--listen-address 0.0.0.0:$FDB_PORT`, in `--public-address $PUBLIC_IP:$FDB_PORT` and in the
+//! self-coordinated cluster file, so `4500:tls` makes the process listen for TLS, advertise
+//! `IP:4500:tls` and write `docker:docker@IP:4500:tls`. No command arguments are needed (the 7.4
+//! script would ignore them; the 8.0 script appends them). The same file is the cluster file
+//! the host uses, and the server certificate doubles as `fdbcli`'s client certificate (it is
+//! valid for client authentication too).
+//!
+//! The server asks clients for a certificate but accepts none (an *untrusted* client may use
+//! public endpoints only); a client that presents one has it verified against the CA.
+//!
+//! A [`FdbContainer`] started this way has [`FdbContainer::tls`], the handle with the client
+//! certificate and CA as paths and PEM text. [`FdbContainer::address`] is still the plain
+//! `IP:4500`; the address a client dials is that with the TLS flag, and
+//! [`FdbContainer::cluster_string`] ends in `:tls`.
+//!
 //! # Future work
 //!
 //! A compose-based multi-process cluster variant (several `fdbserver` processes, redundancy
@@ -117,6 +149,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
+
+pub mod tls;
+
+pub use tls::{CONTAINER_TLS_DIR, Identity, TestPki, TlsCluster};
 
 /// Environment variable selecting the Docker image.
 pub const IMAGE_ENV: &str = "FDB_IMAGE";
@@ -183,6 +219,9 @@ pub enum Error {
     /// The cluster file could not be created.
     #[error("failed to write cluster file: {0}")]
     ClusterFile(#[source] io::Error),
+    /// The test certificates could not be generated or written.
+    #[error("failed to generate or write TLS test certificates: {0}")]
+    Pki(String),
     /// The cluster file inside the container is not what the bridge IP implies.
     #[error("cluster file in container is {actual:?}, expected {expected:?}")]
     ClusterFileMismatch {
@@ -466,6 +505,8 @@ pub struct FdbContainerBuilder {
     startup_timeout: Duration,
     pull_timeout: Duration,
     name: Option<String>,
+    tls: bool,
+    tls_verify_peers: Option<String>,
 }
 
 impl Default for FdbContainerBuilder {
@@ -475,6 +516,8 @@ impl Default for FdbContainerBuilder {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             pull_timeout: DEFAULT_PULL_TIMEOUT,
             name: None,
+            tls: false,
+            tls_verify_peers: None,
         }
     }
 }
@@ -510,27 +553,72 @@ impl FdbContainerBuilder {
         self
     }
 
+    /// Starts the server with TLS on: it listens on and advertises `IP:4500:tls`, with
+    /// generated certificates (see the [crate docs](crate#tls-clusters)). The handle then has
+    /// [`FdbContainer::tls`].
+    #[must_use]
+    pub fn tls(mut self) -> Self {
+        self.tls = true;
+        self
+    }
+
+    /// Sets the server's `FDB_TLS_VERIFY_PEERS` (how it judges client certificates); implies
+    /// [`tls`](Self::tls).
+    #[must_use]
+    pub fn tls_verify_peers(mut self, rules: impl Into<String>) -> Self {
+        self.tls = true;
+        self.tls_verify_peers = Some(rules.into());
+        self
+    }
+
     /// Starts the container and waits until the database is available.
     pub fn start(self) -> Result<FdbContainer> {
         let name = self.name.unwrap_or_else(generate_container_name);
 
+        // Certificates first, so a failure here creates nothing.
+        let tls = if self.tls {
+            let pki = TestPki::generate()?;
+            Some(TlsCluster::new(pki).map_err(|e| Error::Pki(e.to_string()))?)
+        } else {
+            None
+        };
+
         ensure_image(&self.image, self.pull_timeout)?;
+
+        let mut create: Vec<String> = [
+            "create",
+            "--network",
+            "bridge",
+            "--label",
+            LABEL,
+            "--name",
+            &name,
+        ]
+        .map(str::to_owned)
+        .into();
+        if let Some(tls) = &tls {
+            let dir = CONTAINER_TLS_DIR;
+            let mount = format!("{}:{dir}:ro", tls.dir().display());
+            let mut envs = vec![
+                format!("FDB_PORT={FDB_PORT}:tls"),
+                format!("FDB_TLS_CERTIFICATE_FILE={dir}/server-cert.pem"),
+                format!("FDB_TLS_KEY_FILE={dir}/server-key.pem"),
+                format!("FDB_TLS_CA_FILE={dir}/ca.pem"),
+            ];
+            if let Some(rules) = &self.tls_verify_peers {
+                envs.push(format!("FDB_TLS_VERIFY_PEERS={rules}"));
+            }
+            create.extend(["--volume".to_owned(), mount]);
+            for env in envs {
+                create.extend(["--env".to_owned(), env]);
+            }
+        }
+        create.push(self.image.clone());
+        let create_args: Vec<&str> = create.iter().map(String::as_str).collect();
 
         // `docker create` either fails (nothing exists, nothing to clean up, and in particular
         // a name collision never involves the other container) or prints the new ID.
-        let created = docker(
-            &[
-                "create",
-                "--network",
-                "bridge",
-                "--label",
-                LABEL,
-                "--name",
-                &name,
-                &self.image,
-            ],
-            DOCKER_TIMEOUT,
-        )?;
+        let created = docker(&create_args, DOCKER_TIMEOUT)?;
         let id = parse_container_id(&created).ok_or_else(|| {
             Error::Parse(format!(
                 "docker create printed no container id: {created:?}"
@@ -553,7 +641,11 @@ impl FdbContainerBuilder {
             ))
         })?;
         let address = SocketAddr::new(ip, FDB_PORT);
-        let expected = format_cluster_string(address);
+        let expected = if tls.is_some() {
+            format!("{}:tls", format_cluster_string(address))
+        } else {
+            format_cluster_string(address)
+        };
 
         let cluster_string = wait_ready(
             &guard.id,
@@ -577,6 +669,7 @@ impl FdbContainerBuilder {
             address,
             cluster_string,
             cluster_file,
+            tls,
             _dir: dir,
         })
     }
@@ -701,6 +794,8 @@ pub struct FdbContainer {
     address: SocketAddr,
     cluster_string: String,
     cluster_file: PathBuf,
+    // Dropped after the guard: the container is gone before its mounted certificates are.
+    tls: Option<TlsCluster>,
     _dir: TempDir,
 }
 
@@ -713,6 +808,24 @@ impl FdbContainer {
     /// Starts a container for `image` with the default timeouts. Blocking.
     pub fn start_with_image(image: impl Into<String>) -> Result<Self> {
         Self::builder().image(image).start()
+    }
+
+    /// Starts a TLS container for `image` with the default timeouts. Blocking. See
+    /// [`FdbContainerBuilder::tls`].
+    pub fn start_tls_with_image(image: impl Into<String>) -> Result<Self> {
+        Self::builder().image(image).tls().start()
+    }
+
+    /// The TLS side of a container started with [`FdbContainerBuilder::tls`]: the generated
+    /// certificates, with the client's as paths and PEM text. `None` for a plain container.
+    pub fn tls(&self) -> Option<&TlsCluster> {
+        self.tls.as_ref()
+    }
+
+    /// Whether the server speaks TLS: clients must dial [`address`](Self::address) as a
+    /// `:tls` address.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
     }
 
     /// Returns a builder for custom configuration.

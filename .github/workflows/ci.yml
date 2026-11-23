@@ -94,4 +94,6 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # cpp_crosscheck (the binary, and the cpp_crosscheck_* tests in other binaries) is ignored because it
       # needs the dev-only golden-vectors tool, not Docker.
-      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
+      # The tls feature is on so that the TLS docker tests (peer_tls_docker, tls_peer_wrapper) run too;
+      # the plain tests are unaffected by it.
+      - run: cargo nextest run --workspace --features fdb-native-transport/tls --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'

@@ -173,3 +173,72 @@ fn name_collision_fails_without_touching_the_existing_container() {
     drop(first);
     assert!(!container_exists(&first_id));
 }
+
+const IMAGES: [&str; 2] = [
+    "foundationdb/foundationdb:7.4.10",
+    "foundationdb/foundationdb:8.0.1",
+];
+
+/// A TLS container, on both pinned images: the cluster file carries `:tls`, fdbcli works over
+/// TLS inside the container, the certificates are mounted read-only and there for the client,
+/// and everything is gone after drop.
+#[test]
+#[ignore = "requires docker"]
+fn tls_container_starts_on_both_images() {
+    for image in IMAGES {
+        let fdb = FdbContainer::start_tls_with_image(image)
+            .unwrap_or_else(|e| panic!("{image}: container should start: {e}"));
+        let id = fdb.id().to_owned();
+        assert!(fdb.is_tls());
+        assert_eq!(fdb.address().port(), 4500);
+        assert_eq!(
+            fdb.cluster_string(),
+            format!("docker:docker@{}:tls", fdb.address()),
+            "{image}"
+        );
+        let contents = fs::read_to_string(fdb.cluster_file()).unwrap();
+        assert_eq!(contents.trim(), fdb.cluster_string());
+
+        let status = fdb.fdbcli("status minimal").expect("fdbcli works over TLS");
+        assert!(
+            status.contains("The database is available"),
+            "{image}: {status}"
+        );
+
+        // The certificate directory is mounted, read-only.
+        let mounts = docker_output(&[
+            "inspect",
+            "-f",
+            "{{range .Mounts}}{{.Destination}}={{.RW}}{{\"\\n\"}}{{end}}",
+            &id,
+        ]);
+        let mounts = String::from_utf8_lossy(&mounts.stdout).into_owned();
+        assert!(
+            mounts
+                .lines()
+                .any(|l| l == format!("{}=false", fdb_native_testkit::CONTAINER_TLS_DIR)),
+            "{image}: {mounts}"
+        );
+
+        let tls = fdb.tls().expect("tls handle");
+        assert!(tls.ca_path().is_file());
+        assert!(tls.client_cert_path().is_file());
+        assert!(tls.client_key_path().is_file());
+        assert!(tls.ca_pem().contains("BEGIN CERTIFICATE"));
+        assert!(tls.client_cert_pem().contains("BEGIN CERTIFICATE"));
+        assert!(tls.client_key_pem().contains("PRIVATE KEY"));
+        let dir = tls.dir().to_owned();
+
+        drop(fdb);
+        assert!(!container_exists(&id), "{image}");
+        assert!(!dir.exists(), "{image}: certificate directory must be gone");
+    }
+}
+
+#[test]
+#[ignore = "requires docker"]
+fn plain_container_has_no_tls_handle() {
+    let fdb = FdbContainer::start().expect("container");
+    assert!(!fdb.is_tls());
+    assert!(fdb.tls().is_none());
+}
