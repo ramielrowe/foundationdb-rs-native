@@ -134,6 +134,12 @@ impl CommitBuffer {
         self.mutations.is_empty() && self.write_conflicts.is_empty()
     }
 
+    /// The mutations buffered so far, in order (what a watch's baseline value is worked out
+    /// from).
+    pub fn mutations(&self) -> &[Mutation] {
+        &self.mutations
+    }
+
     /// The mutations, the read conflict ranges and the write conflict ranges, for
     /// [`Committer::commit`](super::Committer::commit).
     pub fn into_parts(self) -> (Vec<Mutation>, Vec<KeyRange>, Vec<KeyRange>) {

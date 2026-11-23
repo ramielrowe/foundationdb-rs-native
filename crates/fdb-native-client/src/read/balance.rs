@@ -374,7 +374,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     /// `allAlternativesFailedDelay` (`fdbrpc/LoadBalance.actor.cpp` 7.4, `LoadBalance.cpp`
     /// 8.0:29-53): wait for one of `targets` to come back, for a delay that grows while
     /// alternatives keep failing; `all_alternatives_failed` if none does.
-    async fn all_alternatives_failed_delay(
+    pub(super) async fn all_alternatives_failed_delay(
         &self,
         targets: &[(NetworkAddress, Uid)],
     ) -> Result<(), Error> {

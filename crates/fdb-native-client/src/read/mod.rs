@@ -206,9 +206,11 @@ mod balance;
 mod grv;
 mod location;
 pub(crate) mod util;
+mod watch_lb;
 
 pub use grv::{Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
+pub use watch_lb::WatchTimings;
 
 use grv::Batcher;
 use location::{Location, LocationCache};

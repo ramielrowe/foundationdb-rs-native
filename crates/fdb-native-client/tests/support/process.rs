@@ -26,6 +26,20 @@ pub struct Incoming {
     pub payload: Vec<u8>,
     /// The process's schema set.
     pub schema: SchemaVersion,
+    /// Sends frames on the connection the request came on, at any later time.
+    pub responder: Responder,
+}
+
+/// Sends frames to a client on one of the process's connections (a reply that comes later,
+/// as a storage server's watch reply does).
+#[derive(Clone)]
+pub struct Responder(mpsc::UnboundedSender<Cmd>);
+
+impl Responder {
+    /// Sends `payload` (an `ErrorOr` reply envelope) to `token`.
+    pub fn send(&self, token: Uid, payload: Vec<u8>) {
+        let _ = self.0.send(Cmd::Send(token, payload));
+    }
 }
 
 /// What a handler does with a request.
@@ -195,6 +209,7 @@ impl FakeProcess {
                             token: frame.token,
                             payload: frame.payload.to_vec(),
                             schema,
+                            responder: Responder(cmd_tx.clone()),
                         });
                         match action {
                             Action::Ignore => {}

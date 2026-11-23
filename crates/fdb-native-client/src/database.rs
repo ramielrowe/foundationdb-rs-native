@@ -47,6 +47,7 @@ use crate::error::codes::TLS_ERROR;
 use crate::read::util::Rng;
 use crate::read::{ReadConfig, Reader};
 use crate::transaction::Transaction;
+use crate::watch::{ABSOLUTE_MAX_WATCHES, WatchConfig, WatchContext};
 
 /// How a [`Database`] is built. [`DatabaseOptions::default`] has C++'s knobs everywhere.
 #[derive(Clone, Debug, Default)]
@@ -62,6 +63,8 @@ pub struct DatabaseOptions {
     /// `resource_constrained_max_backoff`, `backoff_growth`, `future_version_retry_delay`)
     /// are also the transactions' (`DEFAULT_BACKOFF`, `DEFAULT_MAX_BACKOFF`, ...).
     pub commit: CommitterConfig,
+    /// Watches: the cap and the polling time.
+    pub watch: WatchConfig,
     /// TLS settings (FoundationDB's `TLS_*` network options). `None` (the default) uses the
     /// environment and the default files, and only if the cluster has `:tls` coordinators;
     /// `Some` enables TLS whatever the coordinators are. See the [module
@@ -198,6 +201,7 @@ pub(crate) struct DbInner<R: Runtime> {
     pub(crate) monitor: Arc<ClusterMonitor<R>>,
     pub(crate) reader: Reader<R, ClientTls>,
     pub(crate) committer: Committer<R, ClientTls>,
+    pub(crate) watches: Arc<WatchContext<R>>,
     pub(crate) knobs: TransactionKnobs,
     tls: bool,
     rng: Mutex<Rng>,
@@ -351,6 +355,12 @@ impl<R: Runtime> Database<R> {
             backoff_growth: options.commit.backoff_growth,
             future_version_retry_delay: options.commit.future_version_retry_delay,
         };
+        let watches = WatchContext::new(
+            rt.clone(),
+            reader.clone(),
+            &options.watch,
+            options.commit.future_version_retry_delay,
+        );
         let rng = Rng::new(options.commit.seed.map(|s| s ^ 0x5eed));
         let committer = Committer::new(rt.clone(), peers.clone(), monitor.clone(), options.commit);
         Ok(Database {
@@ -360,6 +370,7 @@ impl<R: Runtime> Database<R> {
                 monitor,
                 reader,
                 committer,
+                watches,
                 knobs,
                 tls: uses_tls,
                 rng: Mutex::new(rng),
@@ -469,8 +480,38 @@ impl<R: Runtime> Database<R> {
     /// handle of the database (and its transactions) then fails with `operation_cancelled`
     /// (1101). Idempotent.
     pub async fn shutdown(&self) {
+        // The watches fail with `operation_cancelled` (the cluster monitor and the
+        // connections would only end them eventually).
+        self.inner.watches.shutdown();
         self.inner.monitor.shutdown().await;
         self.inner.peers.shutdown().await;
+    }
+
+    /// `MAX_WATCHES` (the database option): the most watches that may be outstanding at once
+    /// (default 10 000; [`WatchConfig::max_outstanding_watches`]). Watches already
+    /// outstanding stay, whatever the new cap. `invalid_option_value` (2006) above
+    /// [`ABSOLUTE_MAX_WATCHES`] (1 000 000).
+    pub fn set_max_watches(&self, max: usize) -> Result<(), Error> {
+        if max > ABSOLUTE_MAX_WATCHES {
+            return Err(Error::with_message(
+                crate::error::codes::INVALID_OPTION_VALUE,
+                "the cap on watches is at most 1 000 000",
+            ));
+        }
+        self.inner.watches.set_max(max);
+        Ok(())
+    }
+
+    /// How many watches are outstanding now: those returned by
+    /// [`Transaction::watch`] that have not resolved, failed or been dropped.
+    pub fn outstanding_watches(&self) -> usize {
+        self.inner.watches.outstanding()
+    }
+
+    /// How many keys the database is watching on the storage servers: one request serves all
+    /// the watches of a key and value (C++'s `WatchMapSize`).
+    pub fn watched_keys(&self) -> usize {
+        self.inner.watches.map_size()
     }
 
     /// Whether [`shutdown`](Self::shutdown) took effect.

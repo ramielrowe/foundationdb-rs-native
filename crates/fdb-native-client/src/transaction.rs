@@ -29,6 +29,11 @@
 //!   the read's answer. Waiting comes with the read-your-writes layer (M5). A read started
 //!   after the commit fails with `used_during_commit`.
 //!
+//! * **Watches** ([`watch`](Transaction::watch)) have the read-your-writes layer's semantics
+//!   already: the watch reads the key (the transaction's own write to it, if any, counts),
+//!   starts when the transaction commits (a read-only one too) and fails if it does not; see
+//!   [`crate::watch`].
+//!
 //! # Retries: [`on_error`](Transaction::on_error)
 //!
 //! `Transaction::onError` and the read-your-writes layer's retry bookkeeping (NativeAPI
@@ -83,7 +88,7 @@
 //!
 //! # Not ported yet
 //!
-//! Range reads, key selectors, watches, versionstamped operations, read-your-writes,
+//! Range reads, key selectors, versionstamped operations, read-your-writes,
 //! snapshot read-your-writes options, the special key space (`\xff\xff`), transaction
 //! tags, priorities, idempotency ids, tenants, the `metadataVersion` key exception, and
 //! database-wide default transaction options.
@@ -106,6 +111,9 @@ use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
 use crate::read::ReadVersionOptions;
 use crate::read::util::{Either, never, race};
+use crate::watch::PendingWatches;
+
+mod watch;
 
 /// The first key a transaction may not read or write without the system-key options.
 const SYSTEM_KEYS_BEGIN: &[u8] = b"\xff";
@@ -318,6 +326,8 @@ struct State {
     commit: CommitStage,
     /// The operations in progress, to interrupt.
     interrupts: Vec<oneshot::Sender<Interrupt>>,
+    /// The watches to start when the transaction commits ([`Transaction::watch`]).
+    watches: PendingWatches,
 }
 
 impl State {
@@ -340,6 +350,7 @@ impl State {
             dead: None,
             commit: CommitStage::Idle,
             interrupts: Vec::new(),
+            watches: PendingWatches::default(),
         }
     }
 
@@ -377,6 +388,7 @@ impl State {
     fn reset_for_retry(&mut self, limits: CommitLimits) {
         self.epoch += 1;
         self.interrupt(|| Interrupt::Abort(Error::new(TRANSACTION_CANCELLED)));
+        self.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
         self.read_version = ReadVersion::Unset;
         self.buffer = CommitBuffer::new(limits);
         self.deferred = None;
@@ -752,6 +764,7 @@ impl<R: Runtime> Transaction<R> {
     /// a value over 100 000 bytes), `key_outside_legal_range` (2004, a key from `\xff` on
     /// without the `AccessSystemKeys` option).
     pub fn set(&self, key: &[u8], value: &[u8]) {
+        self.watches_on_set(key, value);
         self.write(|buffer, flags| {
             if key >= flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
@@ -762,6 +775,7 @@ impl<R: Runtime> Transaction<R> {
 
     /// `clear(key)`: removes `key` when the transaction commits.
     pub fn clear(&self, key: &[u8]) {
+        self.watches_on_clear(key);
         self.write(|buffer, flags| {
             if key >= flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
@@ -775,6 +789,7 @@ impl<R: Runtime> Transaction<R> {
     /// commits. Deferred errors: `inverted_range` (2005) if `begin > end`,
     /// `key_outside_legal_range` if either is past `\xff` (without `AccessSystemKeys`).
     pub fn clear_range(&self, begin: &[u8], end: &[u8]) {
+        self.watches_on_clear_range(begin, end);
         self.write(|buffer, flags| {
             let max = flags.max_write_key();
             if begin > max || end > max {
@@ -788,6 +803,7 @@ impl<R: Runtime> Transaction<R> {
     /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`]). The versionstamp
     /// operations are not supported yet (`client_invalid_operation`, deferred).
     pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: MutationType) {
+        self.watches_on_atomic_op(key, op);
         self.write(|buffer, flags| {
             if key >= flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
@@ -835,12 +851,17 @@ impl<R: Runtime> Transaction<R> {
     /// been sent, that error [`is_maybe_committed`](Error::is_maybe_committed).
     pub async fn commit(&self) -> Result<CommitResult, Error> {
         let sent = Arc::new(AtomicBool::new(false));
-        match self.guarded(self.commit_inner(&sent)).await {
+        let result = match self.guarded(self.commit_inner(&sent)).await {
             Ok(result) => result,
             // Interrupted (cancelled, timed out, reset) once the request may have left.
             Err(e) if sent.load(Ordering::SeqCst) => Err(e.into_maybe_committed()),
             Err(e) => Err(e),
+        };
+        if let Err(e) = &result {
+            // `commitAndWatch`: the watches fail with the commit's error.
+            self.fail_watches(&sent, e);
         }
+        result
     }
 
     async fn commit_inner(&self, sent: &Arc<AtomicBool>) -> Result<CommitResult, Error> {
@@ -870,9 +891,17 @@ impl<R: Runtime> Transaction<R> {
             .commit_buffer_tracked(buffer, read_version, &options, sent)
             .await?;
         let result = CommitResult::from(outcome);
-        let mut state = self.state();
-        if state.epoch == epoch {
-            state.commit = CommitStage::Committed(result.clone());
+        let current = {
+            let mut state = self.state();
+            let current = state.epoch == epoch;
+            if current {
+                state.commit = CommitStage::Committed(result.clone());
+            }
+            current
+        };
+        if current {
+            // `commitAndWatch`: the watches start once the commit succeeded.
+            self.start_watches(result.committed_version()).await;
         }
         Ok(result)
     }
@@ -1031,6 +1060,7 @@ impl<R: Runtime> Transaction<R> {
             return;
         }
         state.interrupt(|| Interrupt::Abort(Error::new(TRANSACTION_CANCELLED)));
+        state.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
         let epoch = state.epoch + 1;
         *state = State::new(&self.inner.db, epoch);
     }

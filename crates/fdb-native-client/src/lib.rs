@@ -71,6 +71,7 @@
 //! * [`read`]: the read path, [`Reader`]: read versions, the key location cache, and
 //!   values.
 //! * [`commit`]: the commit path, [`Committer`] and [`CommitBuffer`].
+//! * [`watch`]: watches ([`Transaction::watch`]).
 //!
 //! # Features
 //!
@@ -87,6 +88,7 @@ pub mod database;
 pub mod error;
 pub mod read;
 pub mod transaction;
+pub mod watch;
 
 pub use cluster::{
     ClusterInfo, ClusterInfoWatch, ClusterMonitor, ClusterMonitorConfig, CommitProxyEndpoints,
@@ -105,3 +107,4 @@ pub use error::{Error, TransactionRetry};
 pub use fdb_native_schema::domain::MutationType;
 pub use read::{KeyLocation, ReadConfig, ReadSnapshot, ReadVersionOptions, Reader};
 pub use transaction::{CommitResult, Snapshot, Transaction, TransactionOption};
+pub use watch::{Watch, WatchConfig};
