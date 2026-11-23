@@ -224,7 +224,8 @@ impl From<GetReadVersionRequest<'_>> for domain::GetReadVersion {
 /// rkBatchThrottled, ssVersionVectorDelta, proxyId)`).
 ///
 /// Absent: `GetReadVersionReply() : version(invalidVersion), locked(false)`, so `version` is
-/// -1. [`Default`] is that too.
+/// -1 (and `ss_version_vector_delta.max_version`, a `VersionVector()`, is -1 too).
+/// [`Default`] is that too.
 #[derive(Wire, Clone, Debug, PartialEq)]
 #[fdb(file_identifier = 15709388, absent = "default")]
 pub struct GetReadVersionReply<'a> {
@@ -451,7 +452,9 @@ impl From<ReadOptions> for domain::ReadOptions {
 /// `GetValueRequest` on 8.0 (`serializer(ar, key, version, tags, reply, spanContext,
 /// options, ssLatestCommitVersions)`).
 ///
-/// Absent: `GetValueRequest() = default`: zero.
+/// Absent: `GetValueRequest() = default`: zero except
+/// `ss_latest_commit_versions.max_version`, which is -1 (`VersionVector()`, `VersionVector.h`,
+/// via `VersionVector::absent()`).
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8454530)]
 pub struct GetValueRequest<'a> {

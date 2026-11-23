@@ -287,7 +287,8 @@ impl From<GetReadVersionRequest<'_>> for domain::GetReadVersion {
 /// rkBatchThrottled, ssVersionVectorDelta, proxyId, proxyTagThrottledDuration)`).
 ///
 /// Absent: `GetReadVersionReply() : version(invalidVersion), locked(false)` over
-/// `BasicLoadBalancedReply() : processBusyTime(0)`, so `version` is -1. [`Default`] is that
+/// `BasicLoadBalancedReply() : processBusyTime(0)`, so `version` is -1 (and
+/// `ss_version_vector_delta.max_version`, a `VersionVector()`, is -1 too). [`Default`] is that
 /// too.
 #[derive(Wire, Clone, Debug, PartialEq)]
 #[fdb(file_identifier = 15709388, absent = "default")]
@@ -524,8 +525,10 @@ impl From<ReadOptions> for domain::ReadOptions {
 /// `GetValueRequest` on 7.4 (`serializer(ar, key, version, tags, reply, spanContext,
 /// tenantInfo, options, ssLatestCommitVersions)`).
 ///
-/// Absent: `GetValueRequest() {}`: zero, `tenantInfo` a `TenantInfo()` (composed by the
-/// field's own absent value).
+/// Absent: zero except what the fields' own absent values give: `tenantInfo` is a
+/// `TenantInfo()` and `ss_latest_commit_versions.max_version` is -1 (`VersionVector()`,
+/// `VersionVector.h`, via `VersionVector::absent()`). C++'s `GetValueRequest() {}` leaves
+/// `version` uninitialised; zero here.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 #[fdb(file_identifier = 8454530)]
 pub struct GetValueRequest<'a> {

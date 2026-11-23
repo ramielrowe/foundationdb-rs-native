@@ -270,6 +270,12 @@ fn v7_4_requests_compose_nested_defaults() {
     assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
     assert_eq!(request.version, 0);
     assert_eq!(request.options, None);
+    // `VersionVector()`: no entries, `maxVersion = invalidVersion`; every other field is zero.
+    assert_eq!(
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
+    );
+    assert_eq!(request, v7_4::GetValueRequest::default());
 
     let request = absent_in_message!(v7_4::CommitTransactionRequest);
     assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
@@ -348,9 +354,12 @@ fn v8_0_zero_default_types() {
         absent_in_message!(v8_0::CdcProxyInterface),
         v8_0::CdcProxyInterface::default()
     );
+    let request = absent_in_message!(v8_0::GetValueRequest);
+    assert_eq!(request, v8_0::GetValueRequest::default());
+    // `VersionVector()`: `maxVersion = invalidVersion`.
     assert_eq!(
-        absent_in_message!(v8_0::GetValueRequest),
-        v8_0::GetValueRequest::default()
+        request.ss_latest_commit_versions.max_version,
+        INVALID_VERSION
     );
     assert_eq!(
         absent_in_message!(v8_0::CommitTransactionRequest),

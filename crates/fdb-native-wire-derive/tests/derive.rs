@@ -533,6 +533,91 @@ fn absent_default_on_generic_types() {
     assert_eq!(Generic::<u8, 2>::absent().fixed, [0, 0]);
 }
 
+// The boundary of the attribute: it changes the absent *table* only. An `Option` of an
+// attributed table is not a table slot (its absent value is `None`), a vector element is
+// always present, and only a union-vector element with tag 0 is an absent union.
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb45)]
+struct OptionHolder<'a> {
+    value: Option<Defaulted<'a>>,
+    after: u8,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb45)]
+#[allow(dead_code)] // written, never read
+struct OptionHolderWithout {
+    #[fdb(skip_slots = 2)]
+    value: (),
+    after: u8,
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb46)]
+struct VecHolder<'a> {
+    items: Vec<Defaulted<'a>>,
+}
+
+#[derive(Wire)]
+#[fdb(file_identifier = 0x000fdb46)]
+struct VecOfShortHolder {
+    items: Vec<OnlyPenalty>,
+}
+
+#[derive(Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 0x000fdb47)]
+struct UnionVecHolder<'a> {
+    items: Vec<DefaultedOrByte<'a>>,
+}
+
+#[test]
+fn absent_default_does_not_reach_options_or_vector_elements() {
+    // `Optional<Config>` absent is nullopt, never `Some(Config())`.
+    let bytes = encode(&OptionHolderWithout {
+        value: (),
+        after: 1,
+    })
+    .unwrap();
+    let holder: OptionHolder = decode(&bytes).unwrap();
+    assert_eq!(holder.value, None);
+    assert_eq!(<Option<Defaulted>>::absent(), None);
+
+    // A vector element is a present table: its missing scalar slots read zero.
+    let bytes = encode(&VecOfShortHolder {
+        items: vec![OnlyPenalty { penalty: 0.5 }, OnlyPenalty { penalty: 2.0 }],
+    })
+    .unwrap();
+    let holder: VecHolder = decode(&bytes).unwrap();
+    let zeroed = |penalty| Defaulted {
+        penalty,
+        version: 0,
+        enabled: false,
+        name: None,
+    };
+    assert_eq!(holder.items, vec![zeroed(0.5), zeroed(2.0)]);
+}
+
+#[test]
+fn a_union_vector_element_with_tag_zero_reads_the_unions_absent_value() {
+    let written = UnionVecHolder {
+        items: vec![DefaultedOrByte::Byte(9)],
+    };
+    let mut bytes = encode(&written).unwrap();
+    assert_eq!(decode::<UnionVecHolder>(&bytes).unwrap(), written);
+    // The tags vector is `count = 1` then the tag, 2 for `Byte`: make it 0.
+    let needle = [1u8, 0, 0, 0, 2];
+    let at: Vec<usize> = (0..bytes.len() - needle.len())
+        .filter(|&i| bytes[i..i + needle.len()] == needle)
+        .collect();
+    assert_eq!(at.len(), 1, "{bytes:02x?}");
+    bytes[at[0] + 4] = 0;
+    assert_eq!(
+        decode::<UnionVecHolder>(&bytes).unwrap().items,
+        vec![DefaultedOrByte::Config(Defaulted::default())]
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Generics.
 
