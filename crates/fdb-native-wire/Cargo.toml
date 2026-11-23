@@ -17,6 +17,7 @@ fdb-native-wire-derive = { workspace = true, optional = true }
 thiserror = "2.0.21"
 
 [dev-dependencies]
+divan = "0.1.21"
 proptest = "1.11.0"
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 
@@ -55,4 +56,10 @@ required-features = ["derive"]
 
 [[test]]
 name = "lazy_view"
+required-features = ["derive"]
+
+# `cargo bench -p fdb-native-wire --bench wire`; see CLAUDE.md.
+[[bench]]
+name = "wire"
+harness = false
 required-features = ["derive"]
