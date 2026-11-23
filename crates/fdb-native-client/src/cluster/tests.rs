@@ -99,12 +99,32 @@ fn sampling_shrinks_long_lists_and_keeps_the_sample() {
     assert!(grv3.iter().all(|p| p.id().first == 2));
     assert!(commit3.iter().all(|p| p.id().first == 2));
 
-    // Back below the limit: everything, and the cache is cleared, so going above it again
-    // with the first set samples anew rather than reusing the old sample blindly.
-    let (grv4, _) = sampler.sample(&proxies(3, 2, 2), 3, 5, &mut rng);
-    assert_eq!(grv4.len(), 2);
-    let (grv5, _) = sampler.sample(&info, 3, 5, &mut rng);
-    assert_eq!(grv5.len(), 3);
+    assert!(!sampler.is_empty());
+
+    // Back below the limit: everything, and the cache is cleared
+    // (SHRINK_PROXY_LIST_CLEAR_CACHE_BELOW_THRESHOLD), for both kinds.
+    let small = proxies(3, 2, 2);
+    let (grv4, commit4) = sampler.sample(&small, 3, 5, &mut rng);
+    assert_eq!(grv4, small.grv_proxies);
+    assert_eq!(commit4, small.commit_proxies);
+    assert!(sampler.is_empty());
+
+    // Going above it again with the first set samples anew from it.
+    let (grv5, commit5) = sampler.sample(&info, 3, 5, &mut rng);
+    assert_eq!((grv5.len(), commit5.len()), (3, 5));
+    assert!(!sampler.is_empty());
+
+    // Only one kind below the limit: only its cache is cleared, the other's sample stays.
+    let mixed = ClientDbInfo {
+        grv_proxies: info.grv_proxies[..2].to_vec(),
+        ..info.clone()
+    };
+    let (grv6, commit6) = sampler.sample(&mixed, 3, 5, &mut rng);
+    assert_eq!(grv6.len(), 2);
+    assert_eq!(
+        ids(&commit6, CommitProxy::id),
+        ids(&commit5, CommitProxy::id)
+    );
 }
 
 #[test]
@@ -222,4 +242,88 @@ fn record_from_a_loaded_cluster_file() {
     assert_eq!(record.path(), Some(path.as_path()));
     assert_eq!(record.check_file(), None);
     assert_eq!(record, ConnectionRecord::open(&path).unwrap());
+}
+
+/// A persist keeps the file's permission bits (and owner and group: chowning to the same
+/// owner always succeeds for that owner), as C++'s `atomicReplace` does.
+#[cfg(unix)]
+#[test]
+fn persist_keeps_mode_and_owner() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fdb.cluster");
+    std::fs::write(&path, "a:b@10.0.0.1:4500\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+
+    let mut record = ConnectionRecord::open(&path).unwrap();
+    let b: ClusterConnectionString = "a:b@10.0.0.2:4500".parse().unwrap();
+    record.set_and_persist(b.clone()).unwrap();
+
+    let after = std::fs::metadata(&path).unwrap();
+    assert_ne!(
+        after.ino(),
+        before.ino(),
+        "replaced, not rewritten in place"
+    );
+    assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+    assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{CLUSTER_FILE_HEADER}{b}\n")
+    );
+
+    // A read-only file is still replaced, and stays read-only.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    record
+        .set_and_persist("a:b@10.0.0.3:4500".parse().unwrap())
+        .unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o444);
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "no temporary file left"
+    );
+}
+
+/// A new file (nothing to copy) gets the process's defaults.
+#[test]
+fn persist_creates_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fdb.cluster");
+    super::record::atomic_replace(&path, b"x").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"x");
+}
+
+/// The first commit proxy of the full list, even when the sample leaves it out.
+#[test]
+fn first_commit_proxy_is_from_the_full_list() {
+    let info = proxies(1, 1, 9);
+    let mut sampler = ProxySampler::default();
+    let mut rng = Rng::new(Some(3));
+    let (grv, commit) = sampler.sample(&info, 3, 1, &mut rng);
+    let cluster = ClusterInfo {
+        client_info: info.clone(),
+        schema: SchemaVersion::V8_0,
+        protocol_version: SchemaVersion::V8_0.protocol_version(),
+        coordinator: Coordinator::parse("10.0.0.1:4500")
+            .unwrap()
+            .resolved()
+            .unwrap(),
+        connection_string: "a:b@10.0.0.1:4500".parse().unwrap(),
+        grv_proxies: grv.into_iter().map(GrvProxyEndpoints::new).collect(),
+        commit_proxies: commit.into_iter().map(CommitProxyEndpoints::new).collect(),
+        sequence: 1,
+    };
+    let first = cluster.first_commit_proxy().unwrap();
+    assert_eq!(first.proxy, info.commit_proxies[0]);
+    assert_eq!(
+        first.streams.expire_idempotency_id,
+        info.commit_proxies[0].base.adjusted(9),
+        "8.0's index"
+    );
+    assert_eq!(cluster.commit_proxy_ids().len(), 1);
+    assert_eq!(cluster.grv_proxy_ids(), vec![info.grv_proxies[0].id()]);
 }
