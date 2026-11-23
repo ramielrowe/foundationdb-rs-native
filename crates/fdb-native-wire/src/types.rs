@@ -25,6 +25,12 @@ impl Wire for Uid {
     const SHAPE: Shape = Shape::Inline { size: 16, align: 8 };
 }
 
+/// `UID::file_identifier` (`flow/include/flow/IRandom.h`, 15597147 on 7.4 and 8.0): a UID is
+/// a message's root in FlowTransport's endpoint-not-found and unauthorized-endpoint packets.
+impl FileIdentified for Uid {
+    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(15_597_147);
+}
+
 impl Encode for Uid {
     fn encode_inline(&self, out: &mut [u8]) -> Result<(), EncodeError> {
         let (first, second) = match out.split_at_mut_checked(8) {
