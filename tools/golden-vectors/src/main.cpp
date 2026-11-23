@@ -35,8 +35,10 @@ int usage() {
 	        "  golden-vectors decode [--raw] [--ignore-file-identifier] TYPE\n"
 	        "      Read a message from stdin (hex by default; whitespace ignored; --raw for binary),\n"
 	        "      decode it as TYPE and print its field dump as JSON. Exit 1 if the reader rejects it.\n"
-	        "  golden-vectors list-types\n"
-	        "      Print the TYPE names accepted by decode, with their file identifiers.\n");
+	        "  golden-vectors list-types [--schema]\n"
+	        "      Print the TYPE names accepted by decode, with their file identifiers; with --schema,\n"
+	        "      print every type's root members and every reachable table's fields as JSON\n"
+	        "      (the same content as fixtures/engine/schemas.json).\n");
 	return 2;
 }
 
@@ -63,6 +65,27 @@ void writeFile(const std::string& path, const std::string& content) {
 		throw std::runtime_error("cannot write " + path);
 	}
 	f << content;
+}
+
+// The schema of every decodable type, in the field-dump type vocabulary.
+Json schemas_json() {
+	SchemaCollector c;
+	Json types = Json::object();
+	for (const auto& [name, t] : registry()) {
+		types.set(name,
+		          Json::object()
+		              .set("file_identifier", Json::uinteger(t.fid))
+		              .set("file_identifier_hex", Json::string(fid_hex(t.fid)))
+		              .set("root", t.schema(c)));
+	}
+	Json tables = Json::object();
+	for (const auto& [name, fields] : c.tables) {
+		tables.set(name, fields);
+	}
+	return Json::object()
+	    .set("format_version", Json::integer(kFormatVersion))
+	    .set("types", types)
+	    .set("tables", tables);
 }
 
 int generate(const std::string& out, const std::string& fdbRev) {
@@ -105,7 +128,9 @@ int generate(const std::string& out, const std::string& fdbRev) {
 	index.set("positive", pos);
 	index.set("negative", neg);
 	index.set("corpus", corp);
+	index.set("schemas", Json::string("schemas.json"));
 	writeFile(dir + "/index.json", index.dump() + "\n");
+	writeFile(dir + "/schemas.json", schemas_json().dump() + "\n");
 	fprintf(stderr,
 	        "wrote %zu positive, %zu negative, %zu corpus files to %s\n",
 	        fx.positives.size(),
@@ -198,9 +223,13 @@ int decode(int argc, char** argv) {
 	}
 }
 
-int listTypes() {
+int listTypes(bool schema) {
 	g_positiveOnly = true;
 	build_engine_vectors();
+	if (schema) {
+		std::cout << schemas_json().dump() << "\n";
+		return 0;
+	}
 	for (const auto& [name, t] : registry()) {
 		printf("%s\t%u\t%s\n", name.c_str(), t.fid, fid_hex(t.fid).c_str());
 	}
@@ -235,7 +264,10 @@ int main(int argc, char** argv) {
 		} else if (cmd == "decode") {
 			return decode(argc - 2, argv + 2);
 		} else if (cmd == "list-types") {
-			return listTypes();
+			if (argc > 3 || (argc == 3 && std::string(argv[2]) != "--schema")) {
+				return usage();
+			}
+			return listTypes(argc == 3);
 		}
 	} catch (const std::exception& e) {
 		fprintf(stderr, "error: %s\n", e.what());

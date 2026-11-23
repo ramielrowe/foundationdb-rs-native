@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Checks golden-vector fixtures.
 
-  check_fixtures.py roundtrip FIXTURE_DIR BINARY
+  check_fixtures.py roundtrip FIXTURE_DIR BINARY [--positive-only]
       Feeds every fixture's bytes to `BINARY decode <cpp_type>` and checks the
       output against the fixture: positive and corpus "accept" records must
       decode to the recorded root; negative and corpus "reject" records must be
-      rejected with the recorded reason.
+      rejected with the recorded reason. --positive-only feeds only positive
+      records (for release-branch readers, which have no bounds checks).
 
   check_fixtures.py compare EXPECTED_DIR ACTUAL_DIR [--positive-only] [--fields-only]
       Compares two generated fixture trees record by record (ignoring
-      index.json). --positive-only compares only positive records (ACTUAL_DIR
+      index.json and schemas.json). --positive-only compares only positive records (ACTUAL_DIR
       may lack the rest). --fields-only implies --positive-only and ignores the
       bytes, comparing everything else (decoded root, size, file identifier):
       use it for a writer whose vtable order legitimately differs, e.g. another
@@ -25,7 +26,7 @@ from pathlib import Path
 def records(engine_dir: Path):
     """Yields (label, record) for every fixture record under engine_dir."""
     for path in sorted(engine_dir.glob("*.json")):
-        if path.name != "index.json":
+        if path.name not in ("index.json", "schemas.json"):
             yield path.name, json.loads(path.read_text())
     for path in sorted((engine_dir / "negative").glob("*.json")):
         yield "negative/" + path.name, json.loads(path.read_text())
@@ -41,10 +42,12 @@ def expectation(rec):
     return rec["expect"]
 
 
-def roundtrip(engine_dir: Path, binary: str) -> int:
+def roundtrip(engine_dir: Path, binary: str, positive_only: bool) -> int:
     failures = 0
     count = 0
     for label, rec in records(engine_dir):
+        if positive_only and rec.get("kind") != "positive":
+            continue
         count += 1
         proc = subprocess.run(
             [binary, "decode", rec["cpp_type"]],
@@ -104,7 +107,7 @@ def compare(expected_dir: Path, actual_dir: Path, positive_only: bool, fields_on
 
 def main(argv):
     if len(argv) >= 4 and argv[1] == "roundtrip":
-        return roundtrip(Path(argv[2]), argv[3])
+        return roundtrip(Path(argv[2]), argv[3], "--positive-only" in argv[4:])
     if len(argv) >= 4 and argv[1] == "compare":
         fields_only = "--fields-only" in argv[4:]
         positive_only = fields_only or "--positive-only" in argv[4:]

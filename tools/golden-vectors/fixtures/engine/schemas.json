@@ -1,0 +1,1103 @@
+{
+  "format_version": 1,
+  "types": {
+    "ArenaHolder": {
+      "file_identifier": 1039121,
+      "file_identifier_hex": "0x000fdb11",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<ArenaHolder>"
+        }
+      ]
+    },
+    "Containers": {
+      "file_identifier": 1039109,
+      "file_identifier_hex": "0x000fdb05",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Containers>"
+        }
+      ]
+    },
+    "DedupHolder": {
+      "file_identifier": 1039126,
+      "file_identifier_hex": "0x000fdb16",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<DedupHolder>"
+        }
+      ]
+    },
+    "EnsureTables": {
+      "file_identifier": 1039118,
+      "file_identifier_hex": "0x000fdb0e",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<EnsureTables>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<Optional<Inner>>>": {
+      "file_identifier": 605018890,
+      "file_identifier_hex": "0x240fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<optional<table<Inner>>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<Payload>>": {
+      "file_identifier": 34593549,
+      "file_identifier_hex": "0x020fdb0d",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<Payload>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<Void>>": {
+      "file_identifier": 35564874,
+      "file_identifier_hex": "0x021ead4a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<Void>>>"
+        }
+      ]
+    },
+    "ErrorOr<Inner>": {
+      "file_identifier": 34593546,
+      "file_identifier_hex": "0x020fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<table<Inner>>"
+        }
+      ]
+    },
+    "ErrorOr<Payload>": {
+      "file_identifier": 34593549,
+      "file_identifier_hex": "0x020fdb0d",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<table<Payload>>"
+        }
+      ]
+    },
+    "FixedBytes": {
+      "file_identifier": 4343,
+      "file_identifier_hex": "0x000010f7",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<FixedBytes>"
+        }
+      ]
+    },
+    "Inner": {
+      "file_identifier": 1039114,
+      "file_identifier_hex": "0x000fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Inner>"
+        }
+      ]
+    },
+    "KVHolder": {
+      "file_identifier": 1039122,
+      "file_identifier_hex": "0x000fdb12",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<KVHolder>"
+        }
+      ]
+    },
+    "Optional<Inner>": {
+      "file_identifier": 68147978,
+      "file_identifier_hex": "0x040fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "optional<table<Inner>>"
+        }
+      ]
+    },
+    "Optionals": {
+      "file_identifier": 1039115,
+      "file_identifier_hex": "0x000fdb0b",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Optionals>"
+        }
+      ]
+    },
+    "OrderDemo": {
+      "file_identifier": 1039120,
+      "file_identifier_hex": "0x000fdb10",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<OrderDemo>"
+        }
+      ]
+    },
+    "ReplyPromise<Inner>": {
+      "file_identifier": 17816330,
+      "file_identifier_hex": "0x010fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<reply_promise>"
+        }
+      ]
+    },
+    "RequestLike": {
+      "file_identifier": 1039119,
+      "file_identifier_hex": "0x000fdb0f",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<RequestLike>"
+        }
+      ]
+    },
+    "Root": {
+      "file_identifier": 1039112,
+      "file_identifier_hex": "0x000fdb08",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Root>"
+        }
+      ]
+    },
+    "RootMembers": {
+      "file_identifier": 1039206,
+      "file_identifier_hex": "0x000fdb66",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "u8"
+        },
+        {
+          "field": "1",
+          "slot": 1,
+          "type": "vector<table<Nested2>>"
+        },
+        {
+          "field": "2",
+          "slot": 2,
+          "type": "table<Nested>"
+        }
+      ]
+    },
+    "Scalars": {
+      "file_identifier": 1039105,
+      "file_identifier_hex": "0x000fdb01",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Scalars>"
+        }
+      ]
+    },
+    "SchemaV1": {
+      "file_identifier": 1039127,
+      "file_identifier_hex": "0x000fdb17",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<SchemaV1>"
+        }
+      ]
+    },
+    "SchemaV2": {
+      "file_identifier": 1039127,
+      "file_identifier_hex": "0x000fdb17",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<SchemaV2>"
+        }
+      ]
+    },
+    "Strings": {
+      "file_identifier": 1039106,
+      "file_identifier_hex": "0x000fdb02",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Strings>"
+        }
+      ]
+    },
+    "Structs": {
+      "file_identifier": 1039113,
+      "file_identifier_hex": "0x000fdb09",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Structs>"
+        }
+      ]
+    },
+    "Untrusted": {
+      "file_identifier": 4242,
+      "file_identifier_hex": "0x00001092",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Untrusted>"
+        }
+      ]
+    },
+    "VariantHolder": {
+      "file_identifier": 1039116,
+      "file_identifier_hex": "0x000fdb0c",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<VariantHolder>"
+        }
+      ]
+    },
+    "VectorRef<Inner>": {
+      "file_identifier": 51370762,
+      "file_identifier_hex": "0x030fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "vector<table<Inner>>"
+        }
+      ]
+    },
+    "VectorRef<StringRef>": {
+      "file_identifier": 63632459,
+      "file_identifier_hex": "0x03caf44b",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "vector<bytes>"
+        }
+      ]
+    },
+    "Vectors": {
+      "file_identifier": 1039108,
+      "file_identifier_hex": "0x000fdb04",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Vectors>"
+        }
+      ]
+    },
+    "WireBytes": {
+      "file_identifier": 4343,
+      "file_identifier_hex": "0x000010f7",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<WireBytes>"
+        }
+      ]
+    },
+    "X<Y1>": {
+      "file_identifier": 1039209,
+      "file_identifier_hex": "0x000fdb69",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<X<Y1>>"
+        }
+      ]
+    },
+    "X<Y2>": {
+      "file_identifier": 1039209,
+      "file_identifier_hex": "0x000fdb69",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<X<Y2>>"
+        }
+      ]
+    },
+    "int32_t": {
+      "file_identifier": 1039204,
+      "file_identifier_hex": "0x000fdb64",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "i32"
+        }
+      ]
+    },
+    "std::variant<int,double,Nested2>": {
+      "file_identifier": 1039208,
+      "file_identifier_hex": "0x000fdb68",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "variant<i32,f64,table<Nested2>>"
+        }
+      ]
+    },
+    "std::vector<Inner>": {
+      "file_identifier": 84925194,
+      "file_identifier_hex": "0x050fdb0a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "vector<table<Inner>>"
+        }
+      ]
+    },
+    "std::vector<bool>": {
+      "file_identifier": 1039205,
+      "file_identifier_hex": "0x000fdb65",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "vector<bool>"
+        }
+      ]
+    },
+    "std::vector<std::tuple<int16_t,bool,int64_t>>": {
+      "file_identifier": 1039207,
+      "file_identifier_hex": "0x000fdb67",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "vector<struct<i16,bool,i64>>"
+        }
+      ]
+    }
+  },
+  "tables": {
+    "table<ArenaHolder>": [
+      {
+        "field": "keys",
+        "slot": 0,
+        "type": "vector<bytes>"
+      },
+      {
+        "field": "single",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "nums",
+        "slot": 2,
+        "type": "vector<i64>"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<Containers>": [
+      {
+        "field": "m",
+        "slot": 0,
+        "type": "vector<table<pair<i32,bytes>>>"
+      },
+      {
+        "field": "s",
+        "slot": 1,
+        "type": "vector<u32>"
+      },
+      {
+        "field": "nested",
+        "slot": 2,
+        "type": "vector<vector<u16>>"
+      }
+    ],
+    "table<DedupA>": [
+      {
+        "field": "x",
+        "slot": 0,
+        "type": "i32"
+      }
+    ],
+    "table<DedupB>": [
+      {
+        "field": "y",
+        "slot": 0,
+        "type": "u32"
+      }
+    ],
+    "table<DedupC>": [
+      {
+        "field": "z",
+        "slot": 0,
+        "type": "f32"
+      }
+    ],
+    "table<DedupHolder>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "table<DedupA>"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "table<DedupB>"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "table<DedupC>"
+      },
+      {
+        "field": "va",
+        "slot": 3,
+        "type": "vector<table<DedupA>>"
+      }
+    ],
+    "table<EnsureTables>": [
+      {
+        "field": "scalar",
+        "slot": 0,
+        "type": "ensure_table<i32>"
+      },
+      {
+        "field": "table",
+        "slot": 1,
+        "type": "ensure_table<table<Inner>>"
+      },
+      {
+        "field": "str",
+        "slot": 2,
+        "type": "ensure_table<bytes>"
+      },
+      {
+        "field": "vec",
+        "slot": 3,
+        "type": "ensure_table<vector<u16>>"
+      },
+      {
+        "field": "wrapped_alt",
+        "slot": 4,
+        "type": "variant<ensure_table<i32>,table<Inner>>"
+      },
+      {
+        "field": "bare_alt",
+        "slot": 6,
+        "type": "variant<i32,table<Inner>>"
+      }
+    ],
+    "table<Error>": [
+      {
+        "field": "error_code",
+        "slot": 0,
+        "type": "u16"
+      }
+    ],
+    "table<FixedBytes>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "array<u8,16>"
+      }
+    ],
+    "table<Inner>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "u32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "bytes"
+      }
+    ],
+    "table<KVHolder>": [
+      {
+        "field": "data",
+        "slot": 0,
+        "type": "preserialized_kv_vector"
+      },
+      {
+        "field": "more",
+        "slot": 1,
+        "type": "bool"
+      }
+    ],
+    "table<Nested2>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "vector<bytes>"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "i32"
+      }
+    ],
+    "table<Nested>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "nested",
+        "slot": 2,
+        "type": "table<Nested2>"
+      },
+      {
+        "field": "c",
+        "slot": 3,
+        "type": "vector<u64>"
+      }
+    ],
+    "table<Optionals>": [
+      {
+        "field": "int_present",
+        "slot": 0,
+        "type": "optional<i32>"
+      },
+      {
+        "field": "int_absent",
+        "slot": 2,
+        "type": "optional<i32>"
+      },
+      {
+        "field": "str_present",
+        "slot": 4,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "str_absent",
+        "slot": 6,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "table_present",
+        "slot": 8,
+        "type": "optional<table<Inner>>"
+      },
+      {
+        "field": "table_absent",
+        "slot": 10,
+        "type": "optional<table<Inner>>"
+      },
+      {
+        "field": "f64_present",
+        "slot": 12,
+        "type": "optional<f64>"
+      },
+      {
+        "field": "uid_present",
+        "slot": 14,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "vec_of_opt",
+        "slot": 16,
+        "type": "vector<optional<i32>>"
+      }
+    ],
+    "table<OrderDemo>": [
+      {
+        "field": "d",
+        "slot": 0,
+        "type": "u16"
+      },
+      {
+        "field": "c",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "a",
+        "slot": 2,
+        "type": "u8"
+      },
+      {
+        "field": "b",
+        "slot": 3,
+        "type": "u64"
+      }
+    ],
+    "table<Payload>": [
+      {
+        "field": "version",
+        "slot": 0,
+        "type": "i64"
+      },
+      {
+        "field": "value",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "id",
+        "slot": 2,
+        "type": "optional<uid>"
+      }
+    ],
+    "table<RequestLike>": [
+      {
+        "field": "key",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "version",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "debugID",
+        "slot": 2,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "reply",
+        "slot": 4,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<Root>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "vector<table<Nested2>>"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "table<Nested>"
+      }
+    ],
+    "table<Scalars>": [
+      {
+        "field": "b",
+        "slot": 0,
+        "type": "bool"
+      },
+      {
+        "field": "u8",
+        "slot": 1,
+        "type": "u8"
+      },
+      {
+        "field": "i8",
+        "slot": 2,
+        "type": "i8"
+      },
+      {
+        "field": "u16",
+        "slot": 3,
+        "type": "u16"
+      },
+      {
+        "field": "i16",
+        "slot": 4,
+        "type": "i16"
+      },
+      {
+        "field": "u32",
+        "slot": 5,
+        "type": "u32"
+      },
+      {
+        "field": "i32",
+        "slot": 6,
+        "type": "i32"
+      },
+      {
+        "field": "u64",
+        "slot": 7,
+        "type": "u64"
+      },
+      {
+        "field": "i64",
+        "slot": 8,
+        "type": "i64"
+      },
+      {
+        "field": "f32",
+        "slot": 9,
+        "type": "f32"
+      },
+      {
+        "field": "f64",
+        "slot": 10,
+        "type": "f64"
+      }
+    ],
+    "table<SchemaV1>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "bytes"
+      }
+    ],
+    "table<SchemaV2>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "u64"
+      },
+      {
+        "field": "d",
+        "slot": 3,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "e",
+        "slot": 5,
+        "type": "vector<u32>"
+      }
+    ],
+    "table<Small>": [
+      {
+        "field": "x",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "name",
+        "slot": 1,
+        "type": "bytes"
+      }
+    ],
+    "table<Strings>": [
+      {
+        "field": "s",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "empty",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "ref",
+        "slot": 2,
+        "type": "bytes"
+      },
+      {
+        "field": "emptyRef",
+        "slot": 3,
+        "type": "bytes"
+      },
+      {
+        "field": "binary",
+        "slot": 4,
+        "type": "bytes"
+      },
+      {
+        "field": "len4",
+        "slot": 5,
+        "type": "bytes"
+      }
+    ],
+    "table<Structs>": [
+      {
+        "field": "tag",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "inline3",
+        "slot": 1,
+        "type": "struct<i16,bool,i64>"
+      },
+      {
+        "field": "inline2",
+        "slot": 2,
+        "type": "struct<u8,u32>"
+      },
+      {
+        "field": "many",
+        "slot": 3,
+        "type": "vector<struct<i16,bool,i64>>"
+      },
+      {
+        "field": "after",
+        "slot": 4,
+        "type": "u16"
+      }
+    ],
+    "table<Untrusted>": [
+      {
+        "field": "s",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "v",
+        "slot": 1,
+        "type": "vector<i64>"
+      },
+      {
+        "field": "o",
+        "slot": 2,
+        "type": "optional<i32>"
+      },
+      {
+        "field": "vo",
+        "slot": 4,
+        "type": "vector<optional<i32>>"
+      },
+      {
+        "field": "b",
+        "slot": 6,
+        "type": "vector<bool>"
+      },
+      {
+        "field": "strs",
+        "slot": 7,
+        "type": "vector<bytes>"
+      }
+    ],
+    "table<VariantHolder>": [
+      {
+        "field": "before",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "v",
+        "slot": 1,
+        "type": "variant<i32,f64,table<Nested2>,bytes,u8>"
+      },
+      {
+        "field": "after",
+        "slot": 3,
+        "type": "u16"
+      }
+    ],
+    "table<Vectors>": [
+      {
+        "field": "v_u8",
+        "slot": 0,
+        "type": "vector<u8>"
+      },
+      {
+        "field": "v_u16",
+        "slot": 1,
+        "type": "vector<u16>"
+      },
+      {
+        "field": "v_i32",
+        "slot": 2,
+        "type": "vector<i32>"
+      },
+      {
+        "field": "v_u64",
+        "slot": 3,
+        "type": "vector<u64>"
+      },
+      {
+        "field": "v_f64",
+        "slot": 4,
+        "type": "vector<f64>"
+      },
+      {
+        "field": "v_str",
+        "slot": 5,
+        "type": "vector<bytes>"
+      },
+      {
+        "field": "v_table",
+        "slot": 6,
+        "type": "vector<table<Small>>"
+      },
+      {
+        "field": "v_empty_u32",
+        "slot": 7,
+        "type": "vector<u32>"
+      },
+      {
+        "field": "v_empty_str",
+        "slot": 8,
+        "type": "vector<bytes>"
+      },
+      {
+        "field": "v_empty_table",
+        "slot": 9,
+        "type": "vector<table<Small>>"
+      },
+      {
+        "field": "v_bool",
+        "slot": 10,
+        "type": "vector<bool>"
+      },
+      {
+        "field": "fixed16",
+        "slot": 11,
+        "type": "array<u8,16>"
+      }
+    ],
+    "table<Void>": [],
+    "table<WireBytes>": [
+      {
+        "field": "v",
+        "slot": 0,
+        "type": "vector<u8>"
+      }
+    ],
+    "table<X<Y1>>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "table<Y1>"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "i32"
+      }
+    ],
+    "table<X<Y2>>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "table<Y2>"
+      },
+      {
+        "field": "c",
+        "slot": 2,
+        "type": "i32"
+      }
+    ],
+    "table<Y1>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      }
+    ],
+    "table<Y2>": [
+      {
+        "field": "a",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "b",
+        "slot": 1,
+        "type": "variant<i32>"
+      }
+    ],
+    "table<pair<i32,bytes>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "bytes"
+      }
+    ],
+    "table<reply_promise>": [
+      {
+        "field": "token",
+        "slot": 0,
+        "type": "uid"
+      }
+    ]
+  }
+}

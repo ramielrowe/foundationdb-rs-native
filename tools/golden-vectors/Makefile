@@ -3,8 +3,13 @@
 #
 #   make                       # build build/golden-vectors against $(FDB_SRC)
 #   make FDB_SRC=/path/to/fdb  # use another FoundationDB checkout or extracted tree
-#   make SANITIZE=1            # build with ASan + UBSan (used by regen.sh --check)
+#   make SANITIZE=1            # build with ASan + UBSan (used by regen.sh --check); run it with
+#                              # UBSAN_OPTIONS=suppressions=ubsan.supp:halt_on_error=1
+#   make CXX=clang++ CXXFLAGS=-O2
 #   make clean
+#
+# CXXFLAGS, CPPFLAGS and LDFLAGS given on the command line are kept; the flags
+# the tool needs (-std=c++20, include paths, sanitizers) are always appended.
 
 TOOL_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 FDB_SRC ?= $(abspath $(TOOL_DIR)/../../../foundationdb)
@@ -12,12 +17,18 @@ BUILD_DIR ?= $(TOOL_DIR)/build
 
 # Make's default CXX is g++; any C++20 compiler works (tested with g++ 15 and clang).
 CXXFLAGS ?= -O1 -g
-CXXFLAGS += -std=c++20 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare -Wno-unused-const-variable
-CPPFLAGS += -I$(FDB_SRC)/flow/include -I$(TOOL_DIR)/src
+override CXXFLAGS += -std=c++20 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
+                     -Wno-sign-compare -Wno-unused-const-variable
+override CPPFLAGS += -I$(FDB_SRC)/flow/include -I$(TOOL_DIR)/src
 
 ifeq ($(SANITIZE),1)
-  CXXFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -fno-sanitize=alignment
-  LDFLAGS += -fsanitize=address,undefined
+  # Every UBSan check aborts, except that alignment is made recoverable so that
+  # ubsan.supp can suppress it inside flat_buffers.h only (FDB reader UB on
+  # hostile input, see that file). Run with halt_on_error=1 so any other
+  # alignment report still aborts.
+  override CXXFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
+                       -fsanitize-recover=alignment
+  override LDFLAGS += -fsanitize=address,undefined
   BIN := $(BUILD_DIR)/golden-vectors-san
   OBJ_DIR := $(BUILD_DIR)/obj-san
 else

@@ -6,10 +6,13 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "dump.h"
+#include "schema.h"
+#include "strict.h"
 #include "stubs.h"
 
 // The save context ObjectWriter passes to save_members.
@@ -92,11 +95,28 @@ struct DecodableType {
 	FileIdentifier fid;
 	// Decodes and returns the root node; throws DecodeError on rejection.
 	std::function<Json(const uint8_t*, size_t, const DecodeOptions&)> decode;
+	// The permitted strict checks (strict.h) that the bytes fail.
+	std::function<std::set<std::string>(const uint8_t*, size_t)> strict;
+	// The members of the root table; registers every reachable table in the collector.
+	std::function<Json(SchemaCollector&)> schema;
 };
 
 inline std::map<std::string, DecodableType>& registry() {
 	static std::map<std::string, DecodableType> r;
 	return r;
+}
+
+template <class... Items>
+Json decode_as(const uint8_t* data, size_t size, FileIdentifier fid, const DecodeOptions& opts) {
+	// Copy into an exactly-sized heap block so sanitizers catch over-reads.
+	std::unique_ptr<uint8_t[]> buf(new uint8_t[size ? size : 1]);
+	if (size) {
+		memcpy(buf.get(), data, size);
+	}
+	Arena arena;
+	std::tuple<Items...> items{};
+	std::apply([&](Items&... it) { decode_into(arena, buf.get(), size, fid, opts, it...); }, items);
+	return std::apply([](const Items&... it) { return dump_root(it...); }, items);
 }
 
 template <class... Items>
@@ -109,16 +129,17 @@ void register_type(const std::string& name, FileIdentifier fid) {
 		}
 		return;
 	}
-	r[name] = DecodableType{ name, fid, [fid](const uint8_t* data, size_t size, const DecodeOptions& opts) {
-		                        // Copy into an exactly-sized heap block so sanitizers catch over-reads.
-		                        std::unique_ptr<uint8_t[]> buf(new uint8_t[size ? size : 1]);
-		                        if (size) {
-		                        	memcpy(buf.get(), data, size);
-		                        }
-		                        Arena arena;
-		                        std::tuple<Items...> items{};
-		                        std::apply([&](Items&... it) { decode_into(arena, buf.get(), size, fid, opts, it...); },
-		                                   items);
-		                        return std::apply([](const Items&... it) { return dump_root(it...); }, items);
-	                        } };
+	r[name] = DecodableType{
+		name,
+		fid,
+		[fid](const uint8_t* data, size_t size, const DecodeOptions& opts) {
+		    return decode_as<Items...>(data, size, fid, opts);
+		},
+		[](const uint8_t* data, size_t size) {
+		    StrictWalker w(data, size);
+		    w.template root<Items...>();
+		    return w.violations;
+		},
+		[](SchemaCollector& c) { return root_schema<Items...>(c); },
+	};
 }

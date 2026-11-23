@@ -16,7 +16,7 @@
       {
         "field": "0",
         "slot": 0,
-        "type": "table<X>",
+        "type": "table<X<Y1>>",
         "value": [
           {
             "field": "a",

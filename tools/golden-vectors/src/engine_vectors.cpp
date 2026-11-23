@@ -280,18 +280,20 @@ struct SchemaV2 {
 // flow/FlatBuffers/nestedCompat
 struct Y1 {
 	TABLE(Y1, 338229)
+	static constexpr const char* x_type_name = "X<Y1>";
 	int a = 0;
 	FIELDS(a)
 };
 struct Y2 {
 	TABLE(Y2, fid(24))
+	static constexpr const char* x_type_name = "X<Y2>";
 	int a = 0;
 	std::variant<int> b;
 	FIELDS(a, b)
 };
 template <class Y>
 struct X {
-	static constexpr const char* type_name = "X";
+	static constexpr const char* type_name = Y::x_type_name;
 	int a = 0;
 	Y b;
 	int c = 0;
@@ -339,14 +341,48 @@ void write16(std::vector<uint8_t>& b, size_t pos, uint16_t x) {
 	memcpy(b.data() + pos, &x, 2);
 }
 
-// Byte position of the vtable of the table that root slot 0 points to.
-size_t first_member_vtable(const std::vector<uint8_t>& b) {
+// Byte position of root slot 0's field in the root table.
+size_t root_slot0(const std::vector<uint8_t>& b) {
 	size_t wrapper = read32(b, 0);
 	size_t wrapperVt = wrapper - (int32_t)read32(b, wrapper);
-	size_t slotPos = wrapper + read16(b, wrapperVt + 4);
-	size_t table = slotPos + read32(b, slotPos);
-	return table - (int32_t)read32(b, table);
+	return wrapper + read16(b, wrapperVt + 4);
 }
+
+// Positions of the table that root slot 0 points to, and of its vtable.
+struct TableLoc {
+	size_t table;
+	size_t vtable;
+};
+TableLoc first_member_table(const std::vector<uint8_t>& b) {
+	size_t slotPos = root_slot0(b);
+	size_t table = slotPos + read32(b, slotPos);
+	return { table, table - (int32_t)read32(b, table) };
+}
+size_t first_member_vtable(const std::vector<uint8_t>& b) {
+	return first_member_table(b).vtable;
+}
+// Byte position of slot |slot|'s field in that table.
+size_t member_field(const std::vector<uint8_t>& b, size_t slot) {
+	TableLoc loc = first_member_table(b);
+	return loc.table + read16(b, loc.vtable + 4 + 2 * slot);
+}
+// Byte position of what the uoffset at |pos| points to.
+size_t target(const std::vector<uint8_t>& b, size_t pos) {
+	return pos + read32(b, pos);
+}
+
+// A small deterministic PRNG (splitmix64), so the random corpus is identical
+// on every platform and standard library.
+struct SplitMix {
+	uint64_t s;
+	uint64_t next() {
+		uint64_t z = (s += 0x9e3779b97f4a7c15ull);
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+		z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+		return z ^ (z >> 31);
+	}
+	uint32_t below(uint32_t n) { return static_cast<uint32_t>(next() % n); }
+};
 
 Json mutation_u32(size_t pos, uint32_t value) {
 	return Json::object()
@@ -485,6 +521,22 @@ void vectorVectors() {
 	         "std::vector<bool>",
 	         fid(101),
 	         bools);
+
+	// The vector<bool> reader treats any nonzero byte as true. (A *scalar* bool
+	// byte other than 0 or 1 is undefined behaviour in the C++ reader.)
+	{
+		auto b = encode(fid(101), std::vector<bool>{ true, false, true, true });
+		size_t data = target(b, root_slot0(b)) + 4;
+		b[data + 0] = 0x02;
+		b[data + 2] = 0xff;
+		b[data + 3] = 0x80;
+		positive_bytes("vectors",
+		               "vector_bool_nonzero",
+		               "A vector<bool> message whose element bytes were changed to 02 00 ff 80: the vector<bool> "
+		               "reader maps every nonzero byte to true, so this decodes as [true, false, true, true].",
+		               "std::vector<bool>",
+		               b);
+	}
 }
 
 Root unitTestRoot() {
@@ -1100,6 +1152,99 @@ void negativeVectors() {
 		         mutation_u16(pos, 0));
 	}
 
+	// Untrusted slots: s=0, v=1, o=2 (tag),3 (offset), vo=4,5, b=6, strs=7.
+	{
+		TableLoc loc = first_member_table(good);
+		auto soffsetTo = [&](int64_t vtablePos) { return (uint32_t)(int32_t)((int64_t)loc.table - vtablePos); };
+
+		uint32_t past = soffsetTo((int64_t)good.size() + 64);
+		auto bad = good;
+		write32(bad, loc.table, past);
+		negative("malformed",
+		         "vtable_soffset_out_of_bounds",
+		         "The Untrusted table's soffset changed so its vtable would start 64 bytes past the end of the "
+		         "buffer.",
+		         T,
+		         bad,
+		         mutation_u32(loc.table, past));
+
+		bad = good;
+		write32(bad, loc.table, 0x80000000u);
+		negative("malformed",
+		         "vtable_soffset_i32_min",
+		         "The Untrusted table's soffset set to 0x80000000 (i32::MIN). vtable = table - soffset lands 2 GiB "
+		         "past the table; a decoder that negates the soffset as an i32 overflows.",
+		         T,
+		         bad,
+		         mutation_u32(loc.table, 0x80000000u));
+
+		uint16_t vsize = (uint16_t)((good.size() - loc.vtable + 2) & ~size_t(1));
+		bad = good;
+		write16(bad, loc.vtable, vsize);
+		negative("malformed",
+		         "vtable_size_past_end",
+		         "The Untrusted vtable's size field set so the vtable runs past the end of the buffer.",
+		         T,
+		         bad,
+		         mutation_u16(loc.vtable, vsize));
+
+		size_t vCount = target(good, member_field(good, 1));
+		bad = good;
+		write32(bad, vCount, 0x20000000u);
+		negative("malformed",
+		         "vector_i64_count_wraps_u32",
+		         "Untrusted.v (vector<i64>) count set to 0x20000000: count * 8 = 2^32, which wraps to 0 in 32-bit "
+		         "arithmetic.",
+		         T,
+		         bad,
+		         mutation_u32(vCount, 0x20000000u));
+
+		size_t bCount = target(good, member_field(good, 6));
+		bad = good;
+		write32(bad, bCount, 0x7ffffff0u);
+		negative("malformed",
+		         "vector_bool_count_oversized",
+		         "Untrusted.b (vector<bool>) count set to 0x7ffffff0.",
+		         T,
+		         bad,
+		         mutation_u32(bCount, 0x7ffffff0u));
+
+		size_t oOffset = member_field(good, 3);
+		uint32_t oob = (uint32_t)(good.size() - oOffset);
+		bad = good;
+		write32(bad, oOffset, oob);
+		negative("malformed",
+		         "union_offset_out_of_bounds",
+		         "Untrusted.o (Optional<int>, tag 1) offset set to point exactly at the end of the buffer, so the "
+		         "4-byte payload is out of bounds.",
+		         T,
+		         bad,
+		         mutation_u32(oOffset, oob));
+
+		if (!g_positiveOnly) {
+			Json sourceRoot = decode_registered(T, good);
+			std::vector<Json> lines;
+			size_t oTag = member_field(good, 2);
+			for (uint8_t tag : { uint8_t(2), uint8_t(255) }) {
+				bad = good;
+				bad[oTag] = tag;
+				lines.push_back(corpus_entry("union_tag_" + std::to_string(tag),
+				                             T,
+				                             bad,
+				                             Json::object()
+				                                 .set("op", Json::string("overwrite_u8"))
+				                                 .set("pos", Json::uinteger(oTag))
+				                                 .set("value", Json::uinteger(tag)),
+				                             sourceRoot));
+			}
+			fixtures().corpora.push_back({ "untrusted_targeted", lines });
+			fixtures().corpusDescriptions.push_back(
+			    { "untrusted_targeted",
+			      "Named mutations of untrusted_good that the C++ reader accepts: Optional union tags 2 and 255 "
+			      "(out of range; C++ decodes the Optional as absent)." });
+		}
+	}
+
 	// A shortened vtable is tolerated: missing slots read as defaults.
 	{
 		auto bad = good;
@@ -1118,11 +1263,12 @@ void negativeVectors() {
 	if (g_positiveOnly) {
 		return;
 	}
+	Json sourceRoot = decode_registered(T, good);
 	{
 		std::vector<Json> lines;
 		for (size_t n = 0; n < good.size(); ++n) {
 			std::vector<uint8_t> g(good.begin(), good.begin() + n);
-			lines.push_back(corpus_entry("truncate_" + std::to_string(n), T, g, mutation_truncate(n)));
+			lines.push_back(corpus_entry("truncate_" + std::to_string(n), T, g, mutation_truncate(n), sourceRoot));
 		}
 		fixtures().corpora.push_back({ "untrusted_truncations", lines });
 		fixtures().corpusDescriptions.push_back(
@@ -1136,8 +1282,14 @@ void negativeVectors() {
 			for (size_t pos = 0; pos + 4 <= good.size(); pos += 4) {
 				auto bad = good;
 				write32(bad, pos, hostile);
-				lines.push_back(corpus_entry(
-				    "word_" + std::to_string(pos) + "_" + hexstr(hostile), T, bad, mutation_u32(pos, hostile)));
+				if (bad == good) {
+					continue; // the word already held this value
+				}
+				lines.push_back(corpus_entry("word_" + std::to_string(pos) + "_" + hexstr(hostile),
+				                             T,
+				                             bad,
+				                             mutation_u32(pos, hostile),
+				                             sourceRoot));
 			}
 		}
 		fixtures().corpora.push_back({ "untrusted_word_overwrites", lines });
@@ -1145,7 +1297,37 @@ void negativeVectors() {
 		    { "untrusted_word_overwrites",
 		      "RejectsMalformedBuffers: each aligned u32 of untrusted_good overwritten with a hostile value (0, 1, "
 		      "0xffffffff, 0x7ffffff0, 0x80000000, 0xfffffff0, 0x10000), with the C++ (FDB main) reader's "
-		      "outcome." });
+		      "outcome. Overwrites that leave the bytes unchanged are omitted." });
+	}
+	{
+		// The random byte-damage loop of RejectsMalformedBuffers, with a fixed seed.
+		SplitMix rng{ 0x0fdb5eed };
+		std::vector<Json> lines;
+		for (int iter = 0; iter < 500; ++iter) {
+			auto bad = good;
+			Json bytesSet = Json::array();
+			int flips = 1 + rng.below(3);
+			for (int i = 0; i < flips; ++i) {
+				uint32_t pos = rng.below(bad.size());
+				uint8_t value = rng.below(256);
+				bad[pos] = value;
+				bytesSet.push(Json::object().set("pos", Json::uinteger(pos)).set("value", Json::uinteger(value)));
+			}
+			if (bad == good) {
+				continue;
+			}
+			lines.push_back(corpus_entry("flip_" + std::to_string(iter),
+			                             T,
+			                             bad,
+			                             Json::object().set("op", Json::string("set_bytes")).set("bytes", bytesSet),
+			                             sourceRoot));
+		}
+		fixtures().corpora.push_back({ "untrusted_random_flips", lines });
+		fixtures().corpusDescriptions.push_back(
+		    { "untrusted_random_flips",
+		      "RejectsMalformedBuffers random damage: 500 iterations (seed 0x0fdb5eed, splitmix64) setting 1-3 "
+		      "random bytes of untrusted_good to random values, applied in order; iterations that change nothing "
+		      "are omitted." });
 	}
 }
 

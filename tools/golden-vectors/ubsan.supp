@@ -1,0 +1,9 @@
+# UBSan suppressions for the SANITIZE=1 build (regen.sh sets UBSAN_OPTIONS).
+#
+# FDB's reader (flat_buffers.h, LoadSaveHelper::SerializeFun) reads vtable
+# entries through a `const uint16_t*` without checking alignment. A hostile
+# soffset in the malformed-input corpora makes that pointer odd: undefined
+# behaviour in FDB's reader on hostile input (harmless on x86). It belongs to
+# the FDB code under test, not to this tool, so it is suppressed in that header
+# only; an alignment error anywhere else still aborts the run.
+alignment:flat_buffers.h

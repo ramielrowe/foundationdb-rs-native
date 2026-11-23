@@ -66,6 +66,27 @@ inline Json decode_registered(const std::string& type, const std::vector<uint8_t
 	return registry().at(type).decode(bytes.data(), bytes.size(), DecodeOptions{});
 }
 
+inline std::set<std::string> strict_violations(const std::string& type, const std::vector<uint8_t>& bytes) {
+	return registry().at(type).strict(bytes.data(), bytes.size());
+}
+
+inline Json string_array(const std::set<std::string>& s) {
+	Json a = Json::array();
+	for (const auto& x : s) {
+		a.push(Json::string(x));
+	}
+	return a;
+}
+
+// Every positive vector must also pass the permitted strict checks: they are
+// meant to accept everything a correct writer produces.
+inline void require_strictly_valid(const std::string& name, const std::string& type, const std::vector<uint8_t>& bytes) {
+	auto v = strict_violations(type, bytes);
+	if (!v.empty()) {
+		throw std::runtime_error("positive vector " + name + " fails strict check " + *v.begin());
+	}
+}
+
 // A positive vector whose bytes are given (hand-built or mutated) and must decode.
 inline void positive_bytes(const std::string& group,
                            const std::string& name,
@@ -75,6 +96,7 @@ inline void positive_bytes(const std::string& group,
                            const std::string& writerType = "") {
 	const auto& t = registry().at(readerType);
 	Json root = decode_registered(readerType, bytes);
+	require_strictly_valid(name, readerType, bytes);
 	Json r = base_record(group, name, "positive", description, readerType, t.fid, bytes);
 	if (!writerType.empty()) {
 		r.set("writer_cpp_type", Json::string(writerType));
@@ -104,6 +126,7 @@ void positive(const std::string& group,
 		        root.dump().c_str());
 		throw std::runtime_error("round trip mismatch");
 	}
+	require_strictly_valid(name, cppType, bytes);
 	Json r = base_record(group, name, "positive", description, cppType, fid, bytes);
 	r.set("root", root);
 	fixtures().positives.push_back({ group, name, "positive", r });
@@ -160,10 +183,13 @@ inline void negative(const std::string& group,
 }
 
 // One line of a corpus: whatever the reader does with |bytes|, recorded.
+// Accepted entries are classified against |sourceRoot|, the decoded message
+// the mutation started from (see README.md, "Corpus accept classes").
 inline Json corpus_entry(const std::string& name,
                          const std::string& readerType,
                          const std::vector<uint8_t>& bytes,
-                         Json mutation) {
+                         Json mutation,
+                         const Json& sourceRoot) {
 	Json root;
 	std::string reason = try_decode(readerType, bytes, &root);
 	const auto& t = registry().at(readerType);
@@ -175,6 +201,15 @@ inline Json corpus_entry(const std::string& name,
 	r.set("mutation", mutation);
 	if (reason.empty()) {
 		r.set("expect", Json::string("accept"));
+		auto violations = strict_violations(readerType, bytes);
+		if (!violations.empty()) {
+			r.set("accept_class", Json::string("structural"));
+			r.set("violations", string_array(violations));
+		} else if (root == sourceRoot) {
+			r.set("accept_class", Json::string("padding"));
+		} else {
+			r.set("accept_class", Json::string("data"));
+		}
 		r.set("root", root);
 	} else {
 		r.set("expect", Json::string("reject"));
