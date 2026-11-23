@@ -15,7 +15,7 @@ use fdb_native_wire::{DecodeError, EncodeError, Endpoint, ErrorOr, NetworkAddres
 use super::Shared;
 use super::location::Location;
 use super::util::{Either, any_available, now_secs, race, secs, try_get_reply, try_get_reply_code};
-use crate::error::ClientError;
+use crate::error::Error;
 use crate::error::codes::*;
 
 // `flow/Knobs.cpp` (the same on both releases; lines 7.4 / 8.0).
@@ -253,11 +253,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A request failure as a [`ClientError`]: a server's error reply is just its code.
-pub(crate) fn client_error(error: RequestError) -> ClientError {
+/// A request failure as a [`Error`]: a server's error reply is just its code.
+pub(crate) fn client_error(error: RequestError) -> Error {
     match error {
-        RequestError::Fdb(e) => ClientError::new(e.code),
-        other => ClientError::from_request(other),
+        RequestError::Fdb(e) => Error::new(e.code),
+        other => Error::from_request(other),
     }
 }
 
@@ -297,7 +297,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         alternatives: &[Endpoint],
         encode: E,
         decode: D,
-    ) -> Result<T, ClientError>
+    ) -> Result<T, Error>
     where
         E: Fn(SchemaVersion, Uid, &mut Vec<u8>) -> Result<(), EncodeError> + Clone + Send + 'static,
         D: Fn(SchemaVersion, &[u8]) -> Result<ErrorOr<T>, DecodeError>,
@@ -339,7 +339,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     // Everything is down: wait for someone to be up.
                     let up = any_available(self.peers.failure_monitor(), &targets);
                     if let Either::Right(()) = race(up, self.closed()).await {
-                        return Err(ClientError::new(OPERATION_CANCELLED));
+                        return Err(Error::new(OPERATION_CANCELLED));
                     }
                     num_attempts = 0;
                 }
@@ -377,7 +377,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     async fn all_alternatives_failed_delay(
         &self,
         targets: &[(NetworkAddress, Uid)],
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), Error> {
         let delay = {
             let now = now_secs(self.rt.now());
             let mut state = lock(&self.state);
@@ -405,8 +405,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let up = any_available(self.peers.failure_monitor(), targets);
         match race(race(up, self.closed()), self.rt.sleep(delay)).await {
             Either::Left(Either::Left(())) => Ok(()),
-            Either::Left(Either::Right(())) => Err(ClientError::new(OPERATION_CANCELLED)),
-            Either::Right(()) => Err(ClientError::new(ALL_ALTERNATIVES_FAILED)),
+            Either::Left(Either::Right(())) => Err(Error::new(OPERATION_CANCELLED)),
+            Either::Right(()) => Err(Error::new(ALL_ALTERNATIVES_FAILED)),
         }
     }
 
@@ -418,12 +418,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         location: &Location,
         request: GetValue,
-    ) -> Result<Option<Vec<u8>>, ClientError> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         let alternatives = &location.servers;
         let n = alternatives.len();
         if n == 0 {
             // An empty team (C++ asserts): nothing to ask until the location is refreshed.
-            return Err(ClientError::new(ALL_ALTERNATIVES_FAILED));
+            return Err(Error::new(ALL_ALTERNATIVES_FAILED));
         }
         let targets: Vec<(NetworkAddress, Uid)> = alternatives.iter().map(|s| s.target()).collect();
         let count_best = location.best_count.max(1);
@@ -554,7 +554,7 @@ type LoadBalancedReply = (f64, Option<u16>, Option<Vec<u8>>);
 enum Outcome {
     Done(Option<Vec<u8>>),
     Retry,
-    Fail(ClientError),
+    Fail(Error),
 }
 
 /// `RequestData::checkAndProcessResultImpl` (`LoadBalance.actor.h` 7.4:572-627,
@@ -597,11 +597,9 @@ fn check_and_process<R: Runtime>(
     }
     match decoded {
         Ok((_, None, value)) => Outcome::Done(value),
-        Ok((_, Some(code), _)) if received_response => Outcome::Fail(ClientError::new(code)),
+        Ok((_, Some(code), _)) if received_response => Outcome::Fail(Error::new(code)),
         Err(e) if received_response => Outcome::Fail(client_error(e)),
-        _ if tried_all && err_code == PROCESS_BEHIND => {
-            Outcome::Fail(ClientError::new(PROCESS_BEHIND))
-        }
+        _ if tried_all && err_code == PROCESS_BEHIND => Outcome::Fail(Error::new(PROCESS_BEHIND)),
         _ => Outcome::Retry,
     }
 }

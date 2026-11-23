@@ -3,9 +3,10 @@
 
 use fdb_native_schema::domain::{KeyRange, Mutation, MutationType};
 
-use super::error::CommitError;
+use super::error::{inverted_range, unsupported};
 use super::limits::CommitLimits;
 use super::prepare::check_mutation;
+use crate::error::Error;
 
 /// What a transaction has buffered to commit, built the way the C++ `Transaction` builds it
 /// (`NativeAPI.actor.cpp` 7.4:6242-6420, 8.0:3985-4160):
@@ -45,7 +46,7 @@ impl CommitBuffer {
     }
 
     /// `Transaction::set`.
-    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), CommitError> {
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         let m = Mutation {
             kind: MutationType::SET_VALUE,
             param1: key.to_vec(),
@@ -69,8 +70,8 @@ impl CommitBuffer {
     }
 
     /// `Transaction::clear(range)`. `inverted_range` if `begin > end`.
-    pub fn clear_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), CommitError> {
-        let range = KeyRange::new(begin, end).map_err(|_| CommitError::InvertedRange)?;
+    pub fn clear_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
+        let range = KeyRange::new(begin, end).map_err(|_| inverted_range())?;
         let m = Mutation {
             kind: MutationType::CLEAR_RANGE,
             param1: range.begin,
@@ -88,14 +89,9 @@ impl CommitBuffer {
     }
 
     /// `Transaction::atomicOp`.
-    pub fn atomic_op(
-        &mut self,
-        key: &[u8],
-        operand: &[u8],
-        op: MutationType,
-    ) -> Result<(), CommitError> {
+    pub fn atomic_op(&mut self, key: &[u8], operand: &[u8], op: MutationType) -> Result<(), Error> {
         if op == MutationType::SET_VALUE || op == MutationType::CLEAR_RANGE {
-            return Err(CommitError::Unsupported(op.0));
+            return Err(unsupported(op.0));
         }
         let m = Mutation {
             kind: op,
@@ -105,7 +101,7 @@ impl CommitBuffer {
         self.push_mutation(m, Some(KeyRange::single_key(key)))
     }
 
-    fn push_mutation(&mut self, m: Mutation, write: Option<KeyRange>) -> Result<(), CommitError> {
+    fn push_mutation(&mut self, m: Mutation, write: Option<KeyRange>) -> Result<(), Error> {
         if let Some(m) = check_mutation(m, &self.limits)? {
             self.mutations.push(m);
             self.write_conflicts.extend(write);
@@ -114,20 +110,16 @@ impl CommitBuffer {
     }
 
     /// `Transaction::addReadConflictRange`.
-    pub fn add_read_conflict_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), CommitError> {
+    pub fn add_read_conflict_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
         self.read_conflicts
-            .push(KeyRange::new(begin, end).map_err(|_| CommitError::InvertedRange)?);
+            .push(KeyRange::new(begin, end).map_err(|_| inverted_range())?);
         Ok(())
     }
 
     /// `Transaction::addWriteConflictRange`.
-    pub fn add_write_conflict_range(
-        &mut self,
-        begin: &[u8],
-        end: &[u8],
-    ) -> Result<(), CommitError> {
+    pub fn add_write_conflict_range(&mut self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
         self.write_conflicts
-            .push(KeyRange::new(begin, end).map_err(|_| CommitError::InvertedRange)?);
+            .push(KeyRange::new(begin, end).map_err(|_| inverted_range())?);
         Ok(())
     }
 

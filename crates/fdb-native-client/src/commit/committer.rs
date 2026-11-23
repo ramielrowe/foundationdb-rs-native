@@ -18,12 +18,16 @@ use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::{DecodeError, EncodeError, Uid};
 
 use super::buffer::CommitBuffer;
-use super::error::{CommitError, error_code};
+use super::error;
 use super::limits::{CommitLimits, normalize_range};
 use super::options::{CommitOptions, CommitterConfig};
 use super::prepare::{intersects, prepare};
 use super::rng::Rng;
 use crate::cluster::{ClusterInfo, ClusterMonitor, CommitProxyEndpoints, MonitorClosed};
+use crate::error::Error;
+use crate::error::codes::{
+    COMMIT_UNKNOWN_RESULT, FUTURE_VERSION, NEVER_REPLY, TRANSACTION_TOO_OLD,
+};
 
 /// What a successful [`Committer::commit`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +79,7 @@ enum Attempt {
     /// may still be in flight.
     Unknown,
     /// A definite error.
-    Error(CommitError),
+    Error(Error),
 }
 
 /// Sends commits to the commit proxies, as `tryCommit` does. See the [module
@@ -134,7 +138,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         buffer: CommitBuffer,
         read_version: i64,
         options: &CommitOptions,
-    ) -> Result<CommitOutcome, CommitError> {
+    ) -> Result<CommitOutcome, Error> {
         let (mutations, reads, writes) = buffer.into_parts();
         self.commit(read_version, mutations, reads, writes, options)
             .await
@@ -152,10 +156,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
     /// * A transaction with no mutation and no write conflict range sends nothing and
     ///   returns [`CommitOutcome::NothingToCommit`].
     /// * `Ok(Committed(id))` carries the proxy's [`CommitId`].
-    /// * [`NotCommitted`](CommitError::NotCommitted): the transaction conflicted (reply
-    ///   `not_committed`, or a `CommitID` with an invalid version, which carries the
-    ///   conflicting ranges with `report_conflicting_keys`).
-    /// * [`CommitUnknownResult`](CommitError::CommitUnknownResult): the request may have been
+    /// * `not_committed` (1020): the transaction conflicted (reply `not_committed`, or a
+    ///   `CommitID` with an invalid version, which carries the conflicting ranges with
+    ///   `report_conflicting_keys`: [`Error::conflicting_ranges`]).
+    /// * `commit_unknown_result` (1021): the request may have been
     ///   delivered (the connection ended after it was sent, or the proxy replied
     ///   `broken_promise`, `request_maybe_delivered` or `commit_unknown_result`) **or the commit
     ///   proxies changed while it was outstanding**. The request is never sent again. Unless
@@ -163,10 +167,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
     ///   the self-conflicting key has committed, which guarantees that the original commit
     ///   either happened or never will; if the dummy cannot be committed (the monitor was shut
     ///   down, a definite error) the result is still this error, unsettled.
-    /// * [`Closed`](CommitError::Closed): the monitor was shut down before the request was
+    /// * `operation_cancelled` (1101): the monitor was shut down before the request was
     ///   offered to a proxy.
-    /// * [`NotSent`](CommitError::NotSent): every proxy that was tried certainly did not get
-    ///   the request, so committing again is safe.
+    /// * `connection_failed` (1026), retryable: every proxy that was tried certainly did not
+    ///   get the request, so committing again is safe.
+    /// * Any other error a proxy replied, as [`Error::from_commit_request`] maps it, and the
+    ///   limit errors of the request's checks (`key_too_large`, `transaction_too_large`, ...).
     ///
     /// Dropping the future cancels the commit locally: the request may still reach the
     /// proxy, as in C++.
@@ -177,7 +183,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         read_conflicts: Vec<KeyRange>,
         write_conflicts: Vec<KeyRange>,
         options: &CommitOptions,
-    ) -> Result<CommitOutcome, CommitError> {
+    ) -> Result<CommitOutcome, Error> {
         let limits = self.limits();
         let uid = self.rng(|r| Uid::new(r.next_u64(), r.next_u64()));
         let Some(commit) = prepare(
@@ -208,7 +214,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
     /// up; idempotency ids are not supported.)
     ///
     /// **Whatever happens to the dummy transaction, the result is
-    /// [`CommitUnknownResult`](CommitError::CommitUnknownResult).** C++ lets a non-retryable
+    /// `commit_unknown_result`.** C++ lets a non-retryable
     /// dummy error escape, which would tell the caller the commit certainly did not happen
     /// although the original request may have been delivered (and may still be in flight if
     /// the dummy could not run): a caller that retries on such an error could commit twice.
@@ -219,7 +225,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         request: &Commit,
         options: &CommitOptions,
         limits: &CommitLimits,
-    ) -> CommitError {
+    ) -> Error {
         if !options.causal_write_risky {
             let mut writes = request.write_conflict_ranges.clone();
             let mut reads = request.read_conflict_ranges.clone();
@@ -229,7 +235,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
                 let _ = self.commit_dummy(range, options, limits).await;
             }
         }
-        CommitError::CommitUnknownResult
+        Error::new(COMMIT_UNKNOWN_RESULT)
     }
 
     /// `commitDummyTransaction` (`NativeAPI.actor.cpp` 7.4:6631-6665, 8.0:4373-4402): a
@@ -242,7 +248,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         range: KeyRange,
         base: &CommitOptions,
         limits: &CommitLimits,
-    ) -> Result<(), CommitError> {
+    ) -> Result<(), Error> {
         let mut options = base.clone();
         options.causal_write_risky = true;
         options.lock_aware = true;
@@ -254,23 +260,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
-            let delay = if error.code() == error_code::TRANSACTION_TOO_OLD
-                || error.code() == error_code::FUTURE_VERSION
-            {
+            let delay = if error.code() == TRANSACTION_TOO_OLD || error.code() == FUTURE_VERSION {
                 // onError: min(FUTURE_VERSION_RETRY_DELAY, maxBackoff)
                 self.config
                     .future_version_retry_delay
                     .min(self.config.max_backoff)
-            } else if error.is_retryable() {
+            } else if error.transaction_retry().is_some() {
                 // getBackoff: backoff * random01, then the backoff grows, to a higher cap for
                 // the resource-constrained errors (7.4:6433-6438).
-                let cap = if matches!(
-                    error.code(),
-                    error_code::COMMIT_PROXY_MEMORY_LIMIT_EXCEEDED
-                        | error_code::GRV_PROXY_MEMORY_LIMIT_EXCEEDED
-                        | error_code::TRANSACTION_THROTTLED_HOT_SHARD
-                        | error_code::TRANSACTION_REJECTED_RANGE_LOCKED
-                ) {
+                let cap = if error.is_resource_constrained() {
                     self.config.resource_constrained_max_backoff
                 } else {
                     self.config.max_backoff
@@ -290,7 +288,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         range: &KeyRange,
         options: &CommitOptions,
         limits: &CommitLimits,
-    ) -> Result<(), CommitError> {
+    ) -> Result<(), Error> {
         let read_version = self.read_version(options).await?;
         let commit = prepare(
             read_version,
@@ -301,12 +299,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             limits,
             Uid::default,
         )?
-        .ok_or_else(|| CommitError::Internal("the dummy transaction is empty".into()))?;
+        .ok_or_else(|| error::internal("the dummy transaction is empty".into()))?;
         match self.send_commit(&Arc::new(commit), options).await {
             Ok(_) => Ok(()),
             Err(Attempt::Error(e)) => Err(e),
             // CAUSAL_WRITE_RISKY: no further dummy, `commit_unknown_result`.
-            Err(Attempt::Unknown) => Err(CommitError::CommitUnknownResult),
+            Err(Attempt::Unknown) => Err(Error::new(COMMIT_UNKNOWN_RESULT)),
         }
     }
 
@@ -317,16 +315,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
     /// (`NativeAPI.actor.cpp` 7.4:7592-7655) it asks again when the proxies change while it
     /// waits. A read version is idempotent, so a request that may have been delivered is
     /// sent to the next proxy, as `loadBalance` does.
-    async fn read_version(&self, options: &CommitOptions) -> Result<i64, CommitError> {
+    async fn read_version(&self, options: &CommitOptions) -> Result<i64, Error> {
         loop {
             if self.monitor.is_closed() {
-                return Err(CommitError::Closed);
+                return Err(error::closed());
             }
             let info = self
                 .monitor
                 .proxies(options.use_provisional_proxies)
                 .await
-                .map_err(|MonitorClosed| CommitError::Closed)?;
+                .map_err(|MonitorClosed| error::closed())?;
             let mut changed = pin!(self.monitor.proxies_changed(&info));
             let mut ask = pin!(self.read_version_once(&info, options));
             let result = poll_fn(|cx| {
@@ -346,12 +344,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         &self,
         info: &ClusterInfo,
         options: &CommitOptions,
-    ) -> Result<i64, CommitError> {
+    ) -> Result<i64, Error> {
         let alternatives = info
             .available_grv_proxies(options.use_provisional_proxies)
             .unwrap_or_default();
         if alternatives.is_empty() {
-            return Err(CommitError::NotSent(RequestError::NotSent(None)));
+            return Err(Error::not_sent(RequestError::NotSent(None)));
         }
         let mut flags = GetReadVersion::PRIORITY_DEFAULT | GetReadVersion::FLAG_CAUSAL_READ_RISKY;
         if options.use_provisional_proxies {
@@ -390,17 +388,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             match result {
                 // `ASSERT(v.version > 0)`
                 Ok(version) if version <= 0 => {
-                    return Err(CommitError::Internal(format!(
+                    return Err(error::internal(format!(
                         "the GRV proxy replied with the invalid read version {version}"
                     )));
                 }
                 Ok(version) => return Ok(version),
                 Err(e) if e.should_retry() || e.maybe_delivered() => last = e,
-                Err(RequestError::Fdb(e)) => return Err(CommitError::from_reply_code(e)),
-                Err(e) => return Err(CommitError::Request(e)),
+                Err(e) => return Err(Error::from_request(e)),
             }
         }
-        Err(CommitError::NotSent(last))
+        Err(Error::not_sent(last))
     }
 
     fn is_failed(&self, peer: &PeerHandle, token: Uid) -> bool {
@@ -424,13 +421,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         //
         // A monitor that was shut down keeps its last info: nothing is sent after that.
         if self.monitor.is_closed() {
-            return Err(Attempt::Error(CommitError::Closed));
+            return Err(Attempt::Error(error::closed()));
         }
         let info = self
             .monitor
             .proxies(options.use_provisional_proxies)
             .await
-            .map_err(|MonitorClosed| Attempt::Error(CommitError::Closed))?;
+            .map_err(|MonitorClosed| Attempt::Error(error::closed()))?;
         let alternatives: Vec<CommitProxyEndpoints> = if options.commit_on_first_proxy {
             // `firstCommitProxy`, or `proxies[0]` of the list.
             info.first_commit_proxy().into_iter().collect()
@@ -440,9 +437,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
                 .unwrap_or_default()
         };
         if alternatives.is_empty() {
-            return Err(Attempt::Error(CommitError::NotSent(RequestError::NotSent(
-                None,
-            ))));
+            return Err(Attempt::Error(Error::not_sent(RequestError::NotSent(None))));
         }
 
         // choose { when(onProxiesChanged) {...} when(reply) {...} }, the first listed first.
@@ -473,16 +468,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
                 return Err(if attempted.load(Ordering::SeqCst) {
                     Attempt::Unknown
                 } else {
-                    Attempt::Error(CommitError::Closed)
+                    Attempt::Error(error::closed())
                 });
             }
         };
 
         match sent {
             Ok(id) if id.version != INVALID_VERSION => Ok(id),
-            Ok(id) => Err(Attempt::Error(CommitError::NotCommitted {
-                conflicting_ranges: conflicting_ranges(request, &id),
-            })),
+            Ok(id) => Err(Attempt::Error(Error::not_committed(conflicting_ranges(
+                request, &id,
+            )))),
             Err(e) => Err(classify(e)),
         }
     }
@@ -645,16 +640,12 @@ fn decode_grv(reply: &Reply) -> Result<i64, RequestError> {
 /// is rethrown. `broken_promise` is `request_maybe_delivered` by the time it gets there
 /// (`brokenPromiseToMaybeDelivered`, `basicLoadBalance`'s `AtMostOnce`).
 fn classify(error: RequestError) -> Attempt {
-    if error.maybe_delivered()
-        || matches!(&error, RequestError::Fdb(e) if e.code == error_code::NEVER_REPLY)
-    {
+    if error.maybe_delivered() || matches!(&error, RequestError::Fdb(e) if e.code == NEVER_REPLY) {
         return Attempt::Unknown;
     }
-    Attempt::Error(match error {
-        RequestError::Fdb(e) => CommitError::from_reply_code(e),
-        e if e.should_retry() => CommitError::NotSent(e),
-        e => CommitError::Request(e),
-    })
+    // A definite answer, or certainly not delivered: `from_commit_request` keeps the code
+    // (and marks a transient refusal as retryable).
+    Attempt::Error(Error::from_commit_request(error))
 }
 
 /// The read conflict ranges `conflictingKRIndices` names, without duplicates, in order

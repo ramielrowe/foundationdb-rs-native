@@ -16,11 +16,11 @@ use futures_core::Stream;
 
 use super::Shared;
 use super::util::{Either, never, now_secs, race, secs};
-use crate::error::ClientError;
+use crate::error::Error;
 use crate::error::codes::{INTERNAL_ERROR, OPERATION_CANCELLED};
 
 /// A read version as the batcher hands it to every transaction of a batch.
-pub(crate) type GrvResult = Result<Arc<ReadVersion>, ClientError>;
+pub(crate) type GrvResult = Result<Arc<ReadVersion>, Error>;
 
 /// A transaction waiting for a read version.
 pub(crate) type Waiter = oneshot::Sender<GrvResult>;
@@ -84,7 +84,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         count: u32,
         flags: u32,
-    ) -> Result<ReadVersion, ClientError> {
+    ) -> Result<ReadVersion, Error> {
         let use_provisional = flags & GetReadVersion::FLAG_USE_PROVISIONAL_PROXIES != 0;
         loop {
             self.check_open()?;
@@ -92,7 +92,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 .monitor
                 .grv_proxies(use_provisional)
                 .await
-                .map_err(|_| ClientError::new(OPERATION_CANCELLED))?;
+                .map_err(|_| Error::new(OPERATION_CANCELLED))?;
             self.hold_proxy_references(&info);
             let alternatives: Vec<Endpoint> = info
                 .available_grv_proxies(use_provisional)
@@ -128,7 +128,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             match race(reply, changed).await {
                 Either::Left(Ok(v)) if v.version > 0 => return Ok(v),
                 // C++ asserts.
-                Either::Left(Ok(_)) => return Err(ClientError::new(INTERNAL_ERROR)),
+                Either::Left(Ok(_)) => return Err(Error::new(INTERNAL_ERROR)),
                 Either::Left(Err(e)) => return Err(e),
                 Either::Right(()) => continue,
             }
