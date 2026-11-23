@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d46214a81bef629d88693350e589a42908b435797166631e6120133bc6fb6b9a # shrinks to leaf = PeerCert { subject: [NameEntry { field: Cn, value: AsnString { tag: 30, bytes: [0, 0, 0, 0, 0, 0, 0, 0] } }], issuer: [], subject_display: "CN = \0\0\0\0\0\0\0\0", issuer_display: "", alt_names: None, not_before: 0, not_after: 9223372036854775807, self_signed: false, profile: Profile { v1: false, ca: Absent, key_usage: Absent, eku_allows_server: Absent } }
