@@ -3,6 +3,7 @@
 //! A `Runtime` trait and a tokio adapter will live here.
 
 mod connect_packet;
+pub mod runtime;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError};
 
