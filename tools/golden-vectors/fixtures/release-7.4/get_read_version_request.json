@@ -1,0 +1,123 @@
+{
+  "format_version": 1,
+  "name": "get_read_version_request",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "GrvProxyInterface::getConsistentReadVersion request. flags carries the priority in its high byte (PRIORITY_SYSTEM_IMMEDIATE = 15 << 24) plus FLAG_USE_MIN_KNOWN_COMMITTED_VERSION | FLAG_CAUSAL_READ_RISKY; tags is a TransactionTagMap<uint32_t> (std::unordered_map, one entry so the order is canonical). 8.0 added maxGrvQueueDelayMS (Optional<int64_t>) as the last slot.",
+  "cpp_type": "GetReadVersionRequest",
+  "file_identifier": 838566,
+  "file_identifier_hex": "0x000ccba6",
+  "size": 208,
+  "bytes": "3c000000a6cb0c0000000600080004000600140004000a001d00040014001c0008000c0004000800140025000c0010001400240018001c002000040032000000040000001c000000005039278c040000030000000500000058000000440000002c000000080000000100000056000000050000000000ce7a050000000010ce7a050000000000a05b010000007c0000000500000000009d5e0500000000009d7eb3de000000000000b4de0000000000000100000004000000980000000800000003000000070000006772762d74616700",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetReadVersionRequest>",
+        "value": [
+          {
+            "field": "transactionCount",
+            "slot": 0,
+            "type": "u32",
+            "value": 3
+          },
+          {
+            "field": "flags",
+            "slot": 1,
+            "type": "u32",
+            "value": 5
+          },
+          {
+            "field": "tags",
+            "slot": 2,
+            "type": "vector<table<pair<bytes,u32>>>",
+            "value": [
+              {
+                "type": "table<pair<bytes,u32>>",
+                "value": [
+                  {
+                    "field": "first",
+                    "slot": 0,
+                    "type": "bytes",
+                    "value": "6772762d746167"
+                  },
+                  {
+                    "field": "second",
+                    "slot": 1,
+                    "type": "u32",
+                    "value": 3
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "debugID",
+            "slot": 3,
+            "type": "optional<uid>",
+            "tag": 1,
+            "value": {
+              "type": "uid",
+              "value": {
+                "first": 57011,
+                "second": 57012
+              }
+            }
+          },
+          {
+            "field": "reply",
+            "slot": 5,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798981,
+                  "second": 9123448420122492933
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 6,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 8849010317829603333,
+                  "second": 8849027910015647749
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 6602277053725147141
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "maxVersion",
+            "slot": 7,
+            "type": "i64",
+            "value": 5000000000000
+          }
+        ]
+      }
+    ]
+  }
+}

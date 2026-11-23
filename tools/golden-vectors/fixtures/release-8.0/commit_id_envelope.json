@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "name": "commit_id_envelope",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "CommitID as sent (ErrorOr<EnsureTable<CommitID>> tag 2).",
+  "cpp_type": "ErrorOr<EnsureTable<CommitID>>",
+  "file_identifier": 47809359,
+  "file_identifier_hex": "0x02d9834f",
+  "size": 120,
+  "bytes": "300000004f83d902000000000800090008000400060006000400060008000400100018000400140016000c00170010002400000008000000020000001c000000f461defb740500001c0000000c0000001100010100000000020000000000000002000000100000006d657461646174612d76657273696f6e",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<CommitID>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<CommitID>>",
+          "value": {
+            "type": "table<CommitID>",
+            "value": [
+              {
+                "field": "version",
+                "slot": 0,
+                "type": "i64",
+                "value": 6000000000500
+              },
+              {
+                "field": "txnBatchId",
+                "slot": 1,
+                "type": "u16",
+                "value": 17
+              },
+              {
+                "field": "metadataVersion",
+                "slot": 2,
+                "type": "optional<bytes>",
+                "tag": 1,
+                "value": {
+                  "type": "bytes",
+                  "value": "6d657461646174612d76657273696f6e"
+                }
+              },
+              {
+                "field": "conflictingKRIndices",
+                "slot": 4,
+                "type": "optional<vector<i32>>",
+                "tag": 1,
+                "value": {
+                  "type": "vector<i32>",
+                  "value": [
+                    {
+                      "type": "i32",
+                      "value": 0
+                    },
+                    {
+                      "type": "i32",
+                      "value": 2
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

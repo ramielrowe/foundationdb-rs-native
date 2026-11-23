@@ -1,0 +1,87 @@
+{
+  "format_version": 1,
+  "name": "get_key_values_reply_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetKeyValuesReply as sent (ErrorOr<EnsureTable<>> tag 2).",
+  "cpp_type": "ErrorOr<EnsureTable<GetKeyValuesReply>>",
+  "file_identifier": 35337498,
+  "file_identifier_hex": "0x021b351a",
+  "size": 152,
+  "bytes": "280000001a351b02080009000800040006000600040012001f0004001c00140018000c001d001e002000000008000000020000001e000000000000000000004001204aa9d1010000000000000c00000000010000000000003b000000030000000700000072616e67652f620700000076616c75652d620700000072616e67652f63000000000800000072616e67652f64ff02000000000100",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetKeyValuesReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetKeyValuesReply>>",
+          "value": {
+            "type": "table<GetKeyValuesReply>",
+            "value": [
+              {
+                "field": "penalty",
+                "slot": 0,
+                "type": "f64",
+                "value": 2.0
+              },
+              {
+                "field": "error",
+                "slot": 1,
+                "type": "optional<table<Error>>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "data",
+                "slot": 3,
+                "type": "preserialized_kv_vector",
+                "value": [
+                  {
+                    "key": "72616e67652f62",
+                    "value": "76616c75652d62"
+                  },
+                  {
+                    "key": "72616e67652f63",
+                    "value": ""
+                  },
+                  {
+                    "key": "72616e67652f64ff",
+                    "value": "0001"
+                  }
+                ]
+              },
+              {
+                "field": "version",
+                "slot": 4,
+                "type": "i64",
+                "value": 2000000000001
+              },
+              {
+                "field": "more",
+                "slot": 5,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "cached",
+                "slot": 6,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

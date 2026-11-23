@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "name": "ping_reply",
+  "group": "transport",
+  "kind": "positive",
+  "description": "The ping reply: ErrorOr<EnsureTable<Void>> tag 2.",
+  "cpp_type": "ErrorOr<EnsureTable<Void>>",
+  "file_identifier": 35564874,
+  "file_identifier_hex": "0x021ead4a",
+  "size": 48,
+  "bytes": "200000004aad1e0200000000000008000900080004000600060004000400040012000000080000000200000010000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<Void>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<Void>>",
+          "value": {
+            "type": "table<Void>",
+            "value": []
+          }
+        }
+      }
+    ]
+  }
+}
