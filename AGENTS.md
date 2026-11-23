@@ -173,6 +173,8 @@ are checked in and Rust tests read them as files; nothing in the workspace build
 the opt-in `cpp_crosscheck` test runs it). Its README documents the fixture format, the
 wire-format details and the decoder strictness policy the `wire` codec follows.
 Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check`.
+The message-level fixtures (`fixtures/release-7.4/`, `fixtures/release-8.0/`) come from
+`FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh --check` (needs docker).
 
 ## Conventions & Patterns
 

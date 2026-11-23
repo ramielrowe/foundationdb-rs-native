@@ -1,0 +1,317 @@
+{
+  "format_version": 1,
+  "name": "open_database_coord_request",
+  "group": "coordinator",
+  "kind": "positive",
+  "description": "ClientLeaderRegInterface::openDatabase request (sent to a coordinator). coordinators holds an IPv4 and an IPv6 NetworkAddress: ip is IPAddress, a table holding std::variant<uint32_t, std::array<uint8_t, 16>>. The reply is a CachedSerialization<ClientDBInfo>, whose wire form is exactly ErrorOr<EnsureTable<ClientDBInfo>> (see client_db_info_envelope).",
+  "cpp_type": "OpenDatabaseCoordRequest",
+  "file_identifier": 214728,
+  "file_identifier_hex": "0x000346c8",
+  "size": 528,
+  "bytes": "54000000c8460300000008000900080004000600080004000600140004000a001000040008000c000a000d00040008000c000c000d00040008000a000c0016003100140018001c0004002000240028002c00300042000000040000001e000000f0b10d0000000000f1b10d0000000000680100001801000004010000f400000094000000780000000c000000000000000000000002000000380000000400000078000000140000000800000001000000040000003435303111000000636f6f72642d746c732e6578616d706c65000000a800000014000000080000000000000004000000343530300d000000636f6f72642e6578616d706c65000000e40000000900000000009d5e0900000000009d7e00000000020000003800000004000000ee0000000c000000941100000000000026010000080000000200000010000000fddb00000000000000000000000000021e0100000c00000094110000000000005601000008000000010000000200000a07000000646573633a696400090000006c6f672d67726f7570000000010000000400000076010000340000001c000000040000000f00000066646230306230373430303030303000100000003031323334353637383961626364656606000000372e342e3131000002000000180000000400000009000000746c735f6572726f7200000015000000696e636f6d70617469626c655f70726f746f636f6c000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<OpenDatabaseCoordRequest>",
+        "value": [
+          {
+            "field": "issues",
+            "slot": 0,
+            "type": "vector<bytes>",
+            "value": [
+              {
+                "type": "bytes",
+                "value": "696e636f6d70617469626c655f70726f746f636f6c"
+              },
+              {
+                "type": "bytes",
+                "value": "746c735f6572726f72"
+              }
+            ]
+          },
+          {
+            "field": "supportedVersions",
+            "slot": 1,
+            "type": "vector<table<ClientVersionRef>>",
+            "value": [
+              {
+                "type": "table<ClientVersionRef>",
+                "value": [
+                  {
+                    "field": "clientVersion",
+                    "slot": 0,
+                    "type": "bytes",
+                    "value": "372e342e3131"
+                  },
+                  {
+                    "field": "sourceVersion",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "30313233343536373839616263646566"
+                  },
+                  {
+                    "field": "protocolVersion",
+                    "slot": 2,
+                    "type": "bytes",
+                    "value": "666462303062303734303030303030"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "traceLogGroup",
+            "slot": 2,
+            "type": "bytes",
+            "value": "6c6f672d67726f7570"
+          },
+          {
+            "field": "knownClientInfoID",
+            "slot": 3,
+            "type": "uid",
+            "value": {
+              "first": 897520,
+              "second": 897521
+            }
+          },
+          {
+            "field": "clusterKey",
+            "slot": 4,
+            "type": "bytes",
+            "value": "646573633a6964"
+          },
+          {
+            "field": "coordinators",
+            "slot": 5,
+            "type": "vector<table<NetworkAddress>>",
+            "value": [
+              {
+                "type": "table<NetworkAddress>",
+                "value": [
+                  {
+                    "field": "ip",
+                    "slot": 0,
+                    "type": "table<IPAddress>",
+                    "value": [
+                      {
+                        "field": "addr",
+                        "slot": 0,
+                        "type": "variant<u32,array<u8,16>>",
+                        "tag": 1,
+                        "value": {
+                          "type": "u32",
+                          "value": 167772162
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "field": "port",
+                    "slot": 1,
+                    "type": "u16",
+                    "value": 4500
+                  },
+                  {
+                    "field": "flags",
+                    "slot": 2,
+                    "type": "u16",
+                    "value": 0
+                  },
+                  {
+                    "field": "fromHostname",
+                    "slot": 3,
+                    "type": "bool",
+                    "value": false
+                  }
+                ]
+              },
+              {
+                "type": "table<NetworkAddress>",
+                "value": [
+                  {
+                    "field": "ip",
+                    "slot": 0,
+                    "type": "table<IPAddress>",
+                    "value": [
+                      {
+                        "field": "addr",
+                        "slot": 0,
+                        "type": "variant<u32,array<u8,16>>",
+                        "tag": 2,
+                        "value": {
+                          "type": "array<u8,16>",
+                          "value": [
+                            {
+                              "type": "u8",
+                              "value": 253
+                            },
+                            {
+                              "type": "u8",
+                              "value": 219
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 0
+                            },
+                            {
+                              "type": "u8",
+                              "value": 2
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "field": "port",
+                    "slot": 1,
+                    "type": "u16",
+                    "value": 4500
+                  },
+                  {
+                    "field": "flags",
+                    "slot": 2,
+                    "type": "u16",
+                    "value": 0
+                  },
+                  {
+                    "field": "fromHostname",
+                    "slot": 3,
+                    "type": "bool",
+                    "value": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "reply",
+            "slot": 6,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798985,
+                  "second": 9123448420122492937
+                }
+              }
+            ]
+          },
+          {
+            "field": "hostnames",
+            "slot": 7,
+            "type": "vector<table<Hostname>>",
+            "value": [
+              {
+                "type": "table<Hostname>",
+                "value": [
+                  {
+                    "field": "host",
+                    "slot": 0,
+                    "type": "bytes",
+                    "value": "636f6f72642e6578616d706c65"
+                  },
+                  {
+                    "field": "service",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "34353030"
+                  },
+                  {
+                    "field": "isTLS",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": false
+                  }
+                ]
+              },
+              {
+                "type": "table<Hostname>",
+                "value": [
+                  {
+                    "field": "host",
+                    "slot": 0,
+                    "type": "bytes",
+                    "value": "636f6f72642d746c732e6578616d706c65"
+                  },
+                  {
+                    "field": "service",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "34353031"
+                  },
+                  {
+                    "field": "isTLS",
+                    "slot": 2,
+                    "type": "bool",
+                    "value": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "internal",
+            "slot": 8,
+            "type": "bool",
+            "value": false
+          }
+        ]
+      }
+    ]
+  }
+}

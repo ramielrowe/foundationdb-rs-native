@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "commit_id_error",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "Commit failed: ErrorOr<EnsureTable<CommitID>> tag 1, Error 1020 (not_committed).",
+  "cpp_type": "ErrorOr<EnsureTable<CommitID>>",
+  "file_identifier": 47809359,
+  "file_identifier_hex": "0x02d9834f",
+  "size": 64,
+  "bytes": "2c0000004f83d9020800090008000400060006000400060008000400100018000400140016000c001700100024000000080000000100000028000000fc030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<CommitID>>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Error>",
+          "value": [
+            {
+              "field": "error_code",
+              "slot": 0,
+              "type": "u16",
+              "value": 1020
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "name": "watch_value_reply",
+  "group": "storage",
+  "kind": "positive",
+  "description": "WatchValueReply as a bare table.",
+  "cpp_type": "WatchValueReply",
+  "file_identifier": 3,
+  "file_identifier_hex": "0x00000003",
+  "size": 56,
+  "bytes": "1c0000000300000000000000000006000800040008000d0004000c000e000000040000001000000009439452a30300000100000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<WatchValueReply>",
+        "value": [
+          {
+            "field": "version",
+            "slot": 0,
+            "type": "i64",
+            "value": 4000000000777
+          },
+          {
+            "field": "cached",
+            "slot": 1,
+            "type": "bool",
+            "value": true
+          }
+        ]
+      }
+    ]
+  }
+}

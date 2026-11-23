@@ -1,0 +1,266 @@
+{
+  "format_version": 1,
+  "name": "get_key_values_request",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageServerInterface::getKeyValues request (adjusted endpoint 2). begin/end are KeySelectorRef tables (key, orEqual, offset). ssLatestCommitVersions has a tag id > 255 and a negative locality and version deltas that need 8 bytes. 8.0 added taskID (Optional<TaskPriority>, an i32 enum) after ssLatestCommitVersions. 7.4 only: tenantInfo (TenantInfo: tenantId, token, arena), the slot after spanContext; 8.0 removed it mid-table, so every later slot moved down by one.",
+  "cpp_type": "GetKeyValuesRequest",
+  "file_identifier": 6795746,
+  "file_identifier_hex": "0x0067b1e2",
+  "size": 448,
+  "bytes": "64000000e2b1670000000600080004000600140004000a001d00040014001c000a001100040010000c0012001400040010001100080012000c0013001e0036000c00100004001400180034001c0020002400280035002c0030000a000d0004000c0008005a000000040000003000000001204aa9d10100002c0100000c010000e803000080380100f4000000d8000000b400000080000000500000000c00000001010000000000003c0000000200000000000000fe010001010002080010a5d4e800000002000000000000002c0100000000000000000200ff0fa5d4e800000000204aa9d1010000be000000010000001400000008000000000101010903000000000000010000000000b0de020000000000b0def40000002b000000000000000c000000010000000000000022010000040000000b000000617574687a2d746f6b656e002e010000020000000000ce7a020000000010ce7a020000000000a05b01000000540100000200000000009d5e0200000000009d7e0000000005000000047363616e0000002e0100000c000000fdffffff010000000700000072616e67652f7a004a0100000c00000001000000000000000700000072616e67652f6100",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetKeyValuesRequest>",
+        "value": [
+          {
+            "field": "begin",
+            "slot": 0,
+            "type": "table<KeySelectorRef>",
+            "value": [
+              {
+                "field": "key",
+                "slot": 0,
+                "type": "bytes",
+                "value": "72616e67652f61"
+              },
+              {
+                "field": "orEqual",
+                "slot": 1,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "offset",
+                "slot": 2,
+                "type": "i32",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "end",
+            "slot": 1,
+            "type": "table<KeySelectorRef>",
+            "value": [
+              {
+                "field": "key",
+                "slot": 0,
+                "type": "bytes",
+                "value": "72616e67652f7a"
+              },
+              {
+                "field": "orEqual",
+                "slot": 1,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "offset",
+                "slot": 2,
+                "type": "i32",
+                "value": -3
+              }
+            ]
+          },
+          {
+            "field": "version",
+            "slot": 2,
+            "type": "i64",
+            "value": 2000000000001
+          },
+          {
+            "field": "limit",
+            "slot": 3,
+            "type": "i32",
+            "value": 1000
+          },
+          {
+            "field": "limitBytes",
+            "slot": 4,
+            "type": "i32",
+            "value": 80000
+          },
+          {
+            "field": "tags",
+            "slot": 5,
+            "type": "optional<tag_set>",
+            "tag": 1,
+            "value": {
+              "type": "tag_set",
+              "value": ["7363616e"]
+            }
+          },
+          {
+            "field": "reply",
+            "slot": 7,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798978,
+                  "second": 9123448420122492930
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 8,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 8849010317829603330,
+                  "second": 8849027910015647746
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 6602277053725147138
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "tenantInfo",
+            "slot": 9,
+            "type": "table<TenantInfo>",
+            "value": [
+              {
+                "field": "tenantId",
+                "slot": 0,
+                "type": "i64",
+                "value": 43
+              },
+              {
+                "field": "token",
+                "slot": 1,
+                "type": "optional<table<WipedString>>",
+                "tag": 1,
+                "value": {
+                  "type": "table<WipedString>",
+                  "value": [
+                    {
+                      "field": "ws",
+                      "slot": 0,
+                      "type": "bytes",
+                      "value": "617574687a2d746f6b656e"
+                    },
+                    {
+                      "field": "arena",
+                      "slot": null,
+                      "type": "arena",
+                      "value": null
+                    }
+                  ]
+                }
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          },
+          {
+            "field": "options",
+            "slot": 10,
+            "type": "optional<table<ReadOptions>>",
+            "tag": 1,
+            "value": {
+              "type": "table<ReadOptions>",
+              "value": [
+                {
+                  "field": "type",
+                  "slot": 0,
+                  "type": "i32",
+                  "value": 1
+                },
+                {
+                  "field": "cacheResult",
+                  "slot": 1,
+                  "type": "bool",
+                  "value": false
+                },
+                {
+                  "field": "debugID",
+                  "slot": 2,
+                  "type": "optional<uid>",
+                  "tag": 1,
+                  "value": {
+                    "type": "uid",
+                    "value": {
+                      "first": 16046325472321077249,
+                      "second": 16046325472321077250
+                    }
+                  }
+                },
+                {
+                  "field": "consistencyCheckStartVersion",
+                  "slot": 4,
+                  "type": "optional<i64>",
+                  "tag": 1,
+                  "value": {
+                    "type": "i64",
+                    "value": 777
+                  }
+                },
+                {
+                  "field": "lockAware",
+                  "slot": 6,
+                  "type": "bool",
+                  "value": true
+                }
+              ]
+            }
+          },
+          {
+            "field": "ssLatestCommitVersions",
+            "slot": 12,
+            "type": "version_vector",
+            "value": {
+              "versions": [
+                {
+                  "locality": -2,
+                  "id": 300,
+                  "version": 1000000000000
+                },
+                {
+                  "locality": 1,
+                  "id": 2,
+                  "version": 1999999999999
+                }
+              ],
+              "maxVersion": 2000000000000
+            }
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

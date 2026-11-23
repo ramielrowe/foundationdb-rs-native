@@ -1,0 +1,41 @@
+error[E0080]: evaluation panicked: a member of an #[fdb(struct)] must be inline (a scalar, Uid or #[fdb(struct)]); tables, strings, vectors and unions cannot be struct members
+ --> tests/ui/const_checks.rs:8:8
+  |
+8 |     b: Vec<u8>,
+  |        ^^^ evaluation of `<NotInline as fdb_native_wire::Wire>::SHAPE` failed here
+
+note: erroneous constant encountered
+ --> tests/ui/const_checks.rs:4:10
+  |
+4 | #[derive(Wire)]
+  |          ^^^^
+  |
+  = note: this note originates in the derive macro `Wire` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: a member of an #[fdb(struct)] cannot be a struct (FDB does not support nested structs)
+  --> tests/ui/const_checks.rs:19:12
+   |
+19 |     inner: Inner,
+   |            ^^^^^ evaluation of `<Nested as fdb_native_wire::Wire>::SHAPE` failed here
+
+note: erroneous constant encountered
+  --> tests/ui/const_checks.rs:15:10
+   |
+15 | #[derive(Wire)]
+   |          ^^^^
+   |
+   = note: this note originates in the derive macro `Wire` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: a union alternative cannot be a union or a vector of unions; wrap it in EnsureTable
+  --> tests/ui/const_checks.rs:25:7
+   |
+25 |     B(Option<u8>),
+   |       ^^^^^^ evaluation of `<UnionInUnion as fdb_native_wire::Wire>::SHAPE` failed here
+
+note: erroneous constant encountered
+  --> tests/ui/const_checks.rs:22:10
+   |
+22 | #[derive(Wire)]
+   |          ^^^^
+   |
+   = note: this note originates in the derive macro `Wire` (in Nightly builds, run with -Z macro-backtrace for more info)

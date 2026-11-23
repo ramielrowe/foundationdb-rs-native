@@ -1,0 +1,74 @@
+{
+  "format_version": 1,
+  "name": "get_key_values_reply_empty",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetKeyValuesReply with no rows: data is a 4-byte blob (count 0), not the shared empty blob.",
+  "cpp_type": "ErrorOr<EnsureTable<GetKeyValuesReply>>",
+  "file_identifier": 35337498,
+  "file_identifier_hex": "0x021b351a",
+  "size": 96,
+  "bytes": "280000001a351b02080009000800040006000600040012001f0004001c00140018000c001d001e002000000008000000020000001e000000000000000000f03f0500000000000000000000000c00000000000000000000000400000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetKeyValuesReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetKeyValuesReply>>",
+          "value": {
+            "type": "table<GetKeyValuesReply>",
+            "value": [
+              {
+                "field": "penalty",
+                "slot": 0,
+                "type": "f64",
+                "value": 1.0
+              },
+              {
+                "field": "error",
+                "slot": 1,
+                "type": "optional<table<Error>>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "data",
+                "slot": 3,
+                "type": "preserialized_kv_vector",
+                "value": []
+              },
+              {
+                "field": "version",
+                "slot": 4,
+                "type": "i64",
+                "value": 5
+              },
+              {
+                "field": "more",
+                "slot": 5,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "cached",
+                "slot": 6,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

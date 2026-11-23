@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "name": "watch_value_reply_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "WatchValueReply as sent.",
+  "cpp_type": "ErrorOr<EnsureTable<WatchValueReply>>",
+  "file_identifier": 33554435,
+  "file_identifier_hex": "0x02000003",
+  "size": 64,
+  "bytes": "20000000030000020000080009000800040006000600040008000d0004000c001600000008000000020000001400000009439452a30300000100000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<WatchValueReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<WatchValueReply>>",
+          "value": {
+            "type": "table<WatchValueReply>",
+            "value": [
+              {
+                "field": "version",
+                "slot": 0,
+                "type": "i64",
+                "value": 4000000000777
+              },
+              {
+                "field": "cached",
+                "slot": 1,
+                "type": "bool",
+                "value": true
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

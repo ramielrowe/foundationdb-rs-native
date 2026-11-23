@@ -99,7 +99,13 @@
 //! access, and [`Reader::blob_range`] the position of a string in the message for owned
 //! zero-copy types (such as `bytes::Bytes` slices of a packet).
 //!
-//! **Tables** are hand-written for now (a `#[derive]` comes later) and are mechanical: one
+//! Tables, unions and structs are normally derived with
+#![cfg_attr(feature = "derive", doc = "[`#[derive(Wire)]`](derive@Wire)")]
+#![cfg_attr(not(feature = "derive"), doc = "`#[derive(Wire)]`")]
+//! (the `derive` feature, on by default), whose docs are
+//! the attribute reference. **Field order is `serializer(ar, ...)` argument order.**
+//!
+//! By hand, **tables** are mechanical: one
 //! [`TableWriter::field`] / [`TableReader::field`] call per `serializer(ar, ...)` argument,
 //! in argument order, skipping `Arena` (which takes no slot). A table whose
 //! `serializer(ar)` call has no arguments at all (such as [`Void`]) decodes with
@@ -117,8 +123,7 @@
 //! [`Shape::struct_member_offset`]. **Blob codecs** (a type whose wire form is a single
 //! string-framed blob, such as FDB's pre-serialized `VectorRef<KeyValueRef>`) are types of
 //! shape [`Shape::Object`] that write with [`Writer::blob_with`] and read their payload
-//! from [`Reader::blob`]. All of these are what a derive macro would generate from the
-//! ordered field list.
+//! from [`Reader::blob`]; they are always written by hand.
 //!
 //! # Writer
 //!
@@ -174,8 +179,14 @@ mod types;
 mod view;
 mod writer;
 
+#[doc(hidden)]
+#[path = "private.rs"]
+pub mod __private;
+
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
 pub use error::{DecodeError, EncodeError, StrictCheck};
+#[cfg(feature = "derive")]
+pub use fdb_native_wire_derive::Wire;
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
 pub use reader::{MAX_DEPTH, Reader, TableReader, VectorHeader};

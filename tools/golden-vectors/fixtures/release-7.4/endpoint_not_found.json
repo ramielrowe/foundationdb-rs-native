@@ -1,0 +1,26 @@
+{
+  "format_version": 1,
+  "name": "endpoint_not_found",
+  "group": "transport",
+  "kind": "positive",
+  "description": "Payload FlowTransport sends to the well-known token WLTOKEN_ENDPOINT_NOT_FOUND (UID(-1, 0)) when a packet arrives for an unknown endpoint: the unknown token, a UID as the root member (a 16-byte scalar inline in the root table). WLTOKEN_UNAUTHORIZED_ENDPOINT (UID(-1, 2)) carries the same payload.",
+  "cpp_type": "UID",
+  "file_identifier": 15597147,
+  "file_identifier_hex": "0x00edfe5b",
+  "size": 40,
+  "bytes": "140000005bfeed00000000000000060014000400060000001100000000009d5e1100000000009d7e",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "uid",
+        "value": {
+          "first": 6817605410908798993,
+          "second": 9123448420122492945
+        }
+      }
+    ]
+  }
+}

@@ -15,7 +15,7 @@
 #include <tuple>
 
 #include "dump.h"
-#include "stubs.h"
+#include "gv_types.h"
 
 class StrictWalker {
 public:
@@ -90,7 +90,8 @@ private:
 	struct TableVisitor {
 		static constexpr bool is_fb_visitor = true;
 		static constexpr bool isDeserializing = false;
-		static constexpr bool isSerializing = true;
+		static constexpr bool isSerializing = false; // a type walk, like FDB's vtable collection
+		GV_VISITOR_EXTRAS
 		StrictWalker& w;
 		size_t t;
 		template <class... Ms>
@@ -183,6 +184,11 @@ private:
 
 	template <class M>
 	void member(Ctx& c, M&) {
+		memberOfType<gv_unwrap_t<std::remove_cv_t<M>>>(c);
+	}
+
+	template <class M>
+	void memberOfType(Ctx& c) {
 		if constexpr (detail::is_vector_of_union_like<M>) {
 			size_t e1 = entry(c, c.i, 4), e2 = entry(c, c.i + 1, 4);
 			c.i += 2;
@@ -279,14 +285,16 @@ private:
 	// structs, a uoffset for everything else.
 	template <class T>
 	void value(size_t pos) {
-		if constexpr (detail::is_scalar<T>) {
+		if constexpr (!std::is_same_v<T, gv_unwrap_t<T>>) {
+			value<gv_unwrap_t<T>>(pos); // e.g. Standalone<T> is serialized as T
+		} else if constexpr (detail::is_scalar<T>) {
 			if constexpr (std::is_same_v<T, bool>) {
 				if (b[pos] > 1) {
 					flag("bool_value"); // undefined behaviour in the C++ reader
 				}
 			}
 		} else if constexpr (detail::is_struct_like<T>) {
-			structMembers<T>(pos, std::make_index_sequence<std::tuple_size_v<T>>{});
+			structMembers<T>(pos, std::make_index_sequence<pack_size(typename struct_like_traits<T>::types{})>{});
 		} else if constexpr (is_spec_v<T, EnsureTable>) {
 			using I = std::decay_t<decltype(std::declval<T&>().asUnderlyingType())>;
 			if constexpr (detail::expect_serialize_member<I>) {

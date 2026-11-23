@@ -1,0 +1,67 @@
+{
+  "format_version": 1,
+  "name": "get_value_reply_absent_value",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetValueReply with value absent (key not found) and LoadBalancedReply::error present.",
+  "cpp_type": "ErrorOr<EnsureTable<GetValueReply>>",
+  "file_identifier": 34933361,
+  "file_identifier_hex": "0x02150a71",
+  "size": 96,
+  "bytes": "30000000710a150200000000080009000800040006000600040010001700040014000c0015001000160006000800040024000000080000000200000022000000000000000000d03f10000000000000000100000000000000440000000d040000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetValueReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetValueReply>>",
+          "value": {
+            "type": "table<GetValueReply>",
+            "value": [
+              {
+                "field": "penalty",
+                "slot": 0,
+                "type": "f64",
+                "value": 0.25
+              },
+              {
+                "field": "error",
+                "slot": 1,
+                "type": "optional<table<Error>>",
+                "tag": 1,
+                "value": {
+                  "type": "table<Error>",
+                  "value": [
+                    {
+                      "field": "error_code",
+                      "slot": 0,
+                      "type": "u16",
+                      "value": 1037
+                    }
+                  ]
+                }
+              },
+              {
+                "field": "value",
+                "slot": 3,
+                "type": "optional<bytes>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "cached",
+                "slot": 5,
+                "type": "bool",
+                "value": false
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

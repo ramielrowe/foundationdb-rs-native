@@ -1,0 +1,68 @@
+{
+  "format_version": 1,
+  "name": "get_key_reply",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetKeyReply as a bare table (sel is a Standalone<KeySelectorRef>).",
+  "cpp_type": "GetKeyReply",
+  "file_identifier": 11226513,
+  "file_identifier_hex": "0x00ab4d91",
+  "size": 112,
+  "bytes": "2c000000914dab000600060004000600080004000a000d0004000c0008000e001600040014000c00100015001e0000000400000016000000000000000000e03f000000000c00000000010000000000003c0000000c00000000000000000000000a00000073656c2f726573756c740000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetKeyReply>",
+        "value": [
+          {
+            "field": "penalty",
+            "slot": 0,
+            "type": "f64",
+            "value": 0.5
+          },
+          {
+            "field": "error",
+            "slot": 1,
+            "type": "optional<table<Error>>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "sel",
+            "slot": 3,
+            "type": "table<KeySelectorRef>",
+            "value": [
+              {
+                "field": "key",
+                "slot": 0,
+                "type": "bytes",
+                "value": "73656c2f726573756c74"
+              },
+              {
+                "field": "orEqual",
+                "slot": 1,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "offset",
+                "slot": 2,
+                "type": "i32",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "field": "cached",
+            "slot": 4,
+            "type": "bool",
+            "value": true
+          }
+        ]
+      }
+    ]
+  }
+}
