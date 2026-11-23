@@ -83,7 +83,7 @@
 //!
 //! # Not ported yet
 //!
-//! Range reads, key selectors, watches, versionstamped operations, read-your-writes,
+//! Range reads, watches, versionstamped operations, read-your-writes,
 //! snapshot read-your-writes options, the special key space (`\xff\xff`), transaction
 //! tags, priorities, idempotency ids, tenants, the `metadataVersion` key exception, and
 //! database-wide default transaction options.
@@ -94,7 +94,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use fdb_native_schema::domain::{INVALID_VERSION, MutationType};
+use fdb_native_schema::domain::{INVALID_VERSION, KeySelector, MutationType};
 #[cfg(feature = "tokio")]
 use fdb_native_transport::runtime::TokioRuntime;
 use fdb_native_transport::runtime::{Instant, Runtime};
@@ -726,6 +726,97 @@ impl<R: Runtime> Transaction<R> {
         .await?
     }
 
+    /// `getKey(selector)`: the key `selector` resolves to at the transaction's read version
+    /// ([`Reader::get_key`](crate::read::Reader::get_key)), as `fdb_c` returns it with
+    /// read-your-writes disabled. **Does not see the transaction's own writes yet** (see the
+    /// [module documentation](self)).
+    ///
+    /// * **Bounds.** A selector that resolves before the first key gives the empty key; one
+    ///   that resolves past the last key the transaction may read gives that bound: `\xff`, or
+    ///   `\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option
+    ///   (`ReadYourWritesTransaction`'s `readThrough` clamps to `getMaxReadKey()`).
+    /// * **Errors.** `key_outside_legal_range` (2004) for a selector key after that bound
+    ///   (the bound itself is allowed); then as [`get`](Self::get). A selector key longer
+    ///   than any key can be is shortened first, as `KeySelectorRef::setKey` does (to one
+    ///   byte over the limit of `getMaxKeySize`).
+    /// * **Read conflict range** (`getKeyAndConflictRange`, NativeAPI 7.4:6077-6092,
+    ///   8.0:3817-3835), from the selector's key `k` and the (unclamped) result `r`: for an
+    ///   offset of 0 or less, `[r, k)` (`[r, k\x00)` if `or_equal`); otherwise `[k, r\x00)`
+    ///   (`[k\x00, r\x00)` if `or_equal`); none if that range is empty or the read fails. It
+    ///   is added when the result arrives: a commit that started before then does not carry
+    ///   it, as C++'s commit leaves out a conflict range that is not ready
+    ///   (`extraConflictRanges`, 7.4:7172-7176, 8.0:4863-4867). (C++'s read-your-writes
+    ///   layer makes the commit wait for the reads; here that comes with M5.) Unlike C++,
+    ///   which adds these ranges after its size check, the range counts toward the
+    ///   transaction's size.
+    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
+        self.get_key_with(selector, false).await
+    }
+
+    async fn get_key_with(&self, selector: &KeySelector, snapshot: bool) -> Result<Vec<u8>, Error> {
+        let (selector, max_read_key, use_provisional_proxies, epoch) = {
+            let mut state = self.state();
+            self.check_handle(&state)?;
+            if let Some(e) = state.deferred.clone() {
+                return Err(e);
+            }
+            state.check_alive(self.rt().now())?;
+            state.check_not_committing()?;
+            let max_read_key = state.flags.max_read_key();
+            let mut selector = selector.clone();
+            // `KeySelectorRef::setKey`: no key is longer than the limit.
+            let limit = state.buffer.limits().max_range_key_size(&selector.key);
+            selector.key.truncate(limit.saturating_add(1));
+            if selector.key.as_slice() > max_read_key {
+                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
+            }
+            (
+                selector,
+                max_read_key,
+                state.flags.use_provisional_proxies,
+                state.epoch,
+            )
+        };
+        let key = self
+            .guarded(async {
+                let version = self.read_version(false).await?;
+                self.inner
+                    .db
+                    .inner
+                    .reader
+                    .get_key_with(&selector, version, use_provisional_proxies)
+                    .await
+            })
+            .await??;
+        if !snapshot {
+            let k = &selector.key;
+            let (begin, end) = if selector.offset <= 0 {
+                let end = if selector.or_equal {
+                    key_after(k)
+                } else {
+                    k.clone()
+                };
+                (key.clone(), end)
+            } else {
+                let begin = if selector.or_equal {
+                    key_after(k)
+                } else {
+                    k.clone()
+                };
+                (begin, key_after(&key))
+            };
+            let mut state = self.state();
+            if begin < end && state.epoch == epoch && matches!(state.commit, CommitStage::Idle) {
+                state.buffer.add_read_conflict_range(&begin, &end)?;
+            }
+        }
+        // `readThrough`: results in keys the transaction may not read are clamped.
+        if key.as_slice() > max_read_key {
+            return Ok(max_read_key.to_vec());
+        }
+        Ok(key)
+    }
+
     /// A write: `f` on the buffer, unless the transaction is committing (`used_during_commit`)
     /// or dead, or the handle is stale; its error is deferred.
     fn write(&self, f: impl FnOnce(&mut CommitBuffer, &Flags) -> Result<(), Error>) {
@@ -1076,5 +1167,10 @@ impl<R: Runtime> Snapshot<'_, R> {
     /// [`Transaction::get`] without a read conflict range.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.tx.get_with(key, true).await
+    }
+
+    /// [`Transaction::get_key`] without a read conflict range.
+    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
+        self.tx.get_key_with(selector, true).await
     }
 }
