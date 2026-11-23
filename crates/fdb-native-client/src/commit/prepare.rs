@@ -5,9 +5,11 @@ use fdb_native_schema::domain::{Commit, KeyRange, Mutation, MutationType};
 use fdb_native_schema::self_conflict_key;
 use fdb_native_wire::Uid;
 
-use super::error::CommitError;
+use super::error;
 use super::limits::{CommitLimits, expected_size, normalize_range};
 use super::options::CommitOptions;
+use crate::error::Error;
+use crate::error::codes::TRANSACTION_READ_ONLY;
 
 /// `SIZE_LIMIT`'s lower bound (`extractIntOption(value, 32, ...)`).
 const MIN_SIZE_LIMIT: u64 = 32;
@@ -40,9 +42,9 @@ fn supported(kind: MutationType) -> bool {
 pub(crate) fn check_mutation(
     m: Mutation,
     limits: &CommitLimits,
-) -> Result<Option<Mutation>, CommitError> {
+) -> Result<Option<Mutation>, Error> {
     if !supported(m.kind) {
-        return Err(CommitError::Unsupported(m.kind.0));
+        return Err(error::unsupported(m.kind.0));
     }
     // `apiVersionAtLeast(510)` (`atomicOp`): `Min` and `And` are sent as `MinV2` and `AndV2`.
     let m = Mutation {
@@ -66,24 +68,18 @@ pub(crate) fn check_mutation(
     }
     let max = limits.max_write_key_size(&m.param1);
     if m.param1.len() > max {
-        return Err(CommitError::KeyTooLarge {
-            size: m.param1.len(),
-            limit: max,
-        });
+        return Err(error::key_too_large(m.param1.len(), max));
     }
     if m.param2.len() > limits.value_size_limit {
-        return Err(CommitError::ValueTooLarge {
-            size: m.param2.len(),
-            limit: limits.value_size_limit,
-        });
+        return Err(error::value_too_large(
+            m.param2.len(),
+            limits.value_size_limit,
+        ));
     }
     Ok(Some(m))
 }
 
-fn normalize_all(
-    ranges: Vec<KeyRange>,
-    limits: &CommitLimits,
-) -> Result<Vec<KeyRange>, CommitError> {
+fn normalize_all(ranges: Vec<KeyRange>, limits: &CommitLimits) -> Result<Vec<KeyRange>, Error> {
     let mut out = Vec::with_capacity(ranges.len());
     for range in &ranges {
         out.extend(normalize_range(range, limits)?);
@@ -143,9 +139,9 @@ pub(crate) fn prepare(
     options: &CommitOptions,
     limits: &CommitLimits,
     self_conflict_id: impl FnOnce() -> Uid,
-) -> Result<Option<Commit>, CommitError> {
+) -> Result<Option<Commit>, Error> {
     if options.size_limit < MIN_SIZE_LIMIT || options.size_limit > limits.transaction_size_limit {
-        return Err(CommitError::InvalidOptionValue(
+        return Err(error::invalid_option(
             "the size limit must be from 32 to TRANSACTION_SIZE_LIMIT",
         ));
     }
@@ -160,22 +156,19 @@ pub(crate) fn prepare(
         return Ok(None);
     }
     if options.read_only {
-        return Err(CommitError::TransactionReadOnly);
+        return Err(Error::new(TRANSACTION_READ_ONLY));
     }
     let size = expected_size(&kept, &read_conflicts, &write_conflicts);
     if size > options.size_limit {
-        return Err(CommitError::TransactionTooLarge {
-            size,
-            limit: options.size_limit,
-        });
+        return Err(error::transaction_too_large(size, options.size_limit));
     }
 
     if !options.causal_write_risky
         && intersects(&mut write_conflicts, &mut read_conflicts).is_none()
     {
         // makeSelfConflicting
-        let key = self_conflict_key(self_conflict_id())
-            .map_err(|e| CommitError::Internal(e.to_string()))?;
+        let key =
+            self_conflict_key(self_conflict_id()).map_err(|e| error::internal(e.to_string()))?;
         let range = KeyRange::single_key(&key);
         read_conflicts.push(range.clone());
         write_conflicts.push(range);

@@ -4,8 +4,8 @@
 //! * [`CommitBuffer`]: what the C++ `Transaction` buffers (`set`, `clear`, `clear_range`,
 //!   atomic operations, conflict ranges).
 //! * [`Committer::commit`]: `Transaction::commitMutations` and `tryCommit`.
-//! * [`CommitError`]: the errors, with their FDB codes. This is the commit path's own error
-//!   type; it will be unified with the client's general error type in let.6.
+//! * Errors are the client's [`Error`](crate::Error), with C++'s codes (`not_committed`
+//!   with the conflicting ranges, `commit_unknown_result`, `key_too_large`, ...).
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -52,7 +52,7 @@
 //!   conflict range unless it is `SetVersionstampedKey`, and `Min`/`And` become
 //!   `MinV2`/`AndV2` (`apiVersionAtLeast(510)`). **Atomic operations are supported except the
 //!   two versionstamp operations**, which need the offset validation of the read-your-writes
-//!   layer and are rejected with [`Unsupported`](CommitError::Unsupported).
+//!   layer and are rejected with `client_invalid_operation`.
 //! * **Key and value limits**: `set` and `atomicOp` throw `key_too_large` above
 //!   `getMaxWriteKeySize` (`KEY_SIZE_LIMIT` 10000, or `SYSTEM_KEY_SIZE_LIMIT` 30000 for keys
 //!   starting `\xff`; 7.4:11995, 8.0:7378) and `value_too_large` above `VALUE_SIZE_LIMIT`
@@ -99,8 +99,8 @@
 //!   the intersection of the request's read and write conflict ranges (a read and a write
 //!   conflict range on that key, `CAUSAL_WRITE_RISKY`, `LOCK_AWARE`, retried with `onError`'s
 //!   backoff until it commits): after that the original request is either committed or can
-//!   never commit. Then [`CommitUnknownResult`](CommitError::CommitUnknownResult). Any other
-//!   error is returned as is ([`CommitError`] table).
+//!   never commit. Then `commit_unknown_result`. Any other error is returned as is
+//!   ([`Error::from_commit_request`](crate::Error::from_commit_request)).
 //!
 //! ## Differences from C++
 //!
@@ -108,18 +108,18 @@
 //!   was never sent from one that was; the transport can
 //!   ([`RequestError::certainly_not_delivered`](fdb_native_transport::rpc::RequestError::certainly_not_delivered)).
 //!   When a connection fails before the request is sent, the next proxy is tried (each once);
-//!   if none got it the result is [`NotSent`](CommitError::NotSent) (code 1026), which is safe
+//!   if none got it the result is `connection_failed` (1026), which is safe
 //!   and retryable (`is_retryable`) and needs no dummy transaction. C++ reports `commit_unknown_result`.
 //! * **An unknown result stays unknown.** In C++ an error of the dummy transaction that
 //!   `onError` does not retry escapes `tryCommit` in place of `commit_unknown_result`, so the
 //!   caller would believe the original did not commit although it may have been delivered.
-//!   Here every way out of the settling is [`CommitUnknownResult`](CommitError::CommitUnknownResult):
+//!   Here every way out of the settling is `commit_unknown_result`:
 //!   the dummy's own failure only means that the original was not settled. The dummy's read
 //!   version is requested again if the proxies change while it waits (as
 //!   `getConsistentReadVersion` does) and its backoff is capped at
 //!   `RESOURCE_CONSTRAINED_MAX_BACKOFF` for the resource-constrained errors.
 //! * **Shutdown of the cluster monitor**: a commit that was never offered to a proxy is
-//!   [`Closed`](CommitError::Closed); once the request may have been delivered it is an
+//!   `operation_cancelled`; once the request may have been delivered it is an
 //!   unknown result. Nothing is sent after the shutdown.
 //! * **The dummy's key**: when the first key of the intersection was truncated to its limit
 //!   plus one byte, the one-key range would be cut to nothing (C++ then commits an empty
@@ -127,13 +127,14 @@
 //! * **No proxies yet** (a recovery): C++ would wait and then report an unknown result without
 //!   having sent anything; the committer waits for proxies and then sends.
 //! * **Read version**: supplied by the caller. A transaction that did not read has none; C++
-//!   fetches one (`FLAG_CAUSAL_READ_RISKY`) in `tryCommit`. The committer fetches one itself
-//!   only for the dummy transaction.
+//!   fetches one (`FLAG_CAUSAL_READ_RISKY`) in `tryCommit`; [`Transaction`](crate::Transaction)
+//!   does that. The committer fetches one itself only for the dummy transaction.
 //! * **Not ported yet**: idempotency ids (they need the idempotency-record read path),
 //!   versionstamped mutations, transaction tags and commit cost estimation, tenants,
 //!   `checkWrites`, debug ids and span contexts, the metadata-version cache and
-//!   `expireIdempotencyId`. The read-your-writes layer's `extraConflictRanges` and its key
-//!   legality checks (`key_outside_legal_range`, access to `\xff` keys) belong to let.6.
+//!   `expireIdempotencyId`. The key legality checks (`key_outside_legal_range`, access to
+//!   `\xff` keys) are [`Transaction`](crate::Transaction)'s; the read-your-writes layer's
+//!   `extraConflictRanges` comes with it.
 
 mod buffer;
 mod committer;
@@ -145,7 +146,6 @@ mod rng;
 
 pub use buffer::CommitBuffer;
 pub use committer::{CommitOutcome, Committer, versionstamp};
-pub use error::{CommitError, error_code};
 pub use limits::{CommitLimits, KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, expected_size};
 pub use options::{CommitOptions, CommitterConfig};
 

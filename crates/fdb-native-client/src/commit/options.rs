@@ -32,7 +32,7 @@ pub struct CommitOptions {
     /// `SIZE_LIMIT`: the largest `getSize()` the commit may have (default
     /// `TRANSACTION_SIZE_LIMIT`, 10 000 000). C++ accepts 32 up to that value
     /// (`extractIntOption(value, 32, TRANSACTION_SIZE_LIMIT)`, `NativeAPI.actor.cpp`
-    /// 7.4:7418); another value is [`InvalidOptionValue`](super::CommitError::InvalidOptionValue).
+    /// 7.4:7418); another value is `invalid_option_value`.
     pub size_limit: u64,
 }
 

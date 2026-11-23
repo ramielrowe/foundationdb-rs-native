@@ -16,7 +16,7 @@ use std::time::Duration;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::{KEY_SPACE_END, ReadConfig, ReadVersionOptions, Reader};
 use fdb_native_client::{
-    ClientError, ClusterConnectionString, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord,
+    ClusterConnectionString, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord,
     TransactionRetry,
 };
 use fdb_native_schema::domain::{
@@ -565,7 +565,7 @@ async fn grv_errors_are_surfaced() {
     // A locked database: `database_locked`, unless lock aware.
     *grv.answer.lock().unwrap() = Ok(true);
     let e = within("GRV", reader.get_read_version()).await.unwrap_err();
-    assert_eq!(e, ClientError::new(codes::DATABASE_LOCKED));
+    assert_eq!(e.code(), codes::DATABASE_LOCKED);
     let mut options = ReadVersionOptions::default();
     options.lock_aware = true;
     assert!(

@@ -3,12 +3,59 @@
 A pure-Rust, native [FoundationDB](https://www.foundationdb.org/) client. It speaks
 FoundationDB's wire protocol directly and does not link `libfdb_c`.
 
-**Status: pre-alpha.** Nothing is usable yet; the repository currently contains only the
-workspace scaffold.
+**Status: pre-alpha.** The vertical slice works end to end against 7.4 and 8.0 clusters
+(plain and TLS): single-key reads, writes, clears, clear ranges, atomic operations and commits,
+with FDB's conflict detection and retry semantics. Range reads, watches, versionstamps and
+read-your-writes are not there yet.
 
 ## Supported servers
 
 FoundationDB 7.4 and 8.0.
+
+## Quick start
+
+```rust,no_run
+use fdb_native_client::{Database, Error};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // FDB_CLUSTER_FILE, ./fdb.cluster or /etc/foundationdb/fdb.cluster.
+    let db = Database::open(None)?;
+
+    // A retry loop, as fdb_transaction_on_error drives it: conflicts and other retryable
+    // errors run the closure again.
+    db.run(|tx, _maybe_committed| async move {
+        tx.set(b"hello", b"world");
+        Ok(())
+    })
+    .await?;
+
+    let value = db
+        .run(|tx, _| async move { tx.get(b"hello").await })
+        .await?;
+    assert_eq!(value.as_deref(), Some(&b"world"[..]));
+
+    db.shutdown().await;
+    Ok(())
+}
+```
+
+* `Database::open(cluster_file)` / `Database::from_connection_string(s)` on tokio (the
+  default `tokio` feature); `Database::open_with(runtime, ...)` over any
+  `fdb_native_transport::runtime::Runtime`.
+* `Transaction`: `get`, `set`, `clear`, `clear_range`, `atomic_op`, conflict ranges,
+  `get_read_version` / `set_read_version`, `commit`, `on_error` (FDB's backoff and retry
+  rules), `reset`, `cancel`, and options (`timeout`, `retry_limit`, `max_retry_delay`,
+  `size_limit`, `causal_write_risky`, `lock_aware`, `use_provisional_proxies`,
+  `report_conflicting_keys`, system-key access).
+* **Reads do not see the transaction's own writes yet** (no read-your-writes layer); conflict
+  ranges are tracked as in C++, so read-modify-write transactions are serializable.
+* One error type, `fdb_native_client::Error`: FDB's code with `is_retryable`,
+  `is_maybe_committed` and `is_retryable_not_committed`. As with every FDB binding, a
+  transaction retried after `commit_unknown_result` may already have committed: make retried
+  work idempotent (`run` tells the closure when an earlier attempt may have committed).
+* TLS clusters (`:tls` coordinators) need the client's `tls` feature; certificates come from
+  `DatabaseOptions::tls` or the usual `FDB_TLS_*` variables.
 
 ## Crates
 
@@ -57,6 +104,13 @@ The `FDB_IMAGE` environment variable selects the server image
 ```bash
 FDB_IMAGE=foundationdb/foundationdb:8.0.1 cargo nextest run --workspace --run-ignored only \
   -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
+```
+
+The client's interop tests against `fdbcli` (`crates/fdb-native-client/tests/docker_database.rs`)
+include a TLS cluster test, built with the `tls` feature:
+
+```bash
+cargo nextest run -p fdb-native-client --features tls --run-ignored only -E 'binary(docker_database)'
 ```
 
 Tests must only target disposable containers started by `fdb-native-testkit`, never a

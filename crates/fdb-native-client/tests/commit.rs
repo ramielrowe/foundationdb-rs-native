@@ -6,198 +6,24 @@
 
 mod support;
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use fdb_native_client::commit::{CommitBuffer, CommitError, CommitOutcome};
+use fdb_native_client::Error;
+use fdb_native_client::commit::{CommitBuffer, CommitOutcome};
 use fdb_native_client::{
     ClusterMonitor, ClusterMonitorConfig, CommitOptions, Committer, CommitterConfig,
     ConnectionRecord,
 };
+use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{
-    Commit, CommitId, GetReadVersion, KeyRange, Mutation, MutationType, ReadVersion,
+    Commit, CommitId, GetReadVersion, KeyRange, Mutation, MutationType,
 };
-use fdb_native_schema::{Request, SchemaVersion, self_conflict_key};
-use fdb_native_transport::connection::{PING_REPLY_OK, PingRequest, well_known};
+use fdb_native_schema::self_conflict_key;
 use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
-use fdb_native_transport::{Checksum, ConnectPacket, FrameConfig, FrameDecoder};
-use fdb_native_wire::{FdbError, ProtocolVersion, Uid};
+use fdb_native_wire::{ProtocolVersion, Uid};
+use support::proxy::{FakeProxy, Incoming};
 use support::{FakeCoordinator, MemRuntime, Net, info, sock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
-
-// ---- a fake proxy -------------------------------------------------------------------------
-
-enum Cmd {
-    Send(Uid, Vec<u8>),
-    Close,
-}
-
-/// A request that reached a fake proxy, as raw bytes.
-struct Incoming {
-    token: Uid,
-    payload: Vec<u8>,
-    schema: SchemaVersion,
-    conn: mpsc::UnboundedSender<Cmd>,
-}
-
-impl Incoming {
-    fn commit(&self) -> (Commit, Uid) {
-        Commit::decode_request(self.schema, &self.payload).expect("a CommitTransactionRequest")
-    }
-
-    fn grv(&self) -> (GetReadVersion, Uid) {
-        GetReadVersion::decode_request(self.schema, &self.payload).expect("a GetReadVersion")
-    }
-
-    fn reply_commit(&self, reply: Result<CommitId, u16>) {
-        let (_, token) = self.commit();
-        let reply = reply.map_err(FdbError::new);
-        let payload = Commit::encode_reply(self.schema, &reply).unwrap();
-        let _ = self.conn.send(Cmd::Send(token, payload));
-    }
-
-    fn reply_grv(&self, version: i64) {
-        let (_, token) = self.grv();
-        let rv = ReadVersion {
-            process_busy_time: 0,
-            version,
-            locked: false,
-            metadata_version: None,
-            tag_throttle_info: Default::default(),
-            mid_shard_size: 0,
-            rk_default_throttled: false,
-            rk_batch_throttled: false,
-            ss_version_vector_delta: Default::default(),
-            proxy_id: Uid::new(9, 9),
-            proxy_tag_throttled_duration: 0.0,
-        };
-        let payload = GetReadVersion::encode_reply(self.schema, &Ok(rv)).unwrap();
-        let _ = self.conn.send(Cmd::Send(token, payload));
-    }
-
-    /// Hangs up the connection the request came on.
-    fn close(&self) {
-        let _ = self.conn.send(Cmd::Close);
-    }
-}
-
-struct FakeProxy {
-    addr: SocketAddr,
-    rx: mpsc::UnboundedReceiver<Incoming>,
-    /// Hang up on every new connection before the handshake.
-    hang_up: Arc<Mutex<bool>>,
-}
-
-impl FakeProxy {
-    fn start(net: &Arc<Net>, addr: SocketAddr, version: ProtocolVersion) -> FakeProxy {
-        let mut listener = net.listen(addr);
-        let (tx, rx) = mpsc::unbounded_channel();
-        let hang_up = Arc::new(Mutex::new(false));
-        let hang = hang_up.clone();
-        tokio::spawn(async move {
-            while let Some(stream) = listener.recv().await {
-                if *hang.lock().unwrap() {
-                    drop(stream);
-                    continue;
-                }
-                tokio::spawn(serve(stream, addr, version, tx.clone()));
-            }
-        });
-        FakeProxy { addr, rx, hang_up }
-    }
-
-    fn hang_up(&self, on: bool) {
-        *self.hang_up.lock().unwrap() = on;
-    }
-
-    async fn next(&mut self) -> Incoming {
-        tokio::time::timeout(Duration::from_secs(60), self.rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("no request reached {} within 60 s", self.addr))
-            .expect("proxy running")
-    }
-
-    fn try_next(&mut self) -> Option<Incoming> {
-        self.rx.try_recv().ok()
-    }
-}
-
-async fn serve(
-    mut stream: DuplexStream,
-    listen: SocketAddr,
-    version: ProtocolVersion,
-    incoming: mpsc::UnboundedSender<Incoming>,
-) {
-    let mut hello = [0u8; ConnectPacket::SIZE];
-    if stream.read_exact(&mut hello).await.is_err() {
-        return;
-    }
-    let (client, _) = ConnectPacket::decode(&hello).expect("client's ConnectPacket");
-    let packet = ConnectPacket::server(version, listen);
-    if stream.write_all(&packet.encode().unwrap()).await.is_err() {
-        return;
-    }
-    if !client.protocol_version.is_compatible(version) {
-        return;
-    }
-    let schema = SchemaVersion::for_protocol_version(version).expect("a supported version");
-    let config = FrameConfig::new(Checksum::for_tls(false));
-    let mut decoder = FrameDecoder::new(config);
-    let (cmd_tx, mut cmds) = mpsc::unbounded_channel();
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        tokio::select! {
-            read = stream.read(&mut buf) => {
-                let Ok(n) = read else { return };
-                if n == 0 {
-                    return;
-                }
-                decoder.push(&buf[..n]);
-                while let Some(frame) = decoder.next_frame().expect("client frames") {
-                    let frame = frame.into_owned();
-                    if frame.token == well_known::PING_PACKET {
-                        let ping: PingRequest =
-                            fdb_native_wire::decode(&frame.payload).expect("ping");
-                        let payload = fdb_native_wire::encode(&PING_REPLY_OK).unwrap();
-                        if write_frame(&mut stream, config, ping.reply.token(), &payload).await.is_err() {
-                            return;
-                        }
-                    } else {
-                        let _ = incoming.send(Incoming {
-                            token: frame.token,
-                            payload: frame.payload.to_vec(),
-                            schema,
-                            conn: cmd_tx.clone(),
-                        });
-                    }
-                }
-            }
-            cmd = cmds.recv() => match cmd {
-                None | Some(Cmd::Close) => return,
-                Some(Cmd::Send(token, payload)) => {
-                    if write_frame(&mut stream, config, token, &payload).await.is_err() {
-                        return;
-                    }
-                }
-            },
-        }
-    }
-}
-
-async fn write_frame(
-    stream: &mut DuplexStream,
-    config: FrameConfig,
-    token: Uid,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    let mut out = Vec::new();
-    config
-        .encode_frame(token, payload, &mut out)
-        .expect("frame");
-    stream.write_all(&out).await
-}
 
 // ---- the environment ----------------------------------------------------------------------
 
@@ -253,7 +79,7 @@ async fn env(schema: SchemaVersion, commit: usize, grv: usize) -> Env {
     }
 }
 
-type CommitResult = Result<CommitOutcome, CommitError>;
+type CommitResult = Result<CommitOutcome, Error>;
 
 fn spawn_commit(
     committer: &Arc<Committer<MemRuntime>>,
@@ -426,14 +252,10 @@ async fn conflicts() {
         let handle = spawn_commit(&env.committer, 1, b, CommitOptions::default());
         env.commit_proxies[0].next().await.reply_commit(Err(1020));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(
-            e,
-            CommitError::NotCommitted {
-                conflicting_ranges: None
-            }
-        );
         assert_eq!(e.code(), 1020);
-        assert!(e.is_retryable() && !e.maybe_committed());
+        assert_eq!(e.conflicting_ranges(), None);
+        assert_eq!(e.code(), 1020);
+        assert!(e.is_retryable() && !e.is_maybe_committed());
 
         // An invalid version with the conflicting read ranges (report_conflicting_keys).
         let mut b = buffer(&env);
@@ -453,34 +275,27 @@ async fn conflicts() {
                 conflicting_kr_indices: Some(vec![2, 0, 2, 99]),
                 ..CommitId::default()
             }));
-        match done(handle).await.unwrap_err() {
-            CommitError::NotCommitted { conflicting_ranges } => assert_eq!(
-                conflicting_ranges.unwrap(),
-                vec![
-                    KeyRange::new("a", "b").unwrap(),
-                    KeyRange::new("e", "f").unwrap()
-                ]
-            ),
-            e => panic!("{e:?}"),
-        }
+        let e = done(handle).await.unwrap_err();
+        assert_eq!(e.code(), 1020, "{e:?}");
+        assert_eq!(
+            e.conflicting_ranges().unwrap(),
+            &[
+                KeyRange::new("a", "b").unwrap(),
+                KeyRange::new("e", "f").unwrap()
+            ][..]
+        );
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn server_errors_are_mapped_and_not_resent() {
     let mut env = env(SchemaVersion::V7_4, 1, 1).await;
-    type Check = fn(&CommitError) -> bool;
+    type Check = fn(&Error) -> bool;
     let cases: [(u16, Check); 4] = [
-        (1007u16, |e: &CommitError| {
-            *e == CommitError::TransactionTooOld
-        }),
-        (1038, |e: &CommitError| {
-            matches!(e, CommitError::Server(f) if f.code == 1038) && e.is_retryable()
-        }),
-        (1042, |e: &CommitError| e.code() == 1042 && e.is_retryable()),
-        (2101, |e: &CommitError| {
-            e.code() == 2101 && !e.is_retryable()
-        }),
+        (1007u16, |e: &Error| e.code() == 1007 && e.is_retryable()),
+        (1038, |e: &Error| e.code() == 1038 && e.is_retryable()),
+        (1042, |e: &Error| e.code() == 1042 && e.is_retryable()),
+        (2101, |e: &Error| e.code() == 2101 && !e.is_retryable()),
     ];
     for (code, check) in cases {
         let mut b = buffer(&env);
@@ -489,7 +304,7 @@ async fn server_errors_are_mapped_and_not_resent() {
         env.commit_proxies[0].next().await.reply_commit(Err(code));
         let e = done(handle).await.unwrap_err();
         assert!(check(&e), "{code}: {e:?}");
-        assert!(e.is_safe_to_retry());
+        assert!(!e.is_maybe_committed());
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none(), "no resend");
         assert!(
@@ -511,9 +326,9 @@ async fn a_lost_connection_after_the_send_is_an_unknown_result_never_resent() {
         let handle = spawn_commit(&env.committer, 1, b, options);
         env.commit_proxies[0].next().await.close();
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, CommitError::CommitUnknownResult);
         assert_eq!(e.code(), 1021);
-        assert!(e.maybe_committed());
+        assert_eq!(e.code(), 1021);
+        assert!(e.is_maybe_committed());
         // Causal write risky: no dummy transaction, and the request is not sent again.
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
@@ -533,11 +348,7 @@ async fn broken_promise_and_commit_unknown_result_replies_are_unknown_results() 
         });
         let handle = spawn_commit(&env.committer, 1, b, options);
         env.commit_proxies[0].next().await.reply_commit(Err(code));
-        assert_eq!(
-            done(handle).await.unwrap_err(),
-            CommitError::CommitUnknownResult,
-            "{code}"
-        );
+        assert_eq!(done(handle).await.unwrap_err().code(), 1021, "{code}");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
     }
@@ -586,10 +397,7 @@ async fn an_unknown_result_commits_a_dummy_transaction_first() {
             version: 960,
             ..CommitId::default()
         }));
-        assert_eq!(
-            done(handle).await.unwrap_err(),
-            CommitError::CommitUnknownResult
-        );
+        assert_eq!(done(handle).await.unwrap_err().code(), 1021);
         assert!(env.commit_proxies[0].try_next().is_none());
     }
 }
@@ -604,9 +412,10 @@ async fn a_failure_before_the_handshake_is_not_sent() {
         let e = done(spawn_commit(&env.committer, 1, b, CommitOptions::default()))
             .await
             .unwrap_err();
-        assert!(matches!(e, CommitError::NotSent(_)), "{e:?}");
+        assert!(e.request_error().is_some(), "{e:?}");
+        assert!(e.is_retryable_not_committed(), "{e:?}");
         assert_eq!(e.code(), 1026);
-        assert!(e.is_safe_to_retry() && !e.maybe_committed());
+        assert!(!e.is_maybe_committed());
         assert!(env.commit_proxies[0].try_next().is_none());
         assert!(
             env.grv_proxies[0].try_next().is_none(),
@@ -663,7 +472,7 @@ async fn proxies_changing_mid_commit_is_an_unknown_result() {
         let long_poll = env.coord.next_call().await;
         long_poll.reply(&info(2, 1, 1, schema));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, CommitError::CommitUnknownResult);
+        assert_eq!(e.code(), 1021);
 
         // A late reply to the abandoned request is ignored; it is not sent again.
         call.reply_commit(Ok(CommitId {
@@ -720,10 +529,7 @@ async fn proxies_changing_mid_commit_runs_the_dummy_transaction_on_the_new_proxi
         version: 301,
         ..CommitId::default()
     }));
-    assert_eq!(
-        done(handle).await.unwrap_err(),
-        CommitError::CommitUnknownResult
-    );
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
     drop(env.monitor.clone());
 }
 
@@ -772,17 +578,13 @@ async fn limits_are_checked_before_anything_is_sent() {
     }
     let e = c.commit_buffer(b, 1, &defaults).await.unwrap_err();
     assert!(
-        matches!(
-            e,
-            CommitError::TransactionTooLarge {
-                limit: 10_000_000,
-                ..
-            }
-        ),
+        e.message()
+            .unwrap()
+            .ends_with("exceed the limit of 10000000"),
         "{e:?}"
     );
     assert_eq!(e.code(), 2101);
-    assert!(e.is_safe_to_retry());
+    assert!(!e.is_maybe_committed());
 
     let mut b = buffer(&env);
     b.set(b"k", b"v").unwrap();
@@ -823,8 +625,8 @@ async fn a_dummy_transaction_that_fails_for_good_is_still_an_unknown_result() {
         // 2000 client_invalid_operation: not on the retry list.
         env.commit_proxies[0].next().await.reply_commit(Err(2000));
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, CommitError::CommitUnknownResult);
-        assert!(e.maybe_committed() && !e.is_safe_to_retry());
+        assert_eq!(e.code(), 1021);
+        assert!(e.is_maybe_committed());
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
     }
@@ -843,7 +645,7 @@ async fn shutdown_while_a_commit_is_outstanding_is_an_unknown_result() {
         let grvs = auto_grv(env.grv_proxies.remove(0), 1000);
         env.monitor.shutdown().await;
         let e = done(handle).await.unwrap_err();
-        assert_eq!(e, CommitError::CommitUnknownResult);
+        assert_eq!(e.code(), 1021);
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(env.commit_proxies[0].try_next().is_none(), "no dummy");
         grvs.abort();
@@ -864,8 +666,8 @@ async fn a_commit_after_shutdown_sends_nothing() {
             let e = done(spawn_commit(&env.committer, 1, b, options))
                 .await
                 .unwrap_err();
-            assert_eq!(e, CommitError::Closed);
-            assert!(e.is_safe_to_retry());
+            assert_eq!(e.code(), 1101);
+            assert!(!e.is_maybe_committed());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(env.commit_proxies[0].try_next().is_none());
@@ -886,7 +688,7 @@ async fn shutdown_while_waiting_for_proxies_is_closed() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!handle.is_finished());
     env.monitor.shutdown().await;
-    assert_eq!(done(handle).await.unwrap_err(), CommitError::Closed);
+    assert_eq!(done(handle).await.unwrap_err().code(), 1101);
     assert!(env.commit_proxies[0].try_next().is_none());
 }
 
@@ -905,8 +707,8 @@ async fn shutdown_while_the_dummy_waits_for_proxies_is_an_unknown_result() {
     assert!(!handle.is_finished());
     env.monitor.shutdown().await;
     let e = done(handle).await.unwrap_err();
-    assert_eq!(e, CommitError::CommitUnknownResult);
-    assert!(e.maybe_committed());
+    assert_eq!(e.code(), 1021);
+    assert!(e.is_maybe_committed());
 }
 
 /// The first key of the intersection is a key truncated to its limit + 1 bytes (8.0 has no
@@ -933,10 +735,7 @@ async fn the_dummy_transaction_has_a_conflict_range_for_a_truncated_key() {
         version: 501,
         ..CommitId::default()
     }));
-    assert_eq!(
-        done(handle).await.unwrap_err(),
-        CommitError::CommitUnknownResult
-    );
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
 }
 
 /// The dummy's read version is asked again when the proxies change while it waits, and a
@@ -962,8 +761,5 @@ async fn the_dummys_read_version_follows_the_proxies() {
         version: 401,
         ..CommitId::default()
     }));
-    assert_eq!(
-        done(handle).await.unwrap_err(),
-        CommitError::CommitUnknownResult
-    );
+    assert_eq!(done(handle).await.unwrap_err().code(), 1021);
 }

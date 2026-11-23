@@ -37,8 +37,8 @@
 //! # }
 //! ```
 //!
-//! Errors are [`ClientError`]s with C++'s codes. Those a transaction retries
-//! ([`ClientError::is_retryable`]: `future_version`, `transaction_too_old`,
+//! Errors are [`Error`]s with C++'s codes. Those a transaction retries
+//! ([`Error::is_retryable`]: `future_version`, `transaction_too_old`,
 //! `database_locked`, `grv_proxy_memory_limit_exceeded`, `process_behind`, ...) are returned
 //! to the caller, as C++ returns them to `Transaction::onError`; the reader retries by itself
 //! only what C++'s read path retries internally (below).
@@ -199,13 +199,13 @@ use fdb_native_wire::{Endpoint, NetworkAddress, Uid, VersionVector};
 use futures_channel::oneshot;
 
 use crate::cluster::{ClusterInfo, ClusterMonitor};
-use crate::error::ClientError;
+use crate::error::Error;
 use crate::error::codes::*;
 
 mod balance;
 mod grv;
 mod location;
-mod util;
+pub(crate) mod util;
 
 pub use grv::{Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
@@ -398,16 +398,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// A read version for a default transaction (`getReadVersion`): batched with the other
     /// requests of the moment, from a GRV proxy. Fails with `database_locked` if the
     /// database is locked.
-    pub async fn get_read_version(&self) -> Result<i64, ClientError> {
+    pub async fn get_read_version(&self) -> Result<i64, Error> {
         self.get_read_version_with(ReadVersionOptions::default())
             .await
     }
 
     /// A read version, requested with `options`.
-    pub async fn get_read_version_with(
-        &self,
-        options: ReadVersionOptions,
-    ) -> Result<i64, ClientError> {
+    pub async fn get_read_version_with(&self, options: ReadVersionOptions) -> Result<i64, Error> {
         let flags = options.flags();
         let (tx, rx) = oneshot::channel();
         let mut waiter = Some(tx);
@@ -437,19 +434,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             }
         }
         if waiter.is_some() {
-            return Err(ClientError::new(INTERNAL_ERROR));
+            return Err(Error::new(INTERNAL_ERROR));
         }
-        let reply = rx
-            .await
-            .map_err(|_| ClientError::new(OPERATION_CANCELLED))??;
+        let reply = rx.await.map_err(|_| Error::new(OPERATION_CANCELLED))??;
         if reply.locked && !options.lock_aware {
-            return Err(ClientError::new(DATABASE_LOCKED));
+            return Err(Error::new(DATABASE_LOCKED));
         }
         Ok(reply.version)
     }
 
     /// A [`ReadSnapshot`] at a new read version.
-    pub async fn snapshot(&self) -> Result<ReadSnapshot<R, W>, ClientError> {
+    pub async fn snapshot(&self) -> Result<ReadSnapshot<R, W>, Error> {
         self.snapshot_with(ReadVersionOptions::default()).await
     }
 
@@ -458,7 +453,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     pub async fn snapshot_with(
         &self,
         options: ReadVersionOptions,
-    ) -> Result<ReadSnapshot<R, W>, ClientError> {
+    ) -> Result<ReadSnapshot<R, W>, Error> {
         let version = self.get_read_version_with(options).await?;
         Ok(ReadSnapshot {
             reader: self.clone(),
@@ -482,7 +477,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// with `client_invalid_operation`. `key` must be below [`KEY_SPACE_END`]
     /// (`key_outside_legal_range`); reading the system keys (`\xff...`) is not checked here
     /// (that is a transaction option).
-    pub async fn get(&self, key: &[u8], version: i64) -> Result<Option<Vec<u8>>, ClientError> {
+    pub async fn get(&self, key: &[u8], version: i64) -> Result<Option<Vec<u8>>, Error> {
         self.get_with(key, version, false).await
     }
 
@@ -493,12 +488,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         key: &[u8],
         version: i64,
         use_provisional_proxies: bool,
-    ) -> Result<Option<Vec<u8>>, ClientError> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         if version <= 0 {
-            return Err(ClientError::new(CLIENT_INVALID_OPERATION));
+            return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
         if key >= KEY_SPACE_END {
-            return Err(ClientError::new(KEY_OUTSIDE_LEGAL_RANGE));
+            return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
         let shared = &self.inner.shared;
         // The location of the previous attempt stays alive until the next one is known (as
@@ -534,9 +529,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 
     /// Where `key` is (`getKeyLocation`): from the cache, or asked of a commit proxy and
     /// cached.
-    pub async fn locate(&self, key: &[u8]) -> Result<KeyLocation, ClientError> {
+    pub async fn locate(&self, key: &[u8]) -> Result<KeyLocation, Error> {
         if key >= KEY_SPACE_END {
-            return Err(ClientError::new(KEY_OUTSIDE_LEGAL_RANGE));
+            return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
         let (range, location) = self
             .inner
@@ -611,7 +606,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
     }
 
     /// The value of `key` at the snapshot's version ([`Reader::get_with`]).
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClientError> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.reader
             .get_with(key, self.version, self.use_provisional_proxies)
             .await
@@ -643,7 +638,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         key: &[u8],
         version: i64,
         use_provisional: bool,
-    ) -> Result<(KeyRange, Arc<Location>), ClientError> {
+    ) -> Result<(KeyRange, Arc<Location>), Error> {
         let cached = lock(&self.locations).get(key);
         if let Some((range, location)) = cached {
             let mut refresh = false;
@@ -695,7 +690,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         key: &[u8],
         version: i64,
         use_provisional: bool,
-    ) -> Result<(KeyRange, Arc<Location>), ClientError> {
+    ) -> Result<(KeyRange, Arc<Location>), Error> {
         loop {
             self.check_open()?;
             let backoff = lock(&self.state).location_backoff;
@@ -706,7 +701,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 .monitor
                 .commit_proxies(use_provisional)
                 .await
-                .map_err(|_| ClientError::new(OPERATION_CANCELLED))?;
+                .map_err(|_| Error::new(OPERATION_CANCELLED))?;
             self.hold_proxy_references(&info);
             let alternatives: Vec<Endpoint> = info
                 .available_commit_proxies(use_provisional)
@@ -741,7 +736,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     self.update_location_backoff(true);
                     let Some((range, servers)) = reply.results.into_iter().next() else {
                         // C++ asserts exactly one result.
-                        return Err(ClientError::new(INTERNAL_ERROR));
+                        return Err(Error::new(INTERNAL_ERROR));
                     };
                     let location = self.cache_location(&range, &servers);
                     return Ok((range, location));
@@ -811,9 +806,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     }
 
     /// `operation_cancelled` once the peer manager is shut down or the monitor closed.
-    pub(crate) fn check_open(&self) -> Result<(), ClientError> {
+    pub(crate) fn check_open(&self) -> Result<(), Error> {
         if self.peers.is_shut_down() || self.monitor.is_closed() {
-            Err(ClientError::new(OPERATION_CANCELLED))
+            Err(Error::new(OPERATION_CANCELLED))
         } else {
             Ok(())
         }

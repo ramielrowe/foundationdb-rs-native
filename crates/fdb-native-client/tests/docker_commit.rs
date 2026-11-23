@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fdb_native_client::commit::{CommitBuffer, CommitError, CommitOutcome};
+use fdb_native_client::Error;
+use fdb_native_client::commit::{CommitBuffer, CommitOutcome};
 use fdb_native_client::{
     ClusterMonitor, ClusterMonitorConfig, CommitOptions, Committer, CommitterConfig,
     ConnectionRecord,
@@ -103,7 +104,7 @@ impl Cluster {
         buffer: CommitBuffer,
         read_version: i64,
         options: &CommitOptions,
-    ) -> Result<CommitOutcome, CommitError> {
+    ) -> Result<CommitOutcome, Error> {
         tokio::time::timeout(
             Duration::from_secs(30),
             self.committer.commit_buffer(buffer, read_version, options),
@@ -265,20 +266,15 @@ async fn docker_overlapping_conflict_ranges_give_not_committed() {
     let e = c.commit(b.clone(), rv, &options).await.unwrap_err();
     println!("B: {e} / {e:?}");
     assert_eq!(e.code(), 1020);
-    match &e {
-        CommitError::NotCommitted { conflicting_ranges } => {
-            // Index 0 is [w, y) (the read conflict ranges are sent sorted by begin: [p, q),
-            // [w, y), then the added range).
-            let ranges = conflicting_ranges.as_ref().expect("conflicting ranges");
-            assert_eq!(ranges.len(), 1);
-            assert_eq!(
-                (&ranges[0].begin[..], &ranges[0].end[..]),
-                (&b"w"[..], &b"y"[..])
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(e.is_retryable() && !e.maybe_committed());
+    // Index 0 is [w, y) (the read conflict ranges are sent sorted by begin: [p, q),
+    // [w, y), then the added range).
+    let ranges = e.conflicting_ranges().expect("conflicting ranges");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(
+        (&ranges[0].begin[..], &ranges[0].end[..]),
+        (&b"w"[..], &b"y"[..])
+    );
+    assert!(e.is_retryable() && !e.is_maybe_committed());
     // Without reportConflictingKeys the same conflict has no ranges.
     let e = c
         .commit(b.clone(), rv, &CommitOptions::default())

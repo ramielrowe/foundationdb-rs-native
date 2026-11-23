@@ -95,7 +95,7 @@ async fn docker_reads_values_written_by_fdbcli() {
                 let snapshot = reader.snapshot().await?;
                 let key = format!("key{:02}", i % 60);
                 let value = snapshot.get(key.as_bytes()).await?;
-                Ok::<_, fdb_native_client::ClientError>((i % 60, value))
+                Ok::<_, fdb_native_client::Error>((i % 60, value))
             })
         })
         .collect();

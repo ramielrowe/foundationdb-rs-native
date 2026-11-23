@@ -4,10 +4,11 @@ use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{Commit, KeyRange, Mutation, MutationType};
 use fdb_native_wire::Uid;
 
-use super::error::error_code;
 use super::limits::{KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, expected_size};
 use super::prepare::{intersects, prepare};
 use super::*;
+use crate::error::Error;
+use crate::error::codes as error_code;
 
 fn limits() -> CommitLimits {
     CommitLimits::for_schema(SchemaVersion::V7_4)
@@ -17,7 +18,7 @@ fn uid() -> Uid {
     Uid::new(1, 2)
 }
 
-fn build(buffer: CommitBuffer, options: &CommitOptions) -> Result<Option<Commit>, CommitError> {
+fn build(buffer: CommitBuffer, options: &CommitOptions) -> Result<Option<Commit>, Error> {
     let (m, r, w) = buffer.into_parts();
     prepare(100, m, r, w, options, &limits(), uid)
 }
@@ -104,8 +105,9 @@ fn clear_and_clear_range() {
     assert_eq!(
         CommitBuffer::new(limits())
             .clear_range(b"b", b"a")
-            .unwrap_err(),
-        CommitError::InvertedRange
+            .unwrap_err()
+            .code(),
+        error_code::INVERTED_RANGE
     );
 }
 
@@ -160,13 +162,12 @@ fn oversized_clear_keys_are_truncated_or_skipped() {
 #[test]
 fn key_and_value_limits() {
     let mut b = CommitBuffer::new(limits());
-    assert!(matches!(
-        b.set(&vec![b'k'; 10_001], b"v"),
-        Err(CommitError::KeyTooLarge {
-            size: 10_001,
-            limit: 10_000
-        })
-    ));
+    let e = b.set(&vec![b'k'; 10_001], b"v").unwrap_err();
+    assert_eq!(e.code(), error_code::KEY_TOO_LARGE);
+    assert_eq!(
+        e.message(),
+        Some("a key of 10001 bytes exceeds the limit of 10000")
+    );
     assert!(b.set(&vec![b'k'; 10_000], b"v").is_ok());
     // System keys have a larger limit.
     let mut sys = vec![0xff];
@@ -218,12 +219,10 @@ fn transaction_size() {
     };
     assert!(build(sets(123_456), &options).unwrap().is_some());
     let e = build(sets(123_457), &options).unwrap_err();
+    assert_eq!(e.code(), error_code::TRANSACTION_TOO_LARGE);
     assert_eq!(
-        e,
-        CommitError::TransactionTooLarge {
-            size: 10_000_017,
-            limit: 10_000_000
-        }
+        e.message(),
+        Some("10000017 bytes exceed the limit of 10000000")
     );
 
     // The size option.
@@ -281,8 +280,8 @@ fn read_only_option() {
     assert!(build(b.clone(), &options).unwrap().is_none());
     b.set(b"k", b"v").unwrap();
     assert_eq!(
-        build(b, &options).unwrap_err(),
-        CommitError::TransactionReadOnly
+        build(b, &options).unwrap_err().code(),
+        error_code::TRANSACTION_READ_ONLY
     );
 }
 
@@ -354,23 +353,22 @@ fn intersects_sorts_and_finds_the_first_overlap() {
 
 #[test]
 fn errors_and_codes() {
+    use fdb_native_transport::rpc::RequestError;
     use fdb_native_wire::FdbError;
-    assert_eq!(CommitError::CommitUnknownResult.code(), 1021);
-    assert!(CommitError::CommitUnknownResult.maybe_committed());
-    assert!(!CommitError::CommitUnknownResult.is_safe_to_retry());
-    let nc = CommitError::from_reply_code(FdbError::new(1020));
+    let reply = |code| Error::from_commit_request(RequestError::Fdb(FdbError::new(code)));
+    let unknown = Error::new(1021);
+    assert!(unknown.is_maybe_committed() && unknown.is_retryable());
+    let nc = reply(1020);
     assert_eq!(nc.code(), 1020);
-    assert!(nc.is_retryable() && nc.is_safe_to_retry());
-    assert_eq!(
-        CommitError::from_reply_code(FdbError::new(1007)),
-        CommitError::TransactionTooOld
-    );
+    assert!(nc.is_retryable_not_committed() && !nc.is_maybe_committed());
+    assert_eq!(reply(1007).code(), 1007);
     for code in [1038, 1042, 1051, 1037, 1213, 1223, 1235, 1242, 1078, 1009] {
-        assert!(CommitError::from_reply_code(FdbError::new(code)).is_retryable());
+        assert!(reply(code).is_retryable(), "{code}");
+        assert!(reply(code).transaction_retry().is_some(), "{code}");
     }
-    assert!(!CommitError::from_reply_code(FdbError::new(2101)).is_retryable());
-    assert!(!CommitError::KeyTooLarge { size: 1, limit: 0 }.is_retryable());
-    assert_eq!(CommitError::Closed.code(), 1101);
+    assert!(!reply(2101).is_retryable());
+    assert!(!super::error::key_too_large(1, 0).is_retryable());
+    assert_eq!(super::error::closed().code(), 1101);
 }
 
 #[test]
@@ -421,8 +419,18 @@ fn raw_min_and_and_become_the_v2_operations() {
 #[test]
 fn not_sent_is_retryable_and_safe() {
     use fdb_native_transport::rpc::RequestError;
-    let e = CommitError::NotSent(RequestError::NotSent(None));
-    assert!(e.is_retryable() && e.is_safe_to_retry() && !e.maybe_committed());
+    let e = Error::from_commit_request(RequestError::NotSent(None));
+    assert_eq!(e.code(), error_code::CONNECTION_FAILED);
+    assert!(e.is_retryable() && e.is_retryable_not_committed() && !e.is_maybe_committed());
+    assert_eq!(
+        e.transaction_retry(),
+        Some(crate::TransactionRetry::Backoff)
+    );
+    // A plain `connection_failed` is not retried.
+    assert_eq!(
+        Error::new(error_code::CONNECTION_FAILED).transaction_retry(),
+        None
+    );
 }
 
 #[test]

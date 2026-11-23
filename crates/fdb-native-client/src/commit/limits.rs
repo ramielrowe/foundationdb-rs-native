@@ -111,9 +111,9 @@ pub fn expected_size(
 pub(crate) fn normalize_range(
     range: &KeyRange,
     limits: &CommitLimits,
-) -> Result<Option<KeyRange>, crate::commit::CommitError> {
+) -> Result<Option<KeyRange>, crate::error::Error> {
     if range.begin > range.end {
-        return Err(crate::commit::CommitError::InvertedRange);
+        return Err(super::error::inverted_range());
     }
     let cut = |key: &[u8]| {
         let max = limits.max_range_key_size(key);
