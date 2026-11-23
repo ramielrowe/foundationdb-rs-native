@@ -102,6 +102,6 @@ pub use cluster_file::{
 
 pub use database::{ClientTls, Database, DatabaseOptions, MaybeCommitted};
 pub use error::{Error, TransactionRetry};
-pub use fdb_native_schema::domain::MutationType;
+pub use fdb_native_schema::domain::{KeySelector, MutationType};
 pub use read::{KeyLocation, ReadConfig, ReadSnapshot, ReadVersionOptions, Reader};
 pub use transaction::{CommitResult, Snapshot, Transaction, TransactionOption};

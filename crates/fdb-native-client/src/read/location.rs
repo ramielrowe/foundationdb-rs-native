@@ -73,6 +73,16 @@ impl ServerInfo {
         (interface.address, interface.server.base.token)
     }
 
+    /// Where to send a request to the stream `index` (`STORAGE_SERVER_STREAMS`): the address
+    /// and the stream's (adjusted) token.
+    pub(crate) fn target_for(&self, index: u32) -> (NetworkAddress, Uid) {
+        let interface = self.interface();
+        (
+            interface.address,
+            interface.server.base.adjusted(index).token,
+        )
+    }
+
     /// The interface.
     pub(crate) fn server(&self) -> StorageServer {
         self.interface().server.clone()
@@ -173,6 +183,41 @@ impl LocationCache {
             },
             cached.location.clone(),
         ))
+    }
+
+    /// `getCachedLocation(key, Reverse::True)`: the cached range containing the keys just
+    /// before `key` (`rangeContainingKeyBefore`: `begin < key <= end`) and its location.
+    pub(crate) fn get_before(&self, key: &[u8]) -> Option<(KeyRange, Arc<Location>)> {
+        let (begin, value) = self.containing_before(key)?;
+        let cached = value.as_ref()?;
+        let end = self.end_of(begin);
+        Some((
+            KeyRange {
+                begin: begin.clone(),
+                end,
+            },
+            cached.location.clone(),
+        ))
+    }
+
+    /// `invalidateCache(key, Reverse::True)`: forgets the location of the range containing
+    /// the keys just before `key`.
+    pub(crate) fn invalidate_key_before(&mut self, key: &[u8]) {
+        let Some((begin, Some(_))) = self.containing_before(key) else {
+            return;
+        };
+        let begin = begin.clone();
+        let end = self.end_of(&begin);
+        self.set(&begin, &end, None);
+    }
+
+    fn containing_before(&self, key: &[u8]) -> Option<(&Vec<u8>, &Option<Cached>)> {
+        if key.is_empty() || key > KEY_SPACE_END {
+            return None;
+        }
+        self.map
+            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key)))
+            .next_back()
     }
 
     fn containing(&self, key: &[u8]) -> Option<(&Vec<u8>, &Option<Cached>)> {
@@ -420,6 +465,35 @@ mod tests {
             Some((range(b"x", KEY_SPACE_END), 3))
         );
         assert_eq!(tag(&cache, b"\xff\xff"), None);
+    }
+
+    #[test]
+    fn lookups_and_invalidation_before_a_key() {
+        let mut rng = Rng::new(Some(1));
+        let mut cache = LocationCache::new(100);
+        cache.insert(&range(b"a", b"c"), location(1), &mut rng);
+        cache.insert(&range(b"c", KEY_SPACE_END), location(2), &mut rng);
+        let before = |cache: &LocationCache, key: &[u8]| {
+            cache.get_before(key).map(|(r, l)| (r, l.best_count))
+        };
+        // The range whose keys come just before `key`: at a boundary, the earlier one.
+        assert_eq!(before(&cache, b"c"), Some((range(b"a", b"c"), 1)));
+        assert_eq!(
+            before(&cache, b"c\x00"),
+            Some((range(b"c", KEY_SPACE_END), 2))
+        );
+        assert_eq!(
+            before(&cache, KEY_SPACE_END),
+            Some((range(b"c", KEY_SPACE_END), 2))
+        );
+        assert_eq!(before(&cache, b"a"), None, "[\"\", a) is unknown");
+        assert_eq!(before(&cache, b""), None);
+        assert_eq!(before(&cache, b"\xff\xff\x00"), None);
+        cache.invalidate_key_before(b"c");
+        assert_eq!(before(&cache, b"c"), None);
+        assert_eq!(tag(&cache, b"c"), Some((range(b"c", KEY_SPACE_END), 2)));
+        cache.invalidate_key_before(KEY_SPACE_END);
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
