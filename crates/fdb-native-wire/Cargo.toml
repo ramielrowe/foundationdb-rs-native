@@ -56,3 +56,7 @@ required-features = ["derive"]
 [[test]]
 name = "lazy_view"
 required-features = ["derive"]
+
+[[test]]
+name = "rpc"
+required-features = ["derive"]

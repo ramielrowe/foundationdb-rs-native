@@ -15,7 +15,7 @@ use std::path::Path;
 
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, FdbError, FileIdentified,
-    ObjectRef, Reader, Shape, Uid, Wire, Writer, decode, encode,
+    ObjectRef, Reader, ReplyPromise, Shape, Uid, Wire, Writer, decode, encode,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -247,10 +247,7 @@ pub mod v7_4 {
                 key: g.key,
                 version: g.version,
                 tags: (!g.tags.is_empty()).then(|| TagSet(g.tags.clone())),
-                reply: ReplyPromise {
-                    token: g.reply_token,
-                    reply: Default::default(),
-                },
+                reply: ReplyPromise::new(g.reply_token),
                 span_context: SpanContext::absent(),
                 tenant_info: TenantInfo::NONE,
                 options: g.debug_id.map(|id| ReadOptions {
@@ -272,7 +269,7 @@ pub mod v7_4 {
                 version: r.version,
                 tags: r.tags.map_or_else(Vec::new, |t| t.0),
                 debug_id: r.options.and_then(|o| o.debug_id),
-                reply_token: r.reply.token,
+                reply_token: r.reply.token(),
             }
         }
     }
@@ -324,10 +321,7 @@ pub mod v8_0 {
                 key: g.key,
                 version: g.version,
                 tags: (!g.tags.is_empty()).then(|| TagSet(g.tags.clone())),
-                reply: ReplyPromise {
-                    token: g.reply_token,
-                    reply: Default::default(),
-                },
+                reply: ReplyPromise::new(g.reply_token),
                 span_context: SpanContext::absent(),
                 options: g.debug_id.map(|id| ReadOptions {
                     read_type: 0,
@@ -348,7 +342,7 @@ pub mod v8_0 {
                 version: r.version,
                 tags: r.tags.map_or_else(Vec::new, |t| t.0),
                 debug_id: r.options.and_then(|o| o.debug_id),
-                reply_token: r.reply.token,
+                reply_token: r.reply.token(),
             }
         }
     }
