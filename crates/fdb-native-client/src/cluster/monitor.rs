@@ -224,7 +224,7 @@ struct GenerationInfo {
 }
 
 /// A decoded reply and the version of the connection it came on.
-struct Reply {
+struct CoordReply {
     info: ClientDbInfo,
     schema: SchemaVersion,
     version: ProtocolVersion,
@@ -476,35 +476,24 @@ pub(crate) fn network_address(coordinator: ResolvedCoordinator) -> NetworkAddres
 }
 
 /// One `tryGetReply` of an `OpenDatabaseCoordRequest` to the coordinator at `peer`, encoded
-/// and decoded with the schema set of the connection it goes out on.
+/// with the schema set of the connection it goes out on and decoded with that of the
+/// connection the reply came on ([`Reply::version`](fdb_native_transport::peer::Reply)).
 async fn open_database(
     peer: &PeerHandle,
     request: OpenDatabaseCoord,
-) -> Result<Reply, RequestError> {
-    // The version the request was encoded for is the version of the connection it was sent
-    // on, which is the one its reply comes on.
-    let negotiated = Arc::new(Mutex::new(None));
-    let slot = negotiated.clone();
-    let payload = peer
+) -> Result<CoordReply, RequestError> {
+    let reply = peer
         .request(
             well_known::CLIENTLEADERREG_OPENDATABASE,
             move |reply, version, out| {
-                let schema = SchemaVersion::for_protocol_version(version).ok_or(
-                    EncodeError::Invalid("no schema set for the coordinator's protocol version"),
-                )?;
-                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((schema, version));
-                request.encode_request_into(schema, reply, out)
+                request.encode_request_into(schema_for(version)?, reply, out)
             },
         )
         .await?;
-    let (schema, version) = negotiated
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
-        // A reply cannot come for a request that was never encoded.
-        .ok_or(RequestError::MaybeDelivered(None))?;
-    match OpenDatabaseCoord::decode_reply(schema, &payload) {
-        Ok(Ok(info)) => Ok(Reply {
+    let version = reply.version;
+    let schema = schema_for(version).map_err(RequestError::Encode)?;
+    match OpenDatabaseCoord::decode_reply(schema, &reply.payload) {
+        Ok(Ok(info)) => Ok(CoordReply {
             info,
             schema,
             version,
@@ -512,4 +501,11 @@ async fn open_database(
         Ok(Err(error)) => Err(RequestError::from_reply_error(error)),
         Err(error) => Err(RequestError::Decode(error)),
     }
+}
+
+/// The schema set for a connection's protocol version.
+fn schema_for(version: ProtocolVersion) -> Result<SchemaVersion, EncodeError> {
+    SchemaVersion::for_protocol_version(version).ok_or(EncodeError::Invalid(
+        "no schema set for the coordinator's protocol version",
+    ))
 }

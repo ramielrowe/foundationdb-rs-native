@@ -40,9 +40,7 @@ async fn read_version(peers: &PeerManager<TokioRuntime>, info: &ClusterInfo) -> 
         max_grv_queue_delay_ms: None,
     };
     let peer = peers.peer_for_endpoint(&endpoint);
-    let version = peer.connect().await.expect("GRV proxy connection");
-    let schema = SchemaVersion::for_protocol_version(version).expect("supported version");
-    let payload = tokio::time::timeout(
+    let reply = tokio::time::timeout(
         Duration::from_secs(10),
         peer.request(endpoint.token, move |reply, version, out| {
             let schema = SchemaVersion::for_protocol_version(version)
@@ -53,7 +51,8 @@ async fn read_version(peers: &PeerManager<TokioRuntime>, info: &ClusterInfo) -> 
     .await
     .expect("GRV reply within 10 s")
     .expect("GRV reply");
-    GetReadVersion::decode_reply(schema, &payload)
+    let schema = SchemaVersion::for_protocol_version(reply.version).expect("supported version");
+    GetReadVersion::decode_reply(schema, &reply.payload)
         .expect("decodable reply")
         .expect("a read version, not an error")
 }

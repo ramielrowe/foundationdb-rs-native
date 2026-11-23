@@ -160,7 +160,8 @@
 //!   (see `fdb_native_transport::peer`, "Version detection"). The request encoder is told the
 //!   connection's version, picks the schema set with
 //!   [`SchemaVersion::for_protocol_version`](fdb_native_schema::SchemaVersion::for_protocol_version),
-//!   and the reply, which comes on that same connection, is decoded with it. The schema set
+//!   and the reply is decoded with the schema set of the version it arrived on
+//!   (`Reply::version`, the same connection's). The schema set
 //!   is part of every published [`ClusterInfo`]. (C++'s multi-version client instead asks a
 //!   coordinator for its protocol version and loads the matching library.)
 //! * **Peer references.** The monitor holds a `PeerRef` to every address coordinator of the
