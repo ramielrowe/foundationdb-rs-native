@@ -29,6 +29,8 @@ use futures_io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 
+pub mod process;
+
 pub fn sock(last: u8, port: u16) -> SocketAddr {
     SocketAddr::from(([10, 0, 0, last], port))
 }

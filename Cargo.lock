@@ -388,6 +388,8 @@ dependencies = [
  "fdb-native-testkit",
  "fdb-native-transport",
  "fdb-native-wire",
+ "futures-channel",
+ "futures-core",
  "futures-io",
  "proptest",
  "regex",

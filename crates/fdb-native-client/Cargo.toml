@@ -14,6 +14,8 @@ workspace = true
 fdb-native-schema.workspace = true
 fdb-native-transport.workspace = true
 fdb-native-wire.workspace = true
+futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-core = "0.3.34"
 thiserror = "2.0.21"
 
 [dev-dependencies]
