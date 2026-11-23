@@ -82,6 +82,10 @@
 //! (vectors, `std::array`), `Option<T>` (`Optional`), [`ErrorOr<T>`] (`Result<T,
 //! FdbError>`), [`EnsureTable<T>`], [`Void`] and [`FdbError`], plus `&T` and `Box<T>`.
 //!
+//! FlowTransport's types are here too: [`ReplyPromise<T>`] and [`RequestStream<T>`] (with the
+//! [`Endpoint`] it holds), which request and interface structs contain, and [`VectorRef<T>`],
+//! a `Vec<T>` with `VectorRef`'s file identifier for a vector that is a message's root.
+//!
 //! Tables, unions and structs are normally derived with
 #![cfg_attr(feature = "derive", doc = "[`#[derive(Wire)]`](derive@Wire)")]
 #![cfg_attr(not(feature = "derive"), doc = "`#[derive(Wire)]`")]
@@ -156,6 +160,7 @@ mod error;
 mod file_identifier;
 mod protocol_version;
 mod reader;
+mod rpc;
 mod shape;
 mod types;
 mod writer;
@@ -171,6 +176,9 @@ pub use fdb_native_wire_derive::Wire;
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
 pub use reader::{MAX_DEPTH, Reader, TableReader};
+pub use rpc::{
+    Endpoint, IpAddress, NetworkAddress, NetworkAddressList, ReplyPromise, RequestStream, VectorRef,
+};
 pub use shape::Shape;
 pub use types::{EnsureTable, ErrorOr, FdbError, Uid, Void};
 pub use writer::{ObjectRef, TableWriter, UnionRef, Writer};
