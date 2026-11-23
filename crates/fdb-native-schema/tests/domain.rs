@@ -1,26 +1,49 @@
-//! The domain layer: round trips through each schema set, the 7.4 tenant default, the
-//! throttle-limit clock conversion, single-key compression edge cases and the interfaces'
-//! adjusted-endpoint indices.
+//! The domain layer: round trips through each schema set, reply tokens, the 7.4 tenant
+//! default, throttle-limit durations, single-key compression and inverted ranges, mutation
+//! checksums, and the interfaces' adjusted-endpoint indices.
 
 #[macro_use]
 mod support;
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use fdb_native_schema::domain::{
     ClientDbInfo, ClientVersion, Commit, CommitCostEstimation, CommitId, CommitProxy,
-    GetKeyServerLocations, GetReadVersion, GetValue, GetValueReply, GrvProxy, Hostname, KeyRange,
-    KeyServerLocations, LATEST_VERSION, Mutation, MutationType, OpenDatabaseCoord, ReadOptions,
-    ReadVersion, StorageServer, TagThrottleLimits, VersionHistory,
+    GetKeyServerLocations, GetReadVersion, GetValue, GetValueReply, GrvProxy, Hostname,
+    InvalidValue, KeyRange, KeyServerLocations, LATEST_VERSION, Mutation, MutationType,
+    OpenDatabaseCoord, ReadOptions, ReadVersion, StorageServer, TagThrottleLimits, TenantMode,
+    VersionHistory,
 };
 use fdb_native_schema::streams::{GRV_PROXY_STREAMS, STORAGE_SERVER_STREAMS};
-use fdb_native_schema::{Request, SchemaVersion, SpanContext, TraceFlags, v7_4, v8_0};
+use fdb_native_schema::{
+    Request, SchemaVersion, SpanContext, TraceFlags, encode_request, encode_request_into, v7_4,
+    v8_0,
+};
 use fdb_native_wire::{
-    DecodeError, Endpoint, EnsureTable, ErrorOr, FdbError, IdempotencyId, IpAddress,
-    NetworkAddress, NetworkAddressList, ProtocolVersion, Tag, TagSet, Uid, VersionVector, decode,
-    encode,
+    Decode, DecodeError, EncodeError, Endpoint, EnsureTable, ErrorOr, FdbError, IdempotencyId,
+    IpAddress, NetworkAddress, NetworkAddressList, ProtocolVersion, Tag, TagSet, Uid,
+    VersionVector, decode, encode,
 };
 use support::*;
+
+const TOKEN: Uid = Uid::new(0x7070, 0x8080);
+
+fn kr(begin: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> KeyRange {
+    KeyRange::new(begin, end).unwrap()
+}
+
+fn mu(kind: MutationType, p1: impl Into<Vec<u8>>, p2: impl Into<Vec<u8>>) -> Mutation {
+    Mutation::new(kind, p1, p2).unwrap()
+}
+
+/// Encodes `request` with [`TOKEN`] and decodes it back, checking the token.
+fn request_round_trip<R: Request + std::fmt::Debug>(version: SchemaVersion, request: &R) -> R {
+    let bytes = request.encode_request(version, TOKEN).unwrap();
+    let (back, token) = R::decode_request(version, &bytes).unwrap();
+    assert_eq!(token, TOKEN);
+    back
+}
 
 fn endpoint(token: Uid, port: u16) -> Endpoint {
     Endpoint::new(
@@ -98,30 +121,31 @@ fn client_db_info(schema: SchemaVersion) -> ClientDbInfo {
         history: vec![VersionHistory {
             version: 77,
             mutations: vec![
-                Mutation::new(MutationType::SET_VALUE, "\u{ff}/conf/x", "1"),
-                Mutation::new(MutationType::CLEAR_RANGE, b"k".to_vec(), b"k\x00".to_vec()),
+                mu(MutationType::SET_VALUE, "\u{ff}/conf/x", "1"),
+                mu(MutationType::CLEAR_RANGE, b"k".to_vec(), b"k\x00".to_vec()),
             ],
         }],
         cluster_id: Uid::new(9, 9),
         cluster_type: 0,
+        // Only 7.4 has it.
+        tenant_mode: (schema == SchemaVersion::V7_4).then_some(TenantMode::REQUIRED),
     }
 }
 
 fn commit() -> Commit {
     Commit {
-        read_conflict_ranges: vec![KeyRange::new("a", "m"), KeyRange::single_key(b"r")],
+        read_conflict_ranges: vec![kr("a", "m"), KeyRange::single_key(b"r")],
         write_conflict_ranges: vec![KeyRange::single_key(b"k1"), KeyRange::single_key(b"")],
         mutations: vec![
-            Mutation::new(MutationType::SET_VALUE, "k1", "v1"),
-            Mutation::new(MutationType::CLEAR_RANGE, b"c".to_vec(), b"c\x00".to_vec()),
-            Mutation::new(MutationType::CLEAR_RANGE, "x", "z"),
-            Mutation::new(MutationType::ADD_VALUE, "counter", [1, 0, 0, 0]),
+            mu(MutationType::SET_VALUE, "k1", "v1"),
+            mu(MutationType::CLEAR_RANGE, b"c".to_vec(), b"c\x00".to_vec()),
+            mu(MutationType::CLEAR_RANGE, "x", "z"),
+            mu(MutationType::ADD_VALUE, "counter", [1, 0, 0, 0]),
         ],
         read_snapshot: 123_456,
         report_conflicting_keys: true,
         lock_aware: true,
         transaction_span_context: Some(span()),
-        reply: Uid::new(5, 6),
         flags: Commit::FLAG_IS_LOCK_AWARE | Commit::FLAG_FIRST_IN_BATCH,
         debug_id: Some(Uid::new(7, 8)),
         commit_cost_estimation: Some(CommitCostEstimation {
@@ -141,7 +165,6 @@ fn get_value() -> GetValue {
         key: b"user/key".to_vec(),
         version: 42,
         tags: Some(tags()),
-        reply: Uid::new(1, 2),
         span_context: span(),
         options: Some(ReadOptions {
             read_type: 3,
@@ -154,13 +177,23 @@ fn get_value() -> GetValue {
     }
 }
 
+fn get_key_server_locations() -> GetKeyServerLocations {
+    GetKeyServerLocations {
+        begin: b"loc/a".to_vec(),
+        end: Some(b"loc/z".to_vec()),
+        limit: 100,
+        reverse: true,
+        span_context: span(),
+        min_tenant_version: LATEST_VERSION,
+    }
+}
+
 fn get_read_version(schema: SchemaVersion) -> GetReadVersion {
     GetReadVersion {
         transaction_count: 3,
         flags: GetReadVersion::PRIORITY_DEFAULT | GetReadVersion::FLAG_CAUSAL_READ_RISKY,
         tags: BTreeMap::from([(b"tagA".to_vec(), 2), (b"tagB".to_vec(), 1)]),
         debug_id: Some(Uid::new(1, 1)),
-        reply: Uid::new(2, 2),
         span_context: span(),
         max_version: 99,
         // Only 8.0 has it.
@@ -174,13 +207,22 @@ fn read_version(schema: SchemaVersion) -> ReadVersion {
         version: 5_000_000_000_123,
         locked: true,
         metadata_version: Some(b"\x00\x01".to_vec()),
-        tag_throttle_info: BTreeMap::from([(
-            b"hot".to_vec(),
-            TagThrottleLimits {
-                tps_rate: 50.0,
-                expiration: 1030.5,
-            },
-        )]),
+        tag_throttle_info: BTreeMap::from([
+            (
+                b"hot".to_vec(),
+                TagThrottleLimits {
+                    tps_rate: 50.0,
+                    duration: 30.5,
+                },
+            ),
+            (
+                b"forever".to_vec(),
+                TagThrottleLimits {
+                    tps_rate: 1.0,
+                    duration: f64::MAX,
+                },
+            ),
+        ]),
         mid_shard_size: 1 << 20,
         rk_default_throttled: true,
         rk_batch_throttled: false,
@@ -212,7 +254,6 @@ fn open_database() -> OpenDatabaseCoord {
             true,
             false,
         )],
-        reply: Uid::new(8, 8),
         hostnames: vec![Hostname {
             host: b"coord.example".to_vec(),
             service: b"4500".to_vec(),
@@ -222,29 +263,22 @@ fn open_database() -> OpenDatabaseCoord {
     }
 }
 
-const NOW: f64 = 1000.0;
-
-/// Request → bytes → request and reply → bytes → reply, through the [`Request`] dispatch.
-/// (Replies may borrow from their bytes, so they are compared by their `Debug` form, which
-/// shows every field.)
+/// Request → bytes → request (with its token) and reply → bytes → reply, through the
+/// [`Request`] dispatch. (Replies may borrow from their bytes, so they are compared by their
+/// `Debug` form, which shows every field.)
 fn round_trip<R>(version: SchemaVersion, request: &R, reply: &ErrorOr<R::Reply<'_>>)
 where
     R: Request + PartialEq + std::fmt::Debug,
     for<'a> R::Reply<'a>: std::fmt::Debug,
 {
-    let bytes = request.encode_request(version).unwrap();
-    assert_eq!(
-        R::decode_request(version, &bytes).as_ref(),
-        Ok(request),
-        "{version}"
-    );
-    let bytes = R::encode_reply(version, reply, NOW).unwrap();
-    let back = R::decode_reply(version, &bytes, NOW).unwrap();
+    assert_eq!(&request_round_trip(version, request), request, "{version}");
+    let bytes = R::encode_reply(version, reply).unwrap();
+    let back = R::decode_reply(version, &bytes).unwrap();
     assert_eq!(format!("{back:?}"), format!("{reply:?}"), "{version}");
     // An error reply is the error envelope.
     let error: ErrorOr<R::Reply<'_>> = Err(FdbError::new(1020));
-    let bytes = R::encode_reply(version, &error, NOW).unwrap();
-    let back = R::decode_reply(version, &bytes, NOW).unwrap();
+    let bytes = R::encode_reply(version, &error).unwrap();
+    let back = R::decode_reply(version, &bytes).unwrap();
     assert_eq!(back.err(), Some(FdbError::new(1020)), "{version}");
 }
 
@@ -259,21 +293,10 @@ fn domain_messages_round_trip_through_each_schema_set() {
         );
         round_trip(
             version,
-            &GetKeyServerLocations {
-                begin: b"loc/a".to_vec(),
-                end: Some(b"loc/z".to_vec()),
-                limit: 100,
-                reverse: true,
-                reply: Uid::new(3, 3),
-                span_context: span(),
-                min_tenant_version: LATEST_VERSION,
-            },
+            &get_key_server_locations(),
             &Ok(KeyServerLocations {
                 results: vec![
-                    (
-                        KeyRange::new("", "m"),
-                        vec![storage_server(1), storage_server(2)],
-                    ),
+                    (kr("", "m"), vec![storage_server(1), storage_server(2)]),
                     (KeyRange::single_key(b"m"), vec![storage_server(3)]),
                 ],
                 tss_mapping: vec![(Uid::new(3, 4), storage_server(4))],
@@ -315,40 +338,94 @@ fn domain_messages_round_trip_through_each_schema_set() {
     }
 }
 
+/// The reply token is a parameter: the same request is encoded with each token it is sent
+/// with, and `encode_request_into` appends exactly what `encode_request` returns.
+#[test]
+fn reply_tokens_and_encode_into() {
+    let request = commit();
+    for v in SchemaVersion::ALL {
+        let a = request.encode_request(v, Uid::new(1, 1)).unwrap();
+        let b = encode_request(v, &request, Uid::new(2, 2)).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(Commit::decode_request(v, &a).unwrap().1, Uid::new(1, 1));
+        assert_eq!(
+            Commit::decode_request(v, &b).unwrap(),
+            (request.clone(), Uid::new(2, 2))
+        );
+
+        let mut frame = b"header".to_vec();
+        encode_request_into(v, &request, Uid::new(1, 1), &mut frame).unwrap();
+        assert_eq!(&frame[..6], b"header");
+        assert_eq!(&frame[6..], &a[..]);
+
+        // On an error the buffer is left as it was.
+        let mut bad = request.clone();
+        bad.read_conflict_ranges.push(KeyRange {
+            begin: b"b".to_vec(),
+            end: b"a".to_vec(),
+        });
+        let mut frame = b"header".to_vec();
+        assert!(bad.encode_request_into(v, TOKEN, &mut frame).is_err());
+        assert_eq!(frame, b"header");
+    }
+}
+
 /// On 7.4 every request with a `TenantInfo` carries the tenant-less one, `tenantId = -1`
 /// with no token; 8.0's requests have none.
 #[test]
 fn a_7_4_request_carries_the_default_tenant() {
     let v = SchemaVersion::V7_4;
-    let bytes = get_value().encode_request(v).unwrap();
+    let bytes = get_value().encode_request(v, TOKEN).unwrap();
     let wire: v7_4::GetValueRequest = decode(&bytes).unwrap();
     assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
     assert_eq!(wire.tenant_info.tenant_id, -1);
     assert_eq!(wire.tenant_info.token, None);
 
-    let bytes = commit().encode_request(v).unwrap();
+    let bytes = commit().encode_request(v, TOKEN).unwrap();
     let wire: v7_4::CommitTransactionRequest = decode(&bytes).unwrap();
     assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
 
-    let request = GetKeyServerLocations {
-        begin: b"a".to_vec(),
-        end: None,
-        limit: 1,
-        reverse: false,
-        reply: Uid::new(1, 1),
-        span_context: SpanContext::default(),
-        min_tenant_version: LATEST_VERSION,
-    };
-    let bytes = request.encode_request(v).unwrap();
+    let bytes = get_key_server_locations().encode_request(v, TOKEN).unwrap();
     let wire: v7_4::GetKeyServerLocationsRequest = decode(&bytes).unwrap();
     assert_eq!(wire.tenant, v7_4::TenantInfo::NONE);
     assert_eq!(wire.min_tenant_version, LATEST_VERSION);
+}
 
-    // An absent TenantInfo would read as tenant 0, which is why it is always written.
+/// C++'s `LoadMember` default-constructs an absent table member, and `TenantInfo()` has
+/// `tenantId = -1`; a present table with an absent `tenantId` slot reads 0.
+#[test]
+fn an_absent_tenant_info_is_the_default_tenant() {
     assert_eq!(
-        <v7_4::TenantInfo as fdb_native_wire::Decode>::absent().tenant_id,
-        0
+        <v7_4::TenantInfo as Decode>::absent(),
+        v7_4::TenantInfo::NONE
     );
+    assert_eq!(v7_4::TenantInfo::default(), v7_4::TenantInfo::NONE);
+
+    // A 7.4 GetValueRequest whose `tenantInfo` slot is absent.
+    #[allow(dead_code)]
+    #[derive(fdb_native_wire::Wire)]
+    #[fdb(file_identifier = 8454530)]
+    struct NoTenant<'a> {
+        key: &'a [u8],
+        version: i64,
+        #[fdb(skip_slots = 2)]
+        tags: (),
+        reply: fdb_native_wire::ReplyPromise<()>,
+        span_context: SpanContext,
+        #[fdb(skip_slots = 1)]
+        tenant_info: (),
+    }
+    let bytes = encode(&NoTenant {
+        key: b"k",
+        version: 1,
+        tags: (),
+        reply: fdb_native_wire::ReplyPromise::new(TOKEN),
+        span_context: span(),
+        tenant_info: (),
+    })
+    .unwrap();
+    let wire: v7_4::GetValueRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
 }
 
 /// The 7.4 fixture's request has a tenant with a token; the domain drops it, and encoding
@@ -359,8 +436,9 @@ fn decoding_a_7_4_request_drops_its_tenant() {
     let wire: v7_4::GetValueRequest = decode(&bytes).unwrap();
     assert_ne!(wire.tenant_info.tenant_id, -1);
     assert!(wire.tenant_info.token.is_some());
-    let request = GetValue::decode_request(SchemaVersion::V7_4, &bytes).unwrap();
-    let encoded = request.encode_request(SchemaVersion::V7_4).unwrap();
+    let (request, token) = GetValue::decode_request(SchemaVersion::V7_4, &bytes).unwrap();
+    assert_eq!(token, wire.reply.token());
+    let encoded = request.encode_request(SchemaVersion::V7_4, token).unwrap();
     let again: v7_4::GetValueRequest = decode(&encoded).unwrap();
     assert_eq!(again.tenant_info, v7_4::TenantInfo::NONE);
     assert_eq!(again.key, wire.key);
@@ -370,80 +448,124 @@ fn decoding_a_7_4_request_drops_its_tenant() {
     );
 }
 
-/// `ClientTagThrottleLimits` travels as a duration; the domain has an expiration on the local
-/// clock, `now + duration` when received and `expiration - now` when sent.
+/// `ClientTagThrottleLimits` travels as a duration relative to the sender's clock; the
+/// domain keeps it and turns it into a deadline from the receive time.
 #[test]
-fn throttle_limits_convert_with_the_given_clock() {
+fn throttle_limits_keep_their_duration() {
     for (release, version) in [
         ("release-7.4", SchemaVersion::V7_4),
         ("release-8.0", SchemaVersion::V8_0),
     ] {
         let bytes = record_bytes(&fixture(release, "get_read_version_reply_envelope"));
-        let at_1000 = GetReadVersion::decode_reply(version, &bytes, 1000.0)
-            .unwrap()
-            .unwrap();
-        let at_5000 = GetReadVersion::decode_reply(version, &bytes, 5000.0)
+        let reply = GetReadVersion::decode_reply(version, &bytes)
             .unwrap()
             .unwrap();
         // The fixture's duration is exactly 30 (the generator's clock does not advance).
-        let (tag, limits) = at_1000.tag_throttle_info.iter().next().unwrap();
-        assert_eq!(limits.expiration, 1030.0, "{release}");
+        let limits = *reply.tag_throttle_info.values().next().unwrap();
+        assert_eq!(limits.duration, 30.0, "{release}");
+        assert_eq!(limits.expires_after(), Some(Duration::from_secs(30)));
+        let received = Instant::now();
         assert_eq!(
-            at_5000.tag_throttle_info[tag].expiration, 5030.0,
-            "{release}"
+            limits.expires_at(received),
+            Some(received + Duration::from_secs(30))
         );
-        assert_eq!(at_5000.tag_throttle_info[tag].tps_rate, limits.tps_rate);
-
-        // Sent at 1010, 20 seconds remain.
-        let bytes = GetReadVersion::encode_reply(version, &Ok(at_1000), 1010.0).unwrap();
+        // Encoding writes the duration back.
+        let bytes = GetReadVersion::encode_reply(version, &Ok(reply)).unwrap();
         let durations: Vec<f64> = match version {
             SchemaVersion::V7_4 => {
                 let r: ErrorOr<EnsureTable<v7_4::GetReadVersionReply>> = decode(&bytes).unwrap();
-                r.unwrap()
-                    .0
-                    .tag_throttle_info
-                    .values()
-                    .map(|l| l.duration)
-                    .collect()
+                let r = r.unwrap().0;
+                r.tag_throttle_info.values().map(|l| l.duration).collect()
             }
             SchemaVersion::V8_0 => {
                 let r: ErrorOr<EnsureTable<v8_0::GetReadVersionReply>> = decode(&bytes).unwrap();
-                r.unwrap()
-                    .0
-                    .tag_throttle_info
-                    .values()
-                    .map(|l| l.duration)
-                    .collect()
+                let r = r.unwrap().0;
+                r.tag_throttle_info.values().map(|l| l.duration).collect()
             }
         };
-        assert_eq!(durations, [20.0], "{release}");
+        assert_eq!(durations, [30.0], "{release}");
     }
+
+    let limits = |duration| TagThrottleLimits {
+        tps_rate: 1.0,
+        duration,
+    };
+    // NO_EXPIRATION (f64::MAX), and anything else that does not fit a Duration: never.
+    assert_eq!(limits(f64::MAX).expires_after(), None);
+    assert_eq!(limits(f64::MAX - 1000.0).expires_after(), None);
+    assert_eq!(limits(f64::INFINITY).expires_after(), None);
+    assert_eq!(limits(f64::MAX).expires_at(Instant::now()), None);
+    // Already expired.
+    assert_eq!(limits(-5.0).expires_after(), Some(Duration::ZERO));
+    assert_eq!(
+        limits(f64::NEG_INFINITY).expires_after(),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(limits(f64::NAN).expires_after(), Some(Duration::ZERO));
+    assert_eq!(
+        limits(0.25).expires_after(),
+        Some(Duration::from_millis(250))
+    );
 }
 
 #[test]
 fn version_specific_fields() {
     // 8.0's maxGrvQueueDelayMS is not sent to 7.4.
-    let request = get_read_version(SchemaVersion::V8_0);
-    let back = GetReadVersion::decode_request(
-        SchemaVersion::V7_4,
-        &request.encode_request(SchemaVersion::V7_4).unwrap(),
-    )
-    .unwrap();
+    let back = request_round_trip(SchemaVersion::V7_4, &get_read_version(SchemaVersion::V8_0));
     assert_eq!(back.max_grv_queue_delay_ms, None);
     // 7.4's proxyTagThrottledDuration is not sent to 8.0.
     let reply = read_version(SchemaVersion::V7_4);
-    let bytes = GetReadVersion::encode_reply(SchemaVersion::V8_0, &Ok(reply), NOW).unwrap();
-    let back = GetReadVersion::decode_reply(SchemaVersion::V8_0, &bytes, NOW)
+    let bytes = GetReadVersion::encode_reply(SchemaVersion::V8_0, &Ok(reply)).unwrap();
+    let back = GetReadVersion::decode_reply(SchemaVersion::V8_0, &bytes)
         .unwrap()
         .unwrap();
     assert_eq!(back.proxy_tag_throttled_duration, 0.0);
+    // 7.4's tenantMode is not sent to 8.0, and is DISABLED on 7.4 when the domain has none.
+    let info = client_db_info(SchemaVersion::V7_4);
+    let bytes = OpenDatabaseCoord::encode_reply(SchemaVersion::V8_0, &Ok(info.clone())).unwrap();
+    let back = OpenDatabaseCoord::decode_reply(SchemaVersion::V8_0, &bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.tenant_mode, None);
+    let info = ClientDbInfo {
+        tenant_mode: None,
+        ..info
+    };
+    let bytes = OpenDatabaseCoord::encode_reply(SchemaVersion::V7_4, &Ok(info)).unwrap();
+    let back = OpenDatabaseCoord::decode_reply(SchemaVersion::V7_4, &bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.tenant_mode, Some(TenantMode::DISABLED));
     // ReadOptions::type is i32 on 7.4 and u32 on 8.0: the bits are kept.
     let mut request = get_value();
     request.options.as_mut().unwrap().read_type = u32::MAX;
     for v in SchemaVersion::ALL {
-        let back = GetValue::decode_request(v, &request.encode_request(v).unwrap()).unwrap();
-        assert_eq!(back, request, "{v}");
+        assert_eq!(request_round_trip(v, &request), request, "{v}");
     }
+}
+
+/// The fixtures' 7.4 `ClientDBInfo` has a tenant mode; the domain carries it.
+#[test]
+fn tenant_mode_from_the_fixtures() {
+    let bytes = record_bytes(&fixture("release-7.4", "client_db_info_envelope"));
+    let wire: ErrorOr<EnsureTable<v7_4::ClientDBInfo>> = decode(&bytes).unwrap();
+    let mode = wire.unwrap().0.tenant_mode.mode;
+    let info = OpenDatabaseCoord::decode_reply(SchemaVersion::V7_4, &bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.tenant_mode, Some(TenantMode(mode)));
+    let bytes = record_bytes(&fixture("release-8.0", "client_db_info_envelope"));
+    let info = OpenDatabaseCoord::decode_reply(SchemaVersion::V8_0, &bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.tenant_mode, None);
+}
+
+#[test]
+fn defaults_match_cpp() {
+    // LoadBalancedReply() has penalty 1.0.
+    assert_eq!(GetValueReply::default().penalty, 1.0);
+    assert_eq!(v7_4::GetValueReply::default().penalty, 1.0);
 }
 
 #[test]
@@ -477,20 +599,29 @@ fn schema_version_from_protocol_version() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Single-key compression.
+// Single-key compression and inverted ranges.
 
 /// `(begin, end)` as the encoder writes them.
-fn written_range(begin: &[u8], end: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let (b, e) = v7_4::KeyRangeRef::new(begin, end).wire_form();
-    (b.to_vec(), e.to_vec())
+fn written_range(begin: &[u8], end: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
+    let (b, e) = v7_4::KeyRangeRef::new(begin, end).wire_form()?;
+    Ok((b.to_vec(), e.to_vec()))
 }
 
-/// The raw strings of a `KeyRangeRef` table, read with a type that does not expand.
+/// The raw fields of a `KeyRangeRef` or `MutationRef` table, with no compression or
+/// checksum handling.
 #[derive(fdb_native_wire::Wire, Debug, PartialEq)]
 #[fdb(file_identifier = 1)]
 struct RawPair<'a> {
     first: &'a [u8],
     second: &'a [u8],
+}
+
+#[derive(fdb_native_wire::Wire, Debug, PartialEq)]
+#[fdb(file_identifier = 1)]
+struct RawMutation<'a> {
+    kind: u8,
+    param1: &'a [u8],
+    param2: &'a [u8],
 }
 
 #[test]
@@ -520,9 +651,12 @@ fn the_encoder_writes_the_compressed_form() {
 #[test]
 fn key_range_single_key_compression() {
     // [k, k\0) is written (k\0, "") and read back.
-    assert_eq!(written_range(b"k", b"k\x00"), (b"k\x00".to_vec(), vec![]));
+    assert_eq!(
+        written_range(b"k", b"k\x00"),
+        Ok((b"k\x00".to_vec(), vec![]))
+    );
     // The empty key: ["", "\0") is written ("\0", "").
-    assert_eq!(written_range(b"", b"\x00"), (b"\x00".to_vec(), vec![]));
+    assert_eq!(written_range(b"", b"\x00"), Ok((b"\x00".to_vec(), vec![])));
     // Not single-key ranges: written as they are.
     for (b, e) in [
         (&b"k"[..], &b"k\x00\x00"[..]),
@@ -530,9 +664,8 @@ fn key_range_single_key_compression() {
         (b"k", b"k\x01"),
         (b"k\x00", b"k\x00"),
         (b"", b""),
-        (b"a", b""),
     ] {
-        assert_eq!(written_range(b, e), (b.to_vec(), e.to_vec()));
+        assert_eq!(written_range(b, e), Ok((b.to_vec(), e.to_vec())));
     }
 
     // Through a message: every range survives encode and decode.
@@ -540,17 +673,20 @@ fn key_range_single_key_compression() {
         KeyRange::single_key(b"k"),
         KeyRange::single_key(b""),
         KeyRange::single_key(b"\x00"),
-        KeyRange::new("k", b"k\x00\x00".to_vec()),
-        KeyRange::new("", ""),
-        KeyRange::new("a", "b"),
+        kr("k", b"k\x00\x00".to_vec()),
+        kr("", ""),
+        kr("a", "b"),
     ];
     let commit = Commit {
         read_conflict_ranges: ranges.to_vec(),
         ..Commit::default()
     };
     for v in SchemaVersion::ALL {
-        let back = Commit::decode_request(v, &commit.encode_request(v).unwrap()).unwrap();
-        assert_eq!(back.read_conflict_ranges, ranges, "{v}");
+        assert_eq!(
+            request_round_trip(v, &commit).read_conflict_ranges,
+            ranges,
+            "{v}"
+        );
     }
 
     // The reader's rules.
@@ -567,24 +703,106 @@ fn key_range_single_key_compression() {
     assert!(matches!(read(b"b", b"a"), Err(DecodeError::Invalid(_))));
 }
 
+/// C++ `KeyRangeRef::serialize` throws `inverted_range` when writing an inverted range, and a
+/// server that cannot deserialize a request exits; `(k\0, "")` would also be read back as the
+/// compressed `[k, k\0)`. Encoding refuses them, and the domain constructors do too.
+#[test]
+fn inverted_ranges_are_not_encoded() {
+    let invalid = |r: Result<(Vec<u8>, Vec<u8>), EncodeError>| {
+        assert!(matches!(r, Err(EncodeError::Invalid(_))), "{r:?}");
+    };
+    invalid(written_range(b"b", b"a"));
+    invalid(written_range(b"k\x00", b""));
+    invalid(written_range(b"a", b""));
+
+    assert!(KeyRange::new("b", "a").is_err());
+    assert!(KeyRange::new(b"k\x00".to_vec(), "").is_err());
+    assert_eq!(kr("a", "a"), KeyRange::new("a", "a").unwrap());
+
+    // Through a request: the reviewer's three probes, and a write conflict range.
+    let inverted = KeyRange {
+        begin: b"b".to_vec(),
+        end: b"a".to_vec(),
+    };
+    let open_end = KeyRange {
+        begin: b"k\x00".to_vec(),
+        end: vec![],
+    };
+    let clear_open = Mutation {
+        kind: MutationType::CLEAR_RANGE,
+        param1: b"k\x00".to_vec(),
+        param2: vec![],
+    };
+    for v in SchemaVersion::ALL {
+        for commit in [
+            Commit {
+                read_conflict_ranges: vec![inverted.clone()],
+                ..Commit::default()
+            },
+            Commit {
+                write_conflict_ranges: vec![open_end.clone()],
+                ..Commit::default()
+            },
+            Commit {
+                mutations: vec![clear_open.clone()],
+                ..Commit::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    commit.encode_request(v, TOKEN),
+                    Err(EncodeError::Invalid(_))
+                ),
+                "{v}: {commit:?}"
+            );
+        }
+        let reply = KeyServerLocations {
+            results: vec![(inverted.clone(), vec![])],
+            ..KeyServerLocations::default()
+        };
+        assert!(GetKeyServerLocations::encode_reply(v, &Ok(reply)).is_err());
+    }
+}
+
 #[test]
 fn mutation_single_key_compression() {
     let written = |kind: u8, p1: &[u8], p2: &[u8]| {
-        let (a, b) = v7_4::MutationRef::new(kind, p1, p2).wire_form();
-        (a.to_vec(), b.to_vec())
+        v7_4::MutationRef::new(kind, p1, p2)
+            .wire_form()
+            .map(|(a, b)| (a.to_vec(), b.to_vec()))
     };
     // Only a ClearRange of one key is compressed.
-    assert_eq!(written(1, b"k", b"k\x00"), (b"k\x00".to_vec(), vec![]));
-    assert_eq!(written(1, b"", b"\x00"), (b"\x00".to_vec(), vec![]));
+    assert_eq!(written(1, b"k", b"k\x00"), Ok((b"k\x00".to_vec(), vec![])));
+    assert_eq!(written(1, b"", b"\x00"), Ok((b"\x00".to_vec(), vec![])));
     assert_eq!(
         written(0, b"k", b"k\x00"),
-        (b"k".to_vec(), b"k\x00".to_vec())
+        Ok((b"k".to_vec(), b"k\x00".to_vec()))
     );
     assert_eq!(
         written(2, b"k", b"k\x00"),
-        (b"k".to_vec(), b"k\x00".to_vec())
+        Ok((b"k".to_vec(), b"k\x00".to_vec()))
     );
-    assert_eq!(written(1, b"k", b"l"), (b"k".to_vec(), b"l".to_vec()));
+    assert_eq!(written(1, b"k", b"l"), Ok((b"k".to_vec(), b"l".to_vec())));
+    // A SetValue to an empty value is not ambiguous: only clears are expanded.
+    assert_eq!(written(0, b"k\x00", b""), Ok((b"k\x00".to_vec(), vec![])));
+    // An inverted clear, including the ambiguous (k\0, ""), is refused.
+    assert!(matches!(
+        written(1, b"k\x00", b""),
+        Err(EncodeError::Invalid(_))
+    ));
+    assert!(matches!(
+        written(1, b"b", b"a"),
+        Err(EncodeError::Invalid(_))
+    ));
+    // So is a type with a checksum flag bit.
+    assert!(matches!(
+        written(0x80, b"k", b"v"),
+        Err(EncodeError::Invalid(_))
+    ));
+    assert!(matches!(
+        written(0x40, b"k", b"v"),
+        Err(EncodeError::Invalid(_))
+    ));
 
     let read = v7_4::MutationRef::from_wire_form;
     assert_eq!(
@@ -600,28 +818,132 @@ fn mutation_single_key_compression() {
     assert_eq!(read(1, b"", b""), Ok(v7_4::MutationRef::new(1, b"", b"")));
     // A compressed param1 must end in \0.
     assert!(matches!(read(1, b"k", b""), Err(DecodeError::Invalid(_))));
-    // A checksummed type (bit 7) is not interpreted: no expansion, kept as received.
-    assert_eq!(
-        read(0x81, b"k\x00", b"\x01\x02\x03\x04"),
-        Ok(v7_4::MutationRef::new(0x81, b"k\x00", b"\x01\x02\x03\x04"))
-    );
 
     // Through a message.
     let mutations = vec![
-        Mutation::new(MutationType::CLEAR_RANGE, b"k".to_vec(), b"k\x00".to_vec()),
-        Mutation::new(MutationType::CLEAR_RANGE, b"".to_vec(), b"\x00".to_vec()),
-        Mutation::new(MutationType::CLEAR_RANGE, "", ""),
-        Mutation::new(MutationType::SET_VALUE, b"k\x00".to_vec(), b"".to_vec()),
-        Mutation::new(MutationType::SET_VALUE, b"k".to_vec(), b"k\x00".to_vec()),
+        mu(MutationType::CLEAR_RANGE, b"k".to_vec(), b"k\x00".to_vec()),
+        mu(MutationType::CLEAR_RANGE, b"".to_vec(), b"\x00".to_vec()),
+        mu(MutationType::CLEAR_RANGE, "", ""),
+        mu(MutationType::SET_VALUE, b"k\x00".to_vec(), b"".to_vec()),
+        mu(MutationType::SET_VALUE, b"k".to_vec(), b"k\x00".to_vec()),
     ];
     let commit = Commit {
         mutations: mutations.clone(),
         ..Commit::default()
     };
     for v in SchemaVersion::ALL {
-        let back = Commit::decode_request(v, &commit.encode_request(v).unwrap()).unwrap();
-        assert_eq!(back.mutations, mutations, "{v}");
+        assert_eq!(request_round_trip(v, &commit).mutations, mutations, "{v}");
     }
+
+    // The domain constructor.
+    assert!(Mutation::new(MutationType::CLEAR_RANGE, "b", "a").is_err());
+    assert!(Mutation::new(MutationType::CLEAR_RANGE, b"k\x00".to_vec(), "").is_err());
+    assert!(Mutation::new(MutationType(0x81), "k", "v").is_err());
+    assert!(Mutation::new(MutationType(0x41), "k", "v").is_err());
+    assert_eq!(
+        Mutation::new(MutationType::SET_VALUE, "b", "a"),
+        Ok(Mutation {
+            kind: MutationType::SET_VALUE,
+            param1: b"b".to_vec(),
+            param2: b"a".to_vec(),
+        })
+    );
+    let _: InvalidValue = KeyRange::new("b", "a").unwrap_err();
+}
+
+/// Mutations written with `ENABLE_MUTATION_CHECKSUM` (and `ENABLE_ACCUMULATIVE_CHECKSUM`):
+/// the reader removes the flag bits and the param2 suffixes before the single-key expansion,
+/// as C++'s `offloadAccumulativeChecksumIndex` / `offloadChecksum` do.
+#[test]
+fn checksummed_mutations_are_offloaded() {
+    let decode_raw = |kind: u8, p1: &[u8], p2: &[u8]| {
+        let raw = RawMutation {
+            kind,
+            param1: p1,
+            param2: p2,
+        };
+        let bytes = encode(&raw).unwrap();
+        let reader = fdb_native_wire::Reader::new(&bytes).unwrap();
+        reader.decode_root::<v7_4::MutationRef>().map(|m| {
+            (
+                m.kind,
+                m.param1.to_vec(),
+                m.param2.to_vec(),
+                m.checksum,
+                m.accumulative_checksum_index,
+            )
+        })
+    };
+    let crc = 0x1234_5678u32.to_le_bytes();
+    let acs = 0xabcdu16.to_le_bytes();
+
+    // SetValue with a checksum.
+    assert_eq!(
+        decode_raw(0x80, b"k", &[&b"v"[..], &crc].concat()),
+        Ok((0, b"k".to_vec(), b"v".to_vec(), Some(0x1234_5678), None))
+    );
+    // With a checksum and an accumulative index.
+    assert_eq!(
+        decode_raw(0xc0 | 2, b"k", &[&b"\x01"[..], &crc, &acs].concat()),
+        Ok((
+            2,
+            b"k".to_vec(),
+            b"\x01".to_vec(),
+            Some(0x1234_5678),
+            Some(0xabcd)
+        ))
+    );
+    // A single-key clear: the suffixes are on the empty param2, then it expands.
+    assert_eq!(
+        decode_raw(0x81, b"k\x00", &crc),
+        Ok((1, b"k".to_vec(), b"k\x00".to_vec(), Some(0x1234_5678), None))
+    );
+    assert_eq!(
+        decode_raw(0xc1, b"k\x00", &[&crc[..], &acs].concat()),
+        Ok((
+            1,
+            b"k".to_vec(),
+            b"k\x00".to_vec(),
+            Some(0x1234_5678),
+            Some(0xabcd)
+        ))
+    );
+    // A param2 too short for its flags (C++'s validateParam2) is an error.
+    assert!(decode_raw(0x80, b"k", b"abc").is_err());
+    assert!(decode_raw(0xc0, b"k", b"abcde").is_err());
+    // An index flag without the checksum flag is never written, and is an error.
+    assert!(decode_raw(0x40, b"k", b"ab").is_err());
+
+    // The domain gets the plain mutation, and re-encoding writes it without checksums.
+    let m: Mutation = v7_4::MutationRef::from_wire_form(0x81, b"k\x00", &crc)
+        .unwrap()
+        .into();
+    assert_eq!(m, mu(MutationType::CLEAR_RANGE, "k", b"k\x00".to_vec()));
+    let param2 = [&b"v"[..], &crc].concat();
+    let raw = v7_4::MutationRef::from_wire_form(0x80, b"k", &param2).unwrap();
+    let bytes = fdb_native_wire::encode_with_identifier(&raw, 1).unwrap();
+    let reader = fdb_native_wire::Reader::new(&bytes).unwrap();
+    assert_eq!(
+        reader.decode_root::<RawMutation>().unwrap(),
+        RawMutation {
+            kind: 0,
+            param1: b"k",
+            param2: b"v"
+        }
+    );
+    // A domain mutation with a flag bit (built without the constructor) does not encode.
+    let commit = Commit {
+        mutations: vec![Mutation {
+            kind: MutationType(0x80),
+            param1: b"k".to_vec(),
+            param2: b"v".to_vec(),
+        }],
+        ..Commit::default()
+    };
+    assert!(matches!(
+        commit.encode_request(SchemaVersion::V8_0, TOKEN),
+        Err(EncodeError::Invalid(_))
+    ));
 }
 
 /// The C++ writer's single-key forms in the fixtures decode to expanded values.
@@ -635,14 +957,14 @@ fn fixtures_single_key_forms_expand() {
             release,
             "commit_transaction_request_single_key_clear",
         ));
-        let commit = Commit::decode_request(v, &bytes).unwrap();
+        let (commit, _) = Commit::decode_request(v, &bytes).unwrap();
         assert_eq!(
             commit.write_conflict_ranges,
             [KeyRange::single_key(b"single")]
         );
         assert_eq!(
             commit.mutations,
-            [Mutation::new(
+            [mu(
                 MutationType::CLEAR_RANGE,
                 b"single".to_vec(),
                 b"single\x00".to_vec()
@@ -810,9 +1132,7 @@ fn domain_interfaces_compute_adjusted_endpoints() {
         ("release-8.0", SchemaVersion::V8_0),
     ] {
         let bytes = record_bytes(&fixture(release, "client_db_info_envelope"));
-        let info = OpenDatabaseCoord::decode_reply(v, &bytes, NOW)
-            .unwrap()
-            .unwrap();
+        let info = OpenDatabaseCoord::decode_reply(v, &bytes).unwrap().unwrap();
         assert_eq!(info.commit_proxies.len(), 2);
         for proxy in &info.commit_proxies {
             assert_eq!(proxy.schema, v);
@@ -841,7 +1161,7 @@ fn domain_interfaces_compute_adjusted_endpoints() {
         }
 
         let bytes = record_bytes(&fixture(release, "get_key_server_locations_reply_envelope"));
-        let locations = GetKeyServerLocations::decode_reply(v, &bytes, NOW)
+        let locations = GetKeyServerLocations::decode_reply(v, &bytes)
             .unwrap()
             .unwrap();
         assert!(!locations.results.is_empty());

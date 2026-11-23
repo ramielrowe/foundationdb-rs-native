@@ -7,9 +7,13 @@
 //! documented as such; a field the domain does not carry is written as the C++ default (on 7.4,
 //! the tenant-less `TenantInfo`). Request types own their data (a commit's mutations can
 //! be moved in from the transaction's buffer and are encoded without a copy); the reply to the
-//! hottest request, [`GetValueReply`], borrows its value from the received message.
+//! hottest request, [`GetValueReply`], borrows its value from the received message. A
+//! request's reply token is not part of it: it is given to
+//! [`Request::encode_request`](crate::Request::encode_request), so the same request can be
+//! sent again with a new token.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use fdb_native_wire::{
     Endpoint, FdbError, IdempotencyId, NetworkAddress, Tag, TagSet, Uid, VersionVector,
@@ -31,10 +35,25 @@ pub const INVALID_VERSION: i64 = -1;
 // ---------------------------------------------------------------------------------------
 // Keys and mutations.
 
-/// A key range `[begin, end)`.
+/// A value FDB refuses to serialize: an inverted key range or clear, or a mutation type with
+/// checksum flag bits. Sending one would make the server fail to deserialize the request
+/// (and exit), so the constructors reject it, and so does encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidValue(pub &'static str);
+
+impl core::fmt::Display for InvalidValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidValue {}
+
+/// A key range `[begin, end)`, `begin <= end`.
 ///
 /// On the wire (`KeyRangeRef`) a single-key range `[k, k\x00)` is compressed; that is the
-/// wire types' business, not this type's.
+/// wire types' business, not this type's. The fields are public, so the invariant is
+/// checked again when a range is encoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyRange {
     /// The first key in the range.
@@ -44,12 +63,19 @@ pub struct KeyRange {
 }
 
 impl KeyRange {
-    /// `[begin, end)`.
-    pub fn new(begin: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> KeyRange {
-        KeyRange {
+    /// `[begin, end)`; an error if `begin > end` (C++ throws `inverted_range`).
+    pub fn new(
+        begin: impl Into<Vec<u8>>,
+        end: impl Into<Vec<u8>>,
+    ) -> Result<KeyRange, InvalidValue> {
+        let range = KeyRange {
             begin: begin.into(),
             end: end.into(),
+        };
+        if range.begin > range.end {
+            return Err(InvalidValue("inverted key range (begin > end)"));
         }
+        Ok(range)
     }
 
     /// `singleKeyRange(key)`: `[key, key\x00)`.
@@ -66,9 +92,8 @@ impl KeyRange {
 
 /// `MutationRef::Type`: a mutation's type byte.
 ///
-/// The value is kept as it is on the wire. Types with the checksum flags (bits 7 and 6,
-/// written only when the `ENABLE_MUTATION_CHECKSUM` client knob is set) are not interpreted:
-/// see [`crate::v7_4::MutationRef`].
+/// Bits 7 and 6 are the checksum flags of the wire form (see
+/// [`crate::v7_4::MutationRef`]), which decoding removes; a type with either set is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MutationType(pub u8);
 
@@ -120,17 +145,25 @@ pub struct Mutation {
 }
 
 impl Mutation {
-    /// A mutation of type `kind`.
+    /// A mutation of type `kind`; an error for a type with bit 6 or 7 set (the wire form's
+    /// checksum flags) or a `ClearRange` with `param1 > param2`.
     pub fn new(
         kind: MutationType,
         param1: impl Into<Vec<u8>>,
         param2: impl Into<Vec<u8>>,
-    ) -> Mutation {
-        Mutation {
+    ) -> Result<Mutation, InvalidValue> {
+        let m = Mutation {
             kind,
             param1: param1.into(),
             param2: param2.into(),
+        };
+        if kind.0 & 0xc0 != 0 {
+            return Err(InvalidValue("a mutation type has bit 6 or 7 set"));
         }
+        if kind == MutationType::CLEAR_RANGE && m.param1 > m.param2 {
+            return Err(InvalidValue("inverted ClearRange (param1 > param2)"));
+        }
+        Ok(m)
     }
 }
 
@@ -247,11 +280,16 @@ pub struct Hostname {
 /// `OpenDatabaseCoordRequest`: the client's long poll for [`ClientDbInfo`], sent to a
 /// coordinator's well-known endpoint `UID(-1, 4)`. The coordinator replies when the
 /// cluster's `ClientDBInfo` id differs from `known_client_info_id`. Identical on 7.4 and 8.0.
+///
+/// [`Default`] is empty: the caller (the coordinator monitor, let.3) must fill
+/// `supported_versions` with this client's own version, as `fdb_c` does, and the cluster
+/// file's `cluster_key`, `coordinators` and `hostnames`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenDatabaseCoord {
     /// `issues`: client issues to report in status.
     pub issues: Vec<Vec<u8>>,
-    /// `supportedVersions`.
+    /// `supportedVersions`: the client versions this client supports, shown in the
+    /// cluster's status. Must be filled in by the caller.
     pub supported_versions: Vec<ClientVersion>,
     /// `traceLogGroup`.
     pub trace_log_group: Vec<u8>,
@@ -261,11 +299,11 @@ pub struct OpenDatabaseCoord {
     pub cluster_key: Vec<u8>,
     /// `coordinators`: the cluster file's addresses.
     pub coordinators: Vec<NetworkAddress>,
-    /// The reply token.
-    pub reply: Uid,
     /// `hostnames`: the cluster file's hostnames.
     pub hostnames: Vec<Hostname>,
-    /// `internal`: whether the client is internal to the cluster (`true` in C++'s default).
+    /// `internal`: whether the client is part of the cluster's own processes. `false` is
+    /// right for a client (`fdb_c` opens databases with `IsInternal::False`); the struct's C++
+    /// default, `true`, is for server processes.
     pub internal: bool,
 }
 
@@ -281,9 +319,14 @@ pub struct VersionHistory {
 /// `ClientDBInfo`: the proxies a client talks to, from the coordinators.
 ///
 /// Version-specific fields a client does not use are not carried, and are written as their
-/// defaults: on 7.4 `tenantMode`, `encryptKeyProxy` and `metaclusterName`, on 8.0 the
-/// native CDC fields (`nativeCdcEnabled`, `nativeCdcTagCount`, `cdcProxies`,
-/// `streamToCDCProxyId`). The wire types have them all.
+/// defaults: on 7.4 `encryptKeyProxy` and `metaclusterName`, on 8.0 the native CDC fields
+/// (`nativeCdcEnabled`, `nativeCdcTagCount`, `cdcProxies`, `streamToCDCProxyId`). The wire
+/// types have them all.
+///
+/// **Identity.** An info's identity is its [`id`](ClientDbInfo::id): C++'s `operator==`
+/// compares only the ids, and the coordinator long poll ([`OpenDatabaseCoord`]'s
+/// `known_client_info_id`) is keyed on it. The derived `PartialEq` here compares every field;
+/// use `a.id == b.id` for C++'s notion of "the same info".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientDbInfo {
     /// `id`: changes whenever anything else does.
@@ -300,6 +343,24 @@ pub struct ClientDbInfo {
     pub cluster_id: Uid,
     /// `clusterType` (`ClusterType`: 0 = standalone).
     pub cluster_type: i32,
+    /// `tenantMode` (7.4 only; `None` from 8.0, which has no tenants). A 7.4 client must
+    /// refuse a tenant-less transaction when it is [`TenantMode::REQUIRED`] (C++ throws
+    /// `tenant_name_required`).
+    pub tenant_mode: Option<TenantMode>,
+}
+
+/// `TenantMode::Mode` (7.4): whether the cluster has tenants, and whether transactions must
+/// use one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TenantMode(pub u32);
+
+impl TenantMode {
+    /// `DISABLED`.
+    pub const DISABLED: TenantMode = TenantMode(0);
+    /// `OPTIONAL_TENANT`.
+    pub const OPTIONAL_TENANT: TenantMode = TenantMode(1);
+    /// `REQUIRED`: every transaction must use a tenant.
+    pub const REQUIRED: TenantMode = TenantMode(2);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -316,8 +377,6 @@ pub struct GetReadVersion {
     pub tags: BTreeMap<Vec<u8>, u32>,
     /// `debugID`.
     pub debug_id: Option<Uid>,
-    /// The reply token.
-    pub reply: Uid,
     /// `spanContext`.
     pub span_context: SpanContext,
     /// `maxVersion`: the largest version in the client's version-vector cache
@@ -344,16 +403,41 @@ impl GetReadVersion {
     pub const FLAG_USE_MIN_KNOWN_COMMITTED_VERSION: u32 = 4;
 }
 
-/// `ClientTagThrottleLimits`, with its expiration on the local clock.
+/// `ClientTagThrottleLimits`, with the duration it was sent with.
 ///
-/// On the wire the limit carries a duration (`expiration - now()` on the sender's clock);
-/// the conversions take the receiver's `now` and store `now + duration` here, as C++ does.
+/// On the wire the limit carries `expiration - now()` on the sender's clock, and C++'s reader
+/// stores `now() + duration` on its own. The duration is kept here as received; the client
+/// turns it into a deadline with the time the reply arrived
+/// ([`expires_at`](TagThrottleLimits::expires_at), or
+/// [`expires_after`](TagThrottleLimits::expires_after) with any clock). Encoding writes the
+/// duration back unchanged.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TagThrottleLimits {
     /// `tpsRate`.
     pub tps_rate: f64,
-    /// `expiration`, in seconds on the clock whose `now` was given to the decode.
-    pub expiration: f64,
+    /// `duration`: seconds from when the reply was sent until the limit expires. C++'s
+    /// `NO_EXPIRATION` is `f64::MAX`, which arrives as a duration close to it.
+    pub duration: f64,
+}
+
+impl TagThrottleLimits {
+    /// How long after the reply arrived the limit expires: `None` if it never does (the
+    /// duration does not fit a [`Duration`], as with `NO_EXPIRATION`, or is infinite), zero if
+    /// it already has (a negative or NaN duration; C++ compares `expiration > now()`, which is
+    /// false for NaN).
+    pub fn expires_after(&self) -> Option<Duration> {
+        if self.duration.is_nan() || self.duration <= 0.0 {
+            return Some(Duration::ZERO);
+        }
+        Duration::try_from_secs_f64(self.duration).ok()
+    }
+
+    /// When the limit expires, for a reply received at `received`: `None` if it never does
+    /// (see [`expires_after`](TagThrottleLimits::expires_after), and the deadline beyond
+    /// what an `Instant` can hold).
+    pub fn expires_at(&self, received: Instant) -> Option<Instant> {
+        received.checked_add(self.expires_after()?)
+    }
 }
 
 /// `GetReadVersionReply`.
@@ -398,8 +482,6 @@ pub struct GetKeyServerLocations {
     pub limit: i32,
     /// `reverse`.
     pub reverse: bool,
-    /// The reply token.
-    pub reply: Uid,
     /// `spanContext`.
     pub span_context: SpanContext,
     /// `minTenantVersion` on 7.4, `legacyVersion` on 8.0 (the same slot's value, renamed when
@@ -446,8 +528,6 @@ pub struct GetValue {
     pub version: i64,
     /// `tags`: the transaction's tags.
     pub tags: Option<TagSet>,
-    /// The reply token.
-    pub reply: Uid,
     /// `spanContext`.
     pub span_context: SpanContext,
     /// `options`.
@@ -457,8 +537,9 @@ pub struct GetValue {
     pub ss_latest_commit_versions: VersionVector,
 }
 
-/// `GetValueReply`. Borrows the value from the reply message.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// `GetValueReply`. Borrows the value from the reply message. [`Default`] is
+/// `GetValueReply()`: penalty 1.0 (`LoadBalancedReply()`), no error, no value.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GetValueReply<'a> {
     /// `penalty` (`LoadBalancedReply`): the server's load, for load balancing.
     pub penalty: f64,
@@ -469,6 +550,17 @@ pub struct GetValueReply<'a> {
     pub value: Option<&'a [u8]>,
     /// `cached`.
     pub cached: bool,
+}
+
+impl Default for GetValueReply<'_> {
+    fn default() -> Self {
+        GetValueReply {
+            penalty: 1.0,
+            error: None,
+            value: None,
+            cached: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -505,8 +597,6 @@ pub struct Commit {
     pub lock_aware: bool,
     /// `transaction.spanContext`.
     pub transaction_span_context: Option<SpanContext>,
-    /// The reply token.
-    pub reply: Uid,
     /// `flags`: [`Commit::FLAG_IS_LOCK_AWARE`], ...
     pub flags: u32,
     /// `debugID`.

@@ -56,9 +56,14 @@ fn expand_single_key<'a>(
 /// The writer sends a single-key range `[k, k\x00)` as `(begin = k\x00, end = "")`, and the
 /// reader expands a range whose `end` is empty and whose `begin` is not back to
 /// `[begin - last byte, begin)`. This type holds the expanded range; [`KeyRangeRef::wire_form`]
-/// is what is written. Decoding rejects a compressed `begin` that does not end in `\x00`
-/// (C++ `ASSERT`s, killing the process) and an inverted range, `begin > end` (C++ throws
-/// `inverted_range`). Encoding does not check for inversion.
+/// is what is written.
+///
+/// An inverted range, `begin > end`, is an error both ways, as in C++, whose `serialize`
+/// throws `inverted_range` on the writer and on the reader side (and a server that fails to
+/// deserialize a request exits, so an inverted conflict range must never be sent). It is
+/// also what keeps the compressed form unambiguous: `(k\x00, "")` as a real range would be
+/// inverted. Decoding also rejects a compressed `begin` that does not end in `\x00` (C++
+/// `ASSERT`s, killing the process).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyRangeRef<'a> {
     /// `begin`.
@@ -74,12 +79,14 @@ impl<'a> KeyRangeRef<'a> {
     }
 
     /// The `(begin, end)` the writer sends: `(end, "")` for a single-key range, else
-    /// `(begin, end)`.
-    pub fn wire_form(&self) -> (&'a [u8], &'a [u8]) {
-        if equals_key_after(self.begin, self.end) {
-            (self.end, b"")
+    /// `(begin, end)`; an error for an inverted range.
+    pub fn wire_form(&self) -> Result<(&'a [u8], &'a [u8]), EncodeError> {
+        if self.begin > self.end {
+            Err(EncodeError::Invalid("inverted KeyRangeRef (begin > end)"))
+        } else if equals_key_after(self.begin, self.end) {
+            Ok((self.end, b""))
         } else {
-            (self.begin, self.end)
+            Ok((self.begin, self.end))
         }
     }
 
@@ -106,7 +113,7 @@ impl Wire for KeyRangeRef<'_> {
 
 impl Encode for KeyRangeRef<'_> {
     fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let (begin, end) = self.wire_form();
+        let (begin, end) = self.wire_form()?;
         let mut t = w.table();
         t.field(&begin)?;
         t.field(&end)?;
@@ -133,27 +140,48 @@ impl<'de: 'a, 'a> Decode<'de> for KeyRangeRef<'a> {
 /// The writer sends a `ClearRange` (type 1) of a single key, `[k, k\x00)`, as `(type,
 /// param1 = k\x00, param2 = "")`; the reader expands a `ClearRange` whose `param2` is empty
 /// and whose `param1` is not. This type holds the expanded mutation;
-/// [`MutationRef::wire_form`] is what is written. Decoding rejects a compressed `param1` that
-/// does not end in `\x00` (C++ logs a `SevError` and marks the mutation corrupted).
+/// [`MutationRef::wire_form`] is what is written. Encoding rejects an inverted `ClearRange`
+/// (`param1 > param2`): `(k\x00, "")` would otherwise be read back as a clear of `k`. Decoding
+/// rejects a compressed `param1` that does not end in `\x00` (C++ logs a `SevError` and marks
+/// the mutation corrupted).
 ///
-/// **Checksums.** With the `ENABLE_MUTATION_CHECKSUM` client knob (off by default), C++
-/// sets bit 7 of the type (and bit 6 with an accumulative checksum index) and appends the
-/// checksum to `param2`. Neither is interpreted here: such a mutation keeps its flagged type
-/// and suffixed `param2` exactly as received (its type is not `ClearRange`, so it is not
-/// expanded) and is re-encoded unchanged. This type never adds checksums.
+/// **Checksums.** With the `ENABLE_MUTATION_CHECKSUM` client knob (off by default), the C++
+/// writer sets bit 7 of the type ([`MutationRef::CHECKSUM_FLAG`]) and appends a 4-byte
+/// checksum to the written `param2`, and with `ENABLE_ACCUMULATIVE_CHECKSUM` also bit 6
+/// ([`MutationRef::ACCUMULATIVE_CHECKSUM_INDEX_FLAG`]) and a 2-byte index after it
+/// (`MutationRef::serialize` in `fdbclient/include/fdbclient/CommitTransaction.h`, the same
+/// on 7.4 and 8.0). The reader undoes this before the single-key expansion, as C++'s
+/// deserialize branch does (`offloadAccumulativeChecksumIndex`, then `offloadChecksum`: the
+/// flag bits are cleared and the suffixes, little-endian, removed from `param2`). The values
+/// are kept in [`checksum`](MutationRef::checksum) and
+/// [`accumulative_checksum_index`](MutationRef::accumulative_checksum_index) as received; the
+/// CRC-32C is not verified (C++ only logs a mismatch and marks the mutation corrupted), and
+/// the encoder never writes checksums, like a C++ writer with the knob off. `kind` never has
+/// the flag bits: decoding rejects a `param2` too short for its flags and an index flag
+/// without the checksum flag, and encoding rejects a type with bit 6 or 7 set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MutationRef<'a> {
-    /// `type` (`MutationRef::Type`, plus the checksum flags).
+    /// `type` (`MutationRef::Type`), without the checksum flags.
     pub kind: u8,
     /// `param1`.
     pub param1: &'a [u8],
-    /// `param2`.
+    /// `param2`, without a checksum suffix.
     pub param2: &'a [u8],
+    /// The checksum suffix of a received mutation (`MutationRef::checksum`). Not written.
+    pub checksum: Option<u32>,
+    /// The accumulative checksum index suffix of a received mutation
+    /// (`MutationRef::accumulativeChecksumIndex`). Not written.
+    pub accumulative_checksum_index: Option<u16>,
 }
 
 impl<'a> MutationRef<'a> {
     /// `ClearRange`.
     pub const CLEAR_RANGE: u8 = 1;
+    /// `CHECKSUM_FLAG_MASK`: the type bit that says `param2` ends in a 4-byte checksum.
+    pub const CHECKSUM_FLAG: u8 = 0x80;
+    /// `ACCUMULATIVE_CHECKSUM_INDEX_FLAG_MASK`: the type bit that says `param2` ends in a
+    /// 2-byte accumulative checksum index (after the checksum).
+    pub const ACCUMULATIVE_CHECKSUM_INDEX_FLAG: u8 = 0x40;
 
     /// A mutation.
     pub const fn new(kind: u8, param1: &'a [u8], param2: &'a [u8]) -> Self {
@@ -161,25 +189,67 @@ impl<'a> MutationRef<'a> {
             kind,
             param1,
             param2,
+            checksum: None,
+            accumulative_checksum_index: None,
         }
     }
 
     /// The `(param1, param2)` the writer sends: `(param2, "")` for a single-key clear, else
-    /// `(param1, param2)`.
-    pub fn wire_form(&self) -> (&'a [u8], &'a [u8]) {
-        if self.kind == Self::CLEAR_RANGE && equals_key_after(self.param1, self.param2) {
-            (self.param2, b"")
+    /// `(param1, param2)`; an error for a type with a checksum flag bit or an inverted
+    /// `ClearRange`.
+    pub fn wire_form(&self) -> Result<(&'a [u8], &'a [u8]), EncodeError> {
+        if self.kind & (Self::CHECKSUM_FLAG | Self::ACCUMULATIVE_CHECKSUM_INDEX_FLAG) != 0 {
+            return Err(EncodeError::Invalid(
+                "a MutationRef type has a checksum flag bit (6 or 7) set",
+            ));
+        }
+        if self.kind != Self::CLEAR_RANGE {
+            Ok((self.param1, self.param2))
+        } else if self.param1 > self.param2 {
+            Err(EncodeError::Invalid(
+                "inverted ClearRange MutationRef (param1 > param2)",
+            ))
+        } else if equals_key_after(self.param1, self.param2) {
+            Ok((self.param2, b""))
         } else {
-            (self.param1, self.param2)
+            Ok((self.param1, self.param2))
         }
     }
 
-    /// The mutation a reader makes of `(kind, param1, param2)` as received.
+    /// The mutation a reader makes of `(type, param1, param2)` as received: checksum
+    /// suffixes removed, then a single-key clear expanded.
     pub fn from_wire_form(
-        kind: u8,
+        type_byte: u8,
         param1: &'a [u8],
         param2: &'a [u8],
     ) -> Result<Self, DecodeError> {
+        let mut kind = type_byte;
+        let mut param2 = param2;
+        let mut checksum = None;
+        let mut accumulative_checksum_index = None;
+        if kind & Self::CHECKSUM_FLAG != 0 {
+            // validateParam2, offloadAccumulativeChecksumIndex, offloadChecksum.
+            if kind & Self::ACCUMULATIVE_CHECKSUM_INDEX_FLAG != 0 {
+                let (rest, index) = param2.split_last_chunk::<2>().ok_or(DecodeError::Invalid(
+                    "a MutationRef param2 is too short for its checksum flags",
+                ))?;
+                accumulative_checksum_index = Some(u16::from_le_bytes(*index));
+                param2 = rest;
+                kind &= !Self::ACCUMULATIVE_CHECKSUM_INDEX_FLAG;
+            }
+            let (rest, crc) = param2.split_last_chunk::<4>().ok_or(DecodeError::Invalid(
+                "a MutationRef param2 is too short for its checksum flags",
+            ))?;
+            checksum = Some(u32::from_le_bytes(*crc));
+            param2 = rest;
+            kind &= !Self::CHECKSUM_FLAG;
+        } else if kind & Self::ACCUMULATIVE_CHECKSUM_INDEX_FLAG != 0 {
+            // C++ only offloads the index together with a checksum; it would keep an
+            // invalid type.
+            return Err(DecodeError::Invalid(
+                "a MutationRef has the accumulative checksum index flag without the checksum flag",
+            ));
+        }
         let (param1, param2) =
             if kind == Self::CLEAR_RANGE && param2.is_empty() && !param1.is_empty() {
                 expand_single_key(
@@ -193,6 +263,8 @@ impl<'a> MutationRef<'a> {
             kind,
             param1,
             param2,
+            checksum,
+            accumulative_checksum_index,
         })
     }
 }
@@ -203,7 +275,7 @@ impl Wire for MutationRef<'_> {
 
 impl Encode for MutationRef<'_> {
     fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let (param1, param2) = self.wire_form();
+        let (param1, param2) = self.wire_form()?;
         let mut t = w.table();
         t.field(&self.kind)?;
         t.field(&param1)?;
@@ -234,7 +306,10 @@ impl<'a> From<&'a domain::KeyRange> for KeyRangeRef<'a> {
 
 impl From<KeyRangeRef<'_>> for domain::KeyRange {
     fn from(r: KeyRangeRef<'_>) -> Self {
-        domain::KeyRange::new(r.begin, r.end)
+        domain::KeyRange {
+            begin: r.begin.to_vec(),
+            end: r.end.to_vec(),
+        }
     }
 }
 
@@ -245,8 +320,13 @@ impl<'a> From<&'a domain::Mutation> for MutationRef<'a> {
 }
 
 impl From<MutationRef<'_>> for domain::Mutation {
+    /// The checksum suffixes, already removed from `param2`, are dropped.
     fn from(m: MutationRef<'_>) -> Self {
-        domain::Mutation::new(domain::MutationType(m.kind), m.param1, m.param2)
+        domain::Mutation {
+            kind: domain::MutationType(m.kind),
+            param1: m.param1.to_vec(),
+            param2: m.param2.to_vec(),
+        }
     }
 }
 
@@ -477,8 +557,9 @@ pub struct OpenDatabaseCoordRequest<'a> {
     pub internal: bool,
 }
 
-impl<'a> From<&'a domain::OpenDatabaseCoord> for OpenDatabaseCoordRequest<'a> {
-    fn from(r: &'a domain::OpenDatabaseCoord) -> Self {
+impl<'a> OpenDatabaseCoordRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::OpenDatabaseCoord, reply: Uid) -> Self {
         OpenDatabaseCoordRequest {
             issues: r.issues.iter().map(Vec::as_slice).collect(),
             supported_versions: r
@@ -494,7 +575,7 @@ impl<'a> From<&'a domain::OpenDatabaseCoord> for OpenDatabaseCoordRequest<'a> {
             known_client_info_id: r.known_client_info_id,
             cluster_key: &r.cluster_key,
             coordinators: r.coordinators.clone(),
-            reply: ReplyPromise::new(r.reply),
+            reply: ReplyPromise::new(reply),
             hostnames: r
                 .hostnames
                 .iter()
@@ -510,6 +591,7 @@ impl<'a> From<&'a domain::OpenDatabaseCoord> for OpenDatabaseCoordRequest<'a> {
 }
 
 impl From<OpenDatabaseCoordRequest<'_>> for domain::OpenDatabaseCoord {
+    /// The reply token is `r.reply.token()`.
     fn from(r: OpenDatabaseCoordRequest<'_>) -> Self {
         domain::OpenDatabaseCoord {
             issues: r.issues.into_iter().map(<[u8]>::to_vec).collect(),
@@ -526,7 +608,6 @@ impl From<OpenDatabaseCoordRequest<'_>> for domain::OpenDatabaseCoord {
             known_client_info_id: r.known_client_info_id,
             cluster_key: r.cluster_key.to_vec(),
             coordinators: r.coordinators,
-            reply: r.reply.token(),
             hostnames: r
                 .hostnames
                 .into_iter()
@@ -545,10 +626,10 @@ impl From<OpenDatabaseCoordRequest<'_>> for domain::OpenDatabaseCoord {
 // GRV proxy.
 
 /// `ClientTagThrottleLimits` as it is on the wire: `serializer(ar, tpsRate, duration)`, where
-/// `duration` is a local of `serialize()`, `expiration - now()` on the writer's clock. The
-/// reader's `expiration` is `now() + duration` on its own clock:
-/// [`ClientTagThrottleLimits::to_domain`] and [`ClientTagThrottleLimits::from_domain`] take
-/// that `now`.
+/// `duration` is a local of `serialize()`, `expiration - now()` on the writer's clock (C++'s
+/// reader sets `expiration = now() + duration` on its own clock). The domain
+/// [`TagThrottleLimits`](domain::TagThrottleLimits) keeps the duration as received and turns
+/// it into a deadline with the receive time.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ClientTagThrottleLimits {
     /// `tpsRate`.
@@ -557,20 +638,20 @@ pub struct ClientTagThrottleLimits {
     pub duration: f64,
 }
 
-impl ClientTagThrottleLimits {
-    /// The limits with `expiration = now + duration`.
-    pub fn to_domain(self, now: f64) -> domain::TagThrottleLimits {
+impl From<ClientTagThrottleLimits> for domain::TagThrottleLimits {
+    fn from(l: ClientTagThrottleLimits) -> Self {
         domain::TagThrottleLimits {
-            tps_rate: self.tps_rate,
-            expiration: now + self.duration,
+            tps_rate: l.tps_rate,
+            duration: l.duration,
         }
     }
+}
 
-    /// The limits as written at `now`: `duration = expiration - now`.
-    pub fn from_domain(limits: &domain::TagThrottleLimits, now: f64) -> Self {
+impl From<&domain::TagThrottleLimits> for ClientTagThrottleLimits {
+    fn from(l: &domain::TagThrottleLimits) -> Self {
         ClientTagThrottleLimits {
-            tps_rate: limits.tps_rate,
-            duration: limits.expiration - now,
+            tps_rate: l.tps_rate,
+            duration: l.duration,
         }
     }
 }
@@ -691,8 +772,9 @@ fn tags_to_domain(mapping: Vec<Pair<Uid, Tag>>) -> Vec<(Uid, Tag)> {
 // Storage server.
 
 /// `GetValueReply` (`serializer(ar, LoadBalancedReply::penalty, LoadBalancedReply::error,
-/// value, cached)`). The value borrows from the message.
-#[derive(Wire, Clone, Copy, Debug, Default, PartialEq)]
+/// value, cached)`). The value borrows from the message. [`Default`] is `GetValueReply()`:
+/// penalty 1.0 (`LoadBalancedReply()`), no error, no value.
+#[derive(Wire, Clone, Copy, Debug, PartialEq)]
 #[fdb(file_identifier = 1378929)]
 pub struct GetValueReply<'a> {
     /// `penalty`.
@@ -703,6 +785,17 @@ pub struct GetValueReply<'a> {
     pub value: Option<&'a [u8]>,
     /// `cached`.
     pub cached: bool,
+}
+
+impl Default for GetValueReply<'_> {
+    fn default() -> Self {
+        GetValueReply {
+            penalty: 1.0,
+            error: None,
+            value: None,
+            cached: false,
+        }
+    }
 }
 
 impl<'a> From<GetValueReply<'a>> for domain::GetValueReply<'a> {

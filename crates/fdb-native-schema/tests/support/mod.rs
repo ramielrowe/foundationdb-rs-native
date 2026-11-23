@@ -114,6 +114,58 @@ pub fn assert_json_eq(context: &str, want: &Value, got: &Value) {
     }
 }
 
+/// The leaves of a dump as `path → value`: the path is the field names (and vector indices)
+/// from the root, e.g. `/0/transaction/mutations[1]/param1`; a union's tag is the leaf
+/// `<path>#tag`. Two dumps that differ only in some fields differ only in the leaves under
+/// those fields' paths.
+pub fn leaves(root: &Value) -> BTreeMap<String, String> {
+    fn walk(x: &Value, path: &str, out: &mut BTreeMap<String, String>) {
+        match x {
+            Value::Object(m) if m.contains_key("type") => {
+                let path = match m.get("field").and_then(Value::as_str) {
+                    Some(f) => format!("{path}/{f}"),
+                    None => path.to_string(),
+                };
+                if let Some(tag) = m.get("tag") {
+                    out.insert(format!("{path}#tag"), tag.to_string());
+                }
+                walk(&m["value"], &path, out);
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if item.get("field").is_some() {
+                        // A table or struct member: named by its field.
+                        walk(item, path, out);
+                    } else {
+                        walk(item, &format!("{path}[{i}]"), out);
+                    }
+                }
+                if items.is_empty() {
+                    out.insert(format!("{path}[]"), "empty".into());
+                }
+            }
+            other => {
+                out.insert(path.to_string(), other.to_string());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The leaf paths where two dumps differ.
+pub fn differing_leaves(want: &Value, got: &Value) -> Vec<String> {
+    let (a, b) = (leaves(want), leaves(got));
+    a.keys()
+        .chain(b.keys())
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------
 // The dumper.
 
@@ -487,7 +539,7 @@ impl Dump for v7_4::KeyRangeRef<'_> {
         "table<KeyRangeRef>".into()
     }
     fn node(&self) -> Value {
-        let (begin, end) = self.wire_form();
+        let (begin, end) = self.wire_form().expect("a valid range");
         node(
             Self::type_name(),
             table_value(vec![("begin", 1, begin.node()), ("end", 1, end.node())]),
@@ -500,7 +552,7 @@ impl Dump for v7_4::MutationRef<'_> {
         "table<MutationRef>".into()
     }
     fn node(&self) -> Value {
-        let (param1, param2) = self.wire_form();
+        let (param1, param2) = self.wire_form().expect("a valid mutation");
         node(
             Self::type_name(),
             table_value(vec![

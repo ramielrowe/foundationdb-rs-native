@@ -18,15 +18,15 @@
 //!
 //! **Tenants.** A request that has a `TenantInfo` must carry one even from a client that does
 //! not use tenants: [`TenantInfo::NONE`] (`tenantId = -1`, no token), which is what every
-//! conversion from a [`domain`] request writes. (An absent `TenantInfo` table
-//! would read as `tenantId = 0`, a real tenant id.) Decoding a request into the domain drops
-//! its tenant.
+//! conversion from a [`domain`] request writes, explicitly. (An absent `TenantInfo` table also
+//! reads as `TenantInfo()`, see [`TenantInfo`], but C++ writers always send the table and so
+//! does this crate.) Decoding a request into the domain drops its tenant.
 
 use std::collections::BTreeMap;
 
 use fdb_native_wire::{
-    IdempotencyIdRef, ReplyPromise, RequestStream, TagSet, TagSetRef, Uid, VersionVector, Void,
-    Wire,
+    Decode, DecodeError, Encode, EncodeError, IdempotencyIdRef, ObjectRef, Reader, ReplyPromise,
+    RequestStream, Shape, TagSet, TagSetRef, Uid, VersionVector, Void, Wire, Writer,
 };
 
 pub use crate::common::{
@@ -73,15 +73,56 @@ pub struct WipedString<'a> {
 
 /// `TenantInfo` (`serializable_traits<TenantInfo>`: `serializer(ar, tenantId, token,
 /// arena)`).
-#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Written by hand rather than derived for one reason: an *absent* `TenantInfo` table (a
+/// missing slot) is `TenantInfo()`, [`TenantInfo::NONE`], because C++'s `LoadMember`
+/// default-constructs a missing member (`member = std::decay_t<decltype(member)>{}`,
+/// `flow/include/flow/flat_buffers.h`) and `TenantInfo()` sets `tenantId = INVALID_TENANT`. A
+/// present table with a missing `tenantId` slot still reads 0, like any scalar. [`Default`] is
+/// also [`TenantInfo::NONE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TenantInfo<'a> {
     /// `tenantId` ([`TenantInfo::INVALID_TENANT`] for none).
     pub tenant_id: i64,
     /// `token`.
     pub token: Option<WipedString<'a>>,
     /// `arena`.
-    #[fdb(arena)]
     pub arena: (),
+}
+
+impl Default for TenantInfo<'_> {
+    fn default() -> Self {
+        TenantInfo::NONE
+    }
+}
+
+impl Wire for TenantInfo<'_> {
+    const SHAPE: Shape = Shape::Table;
+}
+
+impl Encode for TenantInfo<'_> {
+    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+        let mut t = w.table();
+        t.field(&self.tenant_id)?;
+        t.field(&self.token)?;
+        // `arena` takes no slot.
+        t.finish()
+    }
+}
+
+impl<'de: 'a, 'a> Decode<'de> for TenantInfo<'a> {
+    fn absent() -> Self {
+        TenantInfo::NONE
+    }
+
+    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+        let mut t = r.table(at)?;
+        Ok(TenantInfo {
+            tenant_id: t.field()?,
+            token: t.field()?,
+            arena: (),
+        })
+    }
 }
 
 impl TenantInfo<'_> {
@@ -161,12 +202,14 @@ impl From<ClientDBInfo<'_>> for domain::ClientDbInfo {
             history: info.history.into_iter().map(Into::into).collect(),
             cluster_id: info.cluster_id,
             cluster_type: info.cluster_type,
+            tenant_mode: Some(domain::TenantMode(info.tenant_mode.mode)),
         }
     }
 }
 
 impl<'a> From<&'a domain::ClientDbInfo> for ClientDBInfo<'a> {
-    /// `tenantMode`, `encryptKeyProxy` and `metaclusterName` are written as their defaults.
+    /// `encryptKeyProxy` and `metaclusterName` are written as their defaults, and
+    /// `tenantMode` as `DISABLED` when the domain has none.
     fn from(info: &'a domain::ClientDbInfo) -> Self {
         ClientDBInfo {
             grv_proxies: info.grv_proxies.iter().map(Into::into).collect(),
@@ -174,7 +217,9 @@ impl<'a> From<&'a domain::ClientDbInfo> for ClientDBInfo<'a> {
             id: info.id,
             forward: info.forward.as_deref(),
             history: info.history.iter().map(Into::into).collect(),
-            tenant_mode: TenantMode::default(),
+            tenant_mode: TenantMode {
+                mode: info.tenant_mode.unwrap_or_default().0,
+            },
             encrypt_key_proxy: None,
             cluster_id: info.cluster_id,
             cluster_type: info.cluster_type,
@@ -207,15 +252,16 @@ pub struct GetReadVersionRequest<'a> {
     pub max_version: i64,
 }
 
-impl<'a> From<&'a domain::GetReadVersion> for GetReadVersionRequest<'a> {
+impl<'a> GetReadVersionRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
     /// `max_grv_queue_delay_ms` does not exist on 7.4 and is not sent.
-    fn from(r: &'a domain::GetReadVersion) -> Self {
+    pub fn from_domain(r: &'a domain::GetReadVersion, reply: Uid) -> Self {
         GetReadVersionRequest {
             transaction_count: r.transaction_count,
             flags: r.flags,
             tags: r.tags.iter().map(|(k, v)| (k.as_slice(), *v)).collect(),
             debug_id: r.debug_id,
-            reply: ReplyPromise::new(r.reply),
+            reply: ReplyPromise::new(reply),
             span_context: r.span_context,
             max_version: r.max_version,
         }
@@ -229,7 +275,6 @@ impl From<GetReadVersionRequest<'_>> for domain::GetReadVersion {
             flags: r.flags,
             tags: r.tags.into_iter().map(|(k, v)| (k.to_vec(), v)).collect(),
             debug_id: r.debug_id,
-            reply: r.reply.token(),
             span_context: r.span_context,
             max_version: r.max_version,
             max_grv_queue_delay_ms: None,
@@ -268,8 +313,8 @@ pub struct GetReadVersionReply<'a> {
 }
 
 impl<'a> GetReadVersionReply<'a> {
-    /// The domain reply; throttle expirations are `now + duration`.
-    pub fn to_domain(self, now: f64) -> domain::ReadVersion {
+    /// The domain reply (throttle limits keep their durations).
+    pub fn to_domain(self) -> domain::ReadVersion {
         domain::ReadVersion {
             process_busy_time: self.process_busy_time,
             version: self.version,
@@ -278,7 +323,7 @@ impl<'a> GetReadVersionReply<'a> {
             tag_throttle_info: self
                 .tag_throttle_info
                 .into_iter()
-                .map(|(tag, limits)| (tag.to_vec(), limits.to_domain(now)))
+                .map(|(tag, limits)| (tag.to_vec(), limits.into()))
                 .collect(),
             mid_shard_size: self.mid_shard_size,
             rk_default_throttled: self.rk_default_throttled,
@@ -289,8 +334,8 @@ impl<'a> GetReadVersionReply<'a> {
         }
     }
 
-    /// The reply as written at `now`: throttle durations are `expiration - now`.
-    pub fn from_domain(r: &'a domain::ReadVersion, now: f64) -> Self {
+    /// The reply for `r`.
+    pub fn from_domain(r: &'a domain::ReadVersion) -> Self {
         GetReadVersionReply {
             process_busy_time: r.process_busy_time,
             version: r.version,
@@ -299,12 +344,7 @@ impl<'a> GetReadVersionReply<'a> {
             tag_throttle_info: r
                 .tag_throttle_info
                 .iter()
-                .map(|(tag, limits)| {
-                    (
-                        tag.as_slice(),
-                        ClientTagThrottleLimits::from_domain(limits, now),
-                    )
-                })
+                .map(|(tag, limits)| (tag.as_slice(), ClientTagThrottleLimits::from(limits)))
                 .collect(),
             mid_shard_size: r.mid_shard_size,
             rk_default_throttled: r.rk_default_throttled,
@@ -345,14 +385,15 @@ pub struct GetKeyServerLocationsRequest<'a> {
     pub arena: (),
 }
 
-impl<'a> From<&'a domain::GetKeyServerLocations> for GetKeyServerLocationsRequest<'a> {
-    fn from(r: &'a domain::GetKeyServerLocations) -> Self {
+impl<'a> GetKeyServerLocationsRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::GetKeyServerLocations, reply: Uid) -> Self {
         GetKeyServerLocationsRequest {
             begin: &r.begin,
             end: r.end.as_deref(),
             limit: r.limit,
             reverse: r.reverse,
-            reply: ReplyPromise::new(r.reply),
+            reply: ReplyPromise::new(reply),
             span_context: r.span_context,
             tenant: TenantInfo::NONE,
             min_tenant_version: r.min_tenant_version,
@@ -368,7 +409,6 @@ impl From<GetKeyServerLocationsRequest<'_>> for domain::GetKeyServerLocations {
             end: r.end.map(<[u8]>::to_vec),
             limit: r.limit,
             reverse: r.reverse,
-            reply: r.reply.token(),
             span_context: r.span_context,
             min_tenant_version: r.min_tenant_version,
         }
@@ -442,13 +482,14 @@ pub struct GetValueRequest<'a> {
     pub ss_latest_commit_versions: VersionVector,
 }
 
-impl<'a> From<&'a domain::GetValue> for GetValueRequest<'a> {
-    fn from(r: &'a domain::GetValue) -> Self {
+impl<'a> GetValueRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::GetValue, reply: Uid) -> Self {
         GetValueRequest {
             key: &r.key,
             version: r.version,
             tags: r.tags.as_ref().map(TagSet::borrowed),
-            reply: ReplyPromise::new(r.reply),
+            reply: ReplyPromise::new(reply),
             span_context: r.span_context,
             tenant_info: TenantInfo::NONE,
             options: r.options.as_ref().map(ReadOptions::from),
@@ -463,7 +504,6 @@ impl From<GetValueRequest<'_>> for domain::GetValue {
             key: r.key.to_vec(),
             version: r.version,
             tags: r.tags.map(TagSetRef::into_owned),
-            reply: r.reply.token(),
             span_context: r.span_context,
             options: r.options.map(Into::into),
             ss_latest_commit_versions: r.ss_latest_commit_versions,
@@ -502,11 +542,12 @@ pub struct CommitTransactionRequest<'a> {
     pub arena: (),
 }
 
-impl<'a> From<&'a domain::Commit> for CommitTransactionRequest<'a> {
-    fn from(c: &'a domain::Commit) -> Self {
+impl<'a> CommitTransactionRequest<'a> {
+    /// The request for `c`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(c: &'a domain::Commit, reply: Uid) -> Self {
         CommitTransactionRequest {
             transaction: CommitTransactionRef::from(c),
-            reply: ReplyPromise::new(c.reply),
+            reply: ReplyPromise::new(reply),
             flags: c.flags,
             debug_id: c.debug_id,
             commit_cost_estimation: c.commit_cost_estimation.as_ref().map(Into::into),
@@ -525,7 +566,6 @@ impl<'a> From<&'a domain::Commit> for CommitTransactionRequest<'a> {
 impl From<CommitTransactionRequest<'_>> for domain::Commit {
     fn from(r: CommitTransactionRequest<'_>) -> Self {
         let mut commit = domain::Commit {
-            reply: r.reply.token(),
             flags: r.flags,
             debug_id: r.debug_id,
             commit_cost_estimation: r.commit_cost_estimation.map(Into::into),

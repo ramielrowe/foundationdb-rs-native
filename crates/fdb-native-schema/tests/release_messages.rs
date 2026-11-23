@@ -18,9 +18,6 @@ use fdb_native_wire::{DecodeError, EnsureTable, ErrorOr, FileIdentified, decode,
 use serde_json::Value;
 use support::*;
 
-/// The local clock the reply conversions get (any value round-trips durations).
-const NOW: f64 = 1000.0;
-
 /// One fixture checked: its bytes, the Rust re-encoding, and the domain layer's encoding.
 struct Outcome {
     release: &'static str,
@@ -32,8 +29,8 @@ struct Outcome {
     reencoded: Vec<u8>,
     /// Whether `reencoded` is byte-identical to the fixture.
     identical: bool,
-    /// The fixture decoded into the domain, encoded again through [`Request`], and the
-    /// dump of that encoding as the Rust wire type reads it.
+    /// The fixture decoded into the domain, encoded again through [`Request`] (with the
+    /// fixture's reply token), and the dump of that encoding as the Rust wire type reads it.
     domain: Option<(Vec<u8>, Value)>,
 }
 
@@ -77,12 +74,12 @@ macro_rules! check_request {
     ($ty:ty, $domain:ty, $version:expr, $release:literal, $name:literal, $cpp:literal) => {{
         let mut outcome = check!($ty, $release, $name, $cpp);
         let bytes = record_bytes(&fixture($release, $name));
-        let request =
+        let (request, token) =
             <$domain>::decode_request($version, &bytes).expect(concat!($name, ": domain"));
-        let encoded = request.encode_request($version).expect($name);
+        let encoded = request.encode_request($version, token).expect($name);
         assert_eq!(
             <$domain>::decode_request($version, &encoded).as_ref(),
-            Ok(&request),
+            Ok(&(request, token)),
             "{}/{}",
             $release,
             $name
@@ -99,11 +96,10 @@ macro_rules! check_reply {
     ($ty:ty, $domain:ty, $version:expr, $release:literal, $name:literal, $cpp:literal) => {{
         let mut outcome = check!(ErrorOr<EnsureTable<$ty>>, $release, $name, $cpp);
         let bytes = record_bytes(&fixture($release, $name));
-        let reply =
-            <$domain>::decode_reply($version, &bytes, NOW).expect(concat!($name, ": domain"));
-        let encoded = <$domain>::encode_reply($version, &reply, NOW).expect($name);
+        let reply = <$domain>::decode_reply($version, &bytes).expect(concat!($name, ": domain"));
+        let encoded = <$domain>::encode_reply($version, &reply).expect($name);
         assert_eq!(
-            <$domain>::decode_reply($version, &encoded, NOW).as_ref(),
+            <$domain>::decode_reply($version, &encoded).as_ref(),
             Ok(&reply),
             "{}/{}",
             $release,
@@ -113,6 +109,58 @@ macro_rules! check_reply {
         outcome.domain = Some((encoded.clone(), root1(&wire)));
         outcome
     }};
+}
+
+/// The fields the domain layer does not carry, by fixture: the leaf paths (prefixes) where
+/// the dump of a fixture's domain re-encoding may differ from the fixture. Every one is
+/// documented in `domain` or the schema sets; each listed prefix must actually differ (the
+/// fixture sets the field to a non-default value), so a field dropped by mistake, in both
+/// directions of the conversions, shows up as an unexpected difference.
+fn dropped_by_the_domain(release: &str, name: &str) -> &'static [&'static str] {
+    match (release, name) {
+        // The tenant of a 7.4 request (the domain is tenant-less; it writes TenantInfo::NONE).
+        ("release-7.4", "get_value_request") => &["/0/tenantInfo/"],
+        ("release-7.4", "get_key_server_locations_request") => &["/0/tenant/"],
+        // tenantIds is set by the commit proxy; the 7.4 fixture also has a tenant.
+        ("release-7.4", "commit_transaction_request") => {
+            &["/0/tenantInfo/", "/0/transaction/tenantIds"]
+        }
+        ("release-8.0", "commit_transaction_request") => &["/0/transaction/tenantIds"],
+        // ClientDBInfo fields a client does not use.
+        ("release-7.4", "client_db_info_envelope") => &["/0/encryptKeyProxy", "/0/metaclusterName"],
+        ("release-8.0", "client_db_info_envelope") => &[
+            "/0/nativeCdcEnabled",
+            "/0/nativeCdcTagCount",
+            "/0/cdcProxies",
+            "/0/streamToCDCProxyId",
+        ],
+        _ => &[],
+    }
+}
+
+/// Checks the domain re-encodings against [`dropped_by_the_domain`].
+fn check_dropped_fields(outcomes: &[Outcome]) {
+    for o in outcomes {
+        let Some((_, dump)) = &o.domain else { continue };
+        let allowed = dropped_by_the_domain(o.release, o.name);
+        let diffs = differing_leaves(&o.root, dump);
+        for d in &diffs {
+            assert!(
+                allowed.iter().any(|p| d.starts_with(p)),
+                "{}/{}: the domain round trip changed {d} (all differences: {diffs:?})",
+                o.release,
+                o.name
+            );
+        }
+        for p in allowed {
+            assert!(
+                diffs.iter().any(|d| d.starts_with(p)),
+                "{}/{}: {p} is listed as dropped but did not change",
+                o.release,
+                o.name
+            );
+        }
+    }
 }
 
 fn release_7_4() -> Vec<Outcome> {
@@ -459,12 +507,16 @@ fn report(outcomes: &[Outcome]) {
 
 #[test]
 fn release_7_4_fixtures() {
-    report(&release_7_4());
+    let outcomes = release_7_4();
+    check_dropped_fields(&outcomes);
+    report(&outcomes);
 }
 
 #[test]
 fn release_8_0_fixtures() {
-    report(&release_8_0());
+    let outcomes = release_8_0();
+    check_dropped_fields(&outcomes);
+    report(&outcomes);
 }
 
 /// Every message fixture is either checked above or explicitly outside the slice.

@@ -22,14 +22,14 @@
 //!
 //! let version = SchemaVersion::for_protocol_version(ProtocolVersion::V7_4).unwrap();
 //! let commit = Commit {
-//!     mutations: vec![Mutation::new(MutationType::SET_VALUE, "k", "v")],
+//!     mutations: vec![Mutation::new(MutationType::SET_VALUE, "k", "v")?],
 //!     write_conflict_ranges: vec![KeyRange::single_key(b"k")],
 //!     read_snapshot: 1000,
-//!     reply: Uid::new(7, 8),
 //!     ..Commit::default()
 //! };
-//! let bytes = commit.encode_request(version)?; // with the 7.4 tenant-less TenantInfo
-//! assert_eq!(Commit::decode_request(version, &bytes)?, commit);
+//! let reply_token = Uid::new(7, 8); // from the request layer's reply endpoint
+//! let bytes = commit.encode_request(version, reply_token)?; // with the 7.4 tenant-less TenantInfo
+//! assert_eq!(Commit::decode_request(version, &bytes)?, (commit, reply_token));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -41,11 +41,12 @@
 //! are adjusted endpoints whose indices are in [`streams`] (the domain interfaces'
 //! `endpoints()` computes them).
 //!
-//! Wire quirks handled here: single-key compression of `KeyRangeRef` and `MutationRef`
-//! ([`v7_4::KeyRangeRef`], [`v7_4::MutationRef`]), the tenant-less `TenantInfo` a 7.4
-//! request must carry ([`v7_4::TenantInfo::NONE`]), and `ClientTagThrottleLimits`, which
-//! travels as a duration and is an expiration on the local clock in the domain
-//! ([`v7_4::ClientTagThrottleLimits`]).
+//! Wire quirks handled here: single-key compression of `KeyRangeRef` and `MutationRef`, and
+//! the refusal to encode the inverted ranges and clears C++ cannot serialize
+//! ([`v7_4::KeyRangeRef`], [`v7_4::MutationRef`]); `MutationRef`'s optional checksum suffixes;
+//! the tenant-less `TenantInfo` a 7.4 request must carry ([`v7_4::TenantInfo::NONE`]); and
+//! `ClientTagThrottleLimits`, which travels as a duration relative to the sender's clock
+//! ([`domain::TagThrottleLimits::expires_at`]).
 //!
 //! # Binary-format values
 //!
@@ -85,6 +86,6 @@ pub use idempotency::{
     IDEMPOTENCY_ID_KEYS_BEGIN, IdempotencyEntry, IdempotencyValue, decode_idempotency_key,
     idempotency_key, idempotency_scan_range,
 };
-pub use request::{Request, decode_reply, encode_request};
+pub use request::{Request, decode_reply, encode_request, encode_request_into};
 pub use span_context::{SpanContext, TraceFlags};
 pub use version::SchemaVersion;
