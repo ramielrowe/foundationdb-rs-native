@@ -57,9 +57,9 @@
 //! }
 //! ```
 //!
-//! The vertical slice is **reads of single keys, writes, clears, atomic operations and
-//! commits**, with FDB's conflict detection and retry semantics; reads do not yet see the
-//! transaction's own writes (see [`transaction`]).
+//! The client does **reads (keys, key selectors, ranges and range streams), writes, clears,
+//! atomic operations, watches and commits**, with FDB's conflict detection and retry
+//! semantics; reads do not yet see the transaction's own writes (see [`transaction`]).
 //!
 //! # Layers
 //!
@@ -68,8 +68,8 @@
 //! * [`cluster_file`]: cluster files and connection strings.
 //! * [`cluster`]: the coordinator connection, [`ClusterMonitor`], which keeps the client's
 //!   `ClientDBInfo` (its GRV and commit proxies) current.
-//! * [`read`]: the read path, [`Reader`]: read versions, the key location cache, and
-//!   values.
+//! * [`read`]: the read path, [`Reader`]: read versions, the key location cache, values,
+//!   key selectors and ranges.
 //! * [`commit`]: the commit path, [`Committer`] and [`CommitBuffer`].
 //! * [`watch`]: watches ([`Transaction::watch`]).
 //!
@@ -105,6 +105,13 @@ pub use cluster_file::{
 pub use database::{ClientTls, Database, DatabaseOptions, MaybeCommitted};
 pub use error::{Error, TransactionRetry};
 pub use fdb_native_schema::domain::{KeySelector, MutationType};
-pub use read::{KeyLocation, ReadConfig, ReadSnapshot, ReadVersionOptions, Reader};
-pub use transaction::{CommitResult, Snapshot, Transaction, TransactionOption};
+pub use fdb_native_wire::KeyValue;
+pub use read::{
+    KeyLocation, RangeLimits, RangeOptions, RangeRead, ReadConfig, ReadSnapshot,
+    ReadVersionOptions, Reader, StreamingMode,
+};
+pub use transaction::{
+    CommitResult, KeyValueStream, RangeResult, RangeStream, Snapshot, Transaction,
+    TransactionOption,
+};
 pub use watch::{Watch, WatchConfig};

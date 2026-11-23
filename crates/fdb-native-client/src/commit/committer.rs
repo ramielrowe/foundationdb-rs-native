@@ -150,8 +150,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         options: &CommitOptions,
         sent: &AtomicBool,
     ) -> Result<CommitOutcome, Error> {
-        let (mutations, reads, writes) = buffer.into_parts();
-        self.commit_tracked(read_version, mutations, reads, writes, options, sent)
+        let (mutations, reads, writes, extra) = buffer.into_parts_with_extra();
+        self.commit_tracked(read_version, mutations, reads, writes, extra, options, sent)
             .await
     }
 
@@ -200,18 +200,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             mutations,
             read_conflicts,
             write_conflicts,
+            Vec::new(),
             options,
             &AtomicBool::new(false),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn commit_tracked(
         &self,
         read_version: i64,
         mutations: Vec<Mutation>,
         read_conflicts: Vec<KeyRange>,
         write_conflicts: Vec<KeyRange>,
+        extra_read_conflicts: Vec<KeyRange>,
         options: &CommitOptions,
         sent: &AtomicBool,
     ) -> Result<CommitOutcome, Error> {
@@ -222,6 +225,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             mutations,
             read_conflicts,
             write_conflicts,
+            extra_read_conflicts,
             options,
             &limits,
             || uid,
@@ -326,6 +330,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             Vec::new(),
             vec![range.clone()],
             vec![range.clone()],
+            Vec::new(),
             options,
             limits,
             Uid::default,

@@ -10,7 +10,7 @@ use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::VersionVector;
 
 use super::location::{KEY_SPACE_END, Location};
-use super::{ReadSnapshot, Reader, lock};
+use super::{ReadSnapshot, Reader, Shared, lock};
 use crate::error::Error;
 use crate::error::codes::*;
 
@@ -51,7 +51,25 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if selector.key.as_slice() > KEY_SPACE_END {
             return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
-        let shared = &self.inner.shared;
+        get_key(
+            &self.inner.shared,
+            selector,
+            version,
+            use_provisional_proxies,
+        )
+        .await
+    }
+}
+
+/// `getKey`'s loop, after [`Reader::get_key_with`]'s argument checks (`getRangeFallback`
+/// resolves its selectors with it too).
+pub(crate) async fn get_key<R: Runtime, W: StreamWrapper<R::Stream>>(
+    shared: &Shared<R, W>,
+    selector: &KeySelector,
+    version: i64,
+    use_provisional_proxies: bool,
+) -> Result<Vec<u8>, Error> {
+    {
         let mut k = selector.clone();
         // As in `get_with`: the previous attempt's location stays alive until the next one is
         // known.

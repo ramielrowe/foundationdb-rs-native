@@ -189,6 +189,8 @@ pub mod codes {
     pub const READ_VERSION_ALREADY_SET: u16 = 2010;
     /// `version_invalid` (2011).
     pub const VERSION_INVALID: u16 = 2011;
+    /// `range_limits_invalid` (2012).
+    pub const RANGE_LIMITS_INVALID: u16 = 2012;
     /// `used_during_commit` (2017).
     pub const USED_DURING_COMMIT: u16 = 2017;
     /// `invalid_mutation_type` (2018).
@@ -209,6 +211,8 @@ pub mod codes {
     pub const CONNECTION_STRING_INVALID: u16 = 2104;
     /// `tls_error` (2107).
     pub const TLS_ERROR: u16 = 2107;
+    /// `exact_mode_without_limits` (2210).
+    pub const EXACT_MODE_WITHOUT_LIMITS: u16 = 2210;
     /// `unknown_error` (4000).
     pub const UNKNOWN_ERROR: u16 = 4000;
     /// `internal_error` (4100).

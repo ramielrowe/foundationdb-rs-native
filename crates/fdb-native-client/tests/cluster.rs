@@ -8,15 +8,23 @@
 //!   cluster with small shards, split into several shards; selectors that cross shard
 //!   boundaries forward and backward, with offsets in the thousands (several byte-limited
 //!   replies per shard), resolve to what the known key list says.
+//! * `getRange` across shards: the same data read whole, forward and reverse, by the reader
+//!   (unlimited), by range streams in every streaming mode, with row limits that stop
+//!   inside later shards, and with selectors that need `getKey`; checked against the key
+//!   list and `fdbcli getrange`.
 
 #![cfg(feature = "tokio")]
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use fdb_native_client::read::KEY_SPACE_END;
-use fdb_native_client::{Database, KeySelector};
+use std::future::poll_fn;
+use std::pin::Pin;
+
+use fdb_native_client::read::{KEY_SPACE_END, RangeLimits, RangeOptions, StreamingMode};
+use fdb_native_client::{Database, KeySelector, KeyValue};
 use fdb_native_testkit::FdbCluster;
+use futures_core::Stream;
 
 const LIMIT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(240);
@@ -156,6 +164,167 @@ async fn cluster_get_key_resolves_selectors_across_shards() {
             .unwrap();
         assert_eq!(got, key(i));
     }
+
+    db.shutdown().await;
+    drop(db);
+    tokio::task::spawn_blocking(move || drop(cluster))
+        .await
+        .unwrap();
+}
+
+async fn collect<S: Stream + Unpin>(mut stream: S) -> Vec<S::Item> {
+    let mut out = Vec::new();
+    while let Some(item) = within("stream", poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))).await
+    {
+        out.push(item);
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn cluster_get_range_reads_across_shards() {
+    let cluster = Arc::new(
+        tokio::task::spawn_blocking(|| FdbCluster::builder().small_shards().start())
+            .await
+            .unwrap()
+            .expect("cluster"),
+    );
+    println!("{cluster}");
+    let shards = {
+        let cluster = cluster.clone();
+        tokio::task::spawn_blocking(move || {
+            cluster.write_keys("k", COUNT, 1000)?;
+            cluster.wait_for_partitions(4, WAIT)
+        })
+        .await
+        .unwrap()
+        .expect("keys written and split")
+    };
+    println!("{shards} shards");
+    let keys: Vec<Vec<u8>> = (0..COUNT).map(key).collect();
+    let mut reversed = keys.clone();
+    reversed.reverse();
+    let fge = |k: &[u8]| KeySelector::first_greater_or_equal(k.to_vec());
+    let keys_of =
+        |rows: &[KeyValue]| -> Vec<Vec<u8>> { rows.iter().map(|kv| kv.key.clone()).collect() };
+
+    let db = Database::open(Some(cluster.cluster_file())).expect("database");
+    let reader = db.reader();
+    let version = within("GRV", reader.get_read_version()).await.unwrap();
+
+    // The reader, unlimited: every shard, both directions (3 MB: several requests a shard).
+    for (reverse, want) in [(false, &keys), (true, &reversed)] {
+        let r = within(
+            "reader",
+            reader.get_range_with_limits(
+                &fge(b"k"),
+                &fge(b"l"),
+                RangeLimits::UNLIMITED,
+                reverse,
+                version,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!r.more());
+        let rows = r.into_key_values();
+        assert_eq!(&keys_of(&rows), want, "reverse {reverse}");
+        assert!(rows.iter().all(|kv| kv.value.len() == 1000));
+    }
+    let cached = reader.cached_locations();
+    assert!(cached >= 3, "the reads crossed several shards ({cached})");
+
+    // Streams in every mode, both directions.
+    let tx = db.create_transaction();
+    for mode in [
+        StreamingMode::Iterator,
+        StreamingMode::Serial,
+        StreamingMode::Large,
+    ] {
+        for (reverse, want) in [(false, &keys), (true, &reversed)] {
+            let o = RangeOptions::default().mode(mode).reverse(reverse);
+            let rows: Vec<KeyValue> = collect(tx.range_stream(fge(b"k"), fge(b"l"), o))
+                .await
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(&keys_of(&rows), want, "{mode:?} reverse {reverse}");
+        }
+    }
+
+    // Row limits that end inside later shards, from the middle.
+    for (b, n) in [(0, 2500), (700, 1700), (2999, 10)] {
+        for reverse in [false, true] {
+            let o = RangeOptions::with_limit(n)
+                .mode(StreamingMode::Exact)
+                .reverse(reverse);
+            let (begin, end) = if reverse {
+                (fge(b"k"), fge(&key(b)))
+            } else {
+                (fge(&key(b)), fge(b"l"))
+            };
+            let r = within("limit", tx.get_range(&begin, &end, &o))
+                .await
+                .unwrap();
+            let want: Vec<Vec<u8>> = if reverse {
+                reversed[COUNT - b..]
+                    .iter()
+                    .take(n as usize)
+                    .cloned()
+                    .collect()
+            } else {
+                keys[b..].iter().take(n as usize).cloned().collect()
+            };
+            assert_eq!(keys_of(&r.kvs), want, "{b} limit {n} reverse {reverse}");
+        }
+    }
+
+    // Selectors that need `getKey` across shards.
+    let s = |k: Vec<u8>, or_equal: bool, offset: i32| KeySelector::new(k, or_equal, offset);
+    for (b, e, from, to) in [
+        (s(key(100), false, 1000), s(key(2900), false, 0), 1099, 2899),
+        (
+            s(key(1500), true, -1200),
+            s(key(1500), true, 1200),
+            300,
+            2700,
+        ),
+        (
+            s(b"k".to_vec(), false, 2950),
+            s(b"l".to_vec(), false, 5),
+            2949,
+            COUNT,
+        ),
+    ] {
+        for reverse in [false, true] {
+            let o = RangeOptions::with_limit(5000)
+                .mode(StreamingMode::Exact)
+                .reverse(reverse);
+            let r = within("selectors", tx.get_range(&b, &e, &o)).await.unwrap();
+            let got: Vec<Vec<u8>> = keys_of(&r.kvs)
+                .into_iter()
+                .filter(|k| k.starts_with(b"k"))
+                .collect();
+            let mut want = keys[from..to].to_vec();
+            if reverse {
+                want.reverse();
+            }
+            assert_eq!(got, want, "{b:?}..{e:?} reverse {reverse}");
+        }
+    }
+
+    // fdbcli agrees on a window across a boundary.
+    let out = {
+        let cluster = cluster.clone();
+        tokio::task::spawn_blocking(move || cluster.fdbcli("getrangekeys k00000990 k00002010 2000"))
+            .await
+            .unwrap()
+            .expect("fdbcli")
+    };
+    let printed = out.matches("`k0000").count();
+    assert_eq!(printed, 2010 - 990, "{out}");
 
     db.shutdown().await;
     drop(db);
