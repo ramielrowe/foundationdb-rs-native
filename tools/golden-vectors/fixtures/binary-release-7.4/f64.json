@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "f64",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "double 3.141592653589793: the IEEE bits, little-endian.",
+  "cpp_type": "double",
+  "type": "f64",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 8,
+  "bytes": "182d4454fb210940",
+  "value": 3.1415926535897931
+}

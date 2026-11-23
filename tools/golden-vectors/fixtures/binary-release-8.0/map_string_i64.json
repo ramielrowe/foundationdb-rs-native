@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "map_string_i64",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::map<std::string, int64_t>: a count, then each key and its value.",
+  "cpp_type": "std::map<std::string, int64_t>",
+  "type": "map<string,i64>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 31,
+  "bytes": "0200000001000000780100000000000000020000007979feffffffffffffff",
+  "value": [
+    ["x", 1],
+    ["yy", -2]
+  ]
+}

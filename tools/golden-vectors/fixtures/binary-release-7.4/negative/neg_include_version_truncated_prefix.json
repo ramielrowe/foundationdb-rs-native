@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_include_version_truncated_prefix",
+  "kind": "negative",
+  "description": "An IncludeVersion() input shorter than the 8-byte prefix.",
+  "type": "u32",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "bytes": "000000b0",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

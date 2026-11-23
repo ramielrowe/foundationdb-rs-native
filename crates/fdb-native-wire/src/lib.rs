@@ -8,7 +8,8 @@
 //! format; this crate is tested against the vectors that tool generates from FDB's own
 //! C++ code, and its output against FDB's readers.
 //!
-//! The legacy `BinaryWriter` format is not implemented yet.
+//! The legacy `BinaryWriter`/`BinaryReader` format, which a few places in the protocol still use,
+//! is in the [`binary`] module.
 //!
 //! # Usage
 //!
@@ -98,6 +99,10 @@
 //! [`Reader::vector_header`] and [`Decode::decode_element`] give the same element-wise
 //! access, and [`Reader::blob_range`] the position of a string in the message for owned
 //! zero-copy types (such as `bytes::Bytes` slices of a packet).
+//!
+//! FlowTransport's types are here too: [`ReplyPromise<T>`] and [`RequestStream<T>`] (with the
+//! [`Endpoint`] it holds), which request and interface structs contain, and [`VectorRef<T>`],
+//! a `Vec<T>` with `VectorRef`'s file identifier for a vector that is a message's root.
 //!
 //! Tables, unions and structs are normally derived with
 #![cfg_attr(feature = "derive", doc = "[`#[derive(Wire)]`](derive@Wire)")]
@@ -198,6 +203,7 @@
 
 #![warn(missing_docs)]
 
+pub mod binary;
 mod codec;
 mod codecs;
 mod collections;
@@ -205,6 +211,7 @@ mod error;
 mod file_identifier;
 mod protocol_version;
 mod reader;
+mod rpc;
 mod shape;
 mod types;
 mod view;
@@ -226,6 +233,9 @@ pub use fdb_native_wire_derive::Wire;
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
 pub use protocol_version::ProtocolVersion;
 pub use reader::{MAX_DEPTH, Reader, TableReader, VectorHeader};
+pub use rpc::{
+    Endpoint, IpAddress, NetworkAddress, NetworkAddressList, ReplyPromise, RequestStream, VectorRef,
+};
 pub use shape::Shape;
 pub use types::{EnsureTable, ErrorOr, FdbError, Uid, Void};
 pub use view::{VectorIter, VectorView};

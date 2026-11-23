@@ -9,12 +9,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, FdbError, FileIdentified,
-    FileIdentifier, ObjectRef, Reader, Shape, Uid, Void, Wire, Wrapper, Writer,
+    ObjectRef, Reader, ReplyPromise, Shape, Uid, VectorRef, Void, Wire, Writer,
     encode_with_identifier,
 };
 use proptest::prelude::*;
@@ -591,19 +590,6 @@ impl Arb for KvVector {
     }
 }
 
-/// `ReplyPromise<T>`: a table holding the reply endpoint token; its file identifier
-/// composes `T`'s with code 1 (hand-written: the derive only takes plain identifiers).
-#[derive(Clone, Debug, Default, PartialEq, Wire)]
-pub struct ReplyPromise<T> {
-    pub token: Uid,
-    #[fdb(skip)]
-    pub reply: PhantomData<T>,
-}
-
-impl<T: FileIdentified> FileIdentified for ReplyPromise<T> {
-    const FILE_IDENTIFIER: FileIdentifier = T::FILE_IDENTIFIER.compose(Wrapper::ReplyPromise);
-}
-
 impl<T> Dump for ReplyPromise<T> {
     fn type_name() -> String {
         "table<reply_promise>".into()
@@ -611,19 +597,29 @@ impl<T> Dump for ReplyPromise<T> {
     fn node(&self) -> Value {
         node(
             Self::type_name(),
-            table_value(vec![("token", 1, self.token.node())]),
+            table_value(vec![("token", 1, self.token().node())]),
         )
     }
 }
 
 impl<T: Debug + 'static> Arb for ReplyPromise<T> {
     fn arb() -> BoxedStrategy<Self> {
-        Uid::arb()
-            .prop_map(|token| ReplyPromise {
-                token,
-                reply: PhantomData,
-            })
-            .boxed()
+        Uid::arb().prop_map(ReplyPromise::new).boxed()
+    }
+}
+
+impl<T: Dump> Dump for VectorRef<T> {
+    fn type_name() -> String {
+        <Vec<T> as Dump>::type_name()
+    }
+    fn node(&self) -> Value {
+        self.0.node()
+    }
+}
+
+impl<T: Arb> Arb for VectorRef<T> {
+    fn arb() -> BoxedStrategy<Self> {
+        Vec::<T>::arb().prop_map(VectorRef).boxed()
     }
 }
 
@@ -1223,6 +1219,7 @@ pub fn registry() -> Vec<TypeEntry> {
         entry!(typed "ErrorOr<EnsureTable<Void>>", ErrorOr<EnsureTable<Void>>),
         entry!(typed "ErrorOr<Inner>", ErrorOr<Inner>),
         entry!(typed "ErrorOr<Payload>", ErrorOr<Payload>),
+        entry!(typed "ErrorOr<Void>", ErrorOr<Void>),
         entry!(typed "FixedBytes", FixedBytes),
         entry!(typed "Inner", Inner),
         entry!(typed "KVHolder", KvHolder),
@@ -1272,18 +1269,9 @@ pub fn registry() -> Vec<TypeEntry> {
         entry!(typed "Structs", Structs),
         entry!(typed "Untrusted", Untrusted),
         entry!(typed "VariantHolder", VariantHolder),
-        entry!(
-            "VectorRef<Inner>",
-            Inner::FILE_IDENTIFIER.compose(Wrapper::VectorRef).value(),
-            Vec<Inner>
-        ),
-        entry!(
-            "VectorRef<StringRef>",
-            FileIdentifier::new(13300811)
-                .compose(Wrapper::VectorRef)
-                .value(),
-            Vec<&[u8]>
-        ),
+        entry!(typed "Void", Void),
+        entry!(typed "VectorRef<Inner>", VectorRef<Inner>),
+        entry!(typed "VectorRef<StringRef>", VectorRef<&[u8]>),
         entry!(typed "Vectors", Vectors),
         entry!(typed "WireBytes", WireBytes),
         entry!(typed "X<Y1>", XY1),
@@ -1324,8 +1312,8 @@ impl Encode for Alias {
 }
 
 /// An 824-byte `Untrusted` whose `strs` holds 20 offsets to one 600-byte string, and the
-/// value C++ decodes it to. Under the README's classes this is a `data` accept; this crate
-/// rejects it with the `work_limit` check (20 × 604 units > 4 × 824 + 1024).
+/// value C++ decodes it to. Under the README's classes this is a `structural` accept
+/// (`work_limit`); this crate rejects it (20 × 604 units > 4 × 824 + 1024).
 pub fn aliased_untrusted() -> (Untrusted, Vec<u8>) {
     let s = Bytes(vec![0x61; 600]);
     let value = Untrusted {

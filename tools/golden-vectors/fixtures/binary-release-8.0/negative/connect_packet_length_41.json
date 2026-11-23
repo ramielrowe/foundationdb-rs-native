@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "connect_packet_length_41",
+  "kind": "negative",
+  "description": "A ConnectPacket whose connectPacketLength is 41: serialize() throws serialization_failed.",
+  "type": "connect_packet",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "bytes": "290000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "expect": "reject",
+  "cpp_reason": "serialization_failed",
+  "cpp_error_code": 1044
+}

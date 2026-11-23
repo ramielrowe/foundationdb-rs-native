@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "name": "key_servers_value_stable",
+  "group": "usage",
+  "kind": "positive",
+  "description": "A \\xff/keyServers value for a shard that is not moving: IncludeVersion(withShardEncodeLocationMetaData()), vector<UID> src, vector<UID> dest (empty), UID srcId, and no destId.",
+  "cpp_type": "keyServersValue",
+  "type": "key_servers_value",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688295399424
+  },
+  "size": 80,
+  "bytes": "00000072b000db0f03000000010000000000111101000000000022220200000000001111020000000000222203000000000011110300000000002222000000000a000000000011110a00000000002222",
+  "value": {
+    "protocol_version": 1142507688295399424,
+    "src": [
+      {
+        "first": 1229764173248856065,
+        "second": 2459528346497712129
+      },
+      {
+        "first": 1229764173248856066,
+        "second": 2459528346497712130
+      },
+      {
+        "first": 1229764173248856067,
+        "second": 2459528346497712131
+      }
+    ],
+    "dest": [],
+    "src_id": {
+      "first": 1229764173248856074,
+      "second": 2459528346497712138
+    },
+    "dest_id": {
+      "first": 0,
+      "second": 0
+    }
+  }
+}

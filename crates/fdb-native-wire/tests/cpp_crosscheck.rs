@@ -132,7 +132,7 @@ fn generated_values_decode_identically_in_cpp() {
 }
 
 /// The divergence `alias_data.rs` documents: C++ accepts a message that references one
-/// string 20 times (a `data` accept), which this crate rejects with `work_limit`. Every
+/// string 20 times (a `structural` accept, violation `work_limit`), which this crate rejects. Every
 /// offset in it is in bounds, so it is safe for the unchecked release readers too.
 #[test]
 #[ignore = "requires golden-vectors tool"]

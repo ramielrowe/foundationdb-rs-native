@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "sw_version_value",
+  "group": "usage",
+  "kind": "positive",
+  "description": "swVersionValue(SWVersion): ObjectWriter::toValue(swVersion, IncludeVersion(version with the object-serializer flag)): an 8-byte binary prefix, then a flatbuffers-dialect SWVersion table (the bytes of the payload depend on the C++ compiler; compare decoded fields).",
+  "cpp_type": "SWVersion",
+  "type": "sw_version_value",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 2295429193137127424
+  },
+  "size": 72,
+  "bytes": "00000080b000db1f1c0000006ac4d400000000000600080004000a001c0004000c00140010000000040000001200000000000080b000db0f0000007fb000db0f00000073b000db0f",
+  "value": {
+    "newest_protocol_version": 1142507688530280448,
+    "last_run_protocol_version": 1142507688513503232,
+    "lowest_compatible_protocol_version": 1142507688312176640,
+    "file_identifier": 13943914,
+    "prefix": 2295429193137127424,
+    "payload": "1c0000006ac4d400000000000600080004000a001c0004000c00140010000000040000001200000000000080b000db0f0000007fb000db0f00000073b000db0f"
+  }
+}

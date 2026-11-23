@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "span_context_sampled",
+  "group": "usage",
+  "kind": "positive",
+  "description": "The value of the SPAN_PARENT transaction option: BinaryWriter::toValue(SpanContext, IncludeVersion()), 33 bytes.",
+  "cpp_type": "SpanContext",
+  "type": "span_context",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 33,
+  "bytes": "00000074b000db0f010000000000ce7a020000000010ce7a030000000000a05b01",
+  "value": {
+    "trace_id": {
+      "first": 8849010317829603329,
+      "second": 8849027910015647746
+    },
+    "span_id": 6602277053725147139,
+    "flags": 1
+  }
+}

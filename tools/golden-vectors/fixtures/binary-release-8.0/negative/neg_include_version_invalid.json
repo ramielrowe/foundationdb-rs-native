@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "name": "neg_include_version_invalid",
+  "kind": "negative",
+  "description": "An IncludeVersion() prefix below the minimum valid protocol version: incompatible_protocol_version.",
+  "type": "u32",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688530280448
+  },
+  "bytes": "00000000a100db0f01020304",
+  "expect": "reject",
+  "cpp_reason": "incompatible_protocol_version",
+  "cpp_error_code": 2100
+}

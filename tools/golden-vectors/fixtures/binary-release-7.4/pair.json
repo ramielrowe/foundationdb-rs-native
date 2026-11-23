@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "pair",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::pair<uint8_t, std::string>: first, then second.",
+  "cpp_type": "std::pair<uint8_t, std::string>",
+  "type": "pair<u8,string>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 10,
+  "bytes": "0705000000736576656e",
+  "value": [7, "seven"]
+}

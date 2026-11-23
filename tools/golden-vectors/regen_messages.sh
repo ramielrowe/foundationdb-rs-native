@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Regenerates the message-level golden vectors, fixtures/release-7.4 and fixtures/release-8.0,
-# from the real FDB message types of each release branch, built inside the official
-# FoundationDB build image. Needs docker and a FoundationDB checkout; nothing else on the host.
+# Regenerates the golden vectors that come from the real FDB types of each release branch, built
+# inside the official FoundationDB build image: the message-level vectors (fixtures/release-7.4
+# and fixtures/release-8.0, flatbuffers messages) and the legacy binary-format vectors
+# (fixtures/binary-release-7.4 and fixtures/binary-release-8.0, BinaryWriter output). Needs
+# docker and a FoundationDB checkout; nothing else on the host.
 #
 # Usage: tools/golden-vectors/regen_messages.sh [--check]
 #
@@ -12,13 +14,16 @@
 #   BUILD_IMAGE    the build image, pinned by tag and digest (default below).
 #   JOBS           parallel compile jobs (default: nproc).
 #
-# For each branch: export the source, configure FDB's CMake build in the container (with
-# messages/targets.cmake injected through CMAKE_PROJECT_foundationdb_INCLUDE), build the
-# golden_vectors_messages target (which links fdbclient, flow and fdbrpc), write the fixtures,
-# and check that every fixture round-trips through that build's decoder. The build trees and a
-# ccache live in build/msg/ (gitignored), so a second run only rebuilds what changed. The tool
-# directory is mounted read-only: the container writes only into build/msg/, and the result
-# replaces fixtures/<release>/ only after every check for that release passed.
+# For each branch: export the source, check that the types mirrored from FDB's .cpp files and the
+# code the Rust side follows are unchanged (messages/check_mirrors.py), configure FDB's CMake build
+# in the container (with messages/targets.cmake injected through CMAKE_PROJECT_foundationdb_INCLUDE),
+# build the golden_vectors_messages and golden_vectors_binary targets (which link fdbclient, flow
+# and fdbrpc), write both sets of fixtures, and check that every message fixture round-trips
+# through that build's decoder (the binary generator checks its own vectors against the release's
+# BinaryReader). The build trees and a ccache live in build/msg/ (gitignored), so a second run only
+# rebuilds what changed. The tool directory is mounted read-only: the container writes only into
+# build/msg/, and the results replace fixtures/<release>/ and fixtures/binary-<release>/ (both, or
+# neither) only after every check for that release passed.
 #
 #   --check   Also regenerate each branch a second time with the same binary and require
 #             byte-identical output. (Whether the output matches the committed fixtures is
@@ -33,6 +38,8 @@ if [[ ${1:-} == --in-container ]]; then
 	name=$2 rev=$3 jobs=$4 check=$5
 	start=$(date +%s)
 	cd /build
+	echo "== [$name] check the mirrored types against this branch"
+	python3 /gv/messages/check_mirrors.py /src
 	echo "== [$name] configure"
 	CC=clang CXX=clang++ cmake -G Ninja /src \
 		-DUSE_CCACHE=ON \
@@ -44,23 +51,29 @@ if [[ ${1:-} == --in-container ]]; then
 		tail -n 40 /build/configure.log
 		exit 1
 	}
-	echo "== [$name] build golden_vectors_messages (log: build/msg/build-$name/build.log)"
+	echo "== [$name] build golden_vectors_messages and golden_vectors_binary (log: build/msg/build-$name/build.log)"
 	rm -f /build/golden_vectors_messages/gv_fields.g.h # always re-extract the field names
-	ninja -j"$jobs" golden_vectors_messages >/build/build.log 2>&1 || {
+	ninja -j"$jobs" golden_vectors_messages golden_vectors_binary >/build/build.log 2>&1 || {
 		grep -E -A5 'error:|FAILED' /build/build.log | head -n 80
 		exit 1
 	}
 	bin=$(find /build -name golden_vectors_messages -type f -perm -u+x | head -n 1)
-	echo "== [$name] built in $(($(date +%s) - start))s: ${bin#/build/}"
-	# Output goes to /build/out; the host copies it into fixtures/ if this script succeeds.
-	rm -rf /build/out /build/check
+	binbin=$(find /build -name golden_vectors_binary -type f -perm -u+x | head -n 1)
+	echo "== [$name] built in $(($(date +%s) - start))s: ${bin#/build/} ${binbin#/build/}"
+	# Output goes to /build/out and /build/out-binary; the host copies it into fixtures/ if this
+	# script succeeds. (The binary generator checks its own vectors: every value is read back by
+	# the same release's BinaryReader, and every negative vector must be rejected.)
+	rm -rf /build/out /build/check /build/out-binary /build/check-binary
 	"$bin" generate --out /build/out --fdb-rev "$name@$rev"
+	"$binbin" generate --out /build/out-binary --fdb-rev "$name@$rev"
 	echo "== [$name] round trip through the $name decoder"
 	python3 /gv/check_fixtures.py roundtrip "/build/out/$name" "$bin"
 	if [[ $check == 1 ]]; then
 		echo "== [$name] determinism: regenerate with the same binary and compare"
 		"$bin" generate --out /build/check --fdb-rev "$name@$rev"
 		diff -r "/build/out/$name" "/build/check/$name"
+		"$binbin" generate --out /build/check-binary --fdb-rev "$name@$rev"
+		diff -r "/build/out-binary/binary-$name" "/build/check-binary/binary-$name"
 		echo "identical"
 	fi
 	exit 0
@@ -83,7 +96,7 @@ for arg in "$@"; do
 	case $arg in
 	--check) check=1 ;;
 	*)
-		sed -n '2,25p' "$0" >&2
+		sed -n '2,29p' "$0" >&2
 		exit 2
 		;;
 	esac
@@ -159,11 +172,14 @@ for ref in $MSG_BRANCHES; do
 		echo "== [$name] failed (exit $status); fixtures/$name left unchanged" >&2
 		exit "$status"
 	fi
-	# Every check passed: replace the checked-in fixtures.
-	rm -rf "$FIXTURES/$name.new"
+	# Every check passed: replace the checked-in fixtures. Both copies are made first, so that a
+	# failed copy leaves both directories as they were; the renames come last.
+	rm -rf "$FIXTURES/$name.new" "$FIXTURES/binary-$name.new"
 	cp -r "$build/out/$name" "$FIXTURES/$name.new"
-	rm -rf "$FIXTURES/$name"
+	cp -r "$build/out-binary/binary-$name" "$FIXTURES/binary-$name.new"
+	rm -rf "$FIXTURES/$name" "$FIXTURES/binary-$name"
 	mv "$FIXTURES/$name.new" "$FIXTURES/$name"
-	echo "== [$name] fixtures/$name updated"
+	mv "$FIXTURES/binary-$name.new" "$FIXTURES/binary-$name"
+	echo "== [$name] fixtures/$name and fixtures/binary-$name updated"
 done
 echo "== all message fixtures regenerated"

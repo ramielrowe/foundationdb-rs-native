@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "error_or_plain_void_success",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "ErrorOr<Void> (no EnsureTable; Void is a table, so the wire form is the same as ErrorOr<EnsureTable<Void>>) holding Void: tag 2, offset to the empty table.",
+  "cpp_type": "ErrorOr<Void>",
+  "file_identifier": 35564874,
+  "file_identifier_hex": "0x021ead4a",
+  "size": 48,
+  "bytes": "200000004aad1e020000000000000400040006000600040008000900080004000800000008000000020000001e000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<table<Void>>",
+        "tag": 2,
+        "value": {
+          "type": "table<Void>",
+          "value": []
+        }
+      }
+    ]
+  }
+}

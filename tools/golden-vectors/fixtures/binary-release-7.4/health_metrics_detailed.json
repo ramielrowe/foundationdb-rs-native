@@ -1,0 +1,59 @@
+{
+  "format_version": 1,
+  "name": "health_metrics_detailed",
+  "group": "usage",
+  "kind": "positive",
+  "description": "HealthMetrics with storage and log server details.",
+  "cpp_type": "HealthMetrics",
+  "type": "health_metrics",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688328953856
+  },
+  "size": 185,
+  "bytes": "00000074b000db0fe803000000000000b80b0000000000008813000000000000000000000824fe400102000000010000000000111101000000000022220b000000000000000c00000000000000000000000000d03f000000000000e03f02000000000011110200000000002222ffffffffffffffff0000000000000000000000000000f03f000000000000000001000000090000000000111109000000000022226300000000000000d007000000000000a00f000000000000",
+  "value": {
+    "worst_storage_queue": 1000,
+    "limiting_storage_queue": 2000,
+    "worst_storage_durability_lag": 3000,
+    "limiting_storage_durability_lag": 4000,
+    "worst_t_log_queue": 5000,
+    "tps_limit": 123456.5,
+    "batch_limited": true,
+    "storage_stats": [
+      [
+        {
+          "first": 1229764173248856065,
+          "second": 2459528346497712129
+        },
+        {
+          "storage_queue": 11,
+          "storage_durability_lag": 12,
+          "disk_usage": 0.25,
+          "cpu_usage": 0.5
+        }
+      ],
+      [
+        {
+          "first": 1229764173248856066,
+          "second": 2459528346497712130
+        },
+        {
+          "storage_queue": -1,
+          "storage_durability_lag": 0,
+          "disk_usage": 1.0,
+          "cpu_usage": 0.0
+        }
+      ]
+    ],
+    "t_log_queue": [
+      [
+        {
+          "first": 1229764173248856073,
+          "second": 2459528346497712137
+        },
+        99
+      ]
+    ]
+  }
+}

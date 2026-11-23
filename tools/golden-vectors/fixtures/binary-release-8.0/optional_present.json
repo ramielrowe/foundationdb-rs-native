@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "optional_present",
+  "group": "containers",
+  "kind": "positive",
+  "description": "Optional<int32_t> with a value: a bool, then the value.",
+  "cpp_type": "Optional<int32_t>",
+  "type": "optional<i32>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 5,
+  "bytes": "012a000000",
+  "value": 42
+}

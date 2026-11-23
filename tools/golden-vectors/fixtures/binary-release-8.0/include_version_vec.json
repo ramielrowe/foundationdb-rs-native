@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "include_version_vec",
+  "group": "versioning",
+  "kind": "positive",
+  "description": "IncludeVersion() before a std::vector<int32_t>.",
+  "cpp_type": "std::vector<int32_t>",
+  "type": "vec<i32>",
+  "versioning": {
+    "mode": "include",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 20,
+  "bytes": "00000080b000db0f020000000100000002000000",
+  "value": [1, 2]
+}

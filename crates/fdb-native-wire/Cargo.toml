@@ -58,6 +58,10 @@ required-features = ["derive"]
 name = "lazy_view"
 required-features = ["derive"]
 
+[[test]]
+name = "rpc"
+required-features = ["derive"]
+
 # `cargo bench -p fdb-native-wire --bench wire`; see CLAUDE.md.
 [[bench]]
 name = "wire"

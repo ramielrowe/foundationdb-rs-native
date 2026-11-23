@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "vec_string",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::vector<std::string>.",
+  "cpp_type": "std::vector<std::string>",
+  "type": "vec<string>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 20,
+  "bytes": "0300000001000000610000000003000000626364",
+  "value": ["a", "", "bcd"]
+}

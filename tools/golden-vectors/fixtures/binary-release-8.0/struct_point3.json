@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "struct_point3",
+  "group": "containers",
+  "kind": "positive",
+  "description": "A struct whose serialize() is serializer(ar, x, y, label): its members back to back.",
+  "cpp_type": "Point3",
+  "type": "point3",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 17,
+  "bytes": "ffffffff00000000000100000100000070",
+  "value": [-1, 1099511627776, "p"]
+}

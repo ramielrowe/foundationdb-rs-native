@@ -14,6 +14,7 @@ struct Fixture {
 	std::string name;
 	std::string kind; // "positive" | "negative" | "corpus"
 	Json record;
+	std::vector<uint8_t> bytes; // positives: the message
 };
 
 struct FixtureSet {
@@ -102,7 +103,7 @@ inline void positive_bytes(const std::string& group,
 		r.set("writer_cpp_type", Json::string(writerType));
 	}
 	r.set("root", root);
-	fixtures().positives.push_back({ group, name, "positive", r });
+	fixtures().positives.push_back({ group, name, "positive", r, bytes });
 }
 
 // A positive vector: encode |items| as the root of a message, decode the bytes
@@ -129,7 +130,7 @@ void positive(const std::string& group,
 	require_strictly_valid(name, cppType, bytes);
 	Json r = base_record(group, name, "positive", description, cppType, fid, bytes);
 	r.set("root", root);
-	fixtures().positives.push_back({ group, name, "positive", r });
+	fixtures().positives.push_back({ group, name, "positive", r, bytes });
 }
 
 // Encode as Writer, decode as Reader (a different schema with the same file identifier).

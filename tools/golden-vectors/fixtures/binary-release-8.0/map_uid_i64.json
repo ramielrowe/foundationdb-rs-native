@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "name": "map_uid_i64",
+  "group": "containers",
+  "kind": "positive",
+  "description": "std::map<UID, int64_t>.",
+  "cpp_type": "std::map<UID, int64_t>",
+  "type": "map<uid,i64>",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 52,
+  "bytes": "02000000010000000000111101000000000022220a00000000000000020000000000111102000000000022221400000000000000",
+  "value": [
+    [
+      {
+        "first": 1229764173248856065,
+        "second": 2459528346497712129
+      },
+      10
+    ],
+    [
+      {
+        "first": 1229764173248856066,
+        "second": 2459528346497712130
+      },
+      20
+    ]
+  ]
+}

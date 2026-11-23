@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "uid",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "UID: part[0] then part[1], two little-endian uint64_t.",
+  "cpp_type": "UID",
+  "type": "uid",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 16,
+  "bytes": "07000000000011110700000000002222",
+  "value": {
+    "first": 1229764173248856071,
+    "second": 2459528346497712135
+  }
+}

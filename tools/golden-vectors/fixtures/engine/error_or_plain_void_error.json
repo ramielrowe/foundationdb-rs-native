@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "error_or_plain_void_error",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "ErrorOr<Void> carrying an Error (1020 not_committed): tag 1, offset to the Error table.",
+  "cpp_type": "ErrorOr<Void>",
+  "file_identifier": 35564874,
+  "file_identifier_hex": "0x021ead4a",
+  "size": 48,
+  "bytes": "1c0000004aad1e0200000400040006000600040008000900080004000800000008000000010000001a000000fc030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<table<Void>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Error>",
+          "value": [
+            {
+              "field": "error_code",
+              "slot": 0,
+              "type": "u16",
+              "value": 1020
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

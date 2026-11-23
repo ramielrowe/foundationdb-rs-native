@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "u32",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "uint32_t, little-endian.",
+  "cpp_type": "uint32_t",
+  "type": "u32",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 4,
+  "bytes": "efbeadde",
+  "value": 3735928559
+}

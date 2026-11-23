@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "i64_min",
+  "group": "primitives",
+  "kind": "positive",
+  "description": "int64_t minimum.",
+  "cpp_type": "int64_t",
+  "type": "i64",
+  "versioning": {
+    "mode": "unversioned",
+    "protocol_version": null
+  },
+  "size": 8,
+  "bytes": "0000000000000080",
+  "value": -9223372036854775808
+}

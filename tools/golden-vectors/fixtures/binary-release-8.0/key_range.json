@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "name": "key_range",
+  "group": "containers",
+  "kind": "positive",
+  "description": "KeyRange (Standalone<KeyRangeRef>): begin then end, each a StringRef.",
+  "cpp_type": "KeyRange",
+  "type": "key_range",
+  "versioning": {
+    "mode": "assume",
+    "protocol_version": 1142507688530280448
+  },
+  "size": 11,
+  "bytes": "0100000061020000006200",
+  "value": ["61", "6200"]
+}
