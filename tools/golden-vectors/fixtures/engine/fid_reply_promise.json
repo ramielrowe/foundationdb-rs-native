@@ -1,0 +1,33 @@
+{
+  "format_version": 1,
+  "name": "fid_reply_promise",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "ReplyPromise<Inner> (wrapper 1), a table holding the reply endpoint UID token: file identifier 0x010fdb0a composed from Inner (0x000fdb0a).",
+  "cpp_type": "ReplyPromise<Inner>",
+  "file_identifier": 17816330,
+  "file_identifier_hex": "0x010fdb0a",
+  "size": 48,
+  "bytes": "140000000adb0f0106001400040006000800040006000000040000001400000011111111111111112222222222222222",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<reply_promise>",
+        "value": [
+          {
+            "field": "token",
+            "slot": 0,
+            "type": "uid",
+            "value": {
+              "first": 1229782938247303441,
+              "second": 2459565876494606882
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

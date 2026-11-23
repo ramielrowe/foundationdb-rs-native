@@ -1,0 +1,109 @@
+{
+  "format_version": 1,
+  "name": "ensure_table",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "EnsureTable<T>: if T is a table it is transparent; otherwise T is wrapped in a one-slot table (the same shape as the root wrapper), so the field holds an offset to that table. Compare wrapped_alt (variant alternative EnsureTable<i32>: offset to a table holding the i32) with bare_alt (variant alternative i32: offset to the raw 4 bytes).",
+  "cpp_type": "EnsureTables",
+  "file_identifier": 1039118,
+  "file_identifier_hex": "0x000fdb0e",
+  "size": 168,
+  "bytes": "300000000edb0f0000000000000008000c000400080014001e00040008000c0010001c0014001d001800060008000400060000000400000022000000640000004c000000340000001c000000100000000800000001010000fdffffff32000000fdffffff3a000000040000000300000001000200030000004e000000040000000700000077726170706564007e00000005000000040000000400000066697665760000004d000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<EnsureTables>",
+        "value": [
+          {
+            "field": "scalar",
+            "slot": 0,
+            "type": "ensure_table<i32>",
+            "value": {
+              "type": "i32",
+              "value": 77
+            }
+          },
+          {
+            "field": "table",
+            "slot": 1,
+            "type": "ensure_table<table<Inner>>",
+            "value": {
+              "type": "table<Inner>",
+              "value": [
+                {
+                  "field": "a",
+                  "slot": 0,
+                  "type": "u32",
+                  "value": 5
+                },
+                {
+                  "field": "b",
+                  "slot": 1,
+                  "type": "bytes",
+                  "value": "66697665"
+                }
+              ]
+            }
+          },
+          {
+            "field": "str",
+            "slot": 2,
+            "type": "ensure_table<bytes>",
+            "value": {
+              "type": "bytes",
+              "value": "77726170706564"
+            }
+          },
+          {
+            "field": "vec",
+            "slot": 3,
+            "type": "ensure_table<vector<u16>>",
+            "value": {
+              "type": "vector<u16>",
+              "value": [
+                {
+                  "type": "u16",
+                  "value": 1
+                },
+                {
+                  "type": "u16",
+                  "value": 2
+                },
+                {
+                  "type": "u16",
+                  "value": 3
+                }
+              ]
+            }
+          },
+          {
+            "field": "wrapped_alt",
+            "slot": 4,
+            "type": "variant<ensure_table<i32>,table<Inner>>",
+            "tag": 1,
+            "value": {
+              "type": "ensure_table<i32>",
+              "value": {
+                "type": "i32",
+                "value": -3
+              }
+            }
+          },
+          {
+            "field": "bare_alt",
+            "slot": 6,
+            "type": "variant<i32,table<Inner>>",
+            "tag": 1,
+            "value": {
+              "type": "i32",
+              "value": -3
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

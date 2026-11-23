@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "name": "fid_error_or",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "ErrorOr<Inner> (wrapper 2): file identifier 0x020fdb0a composed from Inner (0x000fdb0a).",
+  "cpp_type": "ErrorOr<Inner>",
+  "file_identifier": 34593546,
+  "file_identifier_hex": "0x020fdb0a",
+  "size": 64,
+  "bytes": "200000000adb0f02000006000600040008000c000400080008000900080004000800000008000000020000001c00000001000000040000000100000078000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<table<Inner>>",
+        "tag": 2,
+        "value": {
+          "type": "table<Inner>",
+          "value": [
+            {
+              "field": "a",
+              "slot": 0,
+              "type": "u32",
+              "value": 1
+            },
+            {
+              "field": "b",
+              "slot": 1,
+              "type": "bytes",
+              "value": "78"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

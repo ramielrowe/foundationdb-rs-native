@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "error_or_error",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "ErrorOr<EnsureTable<T>> holding an Error (1020 not_committed): union tag 1, offset to an Error table with one u16 field (error_code). The vtable block still contains T's vtable.",
+  "cpp_type": "ErrorOr<EnsureTable<Payload>>",
+  "file_identifier": 34593549,
+  "file_identifier_hex": "0x020fdb0d",
+  "size": 56,
+  "bytes": "240000000ddb0f0200000c00150004000c001400100006000600040008000900080004000800000008000000010000001a000000fc030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<Payload>>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Error>",
+          "value": [
+            {
+              "field": "error_code",
+              "slot": 0,
+              "type": "u16",
+              "value": 1020
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "name": "wrong_file_identifier",
+  "group": "malformed",
+  "kind": "negative",
+  "description": "RejectsWrongFileIdentifier: a default Untrusted written with file identifier 4243, read expecting 4242.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 96,
+  "bytes": "24000000931000000000140021000400080020000c001000140018001c000600080004000600000004000000220000002c00000028000000000000001c000000140000000c000000140000000000000000000000000000000000000000000000",
+  "mutation": {
+    "op": "file_identifier",
+    "value": 4243
+  },
+  "expect": "reject",
+  "reason": "file identifier mismatch"
+}

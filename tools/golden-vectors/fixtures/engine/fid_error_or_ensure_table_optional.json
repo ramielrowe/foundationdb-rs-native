@@ -1,0 +1,47 @@
+{
+  "format_version": 1,
+  "name": "fid_error_or_ensure_table_optional",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "ErrorOr<EnsureTable<Optional<Inner>>>, a two-level composition: the inner wrapper (4, Optional) takes bits 24..27 and the outer wrapper (2, ErrorOr) bits 28..31. EnsureTable passes T's identifier and composition depth through unchanged. Optional is not a table, so EnsureTable wraps it in a one-slot table (a union directly inside a union is not serializable): file identifier 0x240fdb0a composed from Inner (0x000fdb0a).",
+  "cpp_type": "ErrorOr<EnsureTable<Optional<Inner>>>",
+  "file_identifier": 605018890,
+  "file_identifier_hex": "0x240fdb0a",
+  "size": 80,
+  "bytes": "240000000adb0f2400000000000006000600040008000c000400080008000900080004000800000008000000020000001400000008000000010000002800000001000000040000000100000078000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<optional<table<Inner>>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<optional<table<Inner>>>",
+          "value": {
+            "type": "optional<table<Inner>>",
+            "tag": 1,
+            "value": {
+              "type": "table<Inner>",
+              "value": [
+                {
+                  "field": "a",
+                  "slot": 0,
+                  "type": "u32",
+                  "value": 1
+                },
+                {
+                  "field": "b",
+                  "slot": 1,
+                  "type": "bytes",
+                  "value": "78"
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}

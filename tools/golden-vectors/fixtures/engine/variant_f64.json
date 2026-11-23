@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "name": "variant_f64",
+  "group": "unions",
+  "kind": "positive",
+  "description": "std::variant alternative 1 (f64): tag 2, offset to 8 out-of-line bytes. The out-of-line scalar is not padded or aligned beyond what precedes it.",
+  "cpp_type": "VariantHolder",
+  "file_identifier": 1039116,
+  "file_identifier_hex": "0x000fdb0c",
+  "size": 64,
+  "bytes": "240000000cdb0f000c000c000a000b00040008000a000d000c000400080006000800040006000000040000002400000008000000222211020000000000001940",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<VariantHolder>",
+        "value": [
+          {
+            "field": "before",
+            "slot": 0,
+            "type": "u8",
+            "value": 17
+          },
+          {
+            "field": "v",
+            "slot": 1,
+            "type": "variant<i32,f64,table<Nested2>,bytes,u8>",
+            "tag": 2,
+            "value": {
+              "type": "f64",
+              "value": 6.25
+            }
+          },
+          {
+            "field": "after",
+            "slot": 3,
+            "type": "u16",
+            "value": 8738
+          }
+        ]
+      }
+    ]
+  }
+}

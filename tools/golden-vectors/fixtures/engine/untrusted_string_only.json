@@ -1,0 +1,61 @@
+{
+  "format_version": 1,
+  "name": "untrusted_string_only",
+  "group": "malformed",
+  "kind": "positive",
+  "description": "flow/FlatBuffers/RejectsHostileStringOffsetAndLength: the well-formed message the string offset/length vectors are derived from.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 112,
+  "bytes": "24000000921000000000140021000400080020000c001000140018001c000600080004000600000004000000220000003000000028000000000000001c000000140000000c0000001400000000000000000000000000000000000000000000000b00000068656c6c6f20776f726c6400",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Untrusted>",
+        "value": [
+          {
+            "field": "s",
+            "slot": 0,
+            "type": "bytes",
+            "value": "68656c6c6f20776f726c64"
+          },
+          {
+            "field": "v",
+            "slot": 1,
+            "type": "vector<i64>",
+            "value": []
+          },
+          {
+            "field": "o",
+            "slot": 2,
+            "type": "optional<i32>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "vo",
+            "slot": 4,
+            "type": "vector<optional<i32>>",
+            "value": []
+          },
+          {
+            "field": "b",
+            "slot": 6,
+            "type": "vector<bool>",
+            "value": []
+          },
+          {
+            "field": "strs",
+            "slot": 7,
+            "type": "vector<bytes>",
+            "value": []
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "root_variant_i32",
+  "group": "unions",
+  "kind": "positive",
+  "description": "flow/FlatBuffers/variant: a std::variant<int,double,Nested2> as the root member; the root table has two slots.",
+  "cpp_type": "std::variant<int,double,Nested2>",
+  "file_identifier": 1039208,
+  "file_identifier_hex": "0x000fdb68",
+  "size": 48,
+  "bytes": "2000000068db0f0000000000000008000900080004000a000d000c000400080012000000080000000100000001000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "variant<i32,f64,table<Nested2>>",
+        "tag": 1,
+        "value": {
+          "type": "i32",
+          "value": 1
+        }
+      }
+    ]
+  }
+}

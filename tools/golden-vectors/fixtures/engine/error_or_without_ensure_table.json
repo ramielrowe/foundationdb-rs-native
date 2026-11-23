@@ -1,0 +1,53 @@
+{
+  "format_version": 1,
+  "name": "error_or_without_ensure_table",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "ErrorOr<Payload> without EnsureTable: for a T that is already a table, EnsureTable changes nothing, so the bytes equal error_or_success.",
+  "cpp_type": "ErrorOr<Payload>",
+  "file_identifier": 34593549,
+  "file_identifier_hex": "0x020fdb0d",
+  "size": 112,
+  "bytes": "280000000ddb0f020000000000000c00150004000c001400100006000600040008000900080004000800000008000000020000002600000015cd5b0700000000200000000c0000000100000000000000010000000000000002000000000000000b00000076616c756520627974657300",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<table<Payload>>",
+        "tag": 2,
+        "value": {
+          "type": "table<Payload>",
+          "value": [
+            {
+              "field": "version",
+              "slot": 0,
+              "type": "i64",
+              "value": 123456789
+            },
+            {
+              "field": "value",
+              "slot": 1,
+              "type": "bytes",
+              "value": "76616c7565206279746573"
+            },
+            {
+              "field": "id",
+              "slot": 2,
+              "type": "optional<uid>",
+              "tag": 1,
+              "value": {
+                "type": "uid",
+                "value": {
+                  "first": 1,
+                  "second": 2
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

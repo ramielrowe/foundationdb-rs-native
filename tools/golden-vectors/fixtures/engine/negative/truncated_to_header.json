@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "name": "truncated_to_header",
+  "group": "malformed",
+  "kind": "negative",
+  "description": "BoundsChecksKnob: a valid message cut to its 8-byte header.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 8,
+  "bytes": "2800000092100000",
+  "mutation": {
+    "op": "truncate",
+    "len": 8
+  },
+  "expect": "reject",
+  "reason": "read outside of buffer"
+}

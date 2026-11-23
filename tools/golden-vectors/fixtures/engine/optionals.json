@@ -1,0 +1,139 @@
+{
+  "format_version": 1,
+  "name": "optionals",
+  "group": "unions",
+  "kind": "positive",
+  "description": "Optional<T> is a one-alternative union: two slots (u8 tag, u32 offset). Absent is tag 0 with a zero offset. Present is tag 1; scalar payloads (i32, f64, UID) are stored out of line and the offset points at the raw scalar bytes; string/table payloads are pointed to directly. A vector of Optional is a union vector: two slots holding a vector<u8> of tags and a vector of offsets.",
+  "cpp_type": "Optionals",
+  "file_identifier": 1039115,
+  "file_identifier_hex": "0x000fdb0b",
+  "size": 216,
+  "bytes": "400000000bdb0f00000008000c0004000800280034002c0004002d0008002e000c002f001000300014003100180032001c0033002000240028000600080004000600000004000000360000008800000000000000780000000000000058000000000000004800000034000000200000000c00000001000100010001010300000018000000000000000c00000003000000010001000300000001000000efcdab89674523011032547698badcfe0000000000000c40aa000000090000000400000005000000696e6e6572000000030000006f7074002a000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Optionals>",
+        "value": [
+          {
+            "field": "int_present",
+            "slot": 0,
+            "type": "optional<i32>",
+            "tag": 1,
+            "value": {
+              "type": "i32",
+              "value": 42
+            }
+          },
+          {
+            "field": "int_absent",
+            "slot": 2,
+            "type": "optional<i32>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "str_present",
+            "slot": 4,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "6f7074"
+            }
+          },
+          {
+            "field": "str_absent",
+            "slot": 6,
+            "type": "optional<bytes>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "table_present",
+            "slot": 8,
+            "type": "optional<table<Inner>>",
+            "tag": 1,
+            "value": {
+              "type": "table<Inner>",
+              "value": [
+                {
+                  "field": "a",
+                  "slot": 0,
+                  "type": "u32",
+                  "value": 9
+                },
+                {
+                  "field": "b",
+                  "slot": 1,
+                  "type": "bytes",
+                  "value": "696e6e6572"
+                }
+              ]
+            }
+          },
+          {
+            "field": "table_absent",
+            "slot": 10,
+            "type": "optional<table<Inner>>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "f64_present",
+            "slot": 12,
+            "type": "optional<f64>",
+            "tag": 1,
+            "value": {
+              "type": "f64",
+              "value": 3.5
+            }
+          },
+          {
+            "field": "uid_present",
+            "slot": 14,
+            "type": "optional<uid>",
+            "tag": 1,
+            "value": {
+              "type": "uid",
+              "value": {
+                "first": 81985529216486895,
+                "second": 18364758544493064720
+              }
+            }
+          },
+          {
+            "field": "vec_of_opt",
+            "slot": 16,
+            "type": "vector<optional<i32>>",
+            "value": [
+              {
+                "type": "optional<i32>",
+                "tag": 1,
+                "value": {
+                  "type": "i32",
+                  "value": 1
+                }
+              },
+              {
+                "type": "optional<i32>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "type": "optional<i32>",
+                "tag": 1,
+                "value": {
+                  "type": "i32",
+                  "value": 3
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "root_scalar_i32",
+  "group": "scalars",
+  "kind": "positive",
+  "description": "A bare int32 as the message root: the synthetic root table holds the scalar inline in slot 0 (file identifier supplied explicitly, int has none).",
+  "cpp_type": "int32_t",
+  "file_identifier": 1039204,
+  "file_identifier_hex": "0x000fdb64",
+  "size": 24,
+  "bytes": "1000000064db0f0000000600080004000600000004030201",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "i32",
+        "value": 16909060
+      }
+    ]
+  }
+}

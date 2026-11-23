@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "name": "fid_optional",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "Optional<Inner> (wrapper 4): file identifier 0x040fdb0a composed from Inner (0x000fdb0a).",
+  "cpp_type": "Optional<Inner>",
+  "file_identifier": 68147978,
+  "file_identifier_hex": "0x040fdb0a",
+  "size": 56,
+  "bytes": "180000000adb0f0408000c000400080008000900080004000800000008000000010000001c00000001000000040000000100000078000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "optional<table<Inner>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Inner>",
+          "value": [
+            {
+              "field": "a",
+              "slot": 0,
+              "type": "u32",
+              "value": 1
+            },
+            {
+              "field": "b",
+              "slot": 1,
+              "type": "bytes",
+              "value": "78"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

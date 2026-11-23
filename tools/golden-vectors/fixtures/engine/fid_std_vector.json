@@ -1,0 +1,41 @@
+{
+  "format_version": 1,
+  "name": "fid_std_vector",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "std::vector<Inner> (wrapper 5): file identifier 0x050fdb0a composed from Inner (0x000fdb0a).",
+  "cpp_type": "std::vector<Inner>",
+  "file_identifier": 84925194,
+  "file_identifier_hex": "0x050fdb0a",
+  "size": 64,
+  "bytes": "1c0000000adb0f0500000000000008000c0004000800060008000400060000000400000001000000040000001e00000001000000040000000100000078000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "vector<table<Inner>>",
+        "value": [
+          {
+            "type": "table<Inner>",
+            "value": [
+              {
+                "field": "a",
+                "slot": 0,
+                "type": "u32",
+                "value": 1
+              },
+              {
+                "field": "b",
+                "slot": 1,
+                "type": "bytes",
+                "value": "78"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
