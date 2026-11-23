@@ -1,0 +1,1425 @@
+{
+  "format_version": 1,
+  "types": {
+    "ClientDBInfo": {
+      "file_identifier": 5355080,
+      "file_identifier_hex": "0x0051b648",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<ClientDBInfo>"
+        }
+      ]
+    },
+    "CommitID": {
+      "file_identifier": 14254927,
+      "file_identifier_hex": "0x00d9834f",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<CommitID>"
+        }
+      ]
+    },
+    "CommitTransactionRequest": {
+      "file_identifier": 93948,
+      "file_identifier_hex": "0x00016efc",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<CommitTransactionRequest>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<ClientDBInfo>>": {
+      "file_identifier": 38909512,
+      "file_identifier_hex": "0x0251b648",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<ClientDBInfo>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<CommitID>>": {
+      "file_identifier": 47809359,
+      "file_identifier_hex": "0x02d9834f",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<CommitID>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<GetKeyReply>>": {
+      "file_identifier": 44780945,
+      "file_identifier_hex": "0x02ab4d91",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<GetKeyReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<GetKeyServerLocationsReply>>": {
+      "file_identifier": 44190455,
+      "file_identifier_hex": "0x02a24af7",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<GetKeyServerLocationsReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<GetKeyValuesReply>>": {
+      "file_identifier": 35337498,
+      "file_identifier_hex": "0x021b351a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<GetKeyValuesReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<GetReadVersionReply>>": {
+      "file_identifier": 49263820,
+      "file_identifier_hex": "0x02efb4cc",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<GetReadVersionReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<GetValueReply>>": {
+      "file_identifier": 34933361,
+      "file_identifier_hex": "0x02150a71",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<GetValueReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<Void>>": {
+      "file_identifier": 35564874,
+      "file_identifier_hex": "0x021ead4a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<Void>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<WatchValueReply>>": {
+      "file_identifier": 33554435,
+      "file_identifier_hex": "0x02000003",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<WatchValueReply>>>"
+        }
+      ]
+    },
+    "GetKeyReply": {
+      "file_identifier": 11226513,
+      "file_identifier_hex": "0x00ab4d91",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyReply>"
+        }
+      ]
+    },
+    "GetKeyRequest": {
+      "file_identifier": 10457870,
+      "file_identifier_hex": "0x009f930e",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyRequest>"
+        }
+      ]
+    },
+    "GetKeyServerLocationsReply": {
+      "file_identifier": 10636023,
+      "file_identifier_hex": "0x00a24af7",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyServerLocationsReply>"
+        }
+      ]
+    },
+    "GetKeyServerLocationsRequest": {
+      "file_identifier": 9144680,
+      "file_identifier_hex": "0x008b8968",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyServerLocationsRequest>"
+        }
+      ]
+    },
+    "GetKeyValuesReply": {
+      "file_identifier": 1783066,
+      "file_identifier_hex": "0x001b351a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyValuesReply>"
+        }
+      ]
+    },
+    "GetKeyValuesRequest": {
+      "file_identifier": 6795746,
+      "file_identifier_hex": "0x0067b1e2",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetKeyValuesRequest>"
+        }
+      ]
+    },
+    "GetReadVersionReply": {
+      "file_identifier": 15709388,
+      "file_identifier_hex": "0x00efb4cc",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetReadVersionReply>"
+        }
+      ]
+    },
+    "GetReadVersionRequest": {
+      "file_identifier": 838566,
+      "file_identifier_hex": "0x000ccba6",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetReadVersionRequest>"
+        }
+      ]
+    },
+    "GetValueReply": {
+      "file_identifier": 1378929,
+      "file_identifier_hex": "0x00150a71",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetValueReply>"
+        }
+      ]
+    },
+    "GetValueRequest": {
+      "file_identifier": 8454530,
+      "file_identifier_hex": "0x00810182",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<GetValueRequest>"
+        }
+      ]
+    },
+    "OpenDatabaseCoordRequest": {
+      "file_identifier": 214728,
+      "file_identifier_hex": "0x000346c8",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<OpenDatabaseCoordRequest>"
+        }
+      ]
+    },
+    "PingRequest": {
+      "file_identifier": 4707015,
+      "file_identifier_hex": "0x0047d2c7",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<PingRequest>"
+        }
+      ]
+    },
+    "UID": {
+      "file_identifier": 15597147,
+      "file_identifier_hex": "0x00edfe5b",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "uid"
+        }
+      ]
+    },
+    "WatchValueReply": {
+      "file_identifier": 3,
+      "file_identifier_hex": "0x00000003",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<WatchValueReply>"
+        }
+      ]
+    },
+    "WatchValueRequest": {
+      "file_identifier": 14747733,
+      "file_identifier_hex": "0x00e10855",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<WatchValueRequest>"
+        }
+      ]
+    }
+  },
+  "tables": {
+    "table<ClientDBInfo>": [
+      {
+        "field": "grvProxies",
+        "slot": 0,
+        "type": "vector<table<GrvProxyInterface>>"
+      },
+      {
+        "field": "commitProxies",
+        "slot": 1,
+        "type": "vector<table<CommitProxyInterface>>"
+      },
+      {
+        "field": "id",
+        "slot": 2,
+        "type": "uid"
+      },
+      {
+        "field": "forward",
+        "slot": 3,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "history",
+        "slot": 5,
+        "type": "vector<table<VersionHistory>>"
+      },
+      {
+        "field": "tenantMode",
+        "slot": 6,
+        "type": "table<TenantMode>"
+      },
+      {
+        "field": "encryptKeyProxy",
+        "slot": 7,
+        "type": "optional<table<EncryptKeyProxyInterface>>"
+      },
+      {
+        "field": "clusterId",
+        "slot": 9,
+        "type": "uid"
+      },
+      {
+        "field": "clusterType",
+        "slot": 10,
+        "type": "i32"
+      },
+      {
+        "field": "metaclusterName",
+        "slot": 11,
+        "type": "optional<bytes>"
+      }
+    ],
+    "table<ClientTagThrottleLimits>": [
+      {
+        "field": "tpsRate",
+        "slot": 0,
+        "type": "f64"
+      },
+      {
+        "field": "duration",
+        "slot": 1,
+        "type": "f64"
+      }
+    ],
+    "table<ClientTrCommitCostEstimation>": [
+      {
+        "field": "opsCount",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "writeCosts",
+        "slot": 1,
+        "type": "u64"
+      },
+      {
+        "field": "clearIdxCosts",
+        "slot": 2,
+        "type": "vector<table<pair<i32,u64>>>"
+      },
+      {
+        "field": "expensiveCostEstCount",
+        "slot": 3,
+        "type": "u32"
+      }
+    ],
+    "table<ClientVersionRef>": [
+      {
+        "field": "clientVersion",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "sourceVersion",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "protocolVersion",
+        "slot": 2,
+        "type": "bytes"
+      }
+    ],
+    "table<CommitID>": [
+      {
+        "field": "version",
+        "slot": 0,
+        "type": "i64"
+      },
+      {
+        "field": "txnBatchId",
+        "slot": 1,
+        "type": "u16"
+      },
+      {
+        "field": "metadataVersion",
+        "slot": 2,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "conflictingKRIndices",
+        "slot": 4,
+        "type": "optional<vector<i32>>"
+      }
+    ],
+    "table<CommitProxyInterface>": [
+      {
+        "field": "processId",
+        "slot": 0,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "provisional",
+        "slot": 2,
+        "type": "bool"
+      },
+      {
+        "field": "commit",
+        "slot": 3,
+        "type": "table<request_stream>"
+      }
+    ],
+    "table<CommitTransactionRef>": [
+      {
+        "field": "read_conflict_ranges",
+        "slot": 0,
+        "type": "vector<table<KeyRangeRef>>"
+      },
+      {
+        "field": "write_conflict_ranges",
+        "slot": 1,
+        "type": "vector<table<KeyRangeRef>>"
+      },
+      {
+        "field": "mutations",
+        "slot": 2,
+        "type": "vector<table<MutationRef>>"
+      },
+      {
+        "field": "read_snapshot",
+        "slot": 3,
+        "type": "i64"
+      },
+      {
+        "field": "report_conflicting_keys",
+        "slot": 4,
+        "type": "bool"
+      },
+      {
+        "field": "lock_aware",
+        "slot": 5,
+        "type": "bool"
+      },
+      {
+        "field": "spanContext",
+        "slot": 6,
+        "type": "optional<table<SpanContext>>"
+      },
+      {
+        "field": "tenantIds",
+        "slot": 8,
+        "type": "optional<vector<i64>>"
+      }
+    ],
+    "table<CommitTransactionRequest>": [
+      {
+        "field": "transaction",
+        "slot": 0,
+        "type": "table<CommitTransactionRef>"
+      },
+      {
+        "field": "reply",
+        "slot": 1,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "flags",
+        "slot": 2,
+        "type": "u32"
+      },
+      {
+        "field": "debugID",
+        "slot": 3,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "commitCostEstimation",
+        "slot": 5,
+        "type": "optional<table<ClientTrCommitCostEstimation>>"
+      },
+      {
+        "field": "tagSet",
+        "slot": 7,
+        "type": "optional<tag_set>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 9,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenantInfo",
+        "slot": 10,
+        "type": "table<TenantInfo>"
+      },
+      {
+        "field": "idempotencyId",
+        "slot": 11,
+        "type": "bytes"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<EncryptKeyProxyInterface>": [
+      {
+        "field": "locality",
+        "slot": 0,
+        "type": "table<LocalityData>"
+      },
+      {
+        "field": "myId",
+        "slot": 1,
+        "type": "uid"
+      },
+      {
+        "field": "waitFailure",
+        "slot": 2,
+        "type": "table<request_stream>"
+      }
+    ],
+    "table<Endpoint>": [
+      {
+        "field": "addresses",
+        "slot": 0,
+        "type": "table<NetworkAddressList>"
+      },
+      {
+        "field": "token",
+        "slot": 1,
+        "type": "uid"
+      }
+    ],
+    "table<Error>": [
+      {
+        "field": "error_code",
+        "slot": 0,
+        "type": "u16"
+      }
+    ],
+    "table<GetKeyReply>": [
+      {
+        "field": "penalty",
+        "slot": 0,
+        "type": "f64"
+      },
+      {
+        "field": "error",
+        "slot": 1,
+        "type": "optional<table<Error>>"
+      },
+      {
+        "field": "sel",
+        "slot": 3,
+        "type": "table<KeySelectorRef>"
+      },
+      {
+        "field": "cached",
+        "slot": 4,
+        "type": "bool"
+      }
+    ],
+    "table<GetKeyRequest>": [
+      {
+        "field": "sel",
+        "slot": 0,
+        "type": "table<KeySelectorRef>"
+      },
+      {
+        "field": "version",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "tags",
+        "slot": 2,
+        "type": "optional<tag_set>"
+      },
+      {
+        "field": "reply",
+        "slot": 4,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 5,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenantInfo",
+        "slot": 6,
+        "type": "table<TenantInfo>"
+      },
+      {
+        "field": "options",
+        "slot": 7,
+        "type": "optional<table<ReadOptions>>"
+      },
+      {
+        "field": "ssLatestCommitVersions",
+        "slot": 9,
+        "type": "version_vector"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<GetKeyServerLocationsReply>": [
+      {
+        "field": "results",
+        "slot": 0,
+        "type": "vector<table<pair<table<KeyRangeRef>,vector<table<StorageServerInterface>>>>>"
+      },
+      {
+        "field": "resultsTssMapping",
+        "slot": 1,
+        "type": "vector<table<pair<uid,table<StorageServerInterface>>>>"
+      },
+      {
+        "field": "resultsTagMapping",
+        "slot": 2,
+        "type": "vector<table<pair<uid,struct<u16,i8>>>>"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<GetKeyServerLocationsRequest>": [
+      {
+        "field": "begin",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "end",
+        "slot": 1,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "limit",
+        "slot": 3,
+        "type": "i32"
+      },
+      {
+        "field": "reverse",
+        "slot": 4,
+        "type": "bool"
+      },
+      {
+        "field": "reply",
+        "slot": 5,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 6,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenant",
+        "slot": 7,
+        "type": "table<TenantInfo>"
+      },
+      {
+        "field": "minTenantVersion",
+        "slot": 8,
+        "type": "i64"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<GetKeyValuesReply>": [
+      {
+        "field": "penalty",
+        "slot": 0,
+        "type": "f64"
+      },
+      {
+        "field": "error",
+        "slot": 1,
+        "type": "optional<table<Error>>"
+      },
+      {
+        "field": "data",
+        "slot": 3,
+        "type": "preserialized_kv_vector"
+      },
+      {
+        "field": "version",
+        "slot": 4,
+        "type": "i64"
+      },
+      {
+        "field": "more",
+        "slot": 5,
+        "type": "bool"
+      },
+      {
+        "field": "cached",
+        "slot": 6,
+        "type": "bool"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<GetKeyValuesRequest>": [
+      {
+        "field": "begin",
+        "slot": 0,
+        "type": "table<KeySelectorRef>"
+      },
+      {
+        "field": "end",
+        "slot": 1,
+        "type": "table<KeySelectorRef>"
+      },
+      {
+        "field": "version",
+        "slot": 2,
+        "type": "i64"
+      },
+      {
+        "field": "limit",
+        "slot": 3,
+        "type": "i32"
+      },
+      {
+        "field": "limitBytes",
+        "slot": 4,
+        "type": "i32"
+      },
+      {
+        "field": "tags",
+        "slot": 5,
+        "type": "optional<tag_set>"
+      },
+      {
+        "field": "reply",
+        "slot": 7,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 8,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenantInfo",
+        "slot": 9,
+        "type": "table<TenantInfo>"
+      },
+      {
+        "field": "options",
+        "slot": 10,
+        "type": "optional<table<ReadOptions>>"
+      },
+      {
+        "field": "ssLatestCommitVersions",
+        "slot": 12,
+        "type": "version_vector"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<GetReadVersionReply>": [
+      {
+        "field": "processBusyTime",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "version",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "locked",
+        "slot": 2,
+        "type": "bool"
+      },
+      {
+        "field": "metadataVersion",
+        "slot": 3,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "tagThrottleInfo",
+        "slot": 5,
+        "type": "vector<table<pair<bytes,table<ClientTagThrottleLimits>>>>"
+      },
+      {
+        "field": "midShardSize",
+        "slot": 6,
+        "type": "i64"
+      },
+      {
+        "field": "rkDefaultThrottled",
+        "slot": 7,
+        "type": "bool"
+      },
+      {
+        "field": "rkBatchThrottled",
+        "slot": 8,
+        "type": "bool"
+      },
+      {
+        "field": "ssVersionVectorDelta",
+        "slot": 9,
+        "type": "version_vector"
+      },
+      {
+        "field": "proxyId",
+        "slot": 10,
+        "type": "uid"
+      },
+      {
+        "field": "proxyTagThrottledDuration",
+        "slot": 11,
+        "type": "f64"
+      }
+    ],
+    "table<GetReadVersionRequest>": [
+      {
+        "field": "transactionCount",
+        "slot": 0,
+        "type": "u32"
+      },
+      {
+        "field": "flags",
+        "slot": 1,
+        "type": "u32"
+      },
+      {
+        "field": "tags",
+        "slot": 2,
+        "type": "vector<table<pair<bytes,u32>>>"
+      },
+      {
+        "field": "debugID",
+        "slot": 3,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "reply",
+        "slot": 5,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 6,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "maxVersion",
+        "slot": 7,
+        "type": "i64"
+      }
+    ],
+    "table<GetValueReply>": [
+      {
+        "field": "penalty",
+        "slot": 0,
+        "type": "f64"
+      },
+      {
+        "field": "error",
+        "slot": 1,
+        "type": "optional<table<Error>>"
+      },
+      {
+        "field": "value",
+        "slot": 3,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "cached",
+        "slot": 5,
+        "type": "bool"
+      }
+    ],
+    "table<GetValueRequest>": [
+      {
+        "field": "key",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "version",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "tags",
+        "slot": 2,
+        "type": "optional<tag_set>"
+      },
+      {
+        "field": "reply",
+        "slot": 4,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 5,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenantInfo",
+        "slot": 6,
+        "type": "table<TenantInfo>"
+      },
+      {
+        "field": "options",
+        "slot": 7,
+        "type": "optional<table<ReadOptions>>"
+      },
+      {
+        "field": "ssLatestCommitVersions",
+        "slot": 9,
+        "type": "version_vector"
+      }
+    ],
+    "table<GrvProxyInterface>": [
+      {
+        "field": "processId",
+        "slot": 0,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "provisional",
+        "slot": 2,
+        "type": "bool"
+      },
+      {
+        "field": "getConsistentReadVersion",
+        "slot": 3,
+        "type": "table<request_stream>"
+      }
+    ],
+    "table<Hostname>": [
+      {
+        "field": "host",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "service",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "isTLS",
+        "slot": 2,
+        "type": "bool"
+      }
+    ],
+    "table<IPAddress>": [
+      {
+        "field": "addr",
+        "slot": 0,
+        "type": "variant<u32,array<u8,16>>"
+      }
+    ],
+    "table<KeyRangeRef>": [
+      {
+        "field": "begin",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "end",
+        "slot": 1,
+        "type": "bytes"
+      }
+    ],
+    "table<KeySelectorRef>": [
+      {
+        "field": "key",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "orEqual",
+        "slot": 1,
+        "type": "bool"
+      },
+      {
+        "field": "offset",
+        "slot": 2,
+        "type": "i32"
+      }
+    ],
+    "table<LocalityData>": [
+      {
+        "field": "_data",
+        "slot": 0,
+        "type": "vector<table<pair<bytes,optional<bytes>>>>"
+      }
+    ],
+    "table<MutationRef>": [
+      {
+        "field": "type",
+        "slot": 0,
+        "type": "u8"
+      },
+      {
+        "field": "param1",
+        "slot": 1,
+        "type": "bytes"
+      },
+      {
+        "field": "param2",
+        "slot": 2,
+        "type": "bytes"
+      }
+    ],
+    "table<NetworkAddress>": [
+      {
+        "field": "ip",
+        "slot": 0,
+        "type": "table<IPAddress>"
+      },
+      {
+        "field": "port",
+        "slot": 1,
+        "type": "u16"
+      },
+      {
+        "field": "flags",
+        "slot": 2,
+        "type": "u16"
+      },
+      {
+        "field": "fromHostname",
+        "slot": 3,
+        "type": "bool"
+      }
+    ],
+    "table<NetworkAddressList>": [
+      {
+        "field": "address",
+        "slot": 0,
+        "type": "table<NetworkAddress>"
+      },
+      {
+        "field": "secondaryAddress",
+        "slot": 1,
+        "type": "optional<table<NetworkAddress>>"
+      }
+    ],
+    "table<OpenDatabaseCoordRequest>": [
+      {
+        "field": "issues",
+        "slot": 0,
+        "type": "vector<bytes>"
+      },
+      {
+        "field": "supportedVersions",
+        "slot": 1,
+        "type": "vector<table<ClientVersionRef>>"
+      },
+      {
+        "field": "traceLogGroup",
+        "slot": 2,
+        "type": "bytes"
+      },
+      {
+        "field": "knownClientInfoID",
+        "slot": 3,
+        "type": "uid"
+      },
+      {
+        "field": "clusterKey",
+        "slot": 4,
+        "type": "bytes"
+      },
+      {
+        "field": "coordinators",
+        "slot": 5,
+        "type": "vector<table<NetworkAddress>>"
+      },
+      {
+        "field": "reply",
+        "slot": 6,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "hostnames",
+        "slot": 7,
+        "type": "vector<table<Hostname>>"
+      },
+      {
+        "field": "internal",
+        "slot": 8,
+        "type": "bool"
+      }
+    ],
+    "table<PingRequest>": [
+      {
+        "field": "reply",
+        "slot": 0,
+        "type": "table<reply_promise>"
+      }
+    ],
+    "table<ReadOptions>": [
+      {
+        "field": "type",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "cacheResult",
+        "slot": 1,
+        "type": "bool"
+      },
+      {
+        "field": "debugID",
+        "slot": 2,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "consistencyCheckStartVersion",
+        "slot": 4,
+        "type": "optional<i64>"
+      },
+      {
+        "field": "lockAware",
+        "slot": 6,
+        "type": "bool"
+      }
+    ],
+    "table<SpanContext>": [
+      {
+        "field": "traceID",
+        "slot": 0,
+        "type": "uid"
+      },
+      {
+        "field": "spanID",
+        "slot": 1,
+        "type": "u64"
+      },
+      {
+        "field": "m_Flags",
+        "slot": 2,
+        "type": "u8"
+      }
+    ],
+    "table<StorageServerInterface>": [
+      {
+        "field": "uniqueID",
+        "slot": 0,
+        "type": "uid"
+      },
+      {
+        "field": "locality",
+        "slot": 1,
+        "type": "table<LocalityData>"
+      },
+      {
+        "field": "getValue",
+        "slot": 2,
+        "type": "table<request_stream>"
+      },
+      {
+        "field": "tssPairID",
+        "slot": 3,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "acceptingRequests",
+        "slot": 5,
+        "type": "bool"
+      }
+    ],
+    "table<TenantInfo>": [
+      {
+        "field": "tenantId",
+        "slot": 0,
+        "type": "i64"
+      },
+      {
+        "field": "token",
+        "slot": 1,
+        "type": "optional<table<WipedString>>"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<TenantMode>": [
+      {
+        "field": "mode",
+        "slot": 0,
+        "type": "u32"
+      }
+    ],
+    "table<VersionHistory>": [
+      {
+        "field": "mutations",
+        "slot": 0,
+        "type": "vector<table<MutationRef>>"
+      },
+      {
+        "field": "version",
+        "slot": 1,
+        "type": "i64"
+      }
+    ],
+    "table<Void>": [],
+    "table<WatchValueReply>": [
+      {
+        "field": "version",
+        "slot": 0,
+        "type": "i64"
+      },
+      {
+        "field": "cached",
+        "slot": 1,
+        "type": "bool"
+      }
+    ],
+    "table<WatchValueRequest>": [
+      {
+        "field": "key",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "value",
+        "slot": 1,
+        "type": "optional<bytes>"
+      },
+      {
+        "field": "version",
+        "slot": 3,
+        "type": "i64"
+      },
+      {
+        "field": "tags",
+        "slot": 4,
+        "type": "optional<tag_set>"
+      },
+      {
+        "field": "debugID",
+        "slot": 6,
+        "type": "optional<uid>"
+      },
+      {
+        "field": "reply",
+        "slot": 8,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "spanContext",
+        "slot": 9,
+        "type": "table<SpanContext>"
+      },
+      {
+        "field": "tenantInfo",
+        "slot": 10,
+        "type": "table<TenantInfo>"
+      }
+    ],
+    "table<WipedString>": [
+      {
+        "field": "ws",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<pair<bytes,optional<bytes>>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "optional<bytes>"
+      }
+    ],
+    "table<pair<bytes,table<ClientTagThrottleLimits>>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "table<ClientTagThrottleLimits>"
+      }
+    ],
+    "table<pair<bytes,u32>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "bytes"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "u32"
+      }
+    ],
+    "table<pair<i32,u64>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "i32"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "u64"
+      }
+    ],
+    "table<pair<table<KeyRangeRef>,vector<table<StorageServerInterface>>>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "table<KeyRangeRef>"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "vector<table<StorageServerInterface>>"
+      }
+    ],
+    "table<pair<uid,struct<u16,i8>>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "uid"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "struct<u16,i8>"
+      }
+    ],
+    "table<pair<uid,table<StorageServerInterface>>>": [
+      {
+        "field": "first",
+        "slot": 0,
+        "type": "uid"
+      },
+      {
+        "field": "second",
+        "slot": 1,
+        "type": "table<StorageServerInterface>"
+      }
+    ],
+    "table<reply_promise>": [
+      {
+        "field": "token",
+        "slot": 0,
+        "type": "uid"
+      }
+    ],
+    "table<request_stream>": [
+      {
+        "field": "endpoint",
+        "slot": 0,
+        "type": "table<Endpoint>"
+      }
+    ]
+  }
+}

@@ -8,6 +8,15 @@ can be checked against the C++ reader.
 Nothing in the Rust workspace builds or runs this tool. The fixtures it writes are checked
 in under [`fixtures/`](fixtures/), and Rust tests read them as plain files.
 
+There are two kinds of fixtures:
+
+- `fixtures/engine/`: engine-level vectors (test types modelled on FDB's flatbuffers unit
+  tests, compiled against stand-ins for the flow types), built on the host by `regen.sh`.
+- `fixtures/release-7.4/` and `fixtures/release-8.0/`: message-level vectors (real
+  `GetValueRequest`, `CommitTransactionRequest`, `ClientDBInfo`, ...) serialized by each
+  release branch's own code, built inside the official FDB build image by
+  `regen_messages.sh`. See [Message-level vectors](#message-level-vectors).
+
 - [Build and regenerate](#build-and-regenerate)
 - [Decode mode](#decode-mode)
 - [Fixture format](#fixture-format)
@@ -15,7 +24,7 @@ in under [`fixtures/`](fixtures/), and Rust tests read them as plain files.
 - [Vector catalog](#vector-catalog)
 - [Wire format notes for the codec author](#wire-format-notes-for-the-codec-author)
 - [Types not covered](#types-not-covered)
-- [Message-level vectors (not done)](#message-level-vectors-not-done)
+- [Message-level vectors](#message-level-vectors)
 - [How the tool is put together](#how-the-tool-is-put-together)
 
 ## Build and regenerate
@@ -606,41 +615,293 @@ These real FDB wire types have no engine vector:
 - **`std::deque`** has vector traits and the `vector<T>` wire form, but is untested.
 - **`Standalone<T>`** (encodes as `T`), **`Tag`** (a struct via `struct_like_traits<Tag>`),
   **`IPAddress`** and **`NetworkAddress`** need fdbclient/fdbrpc headers and are out of scope
-  for engine vectors; see the next section.
+  for engine vectors.
 
-## Message-level vectors (not done)
+The message-level vectors cover all of these except `ProtocolVersion`,
+`std::unordered_set` and `boost::container::flat_map` (see the next section).
 
-The plan was to add `fixtures/release-7.4/` and `fixtures/release-8.0/` with real messages
-(`GetValueRequest`, `CommitTransactionRequest`, `ClientDBInfo`, ...) compiled from each
-branch's `fdbclient` headers with stubs. It is not feasible without an FDB build
-environment. Blockers found while probing `fdbclient/StorageServerInterface.h`:
+## Message-level vectors
 
-- Every message header reaches `flow/flow.h`, `fdbrpc/fdbrpc.h` and `fdbclient/FDBTypes.h`,
-  which pull in most of flow: tracing (needs `{fmt}`, not vendored in the FDB tree and not
-  installed here), knobs, the network and simulator interfaces, `FlowTransport`, Swift
-  bridging headers, and so on.
-- `release-7.4` (and 8.0) headers include actor-compiled files (`fdbrpc/LoadBalance.actor.h`,
-  `fdbclient/TagThrottle.actor.h`, `flow/genericactors.actor.h`) that only exist after the
-  C# actor compiler runs (needs mono or dotnet).
-- Generated headers: `fdbclient/FDBOptions.g.h` (vexillographer, also C#),
-  `flow/ProtocolVersion.h` (generated from `ProtocolVersion.h.cmake` by
-  `flow/protocolversion/protocol_version.py`), `flow/config.h` and `SourceVersion.h`
-  (CMake `configure_file`).
+`fixtures/release-7.4/` and `fixtures/release-8.0/` hold real FDB messages, serialized by
+each release branch's own types and serializer: the branch is configured with its own CMake
+build inside the official FoundationDB build image, and a generator target that links
+`fdbclient` (and through it `fdbrpc` and `flow`) writes the fixtures. Nothing is stubbed or
+transcribed except FlowTransport's two-line `PingRequest`, which lives in a `.cpp` file (it is
+mirrored and checked against that file, see below).
 
-Stubbing all of that would mean re-implementing a large part of flow, and transcribing the
-message definitions into the tool instead would only duplicate the Rust schema work without
-checking it.
+### Regenerate
 
-Recommended approach for a follow-up issue: generate message vectors inside FDB's own build
-environment. Use the `foundationdb/build` Docker image (docker is available on this host),
-configure each release branch with CMake, build only the generated-header targets plus
-`fdbclient` (or the whole of `fdbserver`), and compile a small TU, like this tool's
-`main.cpp` with real types in place of the stubs, against the build tree. The output format
-can stay the same: the dumper (`src/dump.h`), schema lister (`src/schema.h`) and strict
-checker (`src/strict.h`) work for any type with a `serialize()` method, and only need field
-names (which they would take from the `serializer()` call arguments with a small script, or
-leave as `f0`, `f1`, ...). An alternative that avoids C++ entirely is to capture real packets
-between `fdbcli` and a test server per release and record them as decode-only vectors.
+Requirements: docker, and a FoundationDB checkout that has the `origin/release-7.4` and
+`origin/release-8.0` refs. Nothing else is needed on the host.
+
+```bash
+FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh           # both releases
+FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh --check   # + determinism
+MSG_BRANCHES=origin/release-8.0 FDB_SRC=... tools/golden-vectors/regen_messages.sh  # one release
+```
+
+For each branch the script:
+
+1. exports the branch with `git archive` into `build/msg/src-<release>/` (only when the
+   commit changed; the FDB checkout is only read, with `git --no-optional-locks`);
+2. starts a disposable build container (`docker run --rm --init`, also removed by ID on
+   exit, error or Ctrl-C) from the pinned image, with this tool directory and the source
+   mounted read-only; it writes only into the build tree `build/msg/build-<release>/` and a
+   ccache in `build/msg/ccache/` (all gitignored);
+3. configures FDB with CMake (`-G Ninja`, clang; Java, Go, Ruby, docs, gRPC, RocksDB and
+   AWS off) and injects this tool's target with
+   `-DCMAKE_PROJECT_foundationdb_INCLUDE=messages/project_include.cmake`, which defers an
+   `include(messages/targets.cmake)` to the end of FDB's top-level `CMakeLists.txt`, so the
+   exported tree is not modified;
+4. builds `golden_vectors_messages` (FDB's generated headers, the actor compiler output,
+   `flow`, `fdbrpc` and `fdbclient`, then `messages/message_vectors.cpp` and `src/main.cpp`);
+5. generates into `build/msg/build-<release>/out/` and feeds every fixture back through that
+   build's `decode` command (`check_fixtures.py roundtrip`);
+6. with `--check`, generates a second time with the same binary and requires byte-identical
+   output;
+7. only if all of that succeeded, replaces `fixtures/<release>/` with the new output. A
+   failed or interrupted run leaves the checked-in fixtures untouched.
+
+`--check` does not compare with the committed fixtures: after a run, `git status` (or
+`git diff tools/golden-vectors/fixtures`) shows whether the output changed. A clean tree means
+the regeneration reproduced the committed fixtures byte for byte.
+
+The build image is pinned by tag and digest in `regen_messages.sh` (`BUILD_IMAGE`):
+`foundationdb/build:rockylinux9-20261120210123-c79f7cf1aa@sha256:eabf6edbff5f6e864a574814db0a10eb63f804a6a8856f801f942a0b4be715e1`,
+a dated build of the `rockylinux9` image that FDB's CI uses
+(`foundationdb/build:rockylinux9-latest` in release-8.0's `.github/workflows/tidy.yml`; both
+branches' `cmake/ConfigureCompiler.cmake` describe its toolchain, and both build with it
+unchanged). It has clang 19 with libc++, CMake 3.31, Ninja and mono. Each fixture
+directory's `index.json` records the branch commit (`fdb_source`), the FDB version and the
+image.
+
+Cost on a 32-core host: a cold build of one branch (configure plus `fdbclient`, 200 to 350
+Ninja steps) takes about 2.5 minutes, and a rebuild after editing the generator about 45
+seconds. Each build tree is about 600 MB.
+
+### Decode mode
+
+The generator has the same CLI as the engine tool (`generate`, `decode`, `list-types
+[--schema]`). Its `decode` runs the branch's real reader (`ArenaObjectReader`, as
+FlowTransport does) after checking the 8-byte header and the file identifier itself. The
+binary links libc++ statically and runs on the host:
+
+```bash
+build/msg/build-release-7.4/bin/golden_vectors_messages list-types
+echo <hex> | build/msg/build-release-7.4/bin/golden_vectors_messages decode GetValueRequest
+echo <hex> | build/msg/build-release-8.0/bin/golden_vectors_messages decode 'ErrorOr<EnsureTable<CommitID>>'
+```
+
+**Checking a Rust encoder**: encode the value a fixture's `root` describes, decode the bytes
+with the matching release's binary and compare the printed `root` with the fixture's. The
+release readers have no bounds checks: only feed them well-formed buffers (for example ones
+the Rust decoder has already accepted); malformed input can crash them.
+
+### Format and vocabulary
+
+The records use the [fixture format](#fixture-format) unchanged; message directories have
+positive records only (no `negative/` or `corpus/`), plus `index.json` and `schemas.json`.
+`cpp_type` is the C++ type name (`GetValueRequest`, `ErrorOr<EnsureTable<CommitID>>`,
+`UID`). Field names are the `serializer()` argument names in the branch's headers: the last
+identifier of each argument (`LoadBalancedReply::penalty` is `penalty`,
+`const_cast<KeyRef&>(begin)` is `begin`). Usually that is the C++ data member, but not
+always:
+
+- `WipedString.ws` is a local in `WipedString::serialize()` (a wrapper around the string).
+  On 7.4, `TenantInfo.token` is therefore `optional<table<WipedString>>`: a union whose
+  payload is a table with one `bytes` field, `ws` (plus an `arena`, which takes no slot).
+- `ClientTagThrottleLimits.duration` is a local computed from the `expiration` member (see
+  the wire notes).
+- `LocalityData._data` is the C++ member name, underscore included (a
+  `std::map<key, Optional<value>>`, dumped as a vector of `pair` tables).
+- `table<request_stream>.endpoint` and `table<reply_promise>.token` are this tool's labels
+  for the single argument of `serializable_traits<RequestStream<T>>` (a local `ep`) and
+  `serializable_traits<ReplyPromise<T>>` (the endpoint's token).
+
+Additions to the [node types](#nodes):
+
+| `type` | C++ | wire form | `value` |
+| --- | --- | --- | --- |
+| `table<Name>` | every FDB struct with a `serialize()`; `Name` is its C++ name | table | members |
+| `table<request_stream>` | `RequestStream<T>` / `PublicRequestStream<T>`, any `T` | one-slot table: `endpoint` (`table<Endpoint>`: `addresses`, `token`) | members |
+| `table<reply_promise>` | `ReplyPromise<T>`, any `T` (as in the engine fixtures) | one-slot table: `token` (`uid`) | members |
+| `bytes` | also `Standalone<StringRef>` (`Key`, `Value`), `IdempotencyIdRef`, `WipedString`'s string | string framing | hex |
+| `tag_set` | `TagSet` | one blob (string framing): per tag, u8 length then the tag bytes; no count | array of hex tags, in order |
+| `version_vector` | `VersionVector` | one blob, see below | `{"versions": [{"locality": i8, "id": u16, "version": i64}], "maxVersion": i64}`, `versions` in `Tag` order (locality, then id) |
+| `preserialized_kv_vector` | `VectorRef<KeyValueRef, VecSerStrategy::String>` (`GetKeyValuesReply::data`) | as in the engine fixtures | as in the engine fixtures |
+| `struct<u16,i8>` | `Tag` (`struct_like_traits<Tag>`: `id` at 0, `locality` at 2) | inline struct, size 4 | members `"0"` (id), `"1"` (locality) |
+| integer types | enums (`TraceFlags` u8, `ReadType` i32 on 7.4 and u32 on 8.0, `ClusterType` i32, `TaskPriority` i32) | scalar of the enum's size | integer |
+
+`Standalone<T>` is serialized exactly as `T` (`LoadSaveHelper<Standalone<T>>` in
+`flow/ObjectSerializer.h`), so the dumps never show it. `Arena` members appear as before
+(`arena`, slot `null`). `schemas.json` lists every reachable table; several C++ types may
+share a dump name only if their fields are identical (`reply_promise`, `request_stream`).
+
+**`VersionVector` blob** (`dynamic_size_traits<VersionVector>`, identical on both branches;
+little-endian, `size_t` is 8 bytes): u64 count of distinct tag localities; per locality run,
+in `Tag` order, i8 locality and u16 run length; if there is at least one entry, u8 tag-id
+width (1 if every id is at most 255, else 2), u8 version-delta width (1, 2, 4 or 8: the
+smallest that holds the largest minus the smallest entry version; the minimum and maximum are
+taken over the entries only, not over the trailing `maxVersion` field), i64 min version (the
+smallest entry version), u64 entry count, then
+per entry the tag id and (version minus min version) in those widths; finally i64
+`maxVersion`. The vectors cover the empty form and the width pairs 1/1, 1/2, 1/4 and 2/8.
+
+### How names and values are checked
+
+- **Field names** come from `messages/extract_fields.py`, which the build runs on the
+  branch's headers (and on `fdbrpc/FlowTransport(.actor).cpp` for `PingRequest`). It finds
+  each table type's `serialize()` (or `serializable_traits<T>`), picks the flatbuffers
+  `serializer()` call (the `if constexpr (is_fb_function<Ar>)` branch where there is one),
+  and generates `gv_table_info<T>` (`src/hooks.h`): the names, the address of the data member
+  each argument names, and a `static_assert` on the file identifier. At dump time the dumper
+  checks that every argument it receives is at that address and that the argument count
+  equals the name count, so a name cannot be attached to the wrong member. The target is
+  compiled with `-fno-access-control` so private members can be named.
+- **Each vector** is encoded twice with different fill bytes (no uninitialized output), must
+  equal FDB's own `ObjectWriter` output byte for byte (with `AssumeVersion`, as FlowTransport
+  serializes packets), is decoded by the branch's `ArenaObjectReader` to the same field dump
+  as the value it was built from, and passes the permitted
+  [strict checks](#corpus-accept-classes).
+- **Determinism**: the output is a function of the source and the compiler. `--check` (two
+  runs of one binary), a second full run and a run from an empty `build/msg/` all reproduce
+  the committed fixtures byte for byte (a clean `git status`). The values
+  avoid the nondeterministic parts: `std::unordered_map` fields (`TransactionTagMap`) hold
+  one entry, and `ClientTagThrottleLimits` serializes `expiration - now()` (the network clock
+  does not advance in the generator, so `duration` is exactly 30.0).
+
+### Wire notes for the codec author
+
+- **Envelopes.** A request is sent as the request table itself (root slot 0, the request's
+  file identifier). A reply is sent as `ErrorOr<EnsureTable<Reply>>`: union tag 2 and the
+  reply table, or tag 1 and `Error`; file identifier `(2 << 24) | id(Reply)`. The
+  `*_envelope` and `*_error` vectors are exactly these. The bare reply vectors (`cpp_type`
+  is the reply type) are the same table without the envelope, for unit tests.
+- **Single-key ranges are compressed.** `KeyRangeRef` [k, k\x00) is written as
+  (begin = k\x00, end = "") and a `ClearRange` `MutationRef` over [k, k\x00) as (type,
+  param1 = k\x00, param2 = ""); the reader restores [k, k\x00). The fixtures' `root` shows
+  the wire form (`commit_transaction_request*`), because the dumper runs the writer side of
+  `serialize()`. A Rust encoder must compress the same way, and its decoder must expand,
+  with exactly the C++ reader's trigger conditions:
+  - `KeyRangeRef`: expand when `end` is empty and `begin` is not: end = begin, begin = begin
+    without its last byte. C++ `ASSERT`s that the last byte of `begin` is `\x00` (the
+    process dies otherwise).
+  - `MutationRef`: expand only when `type` is `ClearRange` (1), `param2` is empty and
+    `param1` is not: param2 = param1, param1 = param1 without its last byte. If the last
+    byte is not `\x00`, C++ logs a `SevError` and marks the mutation corrupted but keeps it.
+  - In both cases the Rust decoder should reject a compressed value whose last byte is not
+    `\x00` (a correct writer never produces one). An empty `begin` / `param1` with an empty
+    `end` / `param2` is not compressed and decodes as two empty strings.
+  `MutationRef` also has checksum forms (a flag bit in the type, a suffix on param2) that are
+  only written when the `ENABLE_MUTATION_CHECKSUM` client knob is set; no vector covers them.
+- **`ClientTagThrottleLimits`** is written as (tpsRate, duration = expiration - now()) and
+  read back as expiration = now() + duration, both with the local clock (so the expiration
+  is relative and clock skew between processes does not matter).
+- **`Endpoint`** is (addresses, token); `NetworkAddressList` is (address, secondaryAddress);
+  `NetworkAddress` is (ip, port, flags, fromHostname) with flags bit 0 = private and bit 1 =
+  TLS; `IPAddress` is a one-slot table holding `variant<u32, array<u8,16>>` (tag 1 IPv4, tag
+  2 IPv6; the u32 is the address as a number, 10.0.0.1 = 0x0a000001). The reader calls
+  `Endpoint::choosePrimaryAddress()`, which swaps primary and secondary when only the
+  secondary matches the local TLS setting; in these vectors the primary is not TLS and the
+  secondary is, so nothing moves.
+- **Interfaces carry one endpoint.** `CommitProxyInterface` sends only `commit`,
+  `GrvProxyInterface` only `getConsistentReadVersion`, `StorageServerInterface` only
+  `getValue`; the other endpoints are `getAdjustedEndpoint(i)`: token (first + (i << 32),
+  (second & 0xffffffff00000000) | (u32(second) + i)). The indices a client needs are the same
+  on both branches: commit proxy 2 = `getKeyServersLocations`; storage server 1 = `getKey`,
+  2 = `getKeyValues`, 10 = `watchValue`. Later commit proxy indices differ (8.0 dropped
+  `getHealthMetrics`, `getTenantId` and `getBlobGranuleLocations`, so for example
+  `expireIdempotencyId` is 10 on 7.4 and 9 on 8.0).
+- **Well-known tokens** are `UID(-1, n)`: 0 endpoint not found, 1 ping, 2 unauthorized
+  endpoint, 4 `ClientLeaderRegInterface::openDatabase` (where a coordinator receives
+  `OpenDatabaseCoordRequest`). The not-found and unauthorized payload is a bare `UID` root
+  (`endpoint_not_found`).
+- **`OpenDatabaseCoordRequest`'s reply** is declared as
+  `ReplyPromise<CachedSerialization<ClientDBInfo>>`, but `CachedSerialization` writes exactly
+  `ErrorOr<EnsureTable<ClientDBInfo>>` (`client_db_info_envelope`).
+- **`WatchValueReply`'s file identifier is 3**, so its envelope's is `0x02000003`.
+- A C++ writer that fills `GetKeyValuesReply::data` by appending must invalidate its cached
+  size first (`VectorRef<_, String>` keeps a cached serialized size that `push_back` leaves at
+  0); this does not affect readers.
+
+### 7.4 versus 8.0
+
+The file identifiers of all covered types are the same on both branches. Schema differences
+(field@slot; a union takes two slots, an `Arena` none; bold fields exist on one side only):
+
+| type | release-7.4 | release-8.0 |
+| --- | --- | --- |
+| `GetValueRequest` | key@0 version@1 tags@2 reply@4 spanContext@5 **tenantInfo@6** options@7 ssLatestCommitVersions@9 | key@0 version@1 tags@2 reply@4 spanContext@5 options@6 ssLatestCommitVersions@8 |
+| `GetKeyValuesRequest` | ... spanContext@8 **tenantInfo@9** options@10 ssLatestCommitVersions@12 arena | ... spanContext@8 options@9 ssLatestCommitVersions@11 **taskID@12** (`optional<i32>`, a `TaskPriority`) arena |
+| `GetKeyRequest` | sel@0 version@1 tags@2 reply@4 spanContext@5 **tenantInfo@6** options@7 ssLatestCommitVersions@9 arena | ... spanContext@5 options@6 ssLatestCommitVersions@8 arena |
+| `WatchValueRequest` | key@0 value@1 version@3 tags@4 debugID@6 reply@8 spanContext@9 **tenantInfo@10** | the same without tenantInfo |
+| `CommitTransactionRequest` | transaction@0 reply@1 flags@2 debugID@3 commitCostEstimation@5 tagSet@7 spanContext@9 **tenantInfo@10** idempotencyId@11 arena | ... spanContext@9 idempotencyId@10 arena |
+| `GetKeyServerLocationsRequest` | begin@0 end@1 limit@3 reverse@4 reply@5 spanContext@6 **tenant@7** **minTenantVersion@8** arena | ... spanContext@6 **legacyVersion@7** (i64) arena |
+| `GetReadVersionRequest` | transactionCount@0 flags@1 tags@2 debugID@3 reply@5 spanContext@6 maxVersion@7 | the same plus **maxGrvQueueDelayMS@8** (`optional<i64>`) |
+| `GetReadVersionReply` | processBusyTime@0 ... proxyId@10 **proxyTagThrottledDuration@11** (f64) | ends at proxyId@10 |
+| `ClientDBInfo` | grvProxies@0 commitProxies@1 id@2 forward@3 history@5 **tenantMode@6** (`table<TenantMode>`: mode u32) **encryptKeyProxy@7** clusterId@9 clusterType@10 **metaclusterName@11** | grvProxies@0 commitProxies@1 id@2 forward@3 history@5 clusterId@6 clusterType@7 **nativeCdcEnabled@8 nativeCdcTagCount@9 cdcProxies@10 streamToCDCProxyId@11** |
+| `ReadOptions` | type@0 is `i32` | type@0 is `u32` (same size) |
+
+`TenantInfo` (tenantId i64, token `optional<table<WipedString>>`, arena) exists only on
+7.4. Because 8.0 removed it from the middle of the read and commit requests, a 7.4 reader
+sees an 8.0 request's later fields in the wrong slots and the reverse: a client must choose
+the schema by the server's protocol version. Everything else covered (the replies other than
+`GetReadVersionReply`, `CommitID`, `OpenDatabaseCoordRequest`, the interfaces, `Endpoint`,
+`MutationRef`, `KeyRangeRef`, `SpanContext`, ...) is identical.
+
+### Message vector catalog
+
+The same 33 vectors exist for both releases; the values differ only in fields that exist on
+one branch. Group `storage`:
+
+| vector | `cpp_type` | covers |
+| --- | --- | --- |
+| `get_value_request` | `GetValueRequest` | every field set; `tag_set` with two tags; `ReadOptions` with every field; `version_vector` with 1-byte deltas; 7.4: `TenantInfo` with a token |
+| `get_value_request_minimal` | `GetValueRequest` | optionals absent, default `SpanContext` (and `TenantInfo` on 7.4); `version_vector` with 2-byte deltas |
+| `get_value_reply` | `GetValueReply` | bare reply: penalty, error (absent), value, cached |
+| `get_value_reply_envelope` | `ErrorOr<EnsureTable<GetValueReply>>` | success envelope |
+| `get_value_reply_absent_value` | `ErrorOr<EnsureTable<GetValueReply>>` | value absent, `LoadBalancedReply::error` present (1037) |
+| `get_value_reply_error` | `ErrorOr<EnsureTable<GetValueReply>>` | error envelope (1009 `future_version`) |
+| `get_key_values_request` | `GetKeyValuesRequest` | `KeySelectorRef` begin and end; `version_vector` with a negative locality, a tag id over 255 and 8-byte deltas; 8.0: `taskID` |
+| `get_key_values_reply`, `get_key_values_reply_envelope` | `GetKeyValuesReply`, `ErrorOr<...>` | pre-serialized KV vector with three rows (one empty value) |
+| `get_key_values_reply_empty` | `ErrorOr<EnsureTable<GetKeyValuesReply>>` | zero rows (a 4-byte blob) |
+| `get_key_request` | `GetKeyRequest` | empty `version_vector` |
+| `get_key_reply`, `get_key_reply_envelope` | `GetKeyReply`, `ErrorOr<...>` | `KeySelector` (`Standalone<KeySelectorRef>`) |
+| `watch_value_request` | `WatchValueRequest` | value and debugID present |
+| `watch_value_reply`, `watch_value_reply_envelope` | `WatchValueReply`, `ErrorOr<...>` | |
+
+Group `proxy`:
+
+| vector | `cpp_type` | covers |
+| --- | --- | --- |
+| `get_read_version_request` | `GetReadVersionRequest` | priority and flags, `TransactionTagMap<u32>` (`vector<table<pair<bytes,u32>>>`), debugID; 8.0: maxGrvQueueDelayMS |
+| `get_read_version_reply`, `get_read_version_reply_envelope` | `GetReadVersionReply`, `ErrorOr<...>` | metadataVersion, tagThrottleInfo (`ClientTagThrottleLimits`), `version_vector` with two localities and 4-byte deltas; 7.4: proxyTagThrottledDuration |
+| `commit_transaction_request` | `CommitTransactionRequest` | `CommitTransactionRef` with conflict ranges, four mutation types and every optional; cost estimation (a `std::deque` of pairs), tag set, idempotency id; single-key range compression |
+| `commit_transaction_request_single_key_clear` | `CommitTransactionRequest` | single-key `ClearRange` compression; everything else default |
+| `commit_id`, `commit_id_envelope` | `CommitID`, `ErrorOr<...>` | metadataVersion, conflictingKRIndices (`optional<vector<i32>>`) |
+| `commit_id_error` | `ErrorOr<EnsureTable<CommitID>>` | 1020 `not_committed` |
+| `get_key_server_locations_request` | `GetKeyServerLocationsRequest` | 7.4: tenant and minTenantVersion; 8.0: legacyVersion |
+| `get_key_server_locations_reply`, `get_key_server_locations_reply_envelope` | `GetKeyServerLocationsReply`, `ErrorOr<...>` | four `StorageServerInterface`s (`LocalityData` map with an absent value, tssPairID, acceptingRequests), the TSS mapping, the tag mapping (`Tag` structs) |
+
+Group `coordinator`:
+
+| vector | `cpp_type` | covers |
+| --- | --- | --- |
+| `open_database_coord_request` | `OpenDatabaseCoordRequest` | issues, supportedVersions (`ClientVersionRef`), hostnames, IPv4 and IPv6 coordinators |
+| `client_db_info`, `client_db_info_envelope` | `ClientDBInfo`, `ErrorOr<...>` | two GRV and two commit proxies (one of each with a TLS secondary address), forward, history (`VersionHistory`); 7.4: tenantMode, encryptKeyProxy, metaclusterName; 8.0: the CDC fields and a `std::map<u64, UID>` |
+
+Group `transport`:
+
+| vector | `cpp_type` | covers |
+| --- | --- | --- |
+| `ping_request` | `PingRequest` | FlowTransport's ping (mirrored from `FlowTransport(.actor).cpp`; file identifier and fields checked) |
+| `ping_reply` | `ErrorOr<EnsureTable<Void>>` | the ping reply |
+| `endpoint_not_found` | `UID` | the endpoint-not-found and unauthorized-endpoint payload |
+
+Not covered: malformed-input vectors for message types (the release readers have no bounds
+checks; the engine corpora cover the reader rules), `MutationRef` checksum forms, streams
+(`GetKeyValuesStreamRequest`, `ReplyPromiseStream`), mapped range reads, tenant management
+and metacluster requests, and FDB's binary (non-flatbuffers) serializer.
 
 ## How the tool is put together
 
@@ -654,9 +915,15 @@ between `fdbcli` and a test server per release and record them as decode-only ve
 | `src/strict.h` | the permitted strict checks used to classify corpus accepts; every positive vector must pass them |
 | `src/fixtures.h` | record builders; every positive vector is decoded again and must equal the dump of its input |
 | `src/engine_vectors.cpp` | test types (modelled on the `flow/flat_buffers.cpp` unit tests) and the catalog |
-| `src/main.cpp` | CLI |
-| `check_fixtures.py` | round-trip and tree-compare checks used by `regen.sh --check` |
+| `src/main.cpp` | CLI (shared by both generators) |
+| `src/hooks.h`, `src/gv_types.h` | customization points (`gv_unwrap`, `gv_leaf`, `gv_table_info`) and the switch between `stubs.h` and the real FDB types |
+| `check_fixtures.py` | round-trip and tree-compare checks used by `regen.sh --check` and `regen_messages.sh` |
 | `ubsan.supp` | the single UBSan suppression (FDB reader alignment UB on hostile input) |
+| `regen_messages.sh` | message vectors: exports each release branch, builds and runs the generator in the FDB build image |
+| `messages/project_include.cmake`, `messages/targets.cmake` | inject the `golden_vectors_messages` target into FDB's CMake build |
+| `messages/real_types.h` | the real types behind the names the dumper uses, leaf dumps (`tag_set`, `version_vector`, ...), template table names, the `PingRequest` mirror |
+| `messages/extract_fields.py` | generates `gv_table_info` (field names, member addresses, file identifier checks) from the branch's headers |
+| `messages/message_vectors.cpp` | the message catalog, and the FDB network setup the real types need |
 
 Only `flow/include/flow/flat_buffers.h`, `FileIdentifier.h` and `ObjectSerializerTraits.h`
 are compiled from `FDB_SRC`; the real Boost `flat_map` header is used. If a release changes
@@ -665,3 +932,9 @@ one of the stubbed trait specializations, update `src/stubs.h` to match.
 To add a vector, add a type with `TABLE(Name, fid(n))` and `FIELDS(...)` to
 `src/engine_vectors.cpp`, call `positive(...)` (or `negative(...)`) in the catalog, and run
 `./regen.sh --check`.
+
+To add a message vector, build the value in `messages/message_vectors.cpp` and call
+`message(...)`. If it reaches a table type that is not listed yet, add the type to `TABLES` in
+`messages/extract_fields.py` (until then the build fails with the `type_name` static
+assertion). Run `./regen_messages.sh --check`, and `./regen.sh --check` too if you changed
+anything in `src/`: both generators share those headers.

@@ -1,0 +1,149 @@
+{
+  "format_version": 1,
+  "name": "get_read_version_reply_envelope",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "GetReadVersionReply as sent.",
+  "cpp_type": "ErrorOr<EnsureTable<GetReadVersionReply>>",
+  "file_identifier": 49263820,
+  "file_identifier_hex": "0x02efb4cc",
+  "size": 280,
+  "bytes": "48000000ccb4ef0208000900080004000600060004000600080004001c0040002c0014003c003d00300034001c003e003f0038000400240008000c00040008000800140004000c0040000000080000000200000038000000e009000000000000e1090000000000007b5039278c04000015cd5b0700000000000000000000e83f48e8010084000000480000000c00000001010101000000003200000002000000000000000001000101000104005039278c04000002000000000000000300000000047011010070613a278c04000000000100000004000000a00000001c00000004000000a400000000000000002059400000000000003e40090000007468726f74746c65640000000a000000000000010000000200030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetReadVersionReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetReadVersionReply>>",
+          "value": {
+            "type": "table<GetReadVersionReply>",
+            "value": [
+              {
+                "field": "processBusyTime",
+                "slot": 0,
+                "type": "i32",
+                "value": 125000
+              },
+              {
+                "field": "version",
+                "slot": 1,
+                "type": "i64",
+                "value": 5000000000123
+              },
+              {
+                "field": "locked",
+                "slot": 2,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "metadataVersion",
+                "slot": 3,
+                "type": "optional<bytes>",
+                "tag": 1,
+                "value": {
+                  "type": "bytes",
+                  "value": "00000001000000020003"
+                }
+              },
+              {
+                "field": "tagThrottleInfo",
+                "slot": 5,
+                "type": "vector<table<pair<bytes,table<ClientTagThrottleLimits>>>>",
+                "value": [
+                  {
+                    "type": "table<pair<bytes,table<ClientTagThrottleLimits>>>",
+                    "value": [
+                      {
+                        "field": "first",
+                        "slot": 0,
+                        "type": "bytes",
+                        "value": "7468726f74746c6564"
+                      },
+                      {
+                        "field": "second",
+                        "slot": 1,
+                        "type": "table<ClientTagThrottleLimits>",
+                        "value": [
+                          {
+                            "field": "tpsRate",
+                            "slot": 0,
+                            "type": "f64",
+                            "value": 100.5
+                          },
+                          {
+                            "field": "duration",
+                            "slot": 1,
+                            "type": "f64",
+                            "value": 30.0
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "midShardSize",
+                "slot": 6,
+                "type": "i64",
+                "value": 123456789
+              },
+              {
+                "field": "rkDefaultThrottled",
+                "slot": 7,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "rkBatchThrottled",
+                "slot": 8,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "ssVersionVectorDelta",
+                "slot": 9,
+                "type": "version_vector",
+                "value": {
+                  "versions": [
+                    {
+                      "locality": 0,
+                      "id": 3,
+                      "version": 5000000000000
+                    },
+                    {
+                      "locality": 1,
+                      "id": 4,
+                      "version": 5000000070000
+                    }
+                  ],
+                  "maxVersion": 5000000070000
+                }
+              },
+              {
+                "field": "proxyId",
+                "slot": 10,
+                "type": "uid",
+                "value": {
+                  "first": 2528,
+                  "second": 2529
+                }
+              },
+              {
+                "field": "proxyTagThrottledDuration",
+                "slot": 11,
+                "type": "f64",
+                "value": 0.75
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "format_version": 1,
+  "name": "get_key_reply_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetKeyReply as sent.",
+  "cpp_type": "ErrorOr<EnsureTable<GetKeyReply>>",
+  "file_identifier": 44780945,
+  "file_identifier_hex": "0x02ab4d91",
+  "size": 128,
+  "bytes": "38000000914dab020000000008000900080004000600060004000600080004000a000d0004000c0008000e001600040014000c00100015002c00000008000000020000001a000000000000000000e03f000000000c0000000001000000000000400000000c00000000000000000000000a00000073656c2f726573756c740000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetKeyReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<GetKeyReply>>",
+          "value": {
+            "type": "table<GetKeyReply>",
+            "value": [
+              {
+                "field": "penalty",
+                "slot": 0,
+                "type": "f64",
+                "value": 0.5
+              },
+              {
+                "field": "error",
+                "slot": 1,
+                "type": "optional<table<Error>>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "sel",
+                "slot": 3,
+                "type": "table<KeySelectorRef>",
+                "value": [
+                  {
+                    "field": "key",
+                    "slot": 0,
+                    "type": "bytes",
+                    "value": "73656c2f726573756c74"
+                  },
+                  {
+                    "field": "orEqual",
+                    "slot": 1,
+                    "type": "bool",
+                    "value": false
+                  },
+                  {
+                    "field": "offset",
+                    "slot": 2,
+                    "type": "i32",
+                    "value": 0
+                  }
+                ]
+              },
+              {
+                "field": "cached",
+                "slot": 4,
+                "type": "bool",
+                "value": true
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

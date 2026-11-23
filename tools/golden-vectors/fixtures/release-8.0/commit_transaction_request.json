@@ -1,0 +1,419 @@
+{
+  "format_version": 1,
+  "name": "commit_transaction_request",
+  "group": "proxy",
+  "kind": "positive",
+  "description": "CommitProxyInterface::commit request (the commit proxy's base endpoint). transaction is a CommitTransactionRef table: two read and two write conflict ranges (one each a single-key range, which the writer sends as (begin = end, end = \"\"): KeyRangeRef's compressed form, decoded back to [k, k\\x00)), four mutations (SetValue, ClearRange, AddValue, SetVersionstampedKey; MutationRef type is a u8), report_conflicting_keys, lock_aware, spanContext (Optional<SpanContext>), tenantIds. idempotencyId is a string-framed blob. 7.4 only: tenantInfo, between spanContext and idempotencyId.",
+  "cpp_type": "CommitTransactionRequest",
+  "file_identifier": 93948,
+  "file_identifier_hex": "0x00016efc",
+  "size": 760,
+  "bytes": "7c000000fc6e01000000000000000600080004000600140004000a001d00040014001c0008000c00040008001a002700040008000c002400100025001400260018001c002000180024000c00100014000400200021002200180023001c000a000d000c00040008000c0018000c00040010001400080010000c0004006e0000000400000058000000cc000000b0000000030000009800000064000000500000002c0000000800000001010100190000006964656d706f74656e63792d69642d30313233343536373839000000b2000000060000000000ce7a060000000010ce7a060000000000a05b010000000b0000000a636f6d6d69742d746167009400000000100000000000000400000008000000010000000100000004000000a8000000002000000000000001000000b5de000000000000b6de000000000000280100000600000000009d5e0600000000009d7e000000000e0100000060defb7405000048010000000100004c000000280000000c00000001010101000000000200000007000000000000000800000000000000000000007a010000070000000000ce7a070000000010ce7a070000000000a05b01000000040000008c0000006000000038000000040000006a01000014000000080000000e00000003000000767376001100000076732f00000000000000000000030000000000009a010000140000000800000002000000040000000100000007000000636f756e74657200be01000018000000080000000100000007000000636c6561722f7a0007000000636c6561722f6100e60100001400000008000000000000000200000076310000020000006b310000020000002c000000040000004c020000140000000400000007000000636c6561722f7a0007000000636c6561722f6100700200000800000024000000030000006b310000020000002800000004000000900200000c00000004000000000000000c000000726561642f73696e676c6500b0020000140000000400000006000000726561642f6d000006000000726561642f610000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<CommitTransactionRequest>",
+        "value": [
+          {
+            "field": "transaction",
+            "slot": 0,
+            "type": "table<CommitTransactionRef>",
+            "value": [
+              {
+                "field": "read_conflict_ranges",
+                "slot": 0,
+                "type": "vector<table<KeyRangeRef>>",
+                "value": [
+                  {
+                    "type": "table<KeyRangeRef>",
+                    "value": [
+                      {
+                        "field": "begin",
+                        "slot": 0,
+                        "type": "bytes",
+                        "value": "726561642f61"
+                      },
+                      {
+                        "field": "end",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "726561642f6d"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<KeyRangeRef>",
+                    "value": [
+                      {
+                        "field": "begin",
+                        "slot": 0,
+                        "type": "bytes",
+                        "value": "726561642f73696e676c6500"
+                      },
+                      {
+                        "field": "end",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": ""
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "write_conflict_ranges",
+                "slot": 1,
+                "type": "vector<table<KeyRangeRef>>",
+                "value": [
+                  {
+                    "type": "table<KeyRangeRef>",
+                    "value": [
+                      {
+                        "field": "begin",
+                        "slot": 0,
+                        "type": "bytes",
+                        "value": "6b3100"
+                      },
+                      {
+                        "field": "end",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": ""
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<KeyRangeRef>",
+                    "value": [
+                      {
+                        "field": "begin",
+                        "slot": 0,
+                        "type": "bytes",
+                        "value": "636c6561722f61"
+                      },
+                      {
+                        "field": "end",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "636c6561722f7a"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "mutations",
+                "slot": 2,
+                "type": "vector<table<MutationRef>>",
+                "value": [
+                  {
+                    "type": "table<MutationRef>",
+                    "value": [
+                      {
+                        "field": "type",
+                        "slot": 0,
+                        "type": "u8",
+                        "value": 0
+                      },
+                      {
+                        "field": "param1",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "6b31"
+                      },
+                      {
+                        "field": "param2",
+                        "slot": 2,
+                        "type": "bytes",
+                        "value": "7631"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<MutationRef>",
+                    "value": [
+                      {
+                        "field": "type",
+                        "slot": 0,
+                        "type": "u8",
+                        "value": 1
+                      },
+                      {
+                        "field": "param1",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "636c6561722f61"
+                      },
+                      {
+                        "field": "param2",
+                        "slot": 2,
+                        "type": "bytes",
+                        "value": "636c6561722f7a"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<MutationRef>",
+                    "value": [
+                      {
+                        "field": "type",
+                        "slot": 0,
+                        "type": "u8",
+                        "value": 2
+                      },
+                      {
+                        "field": "param1",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "636f756e746572"
+                      },
+                      {
+                        "field": "param2",
+                        "slot": 2,
+                        "type": "bytes",
+                        "value": "01000000"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "table<MutationRef>",
+                    "value": [
+                      {
+                        "field": "type",
+                        "slot": 0,
+                        "type": "u8",
+                        "value": 14
+                      },
+                      {
+                        "field": "param1",
+                        "slot": 1,
+                        "type": "bytes",
+                        "value": "76732f0000000000000000000003000000"
+                      },
+                      {
+                        "field": "param2",
+                        "slot": 2,
+                        "type": "bytes",
+                        "value": "767376"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "read_snapshot",
+                "slot": 3,
+                "type": "i64",
+                "value": 6000000000000
+              },
+              {
+                "field": "report_conflicting_keys",
+                "slot": 4,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "lock_aware",
+                "slot": 5,
+                "type": "bool",
+                "value": true
+              },
+              {
+                "field": "spanContext",
+                "slot": 6,
+                "type": "optional<table<SpanContext>>",
+                "tag": 1,
+                "value": {
+                  "type": "table<SpanContext>",
+                  "value": [
+                    {
+                      "field": "traceID",
+                      "slot": 0,
+                      "type": "uid",
+                      "value": {
+                        "first": 8849010317829603335,
+                        "second": 8849027910015647751
+                      }
+                    },
+                    {
+                      "field": "spanID",
+                      "slot": 1,
+                      "type": "u64",
+                      "value": 6602277053725147143
+                    },
+                    {
+                      "field": "m_Flags",
+                      "slot": 2,
+                      "type": "u8",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "field": "tenantIds",
+                "slot": 8,
+                "type": "optional<vector<i64>>",
+                "tag": 1,
+                "value": {
+                  "type": "vector<i64>",
+                  "value": [
+                    {
+                      "type": "i64",
+                      "value": 7
+                    },
+                    {
+                      "type": "i64",
+                      "value": 8
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "field": "reply",
+            "slot": 1,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798982,
+                  "second": 9123448420122492934
+                }
+              }
+            ]
+          },
+          {
+            "field": "flags",
+            "slot": 2,
+            "type": "u32",
+            "value": 3
+          },
+          {
+            "field": "debugID",
+            "slot": 3,
+            "type": "optional<uid>",
+            "tag": 1,
+            "value": {
+              "type": "uid",
+              "value": {
+                "first": 57013,
+                "second": 57014
+              }
+            }
+          },
+          {
+            "field": "commitCostEstimation",
+            "slot": 5,
+            "type": "optional<table<ClientTrCommitCostEstimation>>",
+            "tag": 1,
+            "value": {
+              "type": "table<ClientTrCommitCostEstimation>",
+              "value": [
+                {
+                  "field": "opsCount",
+                  "slot": 0,
+                  "type": "i32",
+                  "value": 4
+                },
+                {
+                  "field": "writeCosts",
+                  "slot": 1,
+                  "type": "u64",
+                  "value": 4096
+                },
+                {
+                  "field": "clearIdxCosts",
+                  "slot": 2,
+                  "type": "vector<table<pair<i32,u64>>>",
+                  "value": [
+                    {
+                      "type": "table<pair<i32,u64>>",
+                      "value": [
+                        {
+                          "field": "first",
+                          "slot": 0,
+                          "type": "i32",
+                          "value": 1
+                        },
+                        {
+                          "field": "second",
+                          "slot": 1,
+                          "type": "u64",
+                          "value": 8192
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "field": "expensiveCostEstCount",
+                  "slot": 3,
+                  "type": "u32",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          {
+            "field": "tagSet",
+            "slot": 7,
+            "type": "optional<tag_set>",
+            "tag": 1,
+            "value": {
+              "type": "tag_set",
+              "value": ["636f6d6d69742d746167"]
+            }
+          },
+          {
+            "field": "spanContext",
+            "slot": 9,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 8849010317829603334,
+                  "second": 8849027910015647750
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 6602277053725147142
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "idempotencyId",
+            "slot": 10,
+            "type": "bytes",
+            "value": "6964656d706f74656e63792d69642d30313233343536373839"
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

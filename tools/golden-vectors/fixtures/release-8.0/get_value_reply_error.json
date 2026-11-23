@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "get_value_reply_error",
+  "group": "storage",
+  "kind": "positive",
+  "description": "Error reply envelope: ErrorOr<EnsureTable<GetValueReply>> tag 1, Error 1009 (future_version).",
+  "cpp_type": "ErrorOr<EnsureTable<GetValueReply>>",
+  "file_identifier": 34933361,
+  "file_identifier_hex": "0x02150a71",
+  "size": 64,
+  "bytes": "2c000000710a1502080009000800040006000600040010001700040014000c0015001000160006000800040024000000080000000100000028000000f1030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<GetValueReply>>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Error>",
+          "value": [
+            {
+              "field": "error_code",
+              "slot": 0,
+              "type": "u16",
+              "value": 1009
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
