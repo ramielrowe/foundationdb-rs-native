@@ -48,3 +48,11 @@ required-features = ["derive"]
 [[test]]
 name = "release_messages"
 required-features = ["derive"]
+
+[[test]]
+name = "containers"
+required-features = ["derive"]
+
+[[test]]
+name = "lazy_view"
+required-features = ["derive"]

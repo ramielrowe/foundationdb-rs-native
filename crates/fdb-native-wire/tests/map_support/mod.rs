@@ -7,10 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use fdb_native_wire::{
-    Decode, DecodeError, Encode, EncodeError, FileIdentified, FileIdentifier, ObjectRef, Reader,
-    Shape, Wire, Writer,
-};
+use fdb_native_wire::Wire;
 use proptest::prelude::*;
 use serde_json::Value;
 
@@ -55,47 +52,12 @@ impl<T: Dump> Dump for BTreeSet<T> {
 
 /// `Containers` with `m` a `std::map<int32_t, std::string>` and `s` a
 /// `std::set<uint32_t>`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Wire)]
+#[fdb(file_identifier = 0x000fdb05)]
 pub struct MapContainers {
     pub m: BTreeMap<i32, Bytes>,
     pub s: BTreeSet<u32>,
     pub nested: Vec<Vec<u16>>,
-}
-
-impl Wire for MapContainers {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl Encode for MapContainers {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let mut t = w.table();
-        t.field(&self.m)?;
-        t.field(&self.s)?;
-        t.field(&self.nested)?;
-        t.finish()
-    }
-}
-
-impl<'de> Decode<'de> for MapContainers {
-    fn absent() -> Self {
-        MapContainers {
-            m: Decode::absent(),
-            s: Decode::absent(),
-            nested: Decode::absent(),
-        }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        let mut t = r.table(at)?;
-        Ok(MapContainers {
-            m: t.field()?,
-            s: t.field()?,
-            nested: t.field()?,
-        })
-    }
-}
-
-impl FileIdentified for MapContainers {
-    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(0x000f_db05);
 }
 
 impl Dump for MapContainers {
@@ -128,7 +90,8 @@ impl Arb for MapContainers {
 
 /// `Containers` with `m` a `std::unordered_map` and `s` a `std::unordered_set`: the same
 /// wire form in hash order, which the C++ reader sorts into its `std::map`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Wire)]
+#[fdb(file_identifier = 0x000fdb05)]
 pub struct HashContainers {
     pub m: HashMap<i32, Bytes>,
     pub s: HashSet<u32>,
@@ -143,42 +106,6 @@ impl HashContainers {
             nested: self.nested.clone(),
         }
     }
-}
-
-impl Wire for HashContainers {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl Encode for HashContainers {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let mut t = w.table();
-        t.field(&self.m)?;
-        t.field(&self.s)?;
-        t.field(&self.nested)?;
-        t.finish()
-    }
-}
-
-impl<'de> Decode<'de> for HashContainers {
-    fn absent() -> Self {
-        HashContainers {
-            m: Decode::absent(),
-            s: Decode::absent(),
-            nested: Decode::absent(),
-        }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        let mut t = r.table(at)?;
-        Ok(HashContainers {
-            m: t.field()?,
-            s: t.field()?,
-            nested: t.field()?,
-        })
-    }
-}
-
-impl FileIdentified for HashContainers {
-    const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(0x000f_db05);
 }
 
 impl Dump for HashContainers {

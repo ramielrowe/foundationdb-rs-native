@@ -248,7 +248,7 @@ fn fixtures_and_noise_read_the_same_lazily() {
 // A view as a table field.
 
 /// `Vectors` with every vector a `VectorView` (slot for slot).
-#[derive(Debug)]
+#[derive(Debug, Wire)]
 struct LazyVectors<'de> {
     v_u8: VectorView<'de, u8>,
     v_u16: VectorView<'de, u16>,
@@ -262,46 +262,6 @@ struct LazyVectors<'de> {
     v_empty_table: VectorView<'de, Small>,
     v_bool: VectorView<'de, bool>,
     fixed16: [u8; 16],
-}
-
-impl Wire for LazyVectors<'_> {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl<'de> Decode<'de> for LazyVectors<'de> {
-    fn absent() -> Self {
-        LazyVectors {
-            v_u8: Decode::absent(),
-            v_u16: Decode::absent(),
-            v_i32: Decode::absent(),
-            v_u64: Decode::absent(),
-            v_f64: Decode::absent(),
-            v_str: Decode::absent(),
-            v_table: Decode::absent(),
-            v_empty_u32: Decode::absent(),
-            v_empty_str: Decode::absent(),
-            v_empty_table: Decode::absent(),
-            v_bool: Decode::absent(),
-            fixed16: Decode::absent(),
-        }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        let mut t = r.table(at)?;
-        Ok(LazyVectors {
-            v_u8: t.field()?,
-            v_u16: t.field()?,
-            v_i32: t.field()?,
-            v_u64: t.field()?,
-            v_f64: t.field()?,
-            v_str: t.field()?,
-            v_table: t.field()?,
-            v_empty_u32: t.field()?,
-            v_empty_str: t.field()?,
-            v_empty_table: t.field()?,
-            v_bool: t.field()?,
-            fixed16: t.field()?,
-        })
-    }
 }
 
 proptest! {
@@ -805,53 +765,14 @@ fn work_is_charged_to_the_budget_of_the_decode_that_made_the_view() {
 // ---------------------------------------------------------------------------------------
 // Nesting depth.
 
-#[derive(Debug)]
+#[derive(Debug, Wire)]
 struct Node {
     kids: Vec<Node>,
 }
 
-impl Wire for Node {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl Encode for Node {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let mut t = w.table();
-        t.field(&self.kids)?;
-        t.finish()
-    }
-}
-
-impl<'de> Decode<'de> for Node {
-    fn absent() -> Self {
-        Node { kids: vec![] }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        Ok(Node {
-            kids: r.table(at)?.field()?,
-        })
-    }
-}
-
+#[derive(Wire)]
 struct LazyNode<'de> {
     kids: VectorView<'de, LazyNode<'de>>,
-}
-
-impl Wire for LazyNode<'_> {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl<'de> Decode<'de> for LazyNode<'de> {
-    fn absent() -> Self {
-        LazyNode {
-            kids: Decode::absent(),
-        }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        Ok(LazyNode {
-            kids: r.table(at)?.field()?,
-        })
-    }
 }
 
 fn walk(node: &LazyNode<'_>) -> Result<usize, DecodeError> {
@@ -1117,43 +1038,11 @@ impl<'__fdb_de: 'a, 'a> Decode<'__fdb_de> for Holder<'a> {
 }
 
 /// The same table with `Vec`s.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Wire)]
 struct EagerHolder<'a> {
     rows: Vec<Small>,
     names: Vec<&'a [u8]>,
     n: u32,
-}
-
-impl Wire for EagerHolder<'_> {
-    const SHAPE: Shape = Shape::Table;
-}
-
-impl Encode for EagerHolder<'_> {
-    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        let mut t = w.table();
-        t.field(&self.rows)?;
-        t.field(&self.names)?;
-        t.field(&self.n)?;
-        t.finish()
-    }
-}
-
-impl<'de: 'a, 'a> Decode<'de> for EagerHolder<'a> {
-    fn absent() -> Self {
-        EagerHolder {
-            rows: vec![],
-            names: vec![],
-            n: 0,
-        }
-    }
-    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        let mut t = r.table(at)?;
-        Ok(EagerHolder {
-            rows: t.field()?,
-            names: t.field()?,
-            n: t.field()?,
-        })
-    }
 }
 
 #[test]
@@ -1231,4 +1120,56 @@ fn re_encoding_a_view_reports_the_element_that_failed() {
     assert_eq!(broken.names.get(0).unwrap(), b"a");
     let intact: Holder = Reader::new(&bytes).unwrap().decode_root().unwrap();
     assert!(encode_with_identifier(&intact, 5).is_ok());
+}
+
+/// The same table with `#[derive(Wire)]`: view fields need nothing special.
+#[derive(Debug, Wire)]
+#[fdb(file_identifier = 0x000fdb77)]
+struct DerivedHolder<'a> {
+    rows: VectorView<'a, Small>,
+    names: VectorView<'a, &'a [u8]>,
+    by_key: VectorView<'a, VectorView<'a, u32>>,
+    n: u32,
+}
+
+/// The eager twin of `DerivedHolder`, with the same wire form.
+#[derive(Debug, PartialEq, Wire)]
+#[fdb(file_identifier = 0x000fdb77)]
+struct DerivedEager<'a> {
+    rows: Vec<Small>,
+    names: Vec<&'a [u8]>,
+    by_key: Vec<Vec<u32>>,
+    n: u32,
+}
+
+#[test]
+fn a_view_field_in_a_derived_table_round_trips() {
+    let strategy = (
+        Vec::<Small>::arb(),
+        prop::collection::vec(prop::collection::vec(any::<u8>(), 0..5), 0..6),
+        prop::collection::vec(prop::collection::vec(any::<u32>(), 0..4), 0..4),
+        any::<u32>(),
+    );
+    runner(300)
+        .run(&strategy, |(rows, names, by_key, n)| {
+            let eager = DerivedEager {
+                rows,
+                names: names.iter().map(Vec::as_slice).collect(),
+                by_key,
+                n,
+            };
+            let bytes = fdb_native_wire::encode(&eager).map_err(fail)?;
+            let holder: DerivedHolder = fdb_native_wire::decode(&bytes).map_err(fail)?;
+            prop_assert_eq!(holder.n, n);
+            prop_assert_eq!(all(&holder.rows).map_err(fail)?, eager.rows.clone());
+            prop_assert_eq!(all(&holder.names).map_err(fail)?, eager.names.clone());
+            let nested: Result<Vec<Vec<u32>>, _> = holder.by_key.iter().map(|v| all(&v?)).collect();
+            prop_assert_eq!(nested.map_err(fail)?, eager.by_key.clone());
+            // Forward the message with its views intact.
+            let again = fdb_native_wire::encode(&holder).map_err(fail)?;
+            let back: DerivedEager = fdb_native_wire::decode(&again).map_err(fail)?;
+            prop_assert_eq!(back, eager);
+            Ok(())
+        })
+        .unwrap();
 }
