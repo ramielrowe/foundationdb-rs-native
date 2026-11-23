@@ -1,4 +1,4 @@
-//! The custom blob codecs (`KeyValueVector`, `VersionVector`, `TagSet`,
+//! The custom blob codecs (`KeyValueVectorRef`, `VersionVector`, `TagSetRef`,
 //! `IdempotencyIdRef`) and `Tag`, against the message-level golden vectors of both
 //! releases, with hand-built blobs for the cases the vectors do not cover, hostile input
 //! and proptest round trips.
@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, IdempotencyId,
-    IdempotencyIdRef, KeyValue, KeyValueRef, KeyValueVector, KeyValueVectorBuf, ObjectRef, Reader,
-    Shape, Tag, TagSet, Uid, VersionVector, Wire, Writer, encode_with_identifier,
+    IdempotencyIdRef, KeyValue, KeyValueRef, KeyValueVector, KeyValueVectorRef, ObjectRef, Reader,
+    Shape, Tag, TagSet, TagSetRef, Uid, VersionVector, Wire, Writer, encode_with_identifier,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -214,7 +214,7 @@ fn check_field(
 // ---------------------------------------------------------------------------------------
 // Fixtures.
 
-fn kv_dump(v: &KeyValueVector<'_>) -> Value {
+fn kv_dump(v: &KeyValueVectorRef<'_>) -> Value {
     Value::Array(
         v.iter()
             .map(|kv| json!({ "key": hex_encode(kv.key), "value": hex_encode(kv.value) }))
@@ -224,14 +224,13 @@ fn kv_dump(v: &KeyValueVector<'_>) -> Value {
 
 fn vv_dump(v: &VersionVector) -> Value {
     let versions: Vec<Value> = v
-        .versions
         .iter()
         .map(|(t, version)| json!({ "locality": t.locality, "id": t.id, "version": version }))
         .collect();
     json!({ "versions": versions, "maxVersion": v.max_version })
 }
 
-fn tags_dump(v: &Option<TagSet<'_>>) -> Value {
+fn tags_dump(v: &Option<TagSetRef<'_>>) -> Value {
     match v {
         None => Value::Null,
         Some(set) => {
@@ -261,10 +260,8 @@ fn blob_cases(record: &Value) -> Vec<Case<'_>> {
     for node in nodes.drain(..) {
         if node["type"] == "preserialized_kv_vector" {
             for fns in [
-                codec_fns!(KeyValueVector, kv_dump),
-                codec_fns!(KeyValueVectorBuf, |v: &KeyValueVectorBuf| kv_dump(
-                    &v.as_view()
-                )),
+                codec_fns!(KeyValueVectorRef, kv_dump),
+                codec_fns!(KeyValueVector, |v: &KeyValueVector| kv_dump(&v.borrowed())),
             ] {
                 cases.push(Case {
                     kind: "kv",
@@ -298,7 +295,7 @@ fn blob_cases(record: &Value) -> Vec<Case<'_>> {
         // GetReadVersionRequest::tags is a different `tags` (a map).
         if node["type"] == "optional<tag_set>" {
             let field = node["field"].as_str().expect("field").to_string();
-            let fns = codec_fns!(Option<TagSet>, tags_dump);
+            let fns = codec_fns!(Option<TagSetRef>, tags_dump);
             cases.push(Case {
                 kind: "tags",
                 field,
@@ -382,11 +379,11 @@ fn message_fixtures_decode_and_reencode_blobs() {
 /// ```text
 /// FDB_GOLDEN_MESSAGES_BIN_7_4=.../build/msg/build-release-7.4/bin/golden_vectors_messages \
 /// FDB_GOLDEN_MESSAGES_BIN_8_0=.../build/msg/build-release-8.0/bin/golden_vectors_messages \
-///     cargo nextest run -p fdb-native-wire --run-ignored only -E 'binary(blob_codecs)'
+///     cargo nextest run -p fdb-native-wire --run-ignored only -E 'test(cpp_crosscheck_release_readers)'
 /// ```
 #[test]
 #[ignore = "requires the message golden-vectors decoders"]
-fn release_readers_decode_reencoded_blobs() {
+fn cpp_crosscheck_release_readers_decode_reencoded_blobs() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -557,7 +554,7 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn decode_kv(blob: &[u8]) -> Result<Rows, DecodeError> {
     through_message(blob, |msg| {
-        let v: KeyValueVector = read_at(msg, 0, false)?;
+        let v: KeyValueVectorRef = read_at(msg, 0, false)?;
         Ok(v.iter()
             .map(|kv| (kv.key.to_vec(), kv.value.to_vec()))
             .collect())
@@ -576,13 +573,16 @@ fn kv_vector_decodes_c_plus_plus_payloads() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[1], (b"range/c".to_vec(), vec![]));
     // The empty vector is a 4-byte blob, not the shared empty blob.
-    let empty = write_at(&KeyValueVector::EMPTY, 0);
+    let empty = write_at(&KeyValueVectorRef::EMPTY, 0);
     assert_eq!(raw_blob(&empty, 0, false, false), Some(vec![0; 4]));
     assert_eq!(decode_kv(&[0; 4]).expect("empty"), vec![]);
     // Owned and borrowed views agree.
-    let buf: KeyValueVectorBuf = [KeyValueRef::new(b"a", b"1")].into_iter().collect();
+    let buf = KeyValueVector::from_pairs([KeyValueRef::new(b"a", b"1")]).unwrap();
     assert_eq!(buf.iter().next(), Some(KeyValueRef::new(b"a", b"1")));
-    assert_eq!(buf.as_view().to_vec(), vec![KeyValue::new("a", "1")]);
+    assert_eq!(
+        buf.iter().map(KeyValueRef::into_owned).collect::<Vec<_>>(),
+        vec![KeyValue::new("a", "1")]
+    );
 }
 
 #[test]
@@ -855,14 +855,12 @@ fn version_vector_decodes_every_width_combination() {
             let blob = vv_blob(&spec);
             let vv = VersionVector::from_payload(&blob)
                 .unwrap_or_else(|e| panic!("widths {tag_width}/{delta_width}: {e}"));
-            let expected: BTreeMap<Tag, i64> = [
+            let expected = [
                 (Tag::new(-2, 5), 1_000),
                 (Tag::new(-2, 9), 1_200),
                 (Tag::new(1, 4), 1_255),
-            ]
-            .into_iter()
-            .collect();
-            assert_eq!(vv.versions, expected, "widths {tag_width}/{delta_width}");
+            ];
+            assert_eq!(vv.entries(), expected, "widths {tag_width}/{delta_width}");
             assert_eq!(vv.max_version, 5_000);
             // The encoder re-picks the narrowest widths; that decodes the same, and is
             // byte-identical exactly when the blob was already narrowest (1/1, as the
@@ -888,9 +886,9 @@ fn version_vector_wide_values_and_extremes() {
     };
     let blob = vv_blob(&spec);
     let vv = VersionVector::from_payload(&blob).expect("decode");
-    assert_eq!(vv.versions[&Tag::new(-98, 300)], i64::MIN);
-    assert_eq!(vv.versions[&Tag::new(127, 0)], -1);
-    assert_eq!(vv.versions[&Tag::new(127, 65535)], i64::MAX);
+    assert_eq!(vv.get(Tag::new(-98, 300)), Some(i64::MIN));
+    assert_eq!(vv.get(Tag::new(127, 0)), Some(-1));
+    assert_eq!(vv.get(Tag::new(127, 65535)), Some(i64::MAX));
     assert_eq!(vv.to_payload().expect("encode"), blob);
 
     // The empty vector, and a default (maxVersion -1).
@@ -911,8 +909,8 @@ fn version_vector_wide_values_and_extremes() {
 fn version_vector_encoder_matches_the_documented_layout() {
     // The fixture of get_key_values_request: negative locality, id 300, 8-byte-range deltas.
     let mut vv = VersionVector::new(2_000_000_000_000);
-    vv.versions.insert(Tag::new(-2, 300), 1_000_000_000_000);
-    vv.versions.insert(Tag::new(1, 2), 1_999_999_999_999);
+    vv.insert(Tag::new(-2, 300), 1_000_000_000_000);
+    vv.insert(Tag::new(1, 2), 1_999_999_999_999);
     let spec = VvSpec {
         runs: vec![(-2, 1), (1, 1)],
         tag_width: 2,
@@ -929,7 +927,7 @@ fn version_vector_encoder_matches_the_documented_layout() {
 fn tag_set_hostile_blobs_are_rejected() {
     let decode = |blob: &[u8]| {
         through_message(blob, |msg| {
-            read_at::<TagSet>(msg, 0, false)
+            read_at::<TagSetRef>(msg, 0, false)
                 .map(|s| s.iter().map(<[u8]>::to_vec).collect::<Vec<_>>())
         })
     };
@@ -943,7 +941,7 @@ fn tag_set_hostile_blobs_are_rejected() {
     }
     // 255-byte tags are the longest the format holds; the encoder refuses longer ones.
     let long = vec![9u8; 256];
-    let set = TagSet::new(vec![&long]);
+    let set: TagSetRef = [&long[..]].into_iter().collect();
     assert!(matches!(
         set.to_payload(),
         Err(EncodeError::InvalidShape(_))
@@ -985,15 +983,15 @@ fn absent_fields_decode_as_c_plus_plus_defaults() {
     );
     assert_eq!(VersionVector::default().max_version, -1);
     assert_eq!(
-        read_at::<KeyValueVector>(&bytes, 1, false).expect("kv"),
-        KeyValueVector::EMPTY
+        read_at::<KeyValueVectorRef>(&bytes, 1, false).expect("kv"),
+        KeyValueVectorRef::EMPTY
     );
     assert_eq!(
-        read_at::<TagSet>(&bytes, 2, false).expect("tags"),
-        TagSet::default()
+        read_at::<TagSetRef>(&bytes, 2, false).expect("tags"),
+        TagSetRef::default()
     );
     assert_eq!(
-        read_at::<Option<TagSet>>(&bytes, 3, false).expect("tags"),
+        read_at::<Option<TagSetRef>>(&bytes, 3, false).expect("tags"),
         None
     );
     assert!(
@@ -1009,18 +1007,81 @@ fn absent_fields_decode_as_c_plus_plus_defaults() {
 
 #[test]
 fn present_but_empty_optional_tag_set_stays_present() {
-    let some = Some(TagSet::default());
+    let some = Some(TagSetRef::default());
     let bytes = write_at(&some, 2);
     assert_eq!(
-        read_at::<Option<TagSet>>(&bytes, 2, false).expect("decode"),
+        read_at::<Option<TagSetRef>>(&bytes, 2, false).expect("decode"),
         some
     );
-    let none: Option<TagSet> = None;
+    let none: Option<TagSetRef> = None;
     let bytes = write_at(&none, 2);
     assert_eq!(
-        read_at::<Option<TagSet>>(&bytes, 2, false).expect("decode"),
+        read_at::<Option<TagSetRef>>(&bytes, 2, false).expect("decode"),
         none
     );
+}
+
+#[test]
+fn kv_vector_with_empty_keys_round_trips() {
+    // Empty keys (and values) are ordinary items: just zero lengths.
+    let blob = kv_blob(&[(b"", b"v"), (b"", b""), (b"k", b"")]);
+    let msg = write_at(&blob.as_slice(), 0);
+    let view: KeyValueVectorRef = read_at(&msg, 0, false).unwrap();
+    assert_eq!(
+        view.iter().collect::<Vec<_>>(),
+        [
+            KeyValueRef::new(b"", b"v"),
+            KeyValueRef::new(b"", b""),
+            KeyValueRef::new(b"k", b"")
+        ]
+    );
+    let again = write_at(&view, 0);
+    assert_eq!(
+        raw_blob(&again, 0, false, false),
+        raw_blob(&msg, 0, false, false)
+    );
+    let owned: KeyValueVector = read_at(&msg, 0, false).unwrap();
+    assert_eq!(owned.payload(), &blob[..]);
+}
+
+#[test]
+fn tag_set_with_empty_tags_round_trips() {
+    // Empty tags are one length byte each; a decoded set keeps repeats as C++ does.
+    let blob = [0u8, 0, 1, b'a', 0];
+    let msg = write_at(&blob.as_slice(), 2);
+    let set: TagSetRef = read_at(&msg, 2, false).unwrap();
+    assert_eq!(set.tags(), [&b""[..], b"", b"a", b""]);
+    let again = write_at(&set, 2);
+    assert_eq!(
+        raw_blob(&again, 2, false, false),
+        Some(blob.to_vec()),
+        "re-encoded"
+    );
+    let owned: TagSet = read_at(&msg, 2, false).unwrap();
+    assert_eq!(owned.len(), 4);
+    assert_eq!(owned.borrowed(), set);
+    // Only empty tags: the blob is as long as the tag count.
+    let msg = write_at(&[0u8; 5].as_slice(), 2);
+    assert_eq!(read_at::<TagSetRef>(&msg, 2, false).unwrap().len(), 5);
+}
+
+#[test]
+fn idempotency_id_whose_first_word_is_small() {
+    // C++ stores a 16-byte id inline unless its first u64 is below 256 (then it
+    // indirects, to tell the two apart); on the wire both are the same 16 bytes.
+    for first in [0u64, 1, 16, 255, 256, u64::MAX] {
+        let mut bytes = first.to_le_bytes().to_vec();
+        bytes.extend(0x0102_0304_0506_0708u64.to_le_bytes());
+        let id = IdempotencyIdRef::new(&bytes).unwrap();
+        assert!(id.is_valid(), "first word {first}");
+        let msg = write_at(&id, 4);
+        assert_eq!(raw_blob(&msg, 4, false, false), Some(bytes.clone()));
+        let back: IdempotencyIdRef = read_at(&msg, 4, false).unwrap();
+        assert_eq!(back.as_bytes(), &bytes[..]);
+        let owned: IdempotencyId = read_at(&msg, 4, false).unwrap();
+        assert_eq!(owned.borrowed(), id);
+        assert_eq!(id.into_owned(), owned);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1049,9 +1110,10 @@ fn corrupted_fixture_messages_never_panic() {
             }
             for m in &mutants {
                 for slot in 0..13 {
-                    let _ = read_at::<KeyValueVector>(m, slot, envelope).map(|v| v.iter().count());
+                    let _ =
+                        read_at::<KeyValueVectorRef>(m, slot, envelope).map(|v| v.iter().count());
                     let _ = read_at::<VersionVector>(m, slot, envelope);
-                    let _ = read_at::<Option<TagSet>>(m, slot, envelope);
+                    let _ = read_at::<Option<TagSetRef>>(m, slot, envelope);
                     let _ = read_at::<IdempotencyIdRef>(m, slot, envelope);
                     let _ = read_at::<Vec<Pair<Uid, Tag>>>(m, slot, envelope);
                 }
@@ -1083,7 +1145,7 @@ fn vv_strategy() -> impl Strategy<Value = VersionVector> {
         prop::collection::btree_map(tag_strategy(), 0..=spread, 0..40).prop_map(move |m| {
             let mut vv = VersionVector::new(max);
             for (tag, delta) in m {
-                vv.versions.insert(tag, base + delta as i64);
+                vv.insert(tag, base + delta as i64);
             }
             vv
         })
@@ -1136,8 +1198,8 @@ proptest! {
     #[test]
     fn arbitrary_bytes_never_panic(blob in prop::collection::vec(any::<u8>(), 0..80)) {
         let _ = VersionVector::from_payload(&blob);
-        let _ = TagSet::from_payload(&blob);
-        if let Ok(kv) = KeyValueVector::parse(&blob) {
+        let _ = TagSetRef::from_payload(&blob);
+        if let Ok(kv) = KeyValueVectorRef::parse(&blob) {
             prop_assert_eq!(kv.payload(), &blob[..]);
             prop_assert_eq!(kv.iter().count(), kv.len());
         }
@@ -1152,18 +1214,18 @@ proptest! {
         )
     ) {
         let model = model_kv(&items);
-        let buf: KeyValueVectorBuf =
-            items.iter().map(|(k, v)| KeyValueRef::new(k, v)).collect();
+        let buf = KeyValueVector::from_pairs(items.iter().map(|(k, v)| KeyValueRef::new(k, v)))
+            .unwrap();
         prop_assert_eq!(buf.payload(), &model[..]);
 
         let msg = write_at(&buf, 3);
         prop_assert_eq!(raw_blob(&msg, 3, false, false), Some(model.clone()));
-        let view: KeyValueVector = read_at(&msg, 3, false).unwrap();
+        let view: KeyValueVectorRef = read_at(&msg, 3, false).unwrap();
         let decoded: Vec<(Vec<u8>, Vec<u8>)> =
             view.iter().map(|kv| (kv.key.to_vec(), kv.value.to_vec())).collect();
         prop_assert_eq!(&decoded, &items);
-        prop_assert_eq!(view, buf.as_view());
-        let owned: KeyValueVectorBuf = read_at(&msg, 3, false).unwrap();
+        prop_assert_eq!(view, buf.borrowed());
+        let owned: KeyValueVector = read_at(&msg, 3, false).unwrap();
         prop_assert_eq!(owned, buf);
         // And as a table element, the other way KeyValueRef travels.
         if let Some((k, v)) = items.first() {
@@ -1178,17 +1240,31 @@ proptest! {
         tags in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..20), 0..6),
         present in any::<bool>(),
     ) {
-        let set: TagSet = tags.iter().map(Vec::as_slice).collect();
+        let set: TagSetRef = tags.iter().map(Vec::as_slice).collect();
+        // `push` skips repeats, keeping the first.
+        let mut unique: Vec<&Vec<u8>> = Vec::new();
+        for t in &tags {
+            if !unique.contains(&t) {
+                unique.push(t);
+            }
+        }
+        prop_assert_eq!(set.len(), unique.len());
         let payload = set.to_payload().unwrap();
-        let model: Vec<u8> = tags.iter().flat_map(|t| std::iter::once(t.len() as u8).chain(t.iter().copied())).collect();
+        let model: Vec<u8> = unique.iter().flat_map(|t| std::iter::once(t.len() as u8).chain(t.iter().copied())).collect();
         prop_assert_eq!(&payload, &model);
-        prop_assert_eq!(TagSet::from_payload(&payload).unwrap(), set.clone());
+        prop_assert_eq!(TagSetRef::from_payload(&payload).unwrap(), set.clone());
 
         let optional = present.then(|| set.clone());
         let msg = write_at(&optional, 2);
-        prop_assert_eq!(read_at::<Option<TagSet>>(&msg, 2, false).unwrap(), optional);
+        prop_assert_eq!(read_at::<Option<TagSetRef>>(&msg, 2, false).unwrap(), optional);
         let msg = write_at(&set, 5);
-        prop_assert_eq!(read_at::<TagSet>(&msg, 5, false).unwrap(), set);
+        prop_assert_eq!(read_at::<TagSetRef>(&msg, 5, false).unwrap(), set.clone());
+        // The owned set reads and writes the same blob.
+        let owned: TagSet = read_at(&msg, 5, false).unwrap();
+        prop_assert_eq!(owned.borrowed(), set.clone());
+        prop_assert_eq!(set.clone().into_owned(), owned.clone());
+        let again = write_at(&owned, 5);
+        prop_assert_eq!(raw_blob(&again, 5, false, false), raw_blob(&msg, 5, false, false));
     }
 
     #[test]

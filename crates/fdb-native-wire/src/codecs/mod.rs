@@ -10,9 +10,9 @@
 //!
 //! | C++ type | Rust type | where it travels |
 //! | --- | --- | --- |
-//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` | [`KeyValueVector`] (borrowed), [`KeyValueVectorBuf`] (owned) | `GetKeyValuesReply::data`, `GetKeyValuesStreamReply::data` |
+//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` | [`KeyValueVectorRef`] (borrowed), [`KeyValueVector`] (owned) | `GetKeyValuesReply::data`, `GetKeyValuesStreamReply::data` |
 //! | `VersionVector` | [`VersionVector`] (with [`Tag`]) | `ssLatestCommitVersions` of the read requests, `GetReadVersionReply::ssVersionVectorDelta` |
-//! | `TagSet` | [`TagSet`] | `Optional<TagSet> tags` of the read requests, `CommitTransactionRequest::tagSet` |
+//! | `TagSet` | [`TagSetRef`] (borrowed), [`TagSet`] (owned) | `Optional<TagSet> tags` of the read requests, `CommitTransactionRequest::tagSet` |
 //! | `IdempotencyIdRef` | [`IdempotencyIdRef`] (borrowed), [`IdempotencyId`] (owned) | `CommitTransactionRequest::idempotencyId` |
 //!
 //! [`Tag`] (`struct_like_traits<Tag>`: `u16 id` at 0, `i8 locality` at 2) is an inline
@@ -26,9 +26,15 @@
 //! and `VersionVector` `load`s read first and `ASSERT` afterwards that they consumed the
 //! blob exactly, which is too late on bad input). The decoders here check every length
 //! against the blob first, reject trailing bytes and never allocate from an unchecked
-//! count; the memory a decode uses is bounded by a small multiple of the blob's size
-//! (the reader's work limit and message size bound the blob). They accept every blob the
-//! C++ writers produce.
+//! count. They accept every blob the C++ writers produce.
+//!
+//! Memory used by a decode, as a multiple of the blob (the blob itself is bounded by the
+//! message size and the reader's work limit; bound untrusted messages): the KV view and
+//! `IdempotencyIdRef` borrow it (0, and `KeyValueVector` and `IdempotencyId` copy it, 1);
+//! a `VersionVector` keeps 16 bytes per entry and an entry takes at least 2 bytes of the
+//! blob (a 1-byte tag id and delta), so at most 8; a `TagSetRef` keeps a 16-byte slice per
+//! tag and a tag takes at least 1 byte (an empty tag), so at most 16, and an owned
+//! `TagSet` adds an allocation per tag on top.
 //!
 //! # 7.4 versus 8.0
 //!
@@ -50,9 +56,9 @@ mod tag_set;
 mod version_vector;
 
 pub use idempotency_id::{IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId};
-pub use kv::{KeyValue, KeyValueIter, KeyValueRef, KeyValueVector, KeyValueVectorBuf};
+pub use kv::{KeyValue, KeyValueIter, KeyValueRef, KeyValueVector, KeyValueVectorRef};
 pub use tag::Tag;
-pub use tag_set::TagSet;
+pub use tag_set::{TagSet, TagSetRef};
 pub use version_vector::{INVALID_VERSION, TAG_LOCALITY_INVALID, Version, VersionVector};
 
 use crate::DecodeError;

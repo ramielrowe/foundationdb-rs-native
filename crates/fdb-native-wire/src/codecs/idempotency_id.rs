@@ -72,7 +72,7 @@ impl<'a> IdempotencyIdRef<'a> {
     }
 
     /// Copies the id.
-    pub fn to_owned_id(&self) -> IdempotencyId {
+    pub fn into_owned(self) -> IdempotencyId {
         IdempotencyId {
             bytes: self.bytes.to_vec(),
         }
@@ -145,6 +145,6 @@ impl<'de> Decode<'de> for IdempotencyId {
     }
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        IdempotencyIdRef::decode_object(r, at).map(|id| id.to_owned_id())
+        IdempotencyIdRef::decode_object(r, at).map(IdempotencyIdRef::into_owned)
     }
 }

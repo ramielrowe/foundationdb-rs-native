@@ -64,5 +64,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      # cpp_crosscheck is ignored because it needs the dev-only golden-vectors tool, not Docker.
-      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
+      # cpp_crosscheck (the binary, and the cpp_crosscheck_* tests in other binaries) is ignored because it
+      # needs the dev-only golden-vectors tool, not Docker.
+      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'

@@ -7,7 +7,7 @@ use crate::{Decode, DecodeError, Encode, EncodeError, ObjectRef, Reader, Shape, 
 
 /// FDB's `KeyValueRef`, borrowing its key and value.
 ///
-/// Outside a pre-serialized vector (see [`KeyValueVector`]) it is a table with two
+/// Outside a pre-serialized vector (see [`KeyValueVectorRef`]) it is a table with two
 /// string fields, `serializer(ar, key, value)`; that is its [`Wire`] form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyValueRef<'a> {
@@ -123,7 +123,7 @@ const TRUNCATED: &str = "preserialized KeyValue vector is truncated";
 /// A pre-serialized `VectorRef<KeyValueRef, VecSerStrategy::String>` (used by
 /// `GetKeyValuesReply::data`): a view of the validated payload of one blob, borrowing it
 /// from the message. Nothing is copied or allocated; [`iter`](Self::iter) walks the
-/// payload.
+/// payload. [`KeyValueVector`] is the owned form.
 ///
 /// The payload is a `u32` item count, then per item a `u32` key length, the key, a `u32`
 /// value length and the value, with no padding or alignment. It is the same on 7.4 and
@@ -131,42 +131,44 @@ const TRUNCATED: &str = "preserialized KeyValue vector is truncated";
 /// blob), which is what [`encode_object`](Encode::encode_object) writes for it.
 ///
 /// FDB's loader trusts the lengths and only `ASSERT`s afterwards that they add up to the
-/// blob; [`KeyValueVector::parse`] and the [`Decode`] impl check them first and reject a
-/// count the blob cannot hold, an item that overruns the blob, a blob shorter than its
+/// blob; [`KeyValueVectorRef::parse`] and the [`Decode`] impl check them first and reject
+/// a count the blob cannot hold, an item that overruns the blob, a blob shorter than its
 /// count, and trailing bytes (and a blob shorter than 4 bytes, such as the shared empty
 /// blob, which FDB never writes for this type). An absent field is the empty vector.
+/// Empty keys and values are fine.
 ///
 /// The format has one encoding per value, so equality compares payload bytes and
 /// re-encoding a decoded vector is byte-identical.
 ///
 /// ```
-/// use fdb_native_wire::{KeyValueRef, KeyValueVector, KeyValueVectorBuf};
+/// use fdb_native_wire::{KeyValueRef, KeyValueVector, KeyValueVectorRef};
 ///
-/// let mut buf = KeyValueVectorBuf::new();
-/// buf.push(b"a", b"1");
-/// buf.push(b"b", b"");
-/// let view = KeyValueVector::parse(buf.payload())?;
+/// let mut buf = KeyValueVector::new();
+/// buf.try_push(b"a", b"1")?;
+/// buf.try_push(b"b", b"")?;
+/// let view = KeyValueVectorRef::parse(buf.payload())?;
 /// assert_eq!(view.len(), 2);
 /// assert_eq!(view.iter().last(), Some(KeyValueRef::new(b"b", b"")));
-/// assert!(KeyValueVector::parse(&buf.payload()[1..]).is_err());
+/// assert_eq!(view.into_owned(), buf);
+/// assert!(KeyValueVectorRef::parse(&buf.payload()[1..]).is_err());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct KeyValueVector<'a> {
+pub struct KeyValueVectorRef<'a> {
     /// The whole payload, count included; validated.
     payload: &'a [u8],
     count: u32,
 }
 
-impl<'a> KeyValueVector<'a> {
+impl<'a> KeyValueVectorRef<'a> {
     /// The empty vector.
-    pub const EMPTY: KeyValueVector<'static> = KeyValueVector {
+    pub const EMPTY: KeyValueVectorRef<'static> = KeyValueVectorRef {
         payload: &EMPTY_PAYLOAD,
         count: 0,
     };
 
     /// Validates a blob payload (without the string framing) and views it.
-    pub fn parse(payload: &'a [u8]) -> Result<KeyValueVector<'a>, DecodeError> {
+    pub fn parse(payload: &'a [u8]) -> Result<KeyValueVectorRef<'a>, DecodeError> {
         let mut c = Cursor::new(payload, TRUNCATED);
         let count = c.u32()?;
         // Every item takes at least its two length prefixes; this also bounds the loop
@@ -187,7 +189,7 @@ impl<'a> KeyValueVector<'a> {
                 "preserialized KeyValue vector has trailing bytes",
             ));
         }
-        Ok(KeyValueVector { payload, count })
+        Ok(KeyValueVectorRef { payload, count })
     }
 
     /// The number of pairs.
@@ -213,19 +215,22 @@ impl<'a> KeyValueVector<'a> {
         }
     }
 
-    /// Copies the pairs out.
-    pub fn to_vec(&self) -> Vec<KeyValue> {
-        self.iter().map(KeyValueRef::into_owned).collect()
+    /// Copies the payload.
+    pub fn into_owned(self) -> KeyValueVector {
+        KeyValueVector {
+            bytes: self.payload.to_vec(),
+            count: self.count,
+        }
     }
 }
 
-impl Default for KeyValueVector<'_> {
+impl Default for KeyValueVectorRef<'_> {
     fn default() -> Self {
-        KeyValueVector::EMPTY
+        KeyValueVectorRef::EMPTY
     }
 }
 
-impl<'a> IntoIterator for KeyValueVector<'a> {
+impl<'a> IntoIterator for KeyValueVectorRef<'a> {
     type Item = KeyValueRef<'a>;
     type IntoIter = KeyValueIter<'a>;
 
@@ -234,7 +239,7 @@ impl<'a> IntoIterator for KeyValueVector<'a> {
     }
 }
 
-impl<'a> IntoIterator for &KeyValueVector<'a> {
+impl<'a> IntoIterator for &KeyValueVectorRef<'a> {
     type Item = KeyValueRef<'a>;
     type IntoIter = KeyValueIter<'a>;
 
@@ -243,7 +248,7 @@ impl<'a> IntoIterator for &KeyValueVector<'a> {
     }
 }
 
-/// The pairs of a [`KeyValueVector`].
+/// The pairs of a [`KeyValueVectorRef`].
 #[derive(Clone, Debug)]
 pub struct KeyValueIter<'a> {
     rest: &'a [u8],
@@ -268,7 +273,10 @@ impl<'a> Iterator for KeyValueIter<'a> {
         match item {
             Some(item) => {
                 self.remaining -= 1;
-                self.rest = &self.rest[self.rest.len() - c.remaining()..];
+                self.rest = self
+                    .rest
+                    .get(self.rest.len() - c.remaining()..)
+                    .unwrap_or_default();
                 Some(item)
             }
             None => {
@@ -288,73 +296,81 @@ impl ExactSizeIterator for KeyValueIter<'_> {}
 
 impl FusedIterator for KeyValueIter<'_> {}
 
-impl Wire for KeyValueVector<'_> {
+impl Wire for KeyValueVectorRef<'_> {
     const SHAPE: Shape = Shape::Object;
 }
 
-impl Encode for KeyValueVector<'_> {
+impl Encode for KeyValueVectorRef<'_> {
     fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
         w.blob(self.payload)
     }
 }
 
-impl<'de: 'a, 'a> Decode<'de> for KeyValueVector<'a> {
+impl<'de: 'a, 'a> Decode<'de> for KeyValueVectorRef<'a> {
     fn absent() -> Self {
-        KeyValueVector::EMPTY
+        KeyValueVectorRef::EMPTY
     }
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        KeyValueVector::parse(r.blob(at)?)
+        KeyValueVectorRef::parse(r.blob(at)?)
     }
 }
 
 /// An owned pre-serialized key-value vector, for building replies (and for decoding
-/// without borrowing). It holds the encoded payload, so encoding it is a copy.
+/// without borrowing). It holds the encoded payload (so it is as large as the blob, and
+/// encoding it is a copy); [`borrowed`](Self::borrowed) views it as a
+/// [`KeyValueVectorRef`].
 ///
 /// ```
-/// use fdb_native_wire::{KeyValueRef, KeyValueVectorBuf};
+/// use fdb_native_wire::{KeyValueRef, KeyValueVector};
 ///
-/// let buf: KeyValueVectorBuf =
-///     [KeyValueRef::new(b"k", b"v"), KeyValueRef::new(b"k2", b"")].into_iter().collect();
+/// let buf = KeyValueVector::from_pairs([KeyValueRef::new(b"k", b"v"), KeyValueRef::new(b"k2", b"")])?;
 /// assert_eq!(buf.len(), 2);
 /// assert_eq!(buf.payload().len(), 4 + (8 + 2) + (8 + 2));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct KeyValueVectorBuf {
+pub struct KeyValueVector {
     /// The payload with the count kept up to date in its first 4 bytes.
     bytes: Vec<u8>,
     count: u32,
-    /// A length or the count did not fit a `u32`; encoding fails.
-    overflow: bool,
 }
 
-impl Default for KeyValueVectorBuf {
+impl Default for KeyValueVector {
     fn default() -> Self {
-        KeyValueVectorBuf::new()
+        KeyValueVector::new()
     }
 }
 
-impl KeyValueVectorBuf {
+impl KeyValueVector {
     /// An empty vector.
-    pub fn new() -> KeyValueVectorBuf {
-        KeyValueVectorBuf {
+    pub fn new() -> KeyValueVector {
+        KeyValueVector {
             bytes: EMPTY_PAYLOAD.to_vec(),
             count: 0,
-            overflow: false,
         }
     }
 
-    /// Appends a pair. A key, a value or a count that does not fit a `u32` is dropped and
-    /// makes encoding fail with [`EncodeError::TooLarge`].
-    pub fn push(&mut self, key: &[u8], value: &[u8]) {
+    /// Appends a pair. Fails with [`EncodeError::TooLarge`], leaving the vector as it was,
+    /// if a length or the count does not fit a `u32` or the blob would exceed what a
+    /// message can hold (`u32::MAX` bytes).
+    pub fn try_push(&mut self, key: &[u8], value: &[u8]) -> Result<(), EncodeError> {
         let (Ok(key_len), Ok(value_len), Some(count)) = (
             u32::try_from(key.len()),
             u32::try_from(value.len()),
             self.count.checked_add(1),
         ) else {
-            self.overflow = true;
-            return;
+            return Err(EncodeError::TooLarge);
         };
+        let new_len = self
+            .bytes
+            .len()
+            .checked_add(8)
+            .and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(value.len()))
+            .filter(|&n| u32::try_from(n).is_ok())
+            .ok_or(EncodeError::TooLarge)?;
+        self.bytes.reserve(new_len - self.bytes.len());
         self.bytes.extend_from_slice(&key_len.to_le_bytes());
         self.bytes.extend_from_slice(key);
         self.bytes.extend_from_slice(&value_len.to_le_bytes());
@@ -363,6 +379,19 @@ impl KeyValueVectorBuf {
         if let Some(header) = self.bytes.first_chunk_mut::<4>() {
             *header = count.to_le_bytes();
         }
+        Ok(())
+    }
+
+    /// A vector of these pairs, or [`EncodeError::TooLarge`] as for
+    /// [`try_push`](Self::try_push).
+    pub fn from_pairs<'a>(
+        pairs: impl IntoIterator<Item = KeyValueRef<'a>>,
+    ) -> Result<KeyValueVector, EncodeError> {
+        let mut out = KeyValueVector::new();
+        for kv in pairs {
+            out.try_push(kv.key, kv.value)?;
+        }
+        Ok(out)
     }
 
     /// The number of pairs.
@@ -386,8 +415,8 @@ impl KeyValueVectorBuf {
     }
 
     /// Views the pairs.
-    pub fn as_view(&self) -> KeyValueVector<'_> {
-        KeyValueVector {
+    pub fn borrowed(&self) -> KeyValueVectorRef<'_> {
+        KeyValueVectorRef {
             payload: &self.bytes,
             count: self.count,
         }
@@ -395,56 +424,33 @@ impl KeyValueVectorBuf {
 
     /// The pairs in order.
     pub fn iter(&self) -> KeyValueIter<'_> {
-        self.as_view().iter()
+        self.borrowed().iter()
     }
 }
 
-impl<'a> Extend<KeyValueRef<'a>> for KeyValueVectorBuf {
-    fn extend<I: IntoIterator<Item = KeyValueRef<'a>>>(&mut self, iter: I) {
-        for kv in iter {
-            self.push(kv.key, kv.value);
-        }
+impl From<KeyValueVectorRef<'_>> for KeyValueVector {
+    fn from(view: KeyValueVectorRef<'_>) -> Self {
+        view.into_owned()
     }
 }
 
-impl<'a> FromIterator<KeyValueRef<'a>> for KeyValueVectorBuf {
-    fn from_iter<I: IntoIterator<Item = KeyValueRef<'a>>>(iter: I) -> Self {
-        let mut buf = KeyValueVectorBuf::new();
-        buf.extend(iter);
-        buf
-    }
-}
-
-impl From<KeyValueVector<'_>> for KeyValueVectorBuf {
-    fn from(view: KeyValueVector<'_>) -> Self {
-        KeyValueVectorBuf {
-            bytes: view.payload.to_vec(),
-            count: view.count,
-            overflow: false,
-        }
-    }
-}
-
-impl Wire for KeyValueVectorBuf {
+impl Wire for KeyValueVector {
     const SHAPE: Shape = Shape::Object;
 }
 
-impl Encode for KeyValueVectorBuf {
+impl Encode for KeyValueVector {
     fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        if self.overflow {
-            return Err(EncodeError::TooLarge);
-        }
-        self.as_view().encode_object(w)
+        self.borrowed().encode_object(w)
     }
 }
 
-impl<'de> Decode<'de> for KeyValueVectorBuf {
+impl<'de> Decode<'de> for KeyValueVector {
     fn absent() -> Self {
-        KeyValueVectorBuf::new()
+        KeyValueVector::new()
     }
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        KeyValueVector::decode_object(r, at).map(KeyValueVectorBuf::from)
+        KeyValueVectorRef::decode_object(r, at).map(KeyValueVectorRef::into_owned)
     }
 }
 
@@ -454,10 +460,10 @@ mod tests {
 
     #[test]
     fn payload_layout_and_iteration() {
-        let mut buf = KeyValueVectorBuf::new();
+        let mut buf = KeyValueVector::new();
         assert_eq!(buf.payload(), [0, 0, 0, 0]);
-        buf.push(b"ab", b"");
-        buf.push(b"", b"xyz");
+        buf.try_push(b"ab", b"").unwrap();
+        buf.try_push(b"", b"xyz").unwrap();
         assert_eq!(
             buf.payload(),
             [
@@ -466,32 +472,47 @@ mod tests {
                 0, 0, 0, 0, 3, 0, 0, 0, b'x', b'y', b'z', // "" -> "xyz"
             ]
         );
-        let view = KeyValueVector::parse(buf.payload()).unwrap();
-        assert_eq!(view, buf.as_view());
+        let view = KeyValueVectorRef::parse(buf.payload()).unwrap();
+        assert_eq!(view, buf.borrowed());
         assert_eq!(
             view.iter().collect::<Vec<_>>(),
             [KeyValueRef::new(b"ab", b""), KeyValueRef::new(b"", b"xyz")]
         );
         assert_eq!(view.iter().len(), 2);
+        assert_eq!(view.into_owned(), buf);
+    }
+
+    #[test]
+    fn empty_keys_and_values() {
+        // One item with an empty key and an empty value is just two zero lengths.
+        let payload = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let view = KeyValueVectorRef::parse(&payload).unwrap();
+        assert_eq!(
+            view.iter().collect::<Vec<_>>(),
+            [KeyValueRef::new(b"", b"")]
+        );
+        let mut buf = KeyValueVector::new();
+        buf.try_push(b"", b"").unwrap();
+        assert_eq!(buf.payload(), payload);
     }
 
     #[test]
     fn rejects_malformed_payloads() {
         // Too short for the count.
         for len in 0..4 {
-            assert!(KeyValueVector::parse(&[0; 4][..len]).is_err());
+            assert!(KeyValueVectorRef::parse(&[0; 4][..len]).is_err());
         }
         // The count says one item; none follows.
-        assert!(KeyValueVector::parse(&[1, 0, 0, 0]).is_err());
+        assert!(KeyValueVectorRef::parse(&[1, 0, 0, 0]).is_err());
         // A count no blob could hold.
-        assert!(KeyValueVector::parse(&[0xff; 4]).is_err());
+        assert!(KeyValueVectorRef::parse(&[0xff; 4]).is_err());
         // A key longer than the blob.
-        assert!(KeyValueVector::parse(&[1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(KeyValueVectorRef::parse(&[1, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]).is_err());
         // Trailing bytes.
-        assert!(KeyValueVector::parse(&[0, 0, 0, 0, 0]).is_err());
+        assert!(KeyValueVectorRef::parse(&[0, 0, 0, 0, 0]).is_err());
         assert_eq!(
-            KeyValueVector::parse(&[0; 4]).unwrap(),
-            KeyValueVector::EMPTY
+            KeyValueVectorRef::parse(&[0; 4]).unwrap(),
+            KeyValueVectorRef::EMPTY
         );
     }
 }
