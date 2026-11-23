@@ -29,6 +29,10 @@
 //! * [`TlsConnector`] is built from that and wraps a connected stream in a
 //!   [`TlsStream`], which implements `futures_io::{AsyncRead, AsyncWrite}`
 //!   and so drops in wherever the transport uses a `Runtime::Stream`.
+//! * [`peer::TlsStreamWrapper`] plugs a connector into the
+//!   [`PeerManager`](crate::peer::PeerManager): it dials `:tls` addresses, bounded by the
+//!   manager's connect timeout, and treats the truncated close FoundationDB sends as a peer
+//!   close.
 //! * Server certificates are checked the way FoundationDB checks them, by
 //!   [`verify_peers::VerifyPeersVerifier`]: the chain must validate against the
 //!   configured CA, and then the configured `verify_peers` rules
@@ -326,6 +330,7 @@
 
 mod config;
 mod error;
+pub mod peer;
 mod pem;
 mod provider;
 mod stream;

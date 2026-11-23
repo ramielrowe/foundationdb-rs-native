@@ -245,7 +245,7 @@ pub use messages::{
 };
 
 use crate::framing::{
-    Checksum, Frame, FrameConfig, FrameDecoder, FrameWriteError, LENGTH_LEN, TOKEN_LEN,
+    Checksum, Frame, FrameConfig, FrameDecoder, FrameError, FrameWriteError, LENGTH_LEN, TOKEN_LEN,
 };
 use crate::runtime::Instant;
 use crate::{ConnectPacket, ConnectPacketError};
@@ -661,6 +661,14 @@ impl Connection {
     /// Sends a frame to `token` whose payload `write` appends to the vector it is given (for
     /// a serializer that writes in place, such as `Writer::finish_into`). On an error nothing
     /// is sent.
+    ///
+    /// `write` must only append: the vector is the connection's output, shared with the
+    /// frames before it. One that shortens it below where it began (`*out = ...`) destroyed
+    /// them; the connection detects that, **fails** with
+    /// [`ConnectionError::InternalEncode`] (nothing waiting is written) and returns
+    /// [`SendError::Closed`]. One that replaces the contents by something at least as long
+    /// cannot be detected: give a writer that is not trusted a vector of its own and
+    /// [`send`](Connection::send) what it wrote (the [peer manager](crate::peer) does).
     pub fn send_with<F, E>(&mut self, token: Uid, write: F) -> Result<(), SendError<E>>
     where
         F: FnOnce(&mut Vec<u8>) -> Result<(), E>,
@@ -676,14 +684,8 @@ impl Connection {
         let core = &mut self.core;
         let config = core.frame_config;
         let buf = core.send_buffer();
-        config
-            .try_encode_frame_with(token, buf, write)
-            .map_err(|e| match e {
-                FrameWriteError::Frame(f) => SendError::Frame(f),
-                FrameWriteError::Payload(p) => SendError::Payload(p),
-            })?;
-        core.note_sent(token);
-        Ok(())
+        let result = config.try_encode_frame_with(token, buf, write);
+        core.sent(token, result)
     }
 
     /// Serializes `message` as a flatbuffers message with its file identifier and sends it to
@@ -708,16 +710,10 @@ impl Connection {
             out, held, writer, ..
         } = &mut *core;
         let buf = if established { out } else { held };
-        config
-            .try_encode_frame_with(token, buf, |buf| {
-                encode_root(writer, buf, message, T::FILE_IDENTIFIER.value())
-            })
-            .map_err(|e| match e {
-                FrameWriteError::Frame(f) => SendError::Frame(f),
-                FrameWriteError::Payload(p) => SendError::Payload(p),
-            })?;
-        core.note_sent(token);
-        Ok(())
+        let result = config.try_encode_frame_with(token, buf, |buf| {
+            encode_root(writer, buf, message, T::FILE_IDENTIFIER.value())
+        });
+        core.sent(token, result)
     }
 
     /// Registers a local receiver: frames for `token` become [`Event::Frame`]s. Returns
@@ -1036,6 +1032,30 @@ impl Core {
             &mut self.out
         } else {
             &mut self.held
+        }
+    }
+
+    /// The outcome of building a frame for the application: counts it as sent, or maps the
+    /// refusal. A payload writer that shortened the output buffer below its frame destroyed
+    /// the frames before it, which cannot be told apart from garbage: the connection fails
+    /// ([`ConnectionError::InternalEncode`]; nothing of what was waiting is written) and the
+    /// caller sees [`SendError::Closed`].
+    fn sent<E>(
+        &mut self,
+        token: Uid,
+        result: Result<(), FrameWriteError<E>>,
+    ) -> Result<(), SendError<E>> {
+        match result {
+            Ok(()) => {
+                self.note_sent(token);
+                Ok(())
+            }
+            Err(FrameWriteError::Frame(e @ FrameError::OutputShrunk { .. })) => {
+                self.fail(ConnectionError::InternalEncode(e.to_string()));
+                Err(SendError::Closed)
+            }
+            Err(FrameWriteError::Frame(f)) => Err(SendError::Frame(f)),
+            Err(FrameWriteError::Payload(p)) => Err(SendError::Payload(p)),
         }
     }
 

@@ -122,6 +122,26 @@ async fn docker_connect_detect_version_and_shutdown() {
             .unwrap_or_else(|e| panic!("{image}: {e}"));
         assert_eq!(reply.protocol_version().without_flags(), right, "{image}");
         assert_eq!(peer.status().generation, Generation(2), "{image}");
+        // The reply says which version it arrived on: the one this connection speaks.
+        let raw = peer
+            .request(well_known::PROTOCOL_INFO, |reply, _version, out| {
+                let request = ProtocolInfoRequest {
+                    reply: ReplyPromise::new(reply),
+                };
+                out.extend_from_slice(&fdb_native_wire::encode(&request)?);
+                Ok::<(), EncodeError>(())
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{image}: {e}"));
+        assert_eq!(raw.version, right, "{image}");
+        assert_eq!(
+            raw.decode::<ProtocolInfoReply>()
+                .unwrap()
+                .protocol_version()
+                .without_flags(),
+            right,
+            "{image}"
+        );
         // Many at once share the connection, each with its own reply token.
         let mut requests = Vec::new();
         for _ in 0..32 {

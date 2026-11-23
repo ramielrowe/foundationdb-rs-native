@@ -97,22 +97,51 @@
 //! the registry minted and **the negotiated protocol version**, so a request is always encoded
 //! for the schema set of the connection it goes out on, including after a version switch:
 //!
-//! ```ignore
+//! ```no_run
+//! # use fdb_native_transport::connection::well_known;
+//! # use fdb_native_transport::peer::{PeerHandle, ProtocolInfoReply, ProtocolInfoRequest};
+//! # use fdb_native_wire::ReplyPromise;
+//! # async fn demo(peer: PeerHandle) -> Result<(), Box<dyn std::error::Error>> {
 //! let reply = peer
-//!     .request_as::<ProtocolInfoReply>(well_known::PROTOCOL_INFO, |reply, _version, out| {
-//!         fdb_native_wire::encode_into(&ProtocolInfoRequest { reply: ReplyPromise::new(reply) }, out)
+//!     .request(well_known::PROTOCOL_INFO, |reply, _version, out| {
+//!         // Append the message: `out` is yours alone, but an encoder should not assume more.
+//!         let request = ProtocolInfoRequest { reply: ReplyPromise::new(reply) };
+//!         out.extend_from_slice(&fdb_native_wire::encode(&request)?);
+//!         Ok(())
 //!     })
 //!     .await?;
+//! // The reply carries the version it arrived on, which schema decoders need.
+//! let _version = reply.version;
+//! let info: ProtocolInfoReply = reply.decode()?;
+//! # let _ = info;
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! The future resolves with the reply payload ([`request`](PeerHandle::request);
-//! [`request_as`](PeerHandle::request_as) also decodes it with
-//! [`decode_reply`]) or a [`RequestError`] whose
+//! The future resolves with a [`Reply`]: the payload and the [`ProtocolVersion`] of the
+//! connection it arrived on (the one the request was encoded for), because decoding a reply
+//! can depend on it (`ClientDBInfo` differs between 7.4 and 8.0). [`Reply::decode`] (and
+//! [`request_as`](PeerHandle::request_as), which does both) decodes it with [`decode_reply`]
+//! for versions that need no schema; otherwise hand `reply.version` and `reply.payload` to the
+//! schema's decoder. A failure is a [`RequestError`] whose
 //! [`maybe_delivered`](RequestError::maybe_delivered) /
 //! [`certainly_not_delivered`](RequestError::certainly_not_delivered) /
 //! [`should_retry`](RequestError::should_retry) say what a caller may do. A connect failure
 //! before the request was applied is [`RequestError::NotSent`]; the cause is in
 //! [`PeerStatus::last_error`] and the [`PeerEvent::ConnectFailed`] event.
+//!
+//! **Encoders.** The closure runs on the peer's task, with a vector **of its own** (the
+//! manager copies what it wrote into the frame afterwards), so whatever it does to the vector
+//! (even `*out = ...`) cannot touch other frames. It should append the message and must not
+//! block. If it fails, the request fails with [`RequestError::Encode`]; if it **panics**, the
+//! panic is caught and the request fails the same way (nothing was sent, certainly not
+//! delivered), and the peer carries on.
+//!
+//! **Fail fast.** If the address is already marked failed in the [`FailureMonitor`], `request`
+//! returns [`RequestError::NotSent`] at once, without queueing or dialing (`tryGetReply` returns
+//! at once when `onDisconnectOrFailure` is ready). Nothing then reconnects an *unreferenced*
+//! peer by itself: [`connect`](PeerHandle::connect) probes explicitly, and a
+//! [`reference`](PeerHandle::reference) makes the peer probe by itself.
 //!
 //! **Cancellation.** Dropping the future cancels the request: if it was still queued it is
 //! never sent; if it was sent, the registry forgets its reply token (a late reply is then an
@@ -227,12 +256,32 @@
 //!
 //! See [`StreamWrapper`]: a hook called for TLS addresses with the connected socket.
 //!
+//! # Panics
+//!
+//! Code that runs on a peer's task is the manager's own, plus three hooks of the application: a
+//! request or frame **encoder** (the closures of [`request`](PeerHandle::request) and
+//! [`send_with`](PeerHandle::send_with)), the [`PeerEventSink`] and the [`StreamWrapper`].
+//!
+//! * A panicking **encoder** is caught: that one request fails with an encode error (nothing
+//!   was written, so it was certainly not delivered) and the peer carries on.
+//! * A panicking **sink** or **wrapper** is not caught, and **must not happen**: the connection
+//!   is not driven while they run, and their state is the application's. If one does panic
+//!   (the task is lost, with the executor's usual report of a panicked task), the peer is
+//!   *abandoned* cleanly: its queue is closed, commands still queued are refused as not sent,
+//!   requests already on the connection fail as maybe delivered
+//!   ([`RequestError::MaybeDelivered`]), its phase becomes [`PeerPhase::Shutdown`], waiters on
+//!   the failure monitor are woken, and it is removed from the manager, so the next
+//!   [`PeerManager::peer`] for the address creates a new, working peer. Handles to the dead
+//!   peer fail their commands (a handle keeps the old state).
+//!
 //! # Shutdown
 //!
 //! [`PeerManager::shutdown`] asks every peer to finish: queued commands are refused (never
 //! sent), requests that were sent complete with [`RequestError::Cancelled`], what is already
 //! queued for writing gets [`shutdown_timeout`](PeerManagerConfig::shutdown_timeout) to be
-//! written, the socket is closed, [`PeerEvent::Closed`] (clean) is reported, and the task ends.
+//! written, the socket is closed, [`PeerEvent::Closed`] (clean) is reported, the address's
+//! waiters on the [`FailureMonitor`] are woken (`notifyDisconnect`) if it had a connection, and
+//! the task ends.
 //! The call returns when all tasks have. Dropping the last [`PeerManager`] clone shuts every
 //! peer down the same way (without waiting): a manager that is gone leaves no task behind.
 //!
@@ -381,33 +430,65 @@ impl PeerShared {
     }
 
     fn add_reference(&self) {
-        let now = self
+        let _ = self
             .references
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
                 Some(if r < 0 { 1 } else { r + 1 })
-            })
-            .map_or(1, |previous| if previous < 0 { 1 } else { previous + 1 });
-        self.references_changed(now);
+            });
+        self.publish_references();
     }
 
     fn remove_reference(&self) {
-        let now = self
+        let _ = self
             .references
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
                 (r > 0).then_some(r - 1)
-            })
-            .map_or(0, |previous| previous - 1);
-        self.references_changed(now);
+            });
+        self.publish_references();
     }
 
-    fn references_changed(&self, now: isize) {
+    /// Publishes the count to the status. It is read **under the status lock**, so of two
+    /// concurrent changes whichever publishes last publishes the final count; a value read
+    /// before taking the lock could be stale by then and be written over a newer one.
+    fn publish_references(&self) {
         self.status.modify(|s| {
-            let count = usize::try_from(now).unwrap_or(0);
+            let count = usize::try_from(self.references.load(Ordering::SeqCst)).unwrap_or(0);
             let changed = s.references != count;
             s.references = count;
             (changed, ())
         });
         let _ = self.ctrl.unbounded_send(Ctrl::RefsChanged);
+    }
+}
+
+/// The reply to a [`request`](PeerHandle::request): the payload and the protocol version of
+/// the connection it arrived on.
+///
+/// The version is the one the request was encoded for (a connection speaks one version, and
+/// the reply comes back on the connection the request went out on). A reply can only be
+/// decoded knowing it: the layout of `ClientDBInfo`, for one, differs between 7.4 and 8.0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Reply {
+    /// The protocol version, without flags, of the connection the reply arrived on: the
+    /// schema set to decode it with.
+    pub version: ProtocolVersion,
+    /// The reply message, an `ErrorOr<EnsureTable<Reply>>` that [`decode_reply`] (or the
+    /// schema's decoder for [`version`](Self::version)) decodes.
+    pub payload: Vec<u8>,
+}
+
+impl Reply {
+    /// The payload decoded as `T` with [`decode_reply`]: a server error becomes
+    /// [`RequestError::Fdb`] / [`RequestError::BrokenPromise`], and a payload that is not a
+    /// `T` [`RequestError::Decode`] (the request was delivered). For a reply whose layout
+    /// depends on the version, use [`version`](Self::version) with the schema's decoder
+    /// instead.
+    pub fn decode<T>(&self) -> Result<T, RequestError>
+    where
+        T: DecodeOwned + FileIdentified,
+    {
+        decode_reply::<T>(&self.payload)
     }
 }
 
@@ -578,22 +659,38 @@ impl PeerHandle {
         }
     }
 
-    /// Sends a request to the remote endpoint `endpoint` of this peer and resolves with the
-    /// reply payload, an `ErrorOr<EnsureTable<Reply>>` message that
-    /// [`decode_reply`] decodes ([`request_as`](Self::request_as) does both). Connects first
-    /// if there is no connection. See [Requests](self#requests).
+    /// Sends a request to the remote endpoint `endpoint` of this peer and resolves with its
+    /// [`Reply`]: the reply payload (an `ErrorOr<EnsureTable<Reply>>` message that
+    /// [`Reply::decode`] / [`decode_reply`] decode, as [`request_as`](Self::request_as) does
+    /// in one step) and the protocol version it arrived on. Connects first if there is no
+    /// connection. See [Requests](self#requests).
     ///
-    /// `encode` writes the request message into the vector it is given. It receives the reply
+    /// If the address is already marked failed in the [`FailureMonitor`] the request is
+    /// refused at once, [`NotSent`](RequestError::NotSent), without being queued or
+    /// dialing (as `tryGetReply` returns at once for a failed address). Call
+    /// [`connect`](Self::connect) to probe it, or hold a [`reference`](Self::reference) to have
+    /// the peer probe by itself.
+    ///
+    /// `encode` appends the request message to the vector it is given. It receives the reply
     /// token to put in the request's `ReplyPromise`, and the negotiated protocol version, to
     /// pick the schema set. It runs on the peer's task once the connection is established, so
     /// it may be called after this future was polled and not at all if the future is dropped
-    /// first.
+    /// first. The vector is the encoder's own and what it writes is copied into the frame, so
+    /// even one that overwrites it cannot damage other frames; an encoder that returns an error
+    /// or **panics** fails only its request, with [`RequestError::Encode`] (nothing was sent).
     ///
     /// The error says whether the request may have been delivered; see [`RequestError`].
-    pub async fn request<F>(&self, endpoint: Uid, encode: F) -> Result<Vec<u8>, RequestError>
+    pub async fn request<F>(&self, endpoint: Uid, encode: F) -> Result<Reply, RequestError>
     where
         F: FnOnce(Uid, ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static,
     {
+        if self.is_failed() {
+            let status = self.status();
+            return Err(match status.last_error {
+                Some(error) => error.not_sent(),
+                None => RequestError::NotSent(None),
+            });
+        }
         let called = self
             .call(|id, reply| Cmd::Request {
                 id,
@@ -610,16 +707,17 @@ impl PeerHandle {
         }
     }
 
-    /// [`request`](Self::request), then the reply decoded as `T` ([`decode_reply`]): a server
+    /// [`request`](Self::request), then the reply decoded as `T` ([`Reply::decode`]): a server
     /// error becomes [`RequestError::Fdb`] / [`RequestError::BrokenPromise`], and a payload
-    /// that is not a `T` [`RequestError::Decode`] (the request was delivered).
+    /// that is not a `T` [`RequestError::Decode`] (the request was delivered). For a reply
+    /// whose layout depends on the protocol version, call [`request`](Self::request) and use
+    /// [`Reply::version`].
     pub async fn request_as<T, F>(&self, endpoint: Uid, encode: F) -> Result<T, RequestError>
     where
         T: DecodeOwned + FileIdentified,
         F: FnOnce(Uid, ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static,
     {
-        let payload = self.request(endpoint, encode).await?;
-        decode_reply::<T>(&payload)
+        self.request(endpoint, encode).await?.decode::<T>()
     }
 
     /// Sends one frame **with no reply expected** (a one-way message) to the remote endpoint
@@ -641,7 +739,9 @@ impl PeerHandle {
     }
 
     /// [`send`](Self::send) with the payload written by `encode`, which is given the negotiated
-    /// protocol version and appends the serialized message to the vector.
+    /// protocol version and appends the serialized message to the vector. As for
+    /// [`request`](Self::request), the vector is the encoder's own, and an encoder that fails
+    /// or panics fails only this send ([`SendError::Encode`]; nothing was sent).
     pub async fn send_with<F>(&self, token: Uid, encode: F) -> Result<Generation, SendError>
     where
         F: FnOnce(ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static,
@@ -666,7 +766,8 @@ impl PeerHandle {
     /// Connects if there is no connection. The registration belongs to the connection it
     /// returns the [`Generation`] of, and ends with it (a reconnect registers nothing); keep
     /// it only while it is needed, since a registered token counts as outstanding for the idle
-    /// rules.
+    /// rules. If the future is dropped after the registration was applied (the caller never
+    /// saw the answer), the registration is undone.
     pub async fn register(&self, token: Uid) -> Result<Generation, SendError> {
         let called = self.call(|id, ack| Cmd::Register { id, token, ack }).await;
         match called {
@@ -683,8 +784,9 @@ impl PeerHandle {
     }
 
     /// Unregisters a token registered with [`register`](Self::register). Never waits. Await
-    /// the `register` first: a cancelled one that was already applied is not undone by an
-    /// earlier-arriving `unregister`.
+    /// the `register` first: an `unregister` that arrives before the `register` is applied
+    /// does nothing. (A `register` whose future is dropped after it was applied is undone by
+    /// the drop itself; see [`register`](Self::register).)
     pub fn unregister(&self, token: Uid) {
         let _ = self.shared.ctrl.unbounded_send(Ctrl::Unregister(token));
     }
@@ -793,19 +895,41 @@ impl<R: Runtime, W> Shared<R, W> {
     /// out a handle, so a handle cannot appear for a peer that was removed. Returns whether it
     /// was removed.
     pub(crate) fn try_retire(&self, key: &PeerKey, peer: &Arc<PeerShared>) -> bool {
-        let mut peers = self.lock_peers();
-        if peers.shutdown || peer.handles() != 0 || peer.references() > 0 || !peer.queue.is_empty()
-        {
-            return false;
-        }
-        match peers.map.get(key) {
-            Some(entry) if Arc::ptr_eq(&entry.shared, peer) => {}
-            _ => return false,
-        }
-        peers.map.remove(key);
+        let removed = {
+            let mut peers = self.lock_peers();
+            if peers.shutdown
+                || peer.handles() != 0
+                || peer.references() > 0
+                || !peer.queue.is_empty()
+            {
+                return false;
+            }
+            match peers.map.get(key) {
+                Some(entry) if Arc::ptr_eq(&entry.shared, peer) => {}
+                _ => return false,
+            }
+            peers.map.remove(key)
+        };
         // Nothing can be queued any more: there is no handle.
         peer.queue.close();
+        // The entry holds this very task: let go of it outside the lock.
+        drop(removed);
         true
+    }
+
+    /// Removes the entry of a peer whose task is gone without having retired it (it panicked
+    /// or was dropped), if the map still holds this very peer: the next [`PeerManager::peer`]
+    /// then creates a new one. Never called with the lock held, and drops the entry (which
+    /// holds the task) outside it.
+    pub(crate) fn forget(&self, key: &PeerKey, peer: &Arc<PeerShared>) {
+        let removed = {
+            let mut peers = self.lock_peers();
+            match peers.map.get(key) {
+                Some(entry) if Arc::ptr_eq(&entry.shared, peer) => peers.map.remove(key),
+                _ => None,
+            }
+        };
+        drop(removed);
     }
 }
 
@@ -834,13 +958,22 @@ impl<R: Runtime, W> Drop for PeerManager<R, W> {
     /// outlive the manager fail their commands.
     fn drop(&mut self) {
         if self.inner.managers.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let mut peers = self.inner.lock_peers();
-            peers.shutdown = true;
-            for entry in peers.map.values_mut() {
-                let _ = entry.shared.ctrl.unbounded_send(Ctrl::Shutdown);
-                // Detach: the task ends by itself.
-                entry.task = None;
-            }
+            // Detach the tasks (they end by themselves), but let go of them outside the lock:
+            // a runtime that cancels a task whose handle is dropped runs its destructors
+            // (which take the lock) right there.
+            let detached: Vec<R::Task<()>> = {
+                let mut peers = self.inner.lock_peers();
+                peers.shutdown = true;
+                peers
+                    .map
+                    .values_mut()
+                    .filter_map(|entry| {
+                        let _ = entry.shared.ctrl.unbounded_send(Ctrl::Shutdown);
+                        entry.task.take()
+                    })
+                    .collect()
+            };
+            drop(detached);
         }
     }
 }
