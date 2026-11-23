@@ -39,3 +39,12 @@ target_compile_definitions(golden_vectors_binary PRIVATE GV_RELEASE_NAME="${GV_R
 # Transaction::tr (the commit request being built) is private.
 target_compile_options(golden_vectors_binary PRIVATE -fno-access-control -Wno-unused-parameter)
 target_link_libraries(golden_vectors_binary PRIVATE fdbclient)
+
+# The packet-framing vectors: FlowTransport's sendPacket() framing core run over this release's
+# PacketBuffer/PacketWriter/SplitBuffer and xxhash.h. See framing_vectors.cpp.
+add_executable(golden_vectors_framing "${GV_MESSAGES_DIR}/framing_vectors.cpp")
+target_include_directories(golden_vectors_framing PRIVATE "${GV_MESSAGES_DIR}" "${GV_MESSAGES_DIR}/../src")
+target_compile_definitions(golden_vectors_framing PRIVATE GV_RELEASE_NAME="${GV_RELEASE_NAME}"
+                                                          GV_FDB_VERSION="${FDB_VERSION}")
+target_compile_options(golden_vectors_framing PRIVATE -fno-access-control -Wno-unused-parameter)
+target_link_libraries(golden_vectors_framing PRIVATE fdbclient)

@@ -1,0 +1,28 @@
+{
+  "format_version": 1,
+  "name": "raw_well_known_token_checksum",
+  "group": "raw",
+  "kind": "positive",
+  "description": "The well-known ping token (-1, 1): the first half of the UID is the first 8 bytes on the wire.",
+  "checksum_enabled": true,
+  "start_offset": 0,
+  "segments": [92],
+  "size": 92,
+  "bytes": "50000000f87ffd4a72c0b865ffffffffffffffff01000000000000000726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8",
+  "frames": [
+    {
+      "offset": 0,
+      "length": 80,
+      "checksum": 7329819990662414328,
+      "token": {
+        "first": 18446744073709551615,
+        "second": 1
+      },
+      "payload_len": 64,
+      "payload_pattern": {
+        "mul": 31,
+        "add": 7
+      }
+    }
+  ]
+}

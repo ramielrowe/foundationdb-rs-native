@@ -539,3 +539,42 @@ fn count_shapes(fields: &[Val]) -> usize {
     walk(fields, &mut set);
     set.len()
 }
+
+/// `finish_into` appends the bytes `finish` returns, after whatever `out` holds, whatever
+/// the prefix (the table offsets are relative to the message, not to the vector).
+#[test]
+fn finish_into_appends_the_bytes_finish_returns() {
+    for seed in 0..40u64 {
+        let fields = gen_fields(&mut Rng(seed * 2_654_435_761 + 17), 0);
+        let expected = message(&mut Writer::new(), &fields, seed as u32).unwrap();
+        for prefix_len in [0usize, 1, 3, 12, 13, 100] {
+            let prefix: Vec<u8> = (0..prefix_len).map(|i| i as u8 ^ 0xA5).collect();
+            let mut out = prefix.clone();
+            let mut w = Writer::new();
+            let root = Fields(&fields).encode_object(&mut w).unwrap();
+            w.finish_into(&mut out, root, seed as u32).unwrap();
+            assert_eq!(out[..prefix_len], prefix[..], "seed {seed}");
+            assert_eq!(
+                out[prefix_len..],
+                expected[..],
+                "seed {seed} prefix {prefix_len}"
+            );
+            // The writer was reset: it writes the next message as a new one does.
+            let again = message(&mut w, &fields, seed as u32).unwrap();
+            assert_eq!(again, expected);
+        }
+    }
+}
+
+#[test]
+fn finish_into_leaves_the_buffer_alone_on_an_error() {
+    let mut other = Writer::new();
+    let fields = gen_fields(&mut Rng(99), 0);
+    let root = Fields(&fields).encode_object(&mut other).unwrap();
+    // A root that this writer never wrote.
+    let mut w = Writer::new();
+    let mut out = b"frame header".to_vec();
+    let err = w.finish_into(&mut out, root, 7);
+    assert!(err.is_err());
+    assert_eq!(out, b"frame header");
+}
