@@ -126,3 +126,20 @@ fn generated_values_decode_identically_in_cpp() {
         );
     }
 }
+
+/// The divergence `alias_data.rs` documents: C++ accepts a message that references one
+/// string 20 times (a `data` accept), which this crate rejects with `work_limit`. Every
+/// offset in it is in bounds, so it is safe for the unchecked release readers too.
+#[test]
+#[ignore = "requires golden-vectors tool"]
+fn aliased_strings_are_accepted_by_cpp() {
+    let (value, bytes) = aliased_untrusted();
+    for bin in decoders() {
+        let root = cpp_decode(&bin, "Untrusted", &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_json_eq(
+            &format!("aliased Untrusted via {}", bin.display()),
+            &root1(&value),
+            &root,
+        );
+    }
+}

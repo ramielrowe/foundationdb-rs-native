@@ -135,3 +135,36 @@ fn mutated_fixtures_never_panic() {
         })
         .unwrap();
 }
+
+/// Mutated fixtures decoded as every type, not only their own (the review's fuzz loop).
+#[test]
+fn mutated_fixtures_as_every_type_never_panic() {
+    let registry = registry();
+    let positives: Vec<Vec<u8>> = records("positive").iter().map(record_bytes).collect();
+    let strategy = (0..positives.len(), prop::collection::vec(mutation(), 0..6));
+    runner(2_000)
+        .run(&strategy, |(i, mutations)| {
+            let mut bytes = positives[i].clone();
+            for m in mutations {
+                if bytes.is_empty() {
+                    break;
+                }
+                match m {
+                    Mutation::Byte(p, v) => {
+                        let p = p % bytes.len();
+                        bytes[p] = v;
+                    }
+                    Mutation::Word(p, v) => {
+                        let p = (p % bytes.len()) & !1;
+                        let n = (bytes.len() - p).min(4);
+                        bytes[p..p + n].copy_from_slice(&v.to_le_bytes()[..n]);
+                    }
+                    Mutation::Truncate(len) => bytes.truncate(len % (bytes.len() + 1)),
+                }
+            }
+            registry
+                .iter()
+                .try_for_each(|entry| check_consistent(entry, &bytes))
+        })
+        .unwrap();
+}

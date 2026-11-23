@@ -84,8 +84,15 @@
 //!
 //! **Tables** are hand-written for now (a `#[derive]` comes later) and are mechanical: one
 //! [`TableWriter::field`] / [`TableReader::field`] call per `serializer(ar, ...)` argument,
-//! in argument order, skipping `Arena` (which takes no slot). A zero-field table
-//! decodes with [`Reader::empty_table`] instead of [`Reader::table`]. **Unions**
+//! in argument order, skipping `Arena` (which takes no slot). A table whose
+//! `serializer(ar)` call has no arguments at all (such as [`Void`]) decodes with
+//! [`Reader::empty_table`], because C++ never follows the offset to it; a table whose only
+//! argument is an `Arena` is followed, so it still uses [`Reader::table`] (with no `field`
+//! calls). Slots a type does not model are stepped over with [`TableReader::skip`] and
+//! written absent with [`TableWriter::skip`]; a layout that depends on the peer's version
+//! reads [`Reader::protocol_version`] / [`Writer::protocol_version`]. Wrapper impls reject
+//! shapes FDB cannot serialize at compile time (a union directly inside `Option`,
+//! `ErrorOr` or an array, a struct inside a struct). **Unions**
 //! (`std::variant`) are enums: `encode_union` returns [`UnionRef::EMPTY`] or
 //! `w.union_value(k + 1, alternative_k)`, `decode_union` maps tag `k + 1` to
 //! `r.alternative(at)` and any other tag to `absent()` (alternative 0's absent value for a
@@ -120,10 +127,16 @@
 //! `vtable_entry`, `bool_value`, `empty_table_offset`, `out_of_bounds` (for offsets C++
 //! does not follow) and `too_deep` (more than [`MAX_DEPTH`] nested tables). It reads
 //! out-of-range union tags, a union tag without its offset slot, and a vector of unions
-//! whose tags count differs from its offsets count the way C++ does. The one check the
-//! README does not list is a work limit ([`DecodeError::WorkLimit`]): decoding stops
-//! after a small multiple of the buffer size worth of objects, which only messages whose
-//! offsets alias the same objects over and over (a decompression bomb) reach.
+//! whose tags count differs from its offsets count the way C++ does.
+//!
+//! It also enforces a work limit ([`DecodeError::WorkLimit`], the README's `work_limit`
+//! check): one decode visits at most 4 × the message length + 1024 units of objects (see
+//! [`Reader`'s docs](Reader#work-limit) for the units). FDB's writer stays below 2 units
+//! per byte; only messages that reference the same objects over and over reach it, and
+//! FDB `main` would accept those. The limit bounds work, not output: a message full of
+//! offsets to one table with no fields present decodes into one whole Rust struct per
+//! offset, about `size_of::<T>() / 4` times the message size. Bound the size of
+//! untrusted messages before decoding them.
 //!
 //! # File identifiers
 //!
@@ -136,6 +149,7 @@
 mod codec;
 mod error;
 mod file_identifier;
+mod protocol_version;
 mod reader;
 mod shape;
 mod types;
@@ -144,6 +158,7 @@ mod writer;
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
 pub use error::{DecodeError, EncodeError, StrictCheck};
 pub use file_identifier::{FileIdentified, FileIdentifier, Wrapper};
+pub use protocol_version::ProtocolVersion;
 pub use reader::{MAX_DEPTH, Reader, TableReader};
 pub use shape::Shape;
 pub use types::{EnsureTable, ErrorOr, FdbError, Uid, Void};

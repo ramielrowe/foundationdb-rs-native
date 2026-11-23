@@ -1,7 +1,7 @@
 //! The encoder: a back-to-front message builder.
 
 use crate::shape::right_align;
-use crate::{Encode, EncodeError, Shape};
+use crate::{Encode, EncodeError, ProtocolVersion, Shape};
 
 /// Largest message the writer produces (offsets and soffsets must fit an `i32`).
 const MAX_MESSAGE: usize = i32::MAX as usize;
@@ -53,6 +53,8 @@ enum Slot {
     Tag(u8),
     /// An offset; `None` writes 0 (an empty union's offset slot).
     Offset(Option<ObjectRef>),
+    /// A slot left absent (vtable entry 0, no bytes in the table).
+    Absent,
 }
 
 impl Slot {
@@ -61,6 +63,7 @@ impl Slot {
             Slot::Inline { size, align, .. } => (size, align),
             Slot::Tag(_) => (1, 1),
             Slot::Offset(_) => (4, 4),
+            Slot::Absent => (0, 1),
         }
     }
 }
@@ -111,15 +114,31 @@ pub struct Writer {
     /// Element objects of the vectors being built.
     refs: Vec<ObjectRef>,
     empty_blob: Option<ObjectRef>,
+    protocol_version: Option<ProtocolVersion>,
 }
 
 impl Writer {
-    /// An empty writer.
+    /// An empty writer with no protocol version.
     pub fn new() -> Writer {
         Writer::default()
     }
 
-    /// Discards the message being built, keeping the allocated memory.
+    /// An empty writer for messages to a peer speaking `version`; [`Encode`] impls whose
+    /// layout differs between versions read it from [`Writer::protocol_version`].
+    pub fn with_protocol_version(version: ProtocolVersion) -> Writer {
+        Writer {
+            protocol_version: Some(version),
+            ..Writer::default()
+        }
+    }
+
+    /// The protocol version messages are written for, if the writer was given one.
+    pub fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.protocol_version
+    }
+
+    /// Discards the message being built, keeping the allocated memory and the protocol
+    /// version.
     pub fn reset(&mut self) {
         self.head = self.buf.len();
         self.vtable_pool.clear();
@@ -179,7 +198,7 @@ impl Writer {
                 let start = self.reserve(len)?;
                 for (i, item) in items.iter().enumerate() {
                     let at = start + i * size;
-                    item.encode_inline(&mut self.buf[at..at + size]);
+                    item.encode_inline(&mut self.buf[at..at + size])?;
                 }
             }
             Shape::Table | Shape::Object => {
@@ -253,7 +272,7 @@ impl Writer {
         match T::SHAPE {
             Shape::Inline { size, .. } => {
                 let start = self.reserve(size)?;
-                value.encode_inline(&mut self.buf[start..start + size]);
+                value.encode_inline(&mut self.buf[start..start + size])?;
                 Ok(self.current())
             }
             Shape::Table | Shape::Object => value.encode_object(self),
@@ -332,7 +351,8 @@ impl Writer {
         scratch_base: usize,
     ) -> Result<ObjectRef, EncodeError> {
         let n = self.slots.len() - slot_base;
-        // generate_vtable (flow/flat_buffers.cpp): stable sort by size, descending.
+        // generate_vtable (flow/flat_buffers.cpp): stable sort by size, descending; absent
+        // (zero-size) slots get no space and keep entry 0.
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
             let size = |i: usize| self.slots[slot_base + i].size_align().0;
@@ -343,6 +363,9 @@ impl Writer {
         let mut max_align = 4;
         for &i in &order {
             let (size, align) = self.slots[slot_base + i].size_align();
+            if size == 0 {
+                continue;
+            }
             let at = right_align(offset, align);
             vtable[i + 2] = u16::try_from(at + 4).map_err(|_| EncodeError::TooLarge)?;
             offset = at + size;
@@ -367,7 +390,7 @@ impl Writer {
                     let value = relative(table.0 - usize::from(vtable[i + 2]), target)?;
                     self.buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
                 }
-                Slot::Offset(None) => {}
+                Slot::Offset(None) | Slot::Absent => {}
             }
         }
         let index = self.intern_vtable(&vtable);
@@ -466,7 +489,7 @@ impl TableWriter<'_> {
             Shape::Inline { size, align } => {
                 let start = self.w.scratch.len();
                 self.w.scratch.resize(start + size, 0);
-                value.encode_inline(&mut self.w.scratch[start..start + size]);
+                value.encode_inline(&mut self.w.scratch[start..start + size])?;
                 self.w.slots.push(Slot::Inline { start, size, align });
             }
             Shape::Table | Shape::Object => {
@@ -485,6 +508,16 @@ impl TableWriter<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Leaves the next `slots` vtable slots absent (entry 0), for serializer arguments the
+    /// type does not model; readers decode them as their default values. FDB's writer never
+    /// omits a field, but every FDB reader accepts absent slots. A union or a vector of
+    /// unions takes two slots.
+    pub fn skip(&mut self, slots: usize) {
+        for _ in 0..slots {
+            self.w.slots.push(Slot::Absent);
+        }
     }
 
     /// Writes the table and returns it.

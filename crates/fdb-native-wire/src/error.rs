@@ -95,9 +95,11 @@ pub enum DecodeError {
     /// A [`StrictCheck`] failed.
     #[error("strict check failed: {0}")]
     Strict(StrictCheck),
-    /// Decoding would do more work than a well-formed message of this size needs. Only
-    /// messages whose offsets alias the same objects many times over reach this limit.
-    #[error("decoding work limit exceeded (objects are aliased too many times)")]
+    /// Decoding would visit more than 4 × the buffer length + 1024 units of objects (see
+    /// [`Reader`](crate::Reader#work-limit)): the message references the same objects
+    /// many times over. FDB's writer never produces such messages, but FDB `main`'s reader
+    /// accepts them; this is the `work_limit` check of the golden-vectors README.
+    #[error("decoding work limit exceeded (objects are referenced too many times)")]
     WorkLimit,
     /// The bytes are well-formed but not a valid value of the type being decoded (for
     /// example a blob codec's payload is inconsistent), or the type cannot be decoded in
@@ -109,11 +111,13 @@ pub enum DecodeError {
 impl DecodeError {
     /// The permitted strict check (in the golden-vectors `violations` vocabulary) that
     /// this error corresponds to, if it is one. Out-of-bounds reads map to
-    /// `out_of_bounds`, which C++ also rejects except for offsets it never follows.
+    /// `out_of_bounds`, which C++ also rejects except for offsets it never follows, and
+    /// [`DecodeError::WorkLimit`] to `work_limit`.
     pub fn check_name(&self) -> Option<&'static str> {
         match self {
             DecodeError::Strict(check) => Some(check.name()),
             DecodeError::OutOfBounds { .. } => Some("out_of_bounds"),
+            DecodeError::WorkLimit => Some("work_limit"),
             _ => None,
         }
     }

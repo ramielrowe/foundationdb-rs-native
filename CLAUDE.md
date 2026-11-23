@@ -66,7 +66,7 @@ cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
 cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'  # Docker-backed integration tests
-cargo test --doc -p fdb-native-wire                            # doc tests (nextest skips them)
+cargo test --doc --workspace                                   # doc tests (nextest skips them)
 ```
 
 `fdb-native-wire`'s encoder is also checked against FDB's C++ readers by an ignored test binary,

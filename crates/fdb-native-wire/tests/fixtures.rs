@@ -243,20 +243,6 @@ fn corpus_obeys_policy() {
 // ---------------------------------------------------------------------------------------
 // Targeted reader tests.
 
-/// An `Encode` that points at an object already written (for building aliased buffers).
-#[derive(Clone, Copy)]
-struct Alias(ObjectRef);
-
-impl Wire for Alias {
-    const SHAPE: Shape = Shape::Object;
-}
-
-impl Encode for Alias {
-    fn encode_object(&self, _: &mut Writer) -> Result<ObjectRef, EncodeError> {
-        Ok(self.0)
-    }
-}
-
 #[test]
 fn aliasing_bombs_hit_the_work_limit() {
     let mut w = Writer::new();

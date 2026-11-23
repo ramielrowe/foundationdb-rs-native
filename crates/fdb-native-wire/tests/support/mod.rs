@@ -1141,3 +1141,55 @@ pub fn registry() -> Vec<TypeEntry> {
 pub fn registry_map() -> BTreeMap<&'static str, TypeEntry> {
     registry().into_iter().map(|e| (e.name, e)).collect()
 }
+
+// ---------------------------------------------------------------------------------------
+// Aliased buffers.
+
+/// An `Encode` that points at an object already written, to build buffers that reference
+/// one object many times (which FDB's writer never does, but its reader accepts). Tables
+/// and objects are both reached through an offset, so one shape serves for both.
+#[derive(Clone, Copy)]
+pub struct Alias(pub ObjectRef);
+
+impl Wire for Alias {
+    const SHAPE: Shape = Shape::Object;
+}
+
+impl Encode for Alias {
+    fn encode_object(&self, _: &mut Writer) -> Result<ObjectRef, EncodeError> {
+        Ok(self.0)
+    }
+}
+
+/// An 824-byte `Untrusted` whose `strs` holds 20 offsets to one 600-byte string, and the
+/// value C++ decodes it to. Under the README's classes this is a `data` accept; this crate
+/// rejects it with the `work_limit` check (20 × 604 units > 4 × 824 + 1024).
+pub fn aliased_untrusted() -> (Untrusted, Vec<u8>) {
+    let s = Bytes(vec![0x61; 600]);
+    let value = Untrusted {
+        s: Bytes(b"x".to_vec()),
+        v: vec![1],
+        o: Some(5),
+        vo: vec![Some(1)],
+        b: vec![true],
+        strs: vec![s.clone(); 20],
+    };
+    let mut w = Writer::new();
+    let blob = w.blob(&s.0).expect("blob");
+    let strs = w.vector(&[Alias(blob); 20]).expect("strs");
+    let mut t = w.table();
+    t.field(&value.s).expect("s");
+    t.field(&value.v).expect("v");
+    t.field(&value.o).expect("o");
+    t.field(&value.vo).expect("vo");
+    t.field(&value.b).expect("b");
+    t.field(&Alias(strs)).expect("strs");
+    let t = t.finish().expect("table");
+    let mut root = w.table();
+    root.field(&Alias(t)).expect("root field");
+    let root = root.finish().expect("root");
+    let bytes = w
+        .finish(root, Untrusted::FILE_IDENTIFIER.value())
+        .expect("finish");
+    (value, bytes)
+}

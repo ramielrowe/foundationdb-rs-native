@@ -53,6 +53,12 @@ impl Shape {
         matches!(self, Shape::Union)
     }
 
+    /// Whether a value of this shape can be a union alternative or an array element:
+    /// anything but [`Shape::Union`] and [`Shape::UnionVector`].
+    pub const fn is_plain(self) -> bool {
+        !matches!(self, Shape::Union | Shape::UnionVector)
+    }
+
     /// Whether this is [`Shape::Table`].
     pub const fn is_table(self) -> bool {
         matches!(self, Shape::Table)

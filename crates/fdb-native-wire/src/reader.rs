@@ -2,7 +2,7 @@
 
 use core::cell::Cell;
 
-use crate::{Decode, DecodeError, Shape, StrictCheck};
+use crate::{Decode, DecodeError, ProtocolVersion, Shape, StrictCheck};
 
 /// Tables may nest at most this deep below the root table (the `too_deep` check).
 pub const MAX_DEPTH: usize = 64;
@@ -15,9 +15,28 @@ pub const MAX_DEPTH: usize = 64;
 ///
 /// Every read is bounds-checked against the buffer and all offset arithmetic is done in
 /// `usize`/`u64` with overflow checks, so no input can make it panic or read out of
-/// bounds. Nesting is limited to [`MAX_DEPTH`] tables, and the total work (and so the
-/// total allocation of owned decoding) is limited to a small multiple of the buffer size,
-/// which a message without aliased objects never reaches.
+/// bounds. Nesting is limited to [`MAX_DEPTH`] tables.
+///
+/// # Work limit
+///
+/// Each decode from the root ([`Reader::root`], and so [`Reader::decode_root`] and
+/// [`decode`](crate::decode)) may visit at most 4 × the buffer length + 1024 *units*,
+/// otherwise it fails with [`DecodeError::WorkLimit`]. Opening a table or following an
+/// offset to a zero-field table costs 4, a string or blob 4 + its length, a vector
+/// 4 + its count × its element's wire size (the inline size, or 4 for an offset), a vector
+/// of unions 5 × its count, and an out-of-line union scalar or struct its size. A message
+/// whose objects are each referenced once costs at most its length; FDB's writer only
+/// shares the empty blob, which keeps its messages below 2 units per byte. Only a message
+/// that points at the same objects over and over (which FDB `main` accepts) reaches the
+/// limit: this is the `work_limit` check of the golden-vectors README.
+///
+/// The limit bounds the work, and so the number of objects decoded, but not the size of
+/// the decoded value: a table with no fields present costs a 4-byte offset in a vector
+/// (the elements may all point at one table) yet decodes into a whole Rust struct of
+/// absent values, so a message of `n` bytes can decode into about `n / 4 ×
+/// size_of::<T>()` bytes of `T` (about 128 × `n` for a 512-byte `T`). Bound the size of untrusted messages before decoding them. Vectors
+/// reserve at most 64 KiB before their elements are decoded, so a large count in a
+/// malformed message does not allocate by itself.
 ///
 /// ```
 /// use fdb_native_wire::{encode_with_identifier, Reader};
@@ -31,21 +50,40 @@ pub const MAX_DEPTH: usize = 64;
 #[derive(Debug)]
 pub struct Reader<'de> {
     buf: &'de [u8],
+    protocol_version: Option<ProtocolVersion>,
     depth: Cell<usize>,
     budget: Cell<usize>,
 }
 
 impl<'de> Reader<'de> {
-    /// A reader for `bytes`, which must hold at least the 8-byte header.
+    /// A reader for `bytes`, which must hold at least the 8-byte header, with no protocol
+    /// version.
     pub fn new(bytes: &'de [u8]) -> Result<Reader<'de>, DecodeError> {
         if bytes.len() < 8 {
             return Err(DecodeError::TooShort { len: bytes.len() });
         }
         Ok(Reader {
             buf: bytes,
+            protocol_version: None,
             depth: Cell::new(0),
-            budget: Cell::new(bytes.len().saturating_mul(4).saturating_add(1024)),
+            budget: Cell::new(work_limit(bytes.len())),
         })
+    }
+
+    /// A reader for a message from a peer speaking `version`; [`Decode`] impls whose
+    /// layout differs between versions read it from [`Reader::protocol_version`].
+    pub fn with_protocol_version(
+        bytes: &'de [u8],
+        version: ProtocolVersion,
+    ) -> Result<Reader<'de>, DecodeError> {
+        let mut reader = Reader::new(bytes)?;
+        reader.protocol_version = Some(version);
+        Ok(reader)
+    }
+
+    /// The protocol version the message was written with, if the reader was given one.
+    pub fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.protocol_version
     }
 
     /// The whole message.
@@ -69,8 +107,9 @@ impl<'de> Reader<'de> {
     }
 
     /// The synthetic root table. Its fields are the items the message was written with
-    /// (usually one).
+    /// (usually one). Each call starts a new [work limit](Reader#work-limit) budget.
     pub fn root(&self) -> Result<TableReader<'_, 'de>, DecodeError> {
+        self.budget.set(work_limit(self.buf.len()));
         self.table(0)
     }
 
@@ -84,7 +123,9 @@ impl<'de> Reader<'de> {
     ///
     /// Checks the table and its vtable against the buffer, and the `table_size`,
     /// `vtable_size`, `offset_into_header`, `zero_uoffset` and `too_deep` strict checks.
-    /// Use [`Reader::empty_table`] for zero-field tables, which C++ never follows.
+    /// Use [`Reader::empty_table`] for tables whose `serializer(ar)` has no arguments,
+    /// which C++ never follows (a table whose only argument is an `Arena` is followed and
+    /// uses this method).
     pub fn table(&self, at: usize) -> Result<TableReader<'_, 'de>, DecodeError> {
         if self.depth.get() > MAX_DEPTH {
             return Err(DecodeError::Strict(StrictCheck::TooDeep));
@@ -228,7 +269,7 @@ impl<'de> Reader<'de> {
         let tag_bytes = self.slice(tags, count as usize)?;
         self.check(offsets, u64::from(count) * 4)?;
         self.charge((count as usize).saturating_mul(5))?;
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = Vec::with_capacity(crate::codec::preallocation::<T>(count as usize));
         for (i, &tag) in tag_bytes.iter().enumerate() {
             out.push(if tag == 0 {
                 T::absent()
@@ -331,10 +372,17 @@ pub struct TableReader<'r, 'de> {
 }
 
 impl<'de> TableReader<'_, 'de> {
+    /// Skips the next `slots` vtable slots without reading them, for serializer arguments
+    /// the type does not model (for example a field that only some protocol versions
+    /// have). A union or a vector of unions takes two slots.
+    pub fn skip(&mut self, slots: usize) {
+        self.next = self.next.saturating_add(slots);
+    }
+
     /// Decodes the next field.
     pub fn field<T: Decode<'de>>(&mut self) -> Result<T, DecodeError> {
         let slot = self.next;
-        self.next += T::SHAPE.slots();
+        self.next = self.next.saturating_add(T::SHAPE.slots());
         match T::SHAPE {
             Shape::Inline { size, .. } => match self.entry(slot, size)? {
                 Some(at) => T::decode_inline(self.r.inline(at, size)?),
@@ -371,7 +419,7 @@ impl<'de> TableReader<'_, 'de> {
 
     /// The position of slot `slot`'s field, or `None` if it is absent.
     fn entry(&self, slot: usize, size: usize) -> Result<Option<usize>, DecodeError> {
-        let index = slot + 2;
+        let index = slot.saturating_add(2);
         if index >= self.vtable_len {
             return Ok(None);
         }
@@ -390,4 +438,9 @@ impl Drop for TableReader<'_, '_> {
     fn drop(&mut self) {
         self.r.depth.set(self.r.depth.get().saturating_sub(1));
     }
+}
+
+/// The work budget for one decode of a `len`-byte message (see [`Reader`]).
+fn work_limit(len: usize) -> usize {
+    len.saturating_mul(4).saturating_add(1024)
 }

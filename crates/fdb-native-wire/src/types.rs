@@ -26,11 +26,14 @@ impl Wire for Uid {
 }
 
 impl Encode for Uid {
-    fn encode_inline(&self, out: &mut [u8]) {
-        let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&self.first.to_le_bytes());
-        bytes[8..].copy_from_slice(&self.second.to_le_bytes());
-        out.copy_from_slice(&bytes);
+    fn encode_inline(&self, out: &mut [u8]) -> Result<(), EncodeError> {
+        let (first, second) = match out.split_at_mut_checked(8) {
+            Some((first, second)) if second.len() == 8 => (first, second),
+            _ => return Err(EncodeError::InvalidShape("UID size")),
+        };
+        first.copy_from_slice(&self.first.to_le_bytes());
+        second.copy_from_slice(&self.second.to_le_bytes());
+        Ok(())
     }
 }
 
@@ -114,7 +117,13 @@ impl<'de> Decode<'de> for FdbError {
 pub type ErrorOr<T> = Result<T, FdbError>;
 
 impl<T: Wire> Wire for ErrorOr<T> {
-    const SHAPE: Shape = Shape::Union;
+    const SHAPE: Shape = {
+        assert!(
+            T::SHAPE.is_plain(),
+            "a union alternative cannot be a union; use EnsureTable"
+        );
+        Shape::Union
+    };
 }
 
 impl<T: Encode> Encode for ErrorOr<T> {
