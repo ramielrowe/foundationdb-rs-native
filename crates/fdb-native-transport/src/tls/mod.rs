@@ -264,7 +264,7 @@
 //! validation here uses `rustls-webpki`, with OpenSSL's remaining checks added to it (see
 //! [`verify_peers::VerifyPeersVerifier`] for the exact rules: which CA-file certificates are
 //! trust anchors, validity periods, `ssl_server` purpose, the self-signed `openssl req -x509`
-//! setup). The aim is that no chain is accepted that OpenSSL 3 rejects. Two kinds of
+//! setup). The aim is that no chain is accepted that OpenSSL 3 rejects. Three kinds of
 //! difference remain.
 //!
 //! **Stricter than OpenSSL**: a certificate FoundationDB accepts is rejected, with an error that
@@ -284,6 +284,22 @@
 //! * a `directoryName` name constraint, permitted or excluded, on any CA of the path makes
 //!   every certificate below it fail, even one whose subject satisfies it: webpki does not
 //!   implement directory-name subtrees and rejects instead, where OpenSSL evaluates them;
+//! * likewise an `rfc822Name` alternative name under `rfc822Name` constraints, and a
+//!   `uniformResourceIdentifier` alternative name under URI constraints, are refused even when
+//!   they satisfy the constraints, and a DNS name webpki finds malformed (an empty label, a
+//!   space, a misplaced wildcard) in an alternative name or a constraint fails under DNS
+//!   constraints;
+//! * an `id-on-SmtpUTF8Mailbox` alternative name under any `rfc822Name` constraint is refused
+//!   (OpenSSL compares it after converting the constraint to Unicode; neither webpki nor this
+//!   crate implement that);
+//! * an intermediate whose `extendedKeyUsage` has the legacy server-gated-crypto OIDs
+//!   (`nsSGC`, `msSGC`) but not `serverAuth` is refused (webpki asks for `serverAuth`);
+//! * RFC 3779 IP address or AS number resources (`ipAddrBlock`, `autonomousSysNum`) on the
+//!   server's certificate are refused; OpenSSL accepts them when the whole chain covers them;
+//! * a BER-only encoding (a constructed string, an indefinite length) in one of the
+//!   extensions OpenSSL checks on every certificate (`basicConstraints`, `keyUsage`,
+//!   `subjectKeyIdentifier`, ...) makes the certificate unusable here; OpenSSL tolerates it.
+//!   No certificate tool writes these;
 //! * a critical extension that webpki does not process, such as `certificatePolicies` on an
 //!   intermediate, is an error; OpenSSL has `certificatePolicies`, `policyConstraints`,
 //!   `policyMappings`, `inhibitAnyPolicy` and `nsCertType` on its list of supported
@@ -302,6 +318,14 @@
 //! path accepted still ends at a configured, in-date, CA-capable trust anchor and has passed
 //! all the checks described on [`verify_peers::VerifyPeersVerifier`], so this adds no
 //! certificate that is not rooted in the CA file; it only finds a valid path in more cases.
+//!
+//! **Certificates OpenSSL cannot load** (accepted): a certificate that OpenSSL's `d2i_X509`
+//! fails to decode at all, for example one with an OID written with a non-minimal
+//! subidentifier or a name attribute that is not valid UTF-8 or is an INTEGER, is not refused
+//! for that alone when webpki can parse it. Such a certificate cannot be what an FDB server
+//! presents, since the server loads its own certificate with OpenSSL, and it still has to
+//! chain to a configured anchor and pass every other check, so a configured CA must have
+//! issued it.
 //!
 //! # Closing, truncation and flushing
 //!

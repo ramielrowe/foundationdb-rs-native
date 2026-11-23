@@ -9,9 +9,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, CustomExtension, DnType, DnValue,
-    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyUsagePurpose, NameConstraints, SanType,
-    SerialNumber,
+    BasicConstraints, Certificate, CertificateParams, CustomExtension, DistinguishedName, DnType,
+    DnValue, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyUsagePurpose, NameConstraints,
+    OtherNameValue, SanType, SerialNumber,
 };
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -150,9 +150,26 @@ const OID_NS_CERT_TYPE: [u64; 7] = [2, 16, 840, 1, 113730, 1, 1];
 const OID_FRESHEST_CRL: [u64; 4] = [2, 5, 29, 46];
 const OID_INHIBIT_ANY_POLICY: [u64; 4] = [2, 5, 29, 54];
 const OID_CERTIFICATE_POLICIES: [u64; 4] = [2, 5, 29, 32];
+const OID_NAME_CONSTRAINTS: [u64; 4] = [2, 5, 29, 30];
 
 /// An authorityKeyIdentifier with only a key identifier that is not anyone's.
 const AKID_OTHER_KEY: [u8; 8] = [0x30, 0x06, 0x80, 0x04, 1, 2, 3, 4];
+
+/// A DER element with identifier `id` (low tag numbers only) around `content`.
+fn tlv(id: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![id];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(u8::try_from(len).unwrap());
+    } else {
+        let bytes = u32::try_from(len).unwrap().to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        out.push(0x80 | u8::try_from(4 - skip).unwrap());
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    out.extend_from_slice(content);
+    out
+}
 
 fn add_email(p: &mut CertificateParams, email: &str) {
     p.distinguished_name.push(
@@ -360,28 +377,45 @@ fn email_name_constraints_apply_to_the_subject_email_address() {
 /// subject satisfies it (OpenSSL accepts; the probe's `ncdir_ok`).
 #[test]
 fn directory_name_constraints_are_stricter_than_openssl() {
-    let org = || {
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(DnType::OrganizationName, "Org");
-        dn
-    };
+    // NameConstraints { [0] or [1] { GeneralSubtree { directoryName [4] EXPLICIT O=Org } } }.
+    // (rcgen writes `[4]` implicitly, which OpenSSL cannot decode: see below.)
+    let org_name = tlv(
+        0x30,
+        &tlv(
+            0x31,
+            &tlv(
+                0x30,
+                &[&[0x06, 0x03, 0x55, 0x04, 0x0A][..], &tlv(0x0C, b"Org")].concat(),
+            ),
+        ),
+    );
+    let constraints = |group: u8| tlv(0x30, &tlv(group, &tlv(0x30, &tlv(0xA4, &org_name))));
     let permitted = root("DirNC Root", |p| {
-        p.name_constraints = Some(name_constraints(
-            vec![GeneralSubtree::DirectoryName(org())],
-            vec![],
-        ));
+        p.custom_extensions = vec![extension(&OID_NAME_CONSTRAINTS, true, &constraints(0xA0))];
     });
     let leaf = server(&permitted, &[("O", "Org"), ("CN", "node-1")], &[], |_| {});
     assert!(verify(&verifier(&[&permitted.cert]), &leaf, &[]).is_err());
 
     let excluded = root("DirNC Excluding Root", |p| {
-        p.name_constraints = Some(name_constraints(
-            vec![],
-            vec![GeneralSubtree::DirectoryName(org())],
-        ));
+        p.custom_extensions = vec![extension(&OID_NAME_CONSTRAINTS, true, &constraints(0xA1))];
     });
     let leaf = server(&excluded, &[("O", "Other"), ("CN", "node-1")], &[], |_| {});
     assert!(verify(&verifier(&[&excluded.cert]), &leaf, &[]).is_err());
+
+    // rcgen's own encoding of a directoryName subtree is `[4] IMPLICIT`, which OpenSSL fails
+    // to decode (the extension is invalid), so that root is no trust anchor at all.
+    let mut org = DistinguishedName::new();
+    org.push(DnType::OrganizationName, "Org");
+    let implicit = root("DirNC Root", |p| {
+        p.name_constraints = Some(name_constraints(
+            vec![GeneralSubtree::DirectoryName(org)],
+            vec![],
+        ));
+    });
+    assert_eq!(
+        try_verifier(&[&implicit.cert]).unwrap_err(),
+        RootError::NoAnchors { provided: 1 }
+    );
 }
 
 // 3. Intermediates must be able to sign ----------------------------------------------------------
@@ -787,4 +821,576 @@ fn cross_signed_intermediates_are_a_documented_path_building_difference() {
     verify(&v, &leaf, &[&cross_y, &cross_x]).unwrap();
     // Without the intermediate that leads to a configured root, there is no path.
     assert!(verify(&v, &leaf, &[&cross_x]).is_err());
+}
+
+// The last round of OpenSSL-profile checks -------------------------------------------------------
+
+const OID_SKID: [u64; 4] = [2, 5, 29, 14];
+const OID_BASIC_CONSTRAINTS: [u64; 4] = [2, 5, 29, 19];
+const OID_CRL_DISTRIBUTION_POINTS: [u64; 4] = [2, 5, 29, 31];
+const OID_OCSP_NOCHECK: [u64; 10] = [1, 3, 6, 1, 5, 5, 7, 48, 1, 5];
+const OID_PROXY_CERT_INFO: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 1, 14];
+const OID_IP_ADDR_BLOCKS: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 1, 7];
+const OID_AS_IDENTIFIERS: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 1, 8];
+const OID_SMTP_UTF8_MAILBOX: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 8, 9];
+
+/// A subjectKeyIdentifier value (an OCTET STRING).
+const SKID: [u8; 4] = [0x04, 0x02, 0xAB, 0xCD];
+/// NULL: not the value of any of the extensions it is put in below.
+const NULL: [u8; 2] = [0x05, 0x00];
+/// proxyCertInfo { proxyPolicy { policyLanguage id-ppl-inheritAll } }
+const PROXY_CERT_INFO: [u8; 14] = [
+    0x30, 0x0C, 0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x15, 0x01,
+];
+/// ipAddrBlock { IPv4 10.0.0.0/8 }
+const IP_10_8: [u8; 14] = [
+    0x30, 0x0C, 0x30, 0x0A, 0x04, 0x02, 0x00, 0x01, 0x30, 0x04, 0x03, 0x02, 0x00, 0x0A,
+];
+/// autonomousSysNum { asnum [0] { 64512 } }
+const AS_64512: [u8; 11] = [
+    0x30, 0x09, 0xA0, 0x07, 0x30, 0x05, 0x02, 0x03, 0x00, 0xFC, 0x00,
+];
+
+/// A server certificate `node-1` under `parent`.
+fn node(parent: &Ca, tweak: impl FnOnce(&mut CertificateParams)) -> Certificate {
+    server(parent, &[("CN", "node-1")], &["node-1.example.com"], tweak)
+}
+
+/// A root that is a CA by its keyUsage alone (no basicConstraints, so rcgen writes no
+/// subjectKeyIdentifier either), with the given extensions.
+fn key_usage_root(cn: &str, extensions: Vec<CustomExtension>) -> Ca {
+    root(cn, |p| {
+        p.is_ca = IsCa::NoCa;
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        p.custom_extensions = extensions;
+    })
+}
+
+/// A self-signed CA that is also a server certificate, for the root-as-peer shortcut.
+fn self_signed_server(cn: &str, extensions: Vec<CustomExtension>) -> Ca {
+    let mut p = params(&[("CN", cn)], &[]);
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    p.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+    ];
+    p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    p.custom_extensions = extensions;
+    Ca::self_signed(p)
+}
+
+fn is_bad_encoding(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::InvalidCertificate(CertificateError::BadEncoding)
+    )
+}
+
+// 9. Self-signed is decided as OpenSSL decides it (EXFLAG_SS) ---------------------------------------
+
+/// OpenSSL calls a certificate self-signed when its subject and issuer compare equal (ASCII
+/// case, runs of white space and the string type aside), its authority key identifier does
+/// not name another key, serial number or issuer, and its signature algorithm is one for its
+/// own key. It does not look for an issuer of such a certificate ("self-signed certificate",
+/// error 18), so a leaf that takes its root's name is refused although the root signed it
+/// (probes `mimic_leaf`, `mimic_leaf_akid`, `mimic_leaf_canon`, `mimic_leaf_akid_skid`).
+#[test]
+fn a_leaf_named_like_its_issuer_is_self_signed_and_refused() {
+    let r = root("Same", |_| {});
+    let v = verifier(&[&r.cert]);
+    let refused = |leaf: &Certificate| {
+        assert!(PeerCert::from_der(leaf.der()).unwrap().is_self_signed());
+        let err = verify(&v, leaf, &[]).unwrap_err();
+        assert!(is_unknown_issuer(&err), "{err:?}");
+    };
+    // No key identifiers.
+    refused(&server(
+        &r,
+        &[("CN", "Same")],
+        &["node-1.example.com"],
+        |_| {},
+    ));
+    // An authority key identifier (the root's key), and no subject key identifier of its own.
+    refused(&server(
+        &r,
+        &[("CN", "Same")],
+        &["node-1.example.com"],
+        |p| {
+            p.use_authority_key_identifier_extension = true;
+        },
+    ));
+    // Equal only canonically: PrintableString "same" against the root's UTF8String "Same".
+    refused(&server(&r, &[], &["node-1.example.com"], |p| {
+        p.distinguished_name.push(
+            DnType::CommonName,
+            DnValue::PrintableString("same".try_into().unwrap()),
+        );
+    }));
+    // A subject key identifier that differs from the authority key identifier: not
+    // self-signed, so issued by the root, and accepted.
+    let distinct = server(&r, &[("CN", "Same")], &["node-1.example.com"], |p| {
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.use_authority_key_identifier_extension = true;
+    });
+    assert!(!PeerCert::from_der(distinct.der()).unwrap().is_self_signed());
+    verify(&v, &distinct, &[]).unwrap();
+}
+
+/// A self-issued intermediate without an authority key identifier is self-signed by the same
+/// rules, and OpenSSL's chain building stops at it: "self-signed certificate in certificate
+/// chain" (error 19, probe `si_inter_ss`). In the CA file it is a trust anchor to OpenSSL,
+/// which does not check its signature, and the chain is accepted (`si_inter_ss_ca`). A
+/// key-rollover intermediate, whose authority key identifier names the root's key, is not
+/// self-signed (`si_inter_rollover`).
+#[test]
+fn a_self_signed_intermediate_is_refused_unless_it_is_in_the_ca_file() {
+    let r = root("R2", |_| {});
+    let ss = ca_under(&r, "R2", |_| {});
+    assert!(PeerCert::from_der(ss.cert.der()).unwrap().is_self_signed());
+    let leaf = node(&ss, |_| {});
+    assert!(verify(&verifier(&[&r.cert]), &leaf, &[&ss.cert]).is_err());
+    verify(&verifier(&[&r.cert, &ss.cert]), &leaf, &[]).unwrap();
+    verify(&verifier(&[&r.cert, &ss.cert]), &leaf, &[&ss.cert]).unwrap();
+
+    let rollover = ca_under(&r, "R2", |p| {
+        p.use_authority_key_identifier_extension = true
+    });
+    assert!(
+        !PeerCert::from_der(rollover.cert.der())
+            .unwrap()
+            .is_self_signed()
+    );
+    let leaf = node(&rollover, |_| {});
+    verify(&verifier(&[&r.cert]), &leaf, &[&rollover.cert]).unwrap();
+}
+
+/// Probe `root_sigalg_mismatch`: an RSA root whose signature algorithm says ECDSA is not
+/// self-signed to OpenSSL (`check_sig_alg_match`), so not a trust anchor. The certificates
+/// were made with the review's `gen/cases.py` (rcgen cannot write a mismatched algorithm); the
+/// good root has the same name and key.
+mod signature_algorithm {
+    use super::*;
+
+    fn pem(text: &str) -> CertificateDer<'static> {
+        pem_certs(text).remove(0)
+    }
+
+    #[test]
+    fn a_root_whose_signature_algorithm_is_for_another_key_type_is_not_self_signed() {
+        let mismatch = pem(include_str!("fixtures/openssl_root_sigalg_mismatch.pem"));
+        let good = pem(include_str!("fixtures/openssl_root_rsa.pem"));
+        let leaf = pem(include_str!("fixtures/openssl_leaf_rsa.pem"));
+        assert!(
+            !PeerCert::from_der(mismatch.as_ref())
+                .unwrap()
+                .is_self_signed()
+        );
+        assert!(PeerCert::from_der(good.as_ref()).unwrap().is_self_signed());
+        let new = |roots: Vec<CertificateDer<'static>>| {
+            VerifyPeersVerifier::new(VerifyPeers::default(), roots, &provider())
+        };
+        assert_eq!(
+            new(vec![mismatch.clone()]).unwrap_err(),
+            RootError::NoAnchors { provided: 1 }
+        );
+        let cert = PeerCert::from_der(leaf.as_ref()).unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            u64::try_from(cert.not_before()).unwrap() + 3600,
+        ));
+        let check = |v: VerifyPeersVerifier| {
+            v.verify_server_cert(
+                &leaf,
+                &[],
+                &ServerName::try_from("x.invalid").unwrap(),
+                &[],
+                now,
+            )
+            .map(|_| ())
+        };
+        check(new(vec![good.clone()]).unwrap()).unwrap();
+        // With both in the CA file, only the good one anchors the chain.
+        check(new(vec![mismatch, good]).unwrap()).unwrap();
+    }
+}
+
+// 10. Name constraints: embedded NULs, SmtpUTF8Mailbox, and OpenSSL's work limit ------------------
+
+/// A commonName with an embedded NUL is refused by OpenSSL's `cn2dnsid` ("unsupported or
+/// invalid name syntax", error 53; probe `nul_cn`), not skipped; a trailing NUL is dropped.
+#[test]
+fn an_embedded_nul_in_a_common_name_is_refused_under_name_constraints() {
+    let leaf_named = |parent: &Ca, cn: &str| {
+        server(parent, &[], &[], |p| {
+            p.distinguished_name
+                .push(DnType::CommonName, DnValue::Utf8String(cn.to_owned()));
+        })
+    };
+    let r = root("NC Root", |p| {
+        p.name_constraints = Some(name_constraints(vec![dns_subtree("example.com")], vec![]));
+    });
+    let v = verifier(&[&r.cert]);
+    assert!(verify(&v, &leaf_named(&r, "evil.org\0x"), &[]).is_err());
+    assert!(verify(&v, &leaf_named(&r, "a.example.com\0x"), &[]).is_err());
+    verify(&v, &leaf_named(&r, "a.example.com\0"), &[]).unwrap();
+    verify(&v, &leaf_named(&r, "a.example.com"), &[]).unwrap();
+    // Without name constraints the commonName is not examined.
+    let plain = root("Plain Root", |_| {});
+    verify(
+        &verifier(&[&plain.cert]),
+        &leaf_named(&plain, "evil.org\0x"),
+        &[],
+    )
+    .unwrap();
+}
+
+/// An `otherName` of type `id-on-SmtpUTF8Mailbox` is an e-mail address to OpenSSL, checked
+/// against `rfc822Name` subtrees (`nc_email_eai`; probe `smtputf8_evil`, error 47). webpki does
+/// not look at it, and this verifier refuses it under any `rfc822Name` constraint, even one it
+/// satisfies (`smtputf8_ok`, which OpenSSL accepts): documented as stricter.
+#[test]
+fn an_smtp_utf8_mailbox_under_email_constraints_is_refused() {
+    let with_mailbox = |parent: &Ca, address: &str| {
+        node(parent, |p| {
+            p.subject_alt_names.push(SanType::OtherName((
+                OID_SMTP_UTF8_MAILBOX.to_vec(),
+                OtherNameValue::Utf8String(address.to_owned()),
+            )));
+        })
+    };
+    let r = root("Mail Root", |p| {
+        p.name_constraints = Some(name_constraints(vec![email_subtree("example.com")], vec![]));
+    });
+    let v = verifier(&[&r.cert]);
+    assert!(verify(&v, &with_mailbox(&r, "x@evil.org"), &[]).is_err());
+    assert!(verify(&v, &with_mailbox(&r, "x@example.com"), &[]).is_err());
+    let r = root("Mail Excluding Root", |p| {
+        p.name_constraints = Some(name_constraints(vec![], vec![email_subtree("evil.org")]));
+    });
+    assert!(
+        verify(
+            &verifier(&[&r.cert]),
+            &with_mailbox(&r, "x@example.com"),
+            &[]
+        )
+        .is_err()
+    );
+    // Under DNS constraints only, it is not looked at.
+    let r = root("DNS Root", |p| {
+        p.name_constraints = Some(name_constraints(vec![dns_subtree("example.com")], vec![]));
+    });
+    verify(&verifier(&[&r.cert]), &with_mailbox(&r, "x@evil.org"), &[]).unwrap();
+}
+
+/// OpenSSL refuses a certificate whose names (subject attributes plus alternative names)
+/// times the subtrees of a constraining CA exceed 2^20 (`NAME_CHECK_MAX`; probe
+/// `nc_many_rdns`, error 1).
+#[test]
+fn name_constraint_checks_are_bounded_as_in_openssl() {
+    let subtrees = (0..1024)
+        .map(|i| dns_subtree(&format!("d{i}.example.com")))
+        .collect();
+    let r = root("Big NC Root", |p| {
+        p.name_constraints = Some(name_constraints(subtrees, vec![]));
+    });
+    let v = verifier(&[&r.cert]);
+    // One alternative name and `attributes` subject attributes.
+    let leaf_with = |attributes: u64| {
+        server(&r, &[], &["node-1.d0.example.com"], |p| {
+            for i in 0..attributes {
+                p.distinguished_name.push(
+                    DnType::CustomDnType(vec![1, 3, 6, 1, 4, 1, 55555, 1, i]),
+                    "x",
+                );
+            }
+        })
+    };
+    // 1024 names times 1024 subtrees is exactly the limit.
+    verify(&v, &leaf_with(1023), &[]).unwrap();
+    let err = verify(&v, &leaf_with(1024), &[]).unwrap_err();
+    assert_eq!(
+        webpki_cause(&err),
+        Some(&webpki::Error::NameConstraintViolation),
+        "{err:?}"
+    );
+}
+
+// 11. nsCertType bits ---------------------------------------------------------------------------
+
+/// OpenSSL clears a BIT STRING's unused bits when it decodes one, so sslServer marked as an
+/// unused bit is not there (probe `ns_pad7`, error 26; `ns_pad6` is fine), and more than 7
+/// unused bits do not decode (the certificate is then invalid).
+#[test]
+fn netscape_certificate_type_unused_bits_do_not_count() {
+    let r = root("Root", |_| {});
+    let v = verifier(&[&r.cert]);
+    let with_type = |bits: &[u8]| {
+        node(&r, |p| {
+            p.custom_extensions = vec![extension(&OID_NS_CERT_TYPE, false, bits)];
+        })
+    };
+    verify(&v, &with_type(&[0x03, 0x02, 0x06, 0x40]), &[]).unwrap();
+    let err = verify(&v, &with_type(&[0x03, 0x02, 0x07, 0x40]), &[]).unwrap_err();
+    assert!(
+        matches!(rejected_as(&err), Some(CertificateRejected::Purpose(_))),
+        "{err:?}"
+    );
+    let err = verify(&v, &with_type(&[0x03, 0x02, 0x08, 0x40]), &[]).unwrap_err();
+    assert!(is_bad_encoding(&err), "{err:?}");
+}
+
+// 12. Certificates OpenSSL marks invalid (EXFLAG_INVALID) --------------------------------------------
+
+/// A duplicated or malformed extension of the kinds OpenSSL decodes for every certificate
+/// makes it unable to link the certificate to an issuer (error 20): probes `skid_dup`,
+/// `leaf_bad_skid`, `leaf_akid_badtag`, `leaf_neg_pl`.
+#[test]
+fn a_leaf_with_a_duplicated_or_malformed_extension_is_refused() {
+    let r = root("Root", |_| {});
+    let v = verifier(&[&r.cert]);
+    let leaf_with =
+        |extensions: Vec<CustomExtension>| node(&r, |p| p.custom_extensions = extensions);
+    let skid = || extension(&OID_SKID, false, &SKID);
+    verify(&v, &leaf_with(vec![skid()]), &[]).unwrap();
+    for extensions in [
+        vec![skid(), skid()],
+        vec![extension(&OID_SKID, false, &NULL)],
+        // An authorityKeyIdentifier whose key identifier has the wrong tag ([UNIVERSAL 0]).
+        vec![extension(
+            &OID_AKID,
+            false,
+            &[0x30, 0x04, 0x00, 0x02, 0xAB, 0xCD],
+        )],
+        // basicConstraints with a negative pathLenConstraint.
+        vec![extension(
+            &OID_BASIC_CONSTRAINTS,
+            true,
+            &[0x30, 0x03, 0x02, 0x01, 0xFF],
+        )],
+        vec![extension(&OID_NS_CERT_TYPE, false, &NULL)],
+        vec![extension(
+            &OID_CRL_DISTRIBUTION_POINTS,
+            false,
+            &[0x30, 0x02, 0x30, 0x00],
+        )],
+    ] {
+        let err = verify(&v, &leaf_with(extensions), &[]).unwrap_err();
+        assert!(is_bad_encoding(&err), "{err:?}");
+    }
+}
+
+/// The same for an intermediate, sent by the peer or taken from the CA file (probes
+/// `inter_dup_skid`, `inter_bad_ns`). rcgen writes a subjectKeyIdentifier for every CA, so one
+/// more is a duplicate.
+#[test]
+fn an_intermediate_with_a_duplicated_or_malformed_extension_is_refused() {
+    let r = root("Root", |_| {});
+    for ext in [
+        extension(&OID_SKID, false, &SKID),
+        extension(&OID_NS_CERT_TYPE, false, &NULL),
+    ] {
+        let inter = ca_under(&r, "Inter", |p| p.custom_extensions = vec![ext]);
+        let leaf = node(&inter, |_| {});
+        let err = verify(&verifier(&[&r.cert]), &leaf, &[&inter.cert]).unwrap_err();
+        assert_eq!(
+            webpki_cause(&err),
+            Some(&webpki::Error::MalformedExtensions),
+            "{err:?}"
+        );
+        assert!(verify(&verifier(&[&r.cert, &inter.cert]), &leaf, &[]).is_err());
+    }
+}
+
+/// A CA-file certificate OpenSSL marks invalid is no trust anchor (probes `root_dup_skid`,
+/// `root_bad_skid`, `root_bad_ns`, `root_neg_pl`, `root_bad_bc`), and not a peer certificate
+/// either (`ss_dupskid`). For the malformed subjectKeyIdentifier the leaf has no authority key
+/// identifier: OpenSSL fails on the issuer's extensions whatever the child has.
+#[test]
+fn a_ca_file_certificate_with_a_duplicated_or_malformed_extension_is_no_anchor() {
+    // The same shape of root with a well-formed subjectKeyIdentifier is a fine anchor.
+    let fine = key_usage_root("Key Usage Root", vec![extension(&OID_SKID, false, &SKID)]);
+    verify(&verifier(&[&fine.cert]), &node(&fine, |_| {}), &[]).unwrap();
+
+    let roots = [
+        root("Dup SKID Root", |p| {
+            p.custom_extensions = vec![extension(&OID_SKID, false, &SKID)];
+        }),
+        root("Bad NS Root", |p| {
+            p.custom_extensions = vec![extension(&OID_NS_CERT_TYPE, false, &NULL)];
+        }),
+        key_usage_root("Bad SKID Root", vec![extension(&OID_SKID, false, &NULL)]),
+        key_usage_root(
+            "Negative PathLen Root",
+            vec![extension(
+                &OID_BASIC_CONSTRAINTS,
+                true,
+                &[0x30, 0x06, 0x01, 0x01, 0xFF, 0x02, 0x01, 0xFF],
+            )],
+        ),
+        // basicConstraints holding an unknown element, which x509-parser's
+        // `basic_constraints()` reports as no extension at all.
+        key_usage_root(
+            "Bad BC Root",
+            vec![extension(
+                &OID_BASIC_CONSTRAINTS,
+                true,
+                &[0x30, 0x03, 0x00, 0x01, 0xFF],
+            )],
+        ),
+    ];
+    let other = root("Other Root", |_| {});
+    for r in &roots {
+        assert_eq!(
+            try_verifier(&[&r.cert]).unwrap_err(),
+            RootError::NoAnchors { provided: 1 }
+        );
+        // Not an anchor; as a candidate intermediate (it stays one) it fails too.
+        assert!(verify(&verifier(&[&r.cert, &other.cert]), &node(r, |_| {}), &[]).is_err());
+    }
+
+    let ss = self_signed_server("ss-dupskid", vec![extension(&OID_SKID, false, &SKID)]);
+    let err = verify(&verifier(&[&ss.cert, &other.cert]), &ss.cert, &[]).unwrap_err();
+    assert!(is_bad_encoding(&err), "{err:?}");
+}
+
+// 13. Proxy certificates and RFC 3779 resources --------------------------------------------------
+
+/// FDB does not allow proxy certificates (`X509_V_FLAG_ALLOW_PROXY_CERTS`), and OpenSSL refuses
+/// any certificate of the chain with `proxyCertInfo` (probes `leaf_proxy_nosan`, error 40;
+/// `leaf_proxy_san`, `inter_proxy`, `ss_proxy`, error 20 as the extension then also makes
+/// them invalid).
+#[test]
+fn proxy_certificates_are_refused() {
+    let proxy = || extension(&OID_PROXY_CERT_INFO, true, &PROXY_CERT_INFO);
+    let r = root("Root", |_| {});
+    let v = verifier(&[&r.cert]);
+    let no_san = server(&r, &[("CN", "node-1")], &[], |p| {
+        p.custom_extensions = vec![proxy()]
+    });
+    let with_san = node(&r, |p| p.custom_extensions = vec![proxy()]);
+    for leaf in [no_san, with_san] {
+        let err = verify(&v, &leaf, &[]).unwrap_err();
+        assert_eq!(
+            webpki_cause(&err),
+            Some(&webpki::Error::ExtensionValueInvalid),
+            "{err:?}"
+        );
+    }
+    let inter = ca_under(&r, "Proxy Inter", |p| p.custom_extensions = vec![proxy()]);
+    assert!(verify(&v, &node(&inter, |_| {}), &[&inter.cert]).is_err());
+    let ss = self_signed_server("ss-proxy", vec![proxy()]);
+    assert_eq!(
+        try_verifier(&[&ss.cert]).unwrap_err(),
+        RootError::NoAnchors { provided: 1 }
+    );
+}
+
+/// RFC 3779 resources on the server certificate are refused (documented as stricter: OpenSSL
+/// accepts them when every certificate up to the root covers them, and refuses the probes'
+/// `leaf_ipaddr` and `leaf_asnum`, whose CAs have none). On an intermediate they are not
+/// looked at, as in OpenSSL (`inter_ipaddr`), unless they do not decode.
+#[test]
+fn ip_address_and_as_number_resources_are_refused_on_the_server_certificate() {
+    let r = root("Root", |_| {});
+    let v = verifier(&[&r.cert]);
+    for (oid, value) in [
+        (&OID_IP_ADDR_BLOCKS, &IP_10_8[..]),
+        (&OID_AS_IDENTIFIERS, &AS_64512[..]),
+    ] {
+        let leaf = node(&r, |p| {
+            p.custom_extensions = vec![extension(oid, false, value)]
+        });
+        let err = verify(&v, &leaf, &[]).unwrap_err();
+        assert_eq!(
+            rejected_as(&err),
+            Some(&CertificateRejected::IpAddressOrAsResources),
+            "{err:?}"
+        );
+    }
+    let inter = ca_under(&r, "IP Inter", |p| {
+        p.custom_extensions = vec![extension(&OID_IP_ADDR_BLOCKS, false, &IP_10_8)];
+    });
+    verify(&v, &node(&inter, |_| {}), &[&inter.cert]).unwrap();
+    let bad = ca_under(&r, "Bad IP Inter", |p| {
+        p.custom_extensions = vec![extension(
+            &OID_IP_ADDR_BLOCKS,
+            false,
+            &[0x30, 0x02, 0x05, 0x00],
+        )];
+    });
+    assert!(verify(&v, &node(&bad, |_| {}), &[&bad.cert]).is_err());
+    // The root-as-peer shortcut too.
+    let ss = self_signed_server(
+        "ss-ip",
+        vec![extension(&OID_IP_ADDR_BLOCKS, false, &IP_10_8)],
+    );
+    let err = verify(&verifier(&[&ss.cert]), &ss.cert, &[]).unwrap_err();
+    assert_eq!(
+        rejected_as(&err),
+        Some(&CertificateRejected::IpAddressOrAsResources),
+        "{err:?}"
+    );
+}
+
+// 14. Matching an issuer by authority key identifier -------------------------------------------
+
+/// `X509_check_akid` compares `authorityCertSerialNumber` as an INTEGER, sign included: a
+/// root with serial 255 (`00 FF`) is not serial -1 (`FF`; probe `akid_negserial`), and
+/// `authorityCertIssuer` with `X509_NAME_cmp`, canonically.
+#[test]
+fn authority_serial_and_issuer_are_compared_as_in_openssl() {
+    let r = root("R3", |p| p.serial_number = Some(SerialNumber::from(255u64)));
+    assert_eq!(
+        PeerCert::from_der(r.cert.der()).unwrap().serial(),
+        [0x00, 0xFF]
+    );
+    let v = verifier(&[&r.cert]);
+    let leaf_with = |akid: &[u8]| {
+        node(&r, |p| {
+            p.custom_extensions = vec![extension(&OID_AKID, false, akid)];
+        })
+    };
+    verify(&v, &leaf_with(&[0x30, 0x04, 0x82, 0x02, 0x00, 0xFF]), &[]).unwrap();
+    let err = verify(&v, &leaf_with(&[0x30, 0x03, 0x82, 0x01, 0xFF]), &[]).unwrap_err();
+    assert!(is_unknown_issuer(&err), "{err:?}");
+
+    let name = |tag: u8, cn: &[u8]| {
+        tlv(
+            0x30,
+            &tlv(
+                0x31,
+                &tlv(
+                    0x30,
+                    &[&[0x06, 0x03, 0x55, 0x04, 0x03][..], &tlv(tag, cn)].concat(),
+                ),
+            ),
+        )
+    };
+    let by_issuer = |name: Vec<u8>| tlv(0x30, &tlv(0xA1, &tlv(0xA4, &name)));
+    // PrintableString "r3" is the root's UTF8String "R3" to OpenSSL.
+    verify(&v, &leaf_with(&by_issuer(name(0x13, b"r3"))), &[]).unwrap();
+    assert!(verify(&v, &leaf_with(&by_issuer(name(0x0C, b"R4"))), &[]).is_err());
+}
+
+// 15. OpenSSL 3.5's supported critical extensions ------------------------------------------------
+
+/// OpenSSL 3.5 handles a critical `cRLDistributionPoints` and `id-pkix-ocsp-nocheck` (probes
+/// `rootcrit_crldp`, `rootcrit_ocspnocheck`), so a root with either is an anchor.
+#[test]
+fn critical_crl_distribution_points_and_ocsp_nocheck_are_supported() {
+    let crldp = tlv(
+        0x30,
+        &tlv(
+            0x30,
+            &tlv(0xA0, &tlv(0xA0, &tlv(0x86, b"http://x.invalid/crl"))),
+        ),
+    );
+    for (oid, value) in [
+        (&OID_CRL_DISTRIBUTION_POINTS[..], crldp),
+        (&OID_OCSP_NOCHECK[..], NULL.to_vec()),
+    ] {
+        let r = root("Critical Root", |p| {
+            p.custom_extensions = vec![extension(oid, true, &value)];
+        });
+        verify(&verifier(&[&r.cert]), &node(&r, |_| {}), &[]).unwrap();
+    }
 }
