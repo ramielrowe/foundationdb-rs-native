@@ -1,8 +1,11 @@
 //! The decoder: a bounds-checked, layout-tolerant reader.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
+use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use crate::{Decode, DecodeError, ProtocolVersion, Shape, StrictCheck};
+use crate::{Decode, DecodeError, ProtocolVersion, Shape, StrictCheck, Wire};
 
 /// Tables may nest at most this deep below the root table (the `too_deep` check).
 pub const MAX_DEPTH: usize = 64;
@@ -38,6 +41,12 @@ pub const MAX_DEPTH: usize = 64;
 /// reserve at most 64 KiB before their elements are decoded, so a large count in a
 /// malformed message does not allocate by itself.
 ///
+/// The budget is shared with the [`VectorView`](crate::VectorView)s a decode creates: a
+/// view charges it as its elements are read, after the decode that created it has
+/// returned, and the views of one decode draw on one budget. Calling [`Reader::root`]
+/// again starts a new budget for the new decode; views of earlier decodes keep theirs
+/// (spent or not).
+///
 /// ```
 /// use fdb_native_wire::{encode_with_identifier, Reader};
 ///
@@ -52,7 +61,15 @@ pub struct Reader<'de> {
     buf: &'de [u8],
     protocol_version: Option<ProtocolVersion>,
     depth: Cell<usize>,
+    /// Work units left, until a lazy view is created (`is_shared`).
     budget: Cell<usize>,
+    /// Whether the budget lives in `shared` now. A decode that creates no lazy view never
+    /// pays for atomics or an allocation.
+    is_shared: Cell<bool>,
+    /// The budget once shared (atomic) with the lazy views of the current decode, which
+    /// outlive the borrow of the reader that created them. Dropped by [`Reader::root`], so
+    /// each decode's views keep their own budget.
+    shared: RefCell<Option<Arc<AtomicUsize>>>,
 }
 
 impl<'de> Reader<'de> {
@@ -67,6 +84,8 @@ impl<'de> Reader<'de> {
             protocol_version: None,
             depth: Cell::new(0),
             budget: Cell::new(work_limit(bytes.len())),
+            is_shared: Cell::new(false),
+            shared: RefCell::new(None),
         })
     }
 
@@ -109,7 +128,10 @@ impl<'de> Reader<'de> {
     /// The synthetic root table. Its fields are the items the message was written with
     /// (usually one). Each call starts a new [work limit](Reader#work-limit) budget.
     pub fn root(&self) -> Result<TableReader<'_, 'de>, DecodeError> {
+        // A fresh budget: views of earlier decodes keep (and may have spent) theirs.
         self.budget.set(work_limit(self.buf.len()));
+        self.is_shared.set(false);
+        self.shared.replace(None);
         self.table(0)
     }
 
@@ -199,6 +221,51 @@ impl<'de> Reader<'de> {
         Ok(bytes)
     }
 
+    /// Where the payload of the string or blob pointed at by the offset at position `at`
+    /// lies in [`Reader::bytes`]: the same checks and work-limit charge as
+    /// [`Reader::blob`], but the position instead of a borrow.
+    ///
+    /// A [`Decode`] impl for an owned zero-copy type (say a `bytes::Bytes` slice of a
+    /// reference-counted packet, which has no lifetime to borrow with) takes the range
+    /// here and slices its own handle on the packet with it. The range is within the
+    /// buffer, so `reader.bytes()[range]` cannot panic.
+    ///
+    /// ```
+    /// use std::ops::Range;
+    /// use fdb_native_wire::{Decode, DecodeError, Reader, Shape, Wire};
+    ///
+    /// /// A string as a range of the packet instead of a borrow of it.
+    /// #[derive(Debug, PartialEq)]
+    /// struct Span(Range<usize>);
+    ///
+    /// impl Wire for Span {
+    ///     const SHAPE: Shape = Shape::Object;
+    /// }
+    ///
+    /// impl<'de> Decode<'de> for Span {
+    ///     fn absent() -> Self {
+    ///         Span(0..0)
+    ///     }
+    ///
+    ///     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+    ///         r.blob_range(at).map(Span)
+    ///     }
+    /// }
+    ///
+    /// let packet = fdb_native_wire::encode_with_identifier(&&b"hello"[..], 7)?;
+    /// let reader = Reader::new(&packet)?;
+    /// let span: Span = reader.decode_root()?;
+    /// assert_eq!(&packet[span.0], b"hello");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn blob_range(&self, at: usize) -> Result<Range<usize>, DecodeError> {
+        let start = self.follow(at, 4)?;
+        let len = u32::from_le_bytes(self.array(start)?) as usize;
+        self.slice(start + 4, len)?;
+        self.charge(len + 4)?;
+        Ok(start + 4..start + 4 + len)
+    }
+
     /// Decodes a union alternative whose offset is at position `at`: a table, string or
     /// vector is decoded as usual, a scalar or struct from the raw bytes the offset points
     /// at (which need not be aligned).
@@ -217,14 +284,58 @@ impl<'de> Reader<'de> {
         }
     }
 
-    /// Decodes a vector of non-union elements whose offset is at position `at`.
-    pub(crate) fn vector<T: Decode<'de>, C>(
-        &self,
-        at: usize,
-        mut push: impl FnMut(&mut C, T),
-        new: impl FnOnce(usize) -> Result<C, DecodeError>,
-    ) -> Result<C, DecodeError> {
-        let element_size = match T::SHAPE {
+    /// Checks the vector of non-union `T` elements whose offset is at position `at` and
+    /// returns where its elements are.
+    ///
+    /// This is the low-level accessor behind every collection impl and behind
+    /// [`VectorView`](crate::VectorView), for custom collections that decode their
+    /// elements one at a time. Decode element `i` with [`Decode::decode_element`] at
+    /// [`VectorHeader::position`]:
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    /// use fdb_native_wire::{Decode, DecodeError, Reader, Shape, Wire};
+    ///
+    /// // A `std::deque<T>`-like collection: the `vector<T>` wire form.
+    /// struct Deque<T>(VecDeque<T>);
+    ///
+    /// impl<T> Wire for Deque<T> {
+    ///     const SHAPE: Shape = Shape::Object;
+    /// }
+    ///
+    /// impl<'de, T: Decode<'de>> Decode<'de> for Deque<T> {
+    ///     fn absent() -> Self {
+    ///         Deque(VecDeque::new())
+    ///     }
+    ///
+    ///     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+    ///         let header = r.vector_header::<T>(at)?;
+    ///         // Not `with_capacity(header.len())`: the count is untrusted.
+    ///         let mut items = VecDeque::new();
+    ///         for i in 0..header.len() {
+    ///             let pos = header.position(i).ok_or(DecodeError::Invalid("index"))?;
+    ///             items.push_back(T::decode_element(r, pos)?);
+    ///         }
+    ///         Ok(Deque(items))
+    ///     }
+    /// }
+    ///
+    /// let bytes = fdb_native_wire::encode_with_identifier(&vec![1u16, 2, 3], 1)?;
+    /// let reader = Reader::new(&bytes)?;
+    /// let deque: Deque<u16> = reader.decode_root()?;
+    /// assert_eq!(deque.0, [1, 2, 3]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// The header is checked the way eager decoding checks it: the offset, the count and
+    /// that `count` elements of `T`'s wire size lie inside the buffer (in 64-bit
+    /// arithmetic). A zero-size element and a union element (use a vector of unions)
+    /// are rejected. It charges the [work limit](Reader#work-limit) 4 + `count` × the
+    /// element's wire size; each [`Decode::decode_element`] call charges the element
+    /// it decodes (an inline element is already paid for here). The count is untrusted
+    /// until the elements decode, so do not reserve memory for it.
+    pub fn vector_header<T: Wire>(&self, at: usize) -> Result<VectorHeader, DecodeError> {
+        let stride = match T::SHAPE {
             // A zero-size element would let the count alone decide the allocation.
             Shape::Inline { size: 0, .. } => {
                 return Err(DecodeError::Invalid("zero-size vector element"));
@@ -239,16 +350,30 @@ impl<'de> Reader<'de> {
         };
         let start = self.follow(at, 4)?;
         let count = u32::from_le_bytes(self.array(start)?);
-        let len = u64::from(count) * element_size as u64;
+        let len = u64::from(count) * stride as u64;
         self.check(start + 4, len)?;
-        // In bounds, so count * element_size <= buffer length.
+        // In bounds, so count * stride <= buffer length.
         self.charge(len as usize + 4)?;
-        let count = count as usize;
-        let mut out = new(count)?;
-        for i in 0..count {
+        Ok(VectorHeader {
+            len: count as usize,
+            first: start + 4,
+            stride,
+        })
+    }
+
+    /// Decodes a vector of non-union elements whose offset is at position `at`.
+    pub(crate) fn vector<T: Decode<'de>, C>(
+        &self,
+        at: usize,
+        mut push: impl FnMut(&mut C, T),
+        new: impl FnOnce(usize) -> Result<C, DecodeError>,
+    ) -> Result<C, DecodeError> {
+        let header = self.vector_header::<T>(at)?;
+        let mut out = new(header.len)?;
+        for i in 0..header.len {
             push(
                 &mut out,
-                T::decode_element(self, start + 4 + i * element_size)?,
+                T::decode_element(self, header.first + i * header.stride)?,
             );
         }
         Ok(out)
@@ -331,25 +456,133 @@ impl<'de> Reader<'de> {
         Ok(out)
     }
 
-    pub(crate) fn byte(&self, pos: usize) -> Result<u8, DecodeError> {
+    /// The byte at `pos`, for [`Decode::decode_element`] impls that read their element
+    /// bytes themselves (as `bool` does).
+    pub fn byte(&self, pos: usize) -> Result<u8, DecodeError> {
         self.buf
             .get(pos)
             .copied()
             .ok_or(DecodeError::OutOfBounds { pos, len: 1 })
     }
 
-    pub(crate) fn inline(&self, pos: usize, size: usize) -> Result<&'de [u8], DecodeError> {
+    /// The `size` bytes at `pos`, for [`Decode::decode_element`] impls that parse inline
+    /// elements themselves.
+    pub fn inline(&self, pos: usize, size: usize) -> Result<&'de [u8], DecodeError> {
         self.slice(pos, size)
     }
 
     fn charge(&self, units: usize) -> Result<(), DecodeError> {
-        match self.budget.get().checked_sub(units) {
-            Some(left) => {
-                self.budget.set(left);
-                Ok(())
-            }
+        if !self.is_shared.get() {
+            return match self.budget.get().checked_sub(units) {
+                Some(left) => {
+                    self.budget.set(left);
+                    Ok(())
+                }
+                None => Err(DecodeError::WorkLimit),
+            };
+        }
+        match &*self.shared.borrow() {
+            Some(shared) => shared
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(units)
+                })
+                .map(|_| ())
+                .map_err(|_| DecodeError::WorkLimit),
             None => Err(DecodeError::WorkLimit),
         }
+    }
+
+    /// What a lazy view needs to read more of the message after this borrow of the
+    /// reader has ended. The first call of a decode moves the remaining budget into a
+    /// shared atomic, which every view of the decode (and this reader) charges from then
+    /// on.
+    pub(crate) fn detach(&self) -> Detached<'de> {
+        let mut shared = self.shared.borrow_mut();
+        let budget = shared.get_or_insert_with(|| {
+            self.is_shared.set(true);
+            Arc::new(AtomicUsize::new(self.budget.get()))
+        });
+        Detached {
+            buf: self.buf,
+            protocol_version: self.protocol_version,
+            depth: self.depth.get(),
+            budget: Arc::clone(budget),
+        }
+    }
+}
+
+/// A [`Reader`]'s state without its borrow: the buffer, protocol version, nesting depth
+/// and the shared work budget, enough to build a reader that continues where the original
+/// was, for lazy decoding.
+#[derive(Clone, Debug)]
+pub(crate) struct Detached<'de> {
+    buf: &'de [u8],
+    protocol_version: Option<ProtocolVersion>,
+    depth: usize,
+    budget: Arc<AtomicUsize>,
+}
+
+impl<'de> Detached<'de> {
+    /// A reader at the nesting depth of the one this was detached from, charging the same
+    /// budget.
+    pub(crate) fn reader(&self) -> Reader<'de> {
+        Reader {
+            buf: self.buf,
+            protocol_version: self.protocol_version,
+            depth: Cell::new(self.depth),
+            budget: Cell::new(0),
+            is_shared: Cell::new(true),
+            shared: RefCell::new(Some(Arc::clone(&self.budget))),
+        }
+    }
+}
+
+/// The checked header of a vector: how many elements it has and where they are; see
+/// [`Reader::vector_header`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VectorHeader {
+    len: usize,
+    first: usize,
+    stride: usize,
+}
+
+impl VectorHeader {
+    /// The header of an absent vector.
+    pub(crate) const EMPTY: VectorHeader = VectorHeader {
+        len: 0,
+        first: 0,
+        stride: 4,
+    };
+
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the vector has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The position of the first element in [`Reader::bytes`] (for an empty vector, the
+    /// position its first element would have).
+    pub fn first(&self) -> usize {
+        self.first
+    }
+
+    /// The distance between elements: the element's inline size, or 4 for an offset.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// The position of element `index` for [`Decode::decode_element`], or `None` if
+    /// `index >= len()`. Every position returned lies within the buffer, with the whole
+    /// element (inline) or its offset (tables, strings, vectors) inside it. That holds
+    /// for the [`Reader`] (buffer) that produced this header only: a position is not
+    /// checked against any other message.
+    pub fn position(&self, index: usize) -> Option<usize> {
+        // len * stride was checked to fit in the buffer, so this cannot overflow.
+        (index < self.len).then(|| self.first + index * self.stride)
     }
 }
 

@@ -14,12 +14,16 @@
 //! Those have no bounds checks; every buffer sent to them here is first accepted by this
 //! crate's decoder, which is at least as strict as FDB main's.
 
+mod map_support;
 mod support;
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use fdb_native_wire::{Reader, decode, encode};
+use map_support::{HashContainers, MapContainers};
+use proptest::prelude::prop;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, TestRunner};
 use serde_json::Value;
@@ -141,5 +145,128 @@ fn aliased_strings_are_accepted_by_cpp() {
             &root1(&value),
             &root,
         );
+    }
+}
+
+/// Sends `bytes` to every C++ decoder as `Containers` and compares its dump with `want`.
+fn assert_cpp_dumps(label: &str, bytes: &[u8], want: &Value) {
+    for bin in decoders() {
+        let got = cpp_decode(&bin, "Containers", bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_json_eq(&format!("{label} via {}", bin.display()), want, &got);
+    }
+}
+
+fn generate<T: Arb>(runner: &mut TestRunner) -> T {
+    T::arb().new_tree(runner).expect("value").current()
+}
+
+/// Values written from real `std::map`-like and `std::set`-like Rust containers (sorted
+/// and hash-ordered) decode in C++ to the same `std::map` and `std::set`.
+#[test]
+#[ignore = "requires golden-vectors tool"]
+fn map_and_set_encoded_values_decode_identically_in_cpp() {
+    const CASES: usize = 64;
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: None,
+        ..Config::default()
+    });
+    for _ in 0..CASES {
+        let m: MapContainers = generate(&mut runner);
+        let bytes = encode(&m).expect("encode");
+        decode::<MapContainers>(&bytes).expect("own output rejected");
+        assert_cpp_dumps("BTreeMap/BTreeSet", &bytes, &root1(&m));
+
+        // C++ reads hash order into its sorted containers.
+        let h: HashContainers = generate(&mut runner);
+        let bytes = encode(&h).expect("encode");
+        decode::<HashContainers>(&bytes).expect("own output rejected");
+        assert_cpp_dumps("HashMap/HashSet", &bytes, &root1(&h));
+    }
+    println!("{CASES} + {CASES} map/set-encoded values decode identically");
+}
+
+/// The engine's own `containers` bytes, read into real maps and sets and written again.
+#[test]
+#[ignore = "requires golden-vectors tool"]
+fn containers_fixture_rewritten_from_real_maps_decodes_in_cpp() {
+    let record = records("positive")
+        .into_iter()
+        .find(|r| r["name"] == "containers")
+        .expect("containers fixture");
+    let m: MapContainers = decode(&record_bytes(&record)).expect("decode");
+    assert_cpp_dumps("containers", &encode(&m).expect("encode"), &record["root"]);
+    let h: HashContainers = decode(&record_bytes(&record)).expect("decode");
+    assert_cpp_dumps(
+        "containers (hash)",
+        &encode(&h).expect("encode"),
+        &record["root"],
+    );
+}
+
+/// Unsorted entries and duplicate keys on the wire (which FDB's writers never produce):
+/// this crate's `BTreeMap`/`HashMap`/`BTreeSet`/`HashSet` end up with exactly what the C++
+/// `std::map` and `std::set` end up with, so "the first entry for a key wins" holds there
+/// too.
+#[test]
+#[ignore = "requires golden-vectors tool"]
+fn duplicate_and_unsorted_entries_decode_like_cpp() {
+    let mut cases = vec![
+        Containers {
+            m: vec![
+                Pair {
+                    first: 3,
+                    second: Bytes(b"first three".to_vec()),
+                },
+                Pair {
+                    first: 1,
+                    second: Bytes(b"one".to_vec()),
+                },
+                Pair {
+                    first: 3,
+                    second: Bytes(b"second three".to_vec()),
+                },
+                Pair {
+                    first: 1,
+                    second: Bytes(b"another one".to_vec()),
+                },
+                Pair {
+                    first: -7,
+                    second: Bytes(vec![]),
+                },
+            ],
+            s: vec![30, 10, 30, 20, 10, 0, u32::MAX, 0],
+            nested: vec![],
+        },
+        Containers {
+            m: vec![],
+            s: vec![],
+            nested: vec![vec![1]],
+        },
+    ];
+    // And generated ones: few distinct keys, so most have duplicates.
+    let mut runner = TestRunner::new(Config {
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let entry = (-3i32..3, Bytes::arb()).prop_map(|(first, second)| Pair { first, second });
+    let strategy = (
+        prop::collection::vec(entry, 0..12),
+        prop::collection::vec(0u32..6, 0..12),
+    );
+    for _ in 0..64 {
+        let (m, s) = strategy.new_tree(&mut runner).expect("value").current();
+        cases.push(Containers {
+            m,
+            s,
+            nested: vec![],
+        });
+    }
+    for (i, wire) in cases.iter().enumerate() {
+        let bytes = encode(wire).expect("encode");
+        let r = Reader::new(&bytes).expect("reader");
+        let m: MapContainers = r.decode_root().expect("decode as BTreeMap");
+        let h: HashContainers = r.decode_root().expect("decode as HashMap");
+        assert_eq!(h.sorted(), m, "case {i}: hash and tree containers differ");
+        assert_cpp_dumps(&format!("duplicates case {i}"), &bytes, &root1(&m));
     }
 }

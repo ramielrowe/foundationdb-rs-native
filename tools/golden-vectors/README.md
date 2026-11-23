@@ -345,6 +345,19 @@ A decode starts from the root table and is charged, every time it reaches an obj
 Every object the C++ writer emits is referenced once, except the shared empty blob, so its
 messages cost at most about 2 units per byte and never reach the limit.
 
+A decoder that reads vectors lazily (the Rust `VectorView`) charges each element when it is
+read, not when the vector is decoded, so two things differ from a decode that finishes
+before returning:
+
+- Re-reading counts. Every read of an element charges its objects again, so a valid message
+  whose elements are read enough times (five full passes over a vector of a thousand small
+  tables measured) reaches `work_limit`. Reads of the same message share one budget.
+- Unread elements are never checked. A lazy decoder may accept a message that an eager
+  decoder rejects (including by one of the permitted checks above, or a negative vector's
+  out-of-bounds offset) when the only fault is in an element that is never read; reading
+  that element gives the error an eager decoder would have given. The vector's own header
+  (offset, count, and that `count` elements fit) is always checked when it is decoded.
+
 No other check is permitted: in particular not object overlap or aliasing (the C++ writer
 itself points every empty string/vector at one shared blob), not alignment of tables,
 strings, vectors or union payloads (union scalars are unaligned by design), and not
