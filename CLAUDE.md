@@ -65,7 +65,21 @@ cargo fmt --all --check                                        # formatting
 cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings are errors in CI)
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
-cargo nextest run --workspace --run-ignored only --no-tests=pass  # Docker-backed integration tests (flag needed only while none exist)
+cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'  # Docker-backed integration tests
+cargo test --doc --workspace                                   # doc tests (nextest skips them)
+```
+
+`fdb-native-wire`'s encoder is also checked against FDB's C++ readers by an ignored test binary,
+`cpp_crosscheck` (`#[ignore = "requires golden-vectors tool"]`, excluded from the Docker CI job).
+It needs the dev-only `tools/golden-vectors` decoder; `FDB_GOLDEN_VECTORS_BIN` is a `:`-separated
+list of decoders to check against. `regen.sh --check` builds the release-7.4 and release-8.0
+readers under `tools/golden-vectors/build/rel-*`; in a git worktree, set `FDB_SRC` explicitly:
+
+```bash
+FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check   # or: make -C tools/golden-vectors FDB_SRC=...
+GV=$PWD/tools/golden-vectors/build
+FDB_GOLDEN_VECTORS_BIN=$GV/golden-vectors:$GV/rel-release-7.4/golden-vectors:$GV/rel-release-8.0/golden-vectors \
+  cargo nextest run -p fdb-native-wire --run-ignored only -E 'binary(cpp_crosscheck)'
 ```
 
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
@@ -86,8 +100,9 @@ targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crate
 
 Outside the workspace, `tools/golden-vectors/` is a dev-only C++ tool that compiles FDB's
 flatbuffers headers and writes golden vectors to `tools/golden-vectors/fixtures/`. The fixtures
-are checked in and Rust tests read them as files; nothing in the workspace builds the tool. Its
-README documents the fixture format and the wire-format details the `wire` codec must match.
+are checked in and Rust tests read them as files; nothing in the workspace builds the tool (only
+the opt-in `cpp_crosscheck` test runs it). Its README documents the fixture format, the
+wire-format details and the decoder strictness policy the `wire` codec follows.
 Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check`.
 
 ## Conventions & Patterns
@@ -96,7 +111,8 @@ Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --c
   Workspace lints: `unsafe_code = "forbid"`, `missing_debug_implementations`, `unreachable_pub`, clippy `all`.
 - Edition 2024, MSRV 1.85. No unstable rustfmt options.
 - **Docker-backed tests**: tests that need a live FDB container are marked
-  `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`.
+  `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`
+  (excluding the `cpp_crosscheck` binary, which needs the golden-vectors tool instead).
   The `FDB_IMAGE` env var selects the image (default `foundationdb/foundationdb:7.4.10`).
   Docker tests live in an integration-test binary named `docker` (or are named `docker_*`) so the
   nextest `docker` test group in `.config/nextest.toml` caps them at 4 concurrent containers.

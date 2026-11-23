@@ -40,6 +40,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --profile ci
+      # nextest does not run doc tests.
+      - run: cargo test --doc --workspace
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -62,4 +64,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass
+      # cpp_crosscheck is ignored because it needs the dev-only golden-vectors tool, not Docker.
+      - run: cargo nextest run --workspace --profile ci --run-ignored only --no-tests=pass -E 'not binary(cpp_crosscheck)'
