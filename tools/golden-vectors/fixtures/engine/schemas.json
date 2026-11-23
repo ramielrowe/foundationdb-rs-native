@@ -100,6 +100,17 @@
         }
       ]
     },
+    "ErrorOr<Void>": {
+      "file_identifier": 35564874,
+      "file_identifier_hex": "0x021ead4a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<table<Void>>"
+        }
+      ]
+    },
     "FixedBytes": {
       "file_identifier": 4343,
       "file_identifier_hex": "0x000010f7",
@@ -327,6 +338,17 @@
           "field": "0",
           "slot": 0,
           "type": "table<Vectors>"
+        }
+      ]
+    },
+    "Void": {
+      "file_identifier": 2010442,
+      "file_identifier_hex": "0x001ead4a",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<Void>"
         }
       ]
     },

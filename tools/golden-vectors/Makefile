@@ -36,7 +36,10 @@ else
   OBJ_DIR := $(BUILD_DIR)/obj
 endif
 
-SRCS := $(wildcard $(TOOL_DIR)/src/*.cpp)
+# engine_vectors_policy.o must be linked after engine_vectors.o: the writer orders vtables by the addresses
+# of per-shape statics, so the object that first instantiates them decides the bytes (see that file).
+POLICY_SRC := $(TOOL_DIR)/src/engine_vectors_policy.cpp
+SRCS := $(filter-out $(POLICY_SRC),$(sort $(wildcard $(TOOL_DIR)/src/*.cpp))) $(POLICY_SRC)
 OBJS := $(patsubst $(TOOL_DIR)/src/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 DEPS := $(OBJS:.o=.d)
 

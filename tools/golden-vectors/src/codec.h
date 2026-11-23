@@ -101,6 +101,9 @@ struct DecodableType {
 	std::function<std::set<std::string>(const uint8_t*, size_t)> strict;
 	// The members of the root table; registers every reachable table in the collector.
 	std::function<Json(SchemaCollector&)> schema;
+	// The work units one decode charges (the full total, up to StrictWalker::kCountCap) and the limit, as counted by
+	// strict.h (for sizing aliasing bombs).
+	std::function<size_t(const uint8_t*, size_t, size_t*)> work;
 };
 
 inline std::map<std::string, DecodableType>& registry() {
@@ -164,5 +167,11 @@ void register_type(const std::string& name, FileIdentifier fid) {
 		    return w.violations;
 		},
 		[](SchemaCollector& c) { return root_schema<Items...>(c); },
+		[](const uint8_t* data, size_t size, size_t* limit) {
+		    StrictWalker w(data, size);
+		    w.template root<Items...>();
+		    *limit = w.workLimit();
+		    return w.work();
+		},
 	};
 }

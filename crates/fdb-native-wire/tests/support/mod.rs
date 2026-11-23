@@ -1223,6 +1223,7 @@ pub fn registry() -> Vec<TypeEntry> {
         entry!(typed "ErrorOr<EnsureTable<Void>>", ErrorOr<EnsureTable<Void>>),
         entry!(typed "ErrorOr<Inner>", ErrorOr<Inner>),
         entry!(typed "ErrorOr<Payload>", ErrorOr<Payload>),
+        entry!(typed "ErrorOr<Void>", ErrorOr<Void>),
         entry!(typed "FixedBytes", FixedBytes),
         entry!(typed "Inner", Inner),
         entry!(typed "KVHolder", KvHolder),
@@ -1272,6 +1273,7 @@ pub fn registry() -> Vec<TypeEntry> {
         entry!(typed "Structs", Structs),
         entry!(typed "Untrusted", Untrusted),
         entry!(typed "VariantHolder", VariantHolder),
+        entry!(typed "Void", Void),
         entry!(
             "VectorRef<Inner>",
             Inner::FILE_IDENTIFIER.compose(Wrapper::VectorRef).value(),
@@ -1324,8 +1326,8 @@ impl Encode for Alias {
 }
 
 /// An 824-byte `Untrusted` whose `strs` holds 20 offsets to one 600-byte string, and the
-/// value C++ decodes it to. Under the README's classes this is a `data` accept; this crate
-/// rejects it with the `work_limit` check (20 × 604 units > 4 × 824 + 1024).
+/// value C++ decodes it to. Under the README's classes this is a `structural` accept
+/// (`work_limit`); this crate rejects it (20 × 604 units > 4 × 824 + 1024).
 pub fn aliased_untrusted() -> (Untrusted, Vec<u8>) {
     let s = Bytes(vec![0x61; 600]);
     let value = Untrusted {

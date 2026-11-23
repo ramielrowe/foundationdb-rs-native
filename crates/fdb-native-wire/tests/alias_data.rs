@@ -1,9 +1,10 @@
 //! The one accepted divergence from FDB `main`'s reader: the `work_limit` check.
 //!
 //! `aliased_untrusted()` is a valid `Untrusted` whose `strs` vector holds 20 offsets to
-//! one 600-byte string. FDB `main` accepts it (`cpp_crosscheck` checks that), so under the
-//! golden-vectors README's classes it would be a `data` accept; the README's `work_limit`
-//! row permits rejecting it, and this crate does.
+//! one 600-byte string. FDB `main` accepts it (`cpp_crosscheck` checks that); the
+//! golden-vectors README classifies it as a `structural` accept with the `work_limit`
+//! violation (`corpus/aliasing_bombs.jsonl`), so rejecting it is permitted, and this crate
+//! does.
 
 mod support;
 
