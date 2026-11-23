@@ -1,10 +1,11 @@
-//! The `SPAN_PARENT` transaction option value.
+//! `SpanContext`: the `SPAN_PARENT` transaction option value (binary format) and the span
+//! context of every request (flatbuffers).
 
 use fdb_native_wire::binary::{
     Decode, DecodeError, Encode, EncodeError, ReadVersioning, Reader, Versioning, Writer,
     from_slice, to_vec,
 };
-use fdb_native_wire::{ProtocolVersion, Uid};
+use fdb_native_wire::{ProtocolVersion, Shape, Uid, Wire};
 
 /// `TraceFlags` (`fdbclient/Tracing.h`): the flag byte of a [`SpanContext`]. C++ declares it
 /// as `enum class TraceFlags : uint8_t` used as a bit field, so any byte is a value; bit 0
@@ -37,8 +38,13 @@ impl<'de> Decode<'de> for TraceFlags {
 }
 
 /// `SpanContext` (`fdbclient/Tracing.h`): a trace id, a span id and flags, serialized as
-/// `serializer(ar, traceID, spanID, m_Flags)`: 25 bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `serializer(ar, traceID, spanID, m_Flags)`.
+///
+/// It has both wire forms, identical on 7.4 and 8.0: in the binary format (the
+/// `SPAN_PARENT` option value, see [`SpanContext::to_option_value`]) it is 25 bytes; in a
+/// flatbuffers message (the `spanContext` of every request) it is a table of those three
+/// fields. [`Default`] is `SpanContext()`: all zero, unsampled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Wire)]
 pub struct SpanContext {
     /// `traceID`.
     pub trace_id: Uid,
@@ -88,9 +94,42 @@ impl<'de> Decode<'de> for SpanContext {
     }
 }
 
+// The flatbuffers form of the flags: a `uint8_t` enum, a 1-byte scalar.
+impl Wire for TraceFlags {
+    const SHAPE: Shape = <u8 as Wire>::SHAPE;
+}
+
+impl fdb_native_wire::Encode for TraceFlags {
+    fn encode_inline(&self, out: &mut [u8]) -> Result<(), fdb_native_wire::EncodeError> {
+        fdb_native_wire::Encode::encode_inline(&self.0, out)
+    }
+}
+
+impl<'de> fdb_native_wire::Decode<'de> for TraceFlags {
+    fn absent() -> Self {
+        TraceFlags::UNSAMPLED
+    }
+
+    fn decode_inline(bytes: &'de [u8]) -> Result<Self, fdb_native_wire::DecodeError> {
+        <u8 as fdb_native_wire::Decode<'de>>::decode_inline(bytes).map(TraceFlags)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatbuffers_table() {
+        let span = SpanContext {
+            trace_id: Uid::new(1, 2),
+            span_id: 3,
+            flags: TraceFlags(0x81),
+        };
+        let bytes = fdb_native_wire::encode_with_identifier(&span, 1).unwrap();
+        let reader = fdb_native_wire::Reader::new(&bytes).unwrap();
+        assert_eq!(reader.decode_root::<SpanContext>().unwrap(), span);
+    }
 
     #[test]
     fn option_value() {
