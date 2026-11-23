@@ -187,7 +187,20 @@ impl Writer {
     /// (scalars, structs) or as `u32` offsets (tables, strings, vectors). The elements
     /// start at a multiple of max(4, element alignment).
     pub fn vector<T: Encode>(&mut self, items: &[T]) -> Result<ObjectRef, EncodeError> {
-        self.vector_counted(items.len(), items)
+        match T::SHAPE {
+            // The elements are written as one slice (`Encode::encode_inline_slice`), a
+            // memcpy for `u8`; the same bytes, order of checks and errors as
+            // `vector_counted` for a slice.
+            Shape::Inline { size, align } if !items.is_empty() => {
+                let count32 = u32::try_from(items.len()).map_err(|_| EncodeError::TooLarge)?;
+                let len = items.len().checked_mul(size).ok_or(EncodeError::TooLarge)?;
+                self.pad_for(len, align.max(4))?;
+                let start = self.reserve(len)?;
+                T::encode_inline_slice(items, &mut self.buf[start..start + len])?;
+                self.push_u32(count32)
+            }
+            _ => self.vector_counted(items.len(), items),
+        }
     }
 
     /// Writes a vector of non-union elements from an iterator of known length, without

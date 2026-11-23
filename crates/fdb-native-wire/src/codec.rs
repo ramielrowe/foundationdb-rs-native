@@ -1,6 +1,8 @@
 //! The codec traits and their impls for standard types.
 
-use crate::{DecodeError, EncodeError, ObjectRef, Reader, Shape, StrictCheck, UnionRef, Writer};
+use crate::{
+    DecodeError, EncodeError, ObjectRef, Reader, Shape, StrictCheck, UnionRef, VectorHeader, Writer,
+};
 
 /// A type with a wire representation; states its [`Shape`].
 ///
@@ -89,6 +91,35 @@ pub trait Encode: Wire {
             "encode_union_vector is not implemented for this type",
         ))
     }
+
+    /// Writes `items`, the elements of a vector of an inline type, into `out`, which is
+    /// exactly `items.len()` times the type's inline size, zeroed. [`Writer::vector`]
+    /// calls it for vectors of [`Shape::Inline`] elements.
+    ///
+    /// The default calls [`encode_inline`](Encode::encode_inline) on each element in turn.
+    /// There is no need to override it unless a whole slice can be written faster than
+    /// element by element: the integer, float and `bool` impls do (a `Vec<u8>` is a
+    /// memcpy), which is the way around the lack of specialization.
+    fn encode_inline_slice(items: &[Self], out: &mut [u8]) -> Result<(), EncodeError>
+    where
+        Self: Sized,
+    {
+        let Shape::Inline { size, .. } = Self::SHAPE else {
+            return Err(EncodeError::InvalidShape(
+                "inline vector of a non-inline type",
+            ));
+        };
+        if items.len().checked_mul(size) != Some(out.len()) {
+            return Err(EncodeError::InvalidShape("inline vector size"));
+        }
+        for (i, item) in items.iter().enumerate() {
+            let chunk = out
+                .get_mut(i * size..(i + 1) * size)
+                .ok_or(EncodeError::InvalidShape("inline vector size"))?;
+            item.encode_inline(chunk)?;
+        }
+        Ok(())
+    }
 }
 
 /// A type that can be read from a buffer with lifetime `'de`, possibly borrowing from it.
@@ -159,6 +190,21 @@ pub trait Decode<'de>: Wire + Sized {
         ))
     }
 
+    /// Decodes the elements of the vector whose `header` was checked (and charged to the
+    /// work limit) by [`Reader::vector_header`] into a `Vec`. `Vec<Self>` calls it.
+    ///
+    /// The default decodes element by element with
+    /// [`decode_element`](Decode::decode_element), reserving at most 64 KiB up front
+    /// however large the count is. There is no need to override it unless a run of
+    /// elements can be decoded faster than one at a time: the integer, float and `bool`
+    /// impls do (a `Vec<u8>` is a memcpy), which is the way around the lack of
+    /// specialization. An override must decode exactly what the default would, charge
+    /// nothing more (inline elements are paid for by the header), and not reserve more
+    /// memory than the bytes it reads from the message.
+    fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
+        r.decode_elements(header)
+    }
+
     /// Decodes a vector element stored at position `pos`. The default dispatches on the
     /// shape; `bool` overrides it because `std::vector<bool>` reads any nonzero byte as
     /// `true`, where a scalar `bool` must be 0 or 1.
@@ -191,6 +237,16 @@ macro_rules! scalar {
             fn encode_inline(&self, out: &mut [u8]) -> Result<(), EncodeError> {
                 copy_inline(out, &self.to_le_bytes())
             }
+
+            fn encode_inline_slice(items: &[Self], out: &mut [u8]) -> Result<(), EncodeError> {
+                if items.len().checked_mul(size_of::<$t>()) != Some(out.len()) {
+                    return Err(EncodeError::InvalidShape("inline vector size"));
+                }
+                for (item, chunk) in items.iter().zip(out.chunks_exact_mut(size_of::<$t>())) {
+                    chunk.copy_from_slice(&item.to_le_bytes());
+                }
+                Ok(())
+            }
         }
 
         impl<'de> Decode<'de> for $t {
@@ -202,11 +258,65 @@ macro_rules! scalar {
                 let bytes = bytes.try_into().map_err(|_| DecodeError::Invalid("scalar size"))?;
                 Ok(<$t>::from_le_bytes(bytes))
             }
+
+            fn decode_elements(
+                r: &Reader<'de>,
+                header: &VectorHeader,
+            ) -> Result<Vec<Self>, DecodeError> {
+                // The header was checked: `len * size` bytes are in the message, so the
+                // vector is no larger than the bytes it is read from.
+                let bytes = r.inline(header.first(), header.len().saturating_mul(size_of::<$t>()))?;
+                Ok(bytes
+                    .chunks_exact(size_of::<$t>())
+                    .map(|chunk| {
+                        let mut le = [0; size_of::<$t>()];
+                        le.copy_from_slice(chunk);
+                        <$t>::from_le_bytes(le)
+                    })
+                    .collect())
+            }
         }
     )*};
 }
 
-scalar!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+scalar!(i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
+impl Wire for u8 {
+    const SHAPE: Shape = Shape::scalar(1);
+}
+
+impl Encode for u8 {
+    fn encode_inline(&self, out: &mut [u8]) -> Result<(), EncodeError> {
+        copy_inline(out, &[*self])
+    }
+
+    /// A `Vec<u8>` (a string, a blob) is one copy.
+    fn encode_inline_slice(items: &[Self], out: &mut [u8]) -> Result<(), EncodeError> {
+        if out.len() != items.len() {
+            return Err(EncodeError::InvalidShape("inline vector size"));
+        }
+        out.copy_from_slice(items);
+        Ok(())
+    }
+}
+
+impl<'de> Decode<'de> for u8 {
+    fn absent() -> Self {
+        0
+    }
+
+    fn decode_inline(bytes: &'de [u8]) -> Result<Self, DecodeError> {
+        match bytes {
+            [b] => Ok(*b),
+            _ => Err(DecodeError::Invalid("scalar size")),
+        }
+    }
+
+    /// A `Vec<u8>` is one copy of bytes the header showed to be in the message.
+    fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
+        Ok(r.inline(header.first(), header.len())?.to_vec())
+    }
+}
 
 impl Wire for bool {
     const SHAPE: Shape = Shape::scalar(1);
@@ -215,6 +325,16 @@ impl Wire for bool {
 impl Encode for bool {
     fn encode_inline(&self, out: &mut [u8]) -> Result<(), EncodeError> {
         copy_inline(out, &[u8::from(*self)])
+    }
+
+    fn encode_inline_slice(items: &[Self], out: &mut [u8]) -> Result<(), EncodeError> {
+        if out.len() != items.len() {
+            return Err(EncodeError::InvalidShape("inline vector size"));
+        }
+        for (item, byte) in items.iter().zip(out) {
+            *byte = u8::from(*item);
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +354,14 @@ impl<'de> Decode<'de> for bool {
 
     fn decode_element(r: &Reader<'de>, pos: usize) -> Result<Self, DecodeError> {
         Ok(r.byte(pos)? != 0)
+    }
+
+    fn decode_elements(r: &Reader<'de>, header: &VectorHeader) -> Result<Vec<Self>, DecodeError> {
+        // As `decode_element`: any nonzero byte is `true`.
+        Ok(r.inline(header.first(), header.len())?
+            .iter()
+            .map(|&b| b != 0)
+            .collect())
     }
 }
 
@@ -428,9 +556,8 @@ impl<'de, T: Decode<'de>> Decode<'de> for Vec<T> {
     }
 
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
-        r.vector(at, Vec::push, |count| {
-            Ok(Vec::with_capacity(preallocation::<T>(count)))
-        })
+        let header = r.vector_header::<T>(at)?;
+        T::decode_elements(r, &header)
     }
 
     fn decode_union_vector(

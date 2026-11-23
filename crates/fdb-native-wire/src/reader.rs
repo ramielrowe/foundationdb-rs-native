@@ -379,6 +379,19 @@ impl<'de> Reader<'de> {
         Ok(out)
     }
 
+    /// Decodes the elements of the vector `header` describes one at a time: the default of
+    /// [`Decode::decode_elements`].
+    pub(crate) fn decode_elements<T: Decode<'de>>(
+        &self,
+        header: &VectorHeader,
+    ) -> Result<Vec<T>, DecodeError> {
+        let mut out = Vec::with_capacity(crate::codec::preallocation::<T>(header.len));
+        for i in 0..header.len {
+            out.push(T::decode_element(self, header.first + i * header.stride)?);
+        }
+        Ok(out)
+    }
+
     /// Decodes a vector of unions from its tags slot and offsets slot positions.
     pub(crate) fn union_vector<T: Decode<'de>>(
         &self,
