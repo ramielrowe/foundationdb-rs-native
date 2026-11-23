@@ -8,6 +8,8 @@ mod connect_packet;
 pub mod connection;
 pub mod framing;
 pub mod runtime;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError, process_transport_id};
 pub use connection::{
