@@ -5,13 +5,19 @@
 //! * [`cluster_file`]: cluster files and connection strings.
 //! * [`cluster`]: the coordinator connection, [`ClusterMonitor`], which keeps the client's
 //!   `ClientDBInfo` (its GRV and commit proxies) current.
+//! * [`commit`]: the commit path, [`Committer`] and [`CommitBuffer`].
 
 pub mod cluster;
 pub mod cluster_file;
+pub mod commit;
 
 pub use cluster::{
     ClusterInfo, ClusterInfoWatch, ClusterMonitor, ClusterMonitorConfig, CommitProxyEndpoints,
     ConnectionRecord, GrvProxyEndpoints, MonitorClosed, MonitorError, MonitorStatus,
+};
+
+pub use commit::{
+    CommitBuffer, CommitError, CommitOptions, CommitOutcome, Committer, CommitterConfig,
 };
 
 pub use cluster_file::{
