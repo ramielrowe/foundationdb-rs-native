@@ -387,6 +387,7 @@ dependencies = [
  "fdb-native-schema",
  "fdb-native-testkit",
  "fdb-native-transport",
+ "fdb-native-tuple",
  "fdb-native-wire",
  "futures-channel",
  "futures-core",

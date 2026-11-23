@@ -50,9 +50,29 @@
 //!   `clear(range)` truncates keys over the limit to limit + 1 byte, drops an empty range,
 //!   and adds the range as write conflict range; an atomic operation adds the key's
 //!   conflict range unless it is `SetVersionstampedKey`, and `Min`/`And` become
-//!   `MinV2`/`AndV2` (`apiVersionAtLeast(510)`). **Atomic operations are supported except the
-//!   two versionstamp operations**, which need the offset validation of the read-your-writes
-//!   layer and are rejected with `client_invalid_operation`.
+//!   `MinV2`/`AndV2` (`apiVersionAtLeast(510)`). The atomic operations are checked as
+//!   `ReadYourWritesTransaction::atomicOp` (7.4:2211, 8.0:2127) checks them: a type that is
+//!   not an atomic operation is `invalid_mutation_type` (2018).
+//! * **Versionstamped operations** (see [`with_versionstamp_offset`]): the last 4 bytes of a
+//!   `SetVersionstampedKey`'s key or a `SetVersionstampedValue`'s value are the
+//!   little-endian `i32` position of 10 placeholder bytes (API version 520 and later). The
+//!   key and value limits apply to the whole key or value, offset included. After them,
+//!   `ReadYourWritesTransaction::atomicOp` (7.4:2263-2290) and `getVersionstampKeyRange`
+//!   (`Atomic.h` 7.4:268) fail with `client_invalid_operation` (2000) if the key or value
+//!   is shorter than 4 bytes, the offset is negative, or `offset + 10 > len - 4`. The write
+//!   conflict range is the key's, **except for `SetVersionstampedKey`**: `atomicOp` adds
+//!   none (7.4:6321, 8.0:4064: `operationType != SetVersionstampedKey`), and the
+//!   read-your-writes layer passes `AddConflictRange::False` (7.4:2268) and adds no range
+//!   for the possible keys to the native transaction either (the range it computes only
+//!   keeps reads of those keys unreadable, a read-your-writes matter). A transaction
+//!   whose only write is a versionstamped key therefore has no write conflict range: it is
+//!   sent (it has a mutation) and gets the self-conflicting key like any blind write. The
+//!   commit proxy replaces the 10 bytes with the commit version (8 bytes big-endian) and
+//!   the transaction's index in the batch (2 bytes big-endian), strips the offset and turns
+//!   the mutation into a `SetValue` (`CommitProxyServer.actor.cpp` 7.4:215-219,
+//!   `transformVersionstampMutation`, `Atomic.h` 7.4:303); the client gets the same 10 bytes
+//!   from the `CommitID` (`placeVersionstamp`, NativeAPI 7.4:6999, 8.0:4680;
+//!   [`CommitOutcome::versionstamp`]). Size accounting is the mutation's, offset included.
 //! * **Key and value limits**: `set` and `atomicOp` throw `key_too_large` above
 //!   `getMaxWriteKeySize` (`KEY_SIZE_LIMIT` 10000, or `SYSTEM_KEY_SIZE_LIMIT` 30000 for keys
 //!   starting `\xff`; 7.4:11995, 8.0:7378) and `value_too_large` above `VALUE_SIZE_LIMIT`
@@ -130,7 +150,7 @@
 //!   fetches one (`FLAG_CAUSAL_READ_RISKY`) in `tryCommit`; [`Transaction`](crate::Transaction)
 //!   does that. The committer fetches one itself only for the dummy transaction.
 //! * **Not ported yet**: idempotency ids (they need the idempotency-record read path),
-//!   versionstamped mutations, transaction tags and commit cost estimation, tenants,
+//!   the `\xff/metadataVersion` special case of `atomicOp`, transaction tags and commit cost estimation, tenants,
 //!   `checkWrites`, debug ids and span contexts, the metadata-version cache and
 //!   `expireIdempotencyId`. The key legality checks (`key_outside_legal_range`, access to
 //!   `\xff` keys) are [`Transaction`](crate::Transaction)'s; the read-your-writes layer's
@@ -143,11 +163,13 @@ mod limits;
 mod options;
 mod prepare;
 mod rng;
+mod versionstamp;
 
 pub use buffer::CommitBuffer;
 pub use committer::{CommitOutcome, Committer, versionstamp};
 pub use limits::{CommitLimits, KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, expected_size};
 pub use options::{CommitOptions, CommitterConfig};
+pub use versionstamp::{VERSIONSTAMP_LEN, with_versionstamp_offset};
 
 #[cfg(test)]
 mod tests;

@@ -8,6 +8,7 @@ use fdb_native_wire::Uid;
 use super::error;
 use super::limits::{CommitLimits, expected_size, normalize_range};
 use super::options::CommitOptions;
+use super::versionstamp::check_offset;
 use crate::error::Error;
 use crate::error::codes::TRANSACTION_READ_ONLY;
 
@@ -15,8 +16,7 @@ use crate::error::codes::TRANSACTION_READ_ONLY;
 const MIN_SIZE_LIMIT: u64 = 32;
 
 /// The mutation types a commit may carry: `SetValue`, `ClearRange` and the atomic operations
-/// `NativeAPI`'s `atomicOp` takes, except the versionstamp operations (not supported yet:
-/// they need the offset checks `ReadYourWritesTransaction::atomicOp` does).
+/// (`isAtomicOp`), the versionstamp operations among them.
 fn supported(kind: MutationType) -> bool {
     matches!(
         kind,
@@ -34,6 +34,8 @@ fn supported(kind: MutationType) -> bool {
             | MutationType::MIN_V2
             | MutationType::AND_V2
             | MutationType::COMPARE_AND_CLEAR
+            | MutationType::SET_VERSIONSTAMPED_KEY
+            | MutationType::SET_VERSIONSTAMPED_VALUE
     )
 }
 
@@ -44,7 +46,7 @@ pub(crate) fn check_mutation(
     limits: &CommitLimits,
 ) -> Result<Option<Mutation>, Error> {
     if !supported(m.kind) {
-        return Err(error::unsupported(m.kind.0));
+        return Err(error::invalid_mutation_type(m.kind.0));
     }
     // `apiVersionAtLeast(510)` (`atomicOp`): `Min` and `And` are sent as `MinV2` and `AndV2`.
     let m = Mutation {
@@ -76,6 +78,8 @@ pub(crate) fn check_mutation(
             limits.value_size_limit,
         ));
     }
+    // After the size checks, as `ReadYourWritesTransaction::atomicOp` orders them.
+    check_offset(m.kind, &m.param1, &m.param2)?;
     Ok(Some(m))
 }
 

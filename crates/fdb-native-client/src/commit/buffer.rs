@@ -3,7 +3,7 @@
 
 use fdb_native_schema::domain::{KeyRange, Mutation, MutationType};
 
-use super::error::{inverted_range, unsupported};
+use super::error::{invalid_mutation_type, inverted_range};
 use super::limits::CommitLimits;
 use super::prepare::check_mutation;
 use crate::error::Error;
@@ -19,7 +19,11 @@ use crate::error::Error;
 ///   with keys over the limit truncated and an empty result dropped.
 /// * [`atomic_op`](Self::atomic_op): the mutation and, except for `SetVersionstampedKey`,
 ///   a write conflict range on the key. `Min` and `And` become `MinV2` and `AndV2` (what
-///   `apiVersionAtLeast(510)` does). The versionstamp operations are not supported yet.
+///   `apiVersionAtLeast(510)` does). The versionstamp operations
+///   ([`set_versionstamped_key`](Self::set_versionstamped_key),
+///   [`set_versionstamped_value`](Self::set_versionstamped_value)) have their 4-byte offset
+///   checked (`client_invalid_operation`); a versionstamped key adds **no** write conflict
+///   range (the key it writes is not known), as in C++.
 /// * [`add_read_conflict_range`](Self::add_read_conflict_range),
 ///   [`add_write_conflict_range`](Self::add_write_conflict_range): as given.
 ///
@@ -88,17 +92,41 @@ impl CommitBuffer {
         Ok(())
     }
 
-    /// `Transaction::atomicOp`.
+    /// `ReadYourWritesTransaction::atomicOp` (on `Transaction::atomicOp`): `invalid_mutation_type`
+    /// (2018) unless `op` is an atomic operation (`SetValue` and `ClearRange` are not),
+    /// `key_too_large`, `value_too_large`, and for the versionstamp operations
+    /// `client_invalid_operation` if the offset is not valid (see
+    /// [`with_versionstamp_offset`](super::with_versionstamp_offset)).
+    ///
+    /// The write conflict range is the key's, except for `SetVersionstampedKey`:
+    /// `Transaction::atomicOp` adds none for it (`NativeAPI.actor.cpp` 7.4:6321, 8.0:4064) and
+    /// the read-your-writes layer passes `AddConflictRange::False` for it (7.4:2268), so
+    /// that the commit has no write conflict range for the key it writes.
     pub fn atomic_op(&mut self, key: &[u8], operand: &[u8], op: MutationType) -> Result<(), Error> {
         if op == MutationType::SET_VALUE || op == MutationType::CLEAR_RANGE {
-            return Err(unsupported(op.0));
+            return Err(invalid_mutation_type(op.0));
         }
         let m = Mutation {
             kind: op,
             param1: key.to_vec(),
             param2: operand.to_vec(),
         };
-        self.push_mutation(m, Some(KeyRange::single_key(key)))
+        let write = (op != MutationType::SET_VERSIONSTAMPED_KEY).then(|| KeyRange::single_key(key));
+        self.push_mutation(m, write)
+    }
+
+    /// `atomic_op(key, value, SetVersionstampedKey)`: sets `value` at `key` with the
+    /// 10-byte placeholder at the offset in the last 4 bytes of `key` replaced by the
+    /// transaction's versionstamp. No write conflict range is added.
+    pub fn set_versionstamped_key(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_KEY)
+    }
+
+    /// `atomic_op(key, value, SetVersionstampedValue)`: sets `key` to `value` with the
+    /// placeholder at the offset in the last 4 bytes of `value` replaced by the
+    /// transaction's versionstamp.
+    pub fn set_versionstamped_value(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_VALUE)
     }
 
     fn push_mutation(&mut self, m: Mutation, write: Option<KeyRange>) -> Result<(), Error> {

@@ -327,15 +327,277 @@ fn atomic_ops() {
         ]
     );
     assert_eq!(c.write_conflict_ranges.len(), 3 + 1);
+    // Not atomic operations (`isAtomicOp`): `invalid_mutation_type`.
     let mut b = CommitBuffer::new(limits());
     for t in [
-        MutationType::SET_VERSIONSTAMPED_KEY,
-        MutationType::SET_VERSIONSTAMPED_VALUE,
+        MutationType(3),
         MutationType(5),
+        MutationType(21),
         MutationType::SET_VALUE,
+        MutationType::CLEAR_RANGE,
     ] {
-        assert_eq!(b.atomic_op(b"k", b"v", t).unwrap_err().code(), 2000);
+        assert_eq!(
+            b.atomic_op(b"k", b"v", t).unwrap_err().code(),
+            error_code::INVALID_MUTATION_TYPE,
+            "{t:?}"
+        );
     }
+    assert!(b.is_empty());
+}
+
+/// `placeholder` bytes at `at`, then `tail`, then the 4-byte offset `offset`.
+fn stamped(at: usize, tail: usize, offset: i32) -> Vec<u8> {
+    let mut v = vec![b'p'; at];
+    v.extend_from_slice(&[0xff; 10]);
+    v.extend(std::iter::repeat_n(b't', tail));
+    v.extend_from_slice(&offset.to_le_bytes());
+    v
+}
+
+#[test]
+fn versionstamp_offsets_are_validated_as_cpp_does() {
+    use MutationType as T;
+    let code = |kind, key: &[u8], value: &[u8]| {
+        let mut b = CommitBuffer::new(limits());
+        b.atomic_op(key, value, kind).map_err(|e| e.code())
+    };
+    let bad = Err(error_code::CLIENT_INVALID_OPERATION);
+    // A key: `offset + 10 <= len - 4`, `offset >= 0`, `len >= 4`.
+    for (key, ok) in [
+        (stamped(0, 0, 0), true),
+        (stamped(3, 5, 3), true),
+        (stamped(3, 0, 3), true),
+        (stamped(3, 0, 4), false), // one past the end
+        (stamped(3, 0, 2), true),  // any offset that fits: the bytes are replaced
+        (stamped(0, 0, -1), false),
+        (stamped(0, 0, i32::MIN), false),
+        (stamped(0, 0, i32::MAX), false),
+        (stamped(0, 0, 1), false),
+        (vec![1, 2, 3], false),
+        (vec![], false),
+        (vec![0, 0, 0, 0], false), // offset 0 but no room for ten bytes
+        (vec![0; 13], false),
+        (vec![0; 14], true),
+    ] {
+        let expected = if ok { Ok(()) } else { bad };
+        assert_eq!(
+            code(T::SET_VERSIONSTAMPED_KEY, &key, b"v"),
+            expected,
+            "{key:?}"
+        );
+        // The same bytes as a value.
+        assert_eq!(
+            code(T::SET_VERSIONSTAMPED_VALUE, b"k", &key),
+            expected,
+            "{key:?}"
+        );
+    }
+    // Only the versionstamped parameter is looked at: a key that is no valid value, and the
+    // other way round.
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_KEY, &stamped(0, 0, 0), b""),
+        Ok(())
+    );
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_VALUE, b"", &stamped(0, 0, 0)),
+        Ok(())
+    );
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_VALUE, &stamped(0, 0, 0), b"x"),
+        bad
+    );
+    // A plain atomic operation does not look at its operand's tail.
+    assert_eq!(code(T::ADD_VALUE, b"k", &[1, 2]), Ok(()));
+    // The offset is little-endian.
+    let mut key = vec![0u8; 300];
+    key.extend_from_slice(&[0x2c, 0x01, 0, 0]); // 300
+    assert_eq!(code(T::SET_VERSIONSTAMPED_KEY, &key, b""), bad);
+    let mut key = vec![0u8; 400];
+    key.extend_from_slice(&[0x2c, 0x01, 0, 0]);
+    assert_eq!(code(T::SET_VERSIONSTAMPED_KEY, &key, b""), Ok(()));
+    // The limits come first (the whole key counts, offset included), as in `atomicOp`.
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_KEY, &vec![0xaa; 10_001], b"").unwrap_err(),
+        error_code::KEY_TOO_LARGE
+    );
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_KEY, &stamped(1, 9_985, 1), b""),
+        Ok(())
+    );
+    assert_eq!(
+        code(T::SET_VERSIONSTAMPED_KEY, &stamped(1, 9_986, 1), b"").unwrap_err(),
+        error_code::KEY_TOO_LARGE
+    );
+    assert_eq!(
+        code(
+            T::SET_VERSIONSTAMPED_VALUE,
+            b"k",
+            &stamped(0, 100_000 - 14, 0)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        code(
+            T::SET_VERSIONSTAMPED_VALUE,
+            b"k",
+            &stamped(0, 100_000 - 13, 0)
+        )
+        .unwrap_err(),
+        error_code::VALUE_TOO_LARGE
+    );
+    // A system key has the larger limit.
+    let mut key = stamped(1, 20_000, 1);
+    key[0] = 0xff;
+    assert_eq!(code(T::SET_VERSIONSTAMPED_KEY, &key, b""), Ok(()));
+}
+
+#[test]
+fn a_failed_versionstamp_operation_buffers_nothing() {
+    let mut b = CommitBuffer::new(limits());
+    assert!(b.set_versionstamped_key(b"abc", b"v").is_err());
+    assert!(b.set_versionstamped_value(b"k", b"abc").is_err());
+    assert!(b.is_empty());
+    assert!(build(b, &CommitOptions::default()).unwrap().is_none());
+}
+
+#[test]
+fn a_versionstamped_key_has_no_write_conflict_range_a_value_has_one() {
+    let key = stamped(4, 3, 4);
+    let value = stamped(1, 2, 1);
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_key(&key, b"v").unwrap();
+    assert!(!b.is_empty(), "a mutation is something to commit");
+    let options = CommitOptions {
+        causal_write_risky: true,
+        ..CommitOptions::default()
+    };
+    // The request carries the key with its offset, as the proxy expects it (it strips it).
+    let c = build(b.clone(), &options).unwrap().unwrap();
+    assert_eq!(
+        c.mutations,
+        vec![Mutation::new(MutationType::SET_VERSIONSTAMPED_KEY, key.clone(), "v").unwrap()]
+    );
+    assert!(c.write_conflict_ranges.is_empty() && c.read_conflict_ranges.is_empty());
+
+    // Without `causal_write_risky` the transaction is a blind write: the self-conflicting key.
+    let c = build(b, &CommitOptions::default()).unwrap().unwrap();
+    let sc = fdb_native_schema::self_conflict_key(uid()).unwrap();
+    assert_eq!(c.write_conflict_ranges, vec![KeyRange::single_key(&sc)]);
+    assert_eq!(c.read_conflict_ranges, vec![KeyRange::single_key(&sc)]);
+    assert_eq!(c.mutations.len(), 1);
+
+    // The value operation writes a known key: the usual single-key range, and the mutation
+    // keeps the value's offset.
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_value(b"k", &value).unwrap();
+    let c = build(b, &options).unwrap().unwrap();
+    assert_eq!(
+        c.mutations,
+        vec![Mutation::new(MutationType::SET_VERSIONSTAMPED_VALUE, "k", value).unwrap()]
+    );
+    assert_eq!(c.write_conflict_ranges, vec![KeyRange::single_key(b"k")]);
+
+    // Both, with a read of the value's key: it intersects the value's write range, no
+    // self-conflict; and the key adds nothing.
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_key(&key, b"v").unwrap();
+    b.set_versionstamped_value(b"k", &stamped(0, 0, 0)).unwrap();
+    b.add_read_conflict_range(b"k", b"l").unwrap();
+    let c = build(b, &CommitOptions::default()).unwrap().unwrap();
+    assert_eq!(c.write_conflict_ranges, vec![KeyRange::single_key(b"k")]);
+    assert_eq!(c.read_conflict_ranges, vec![r("k", "l")]);
+    assert_eq!(
+        c.mutations.iter().map(|m| m.kind).collect::<Vec<_>>(),
+        vec![
+            MutationType::SET_VERSIONSTAMPED_KEY,
+            MutationType::SET_VERSIONSTAMPED_VALUE
+        ]
+    );
+    // An explicit write conflict range is kept as given.
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_key(&key, b"v").unwrap();
+    b.add_write_conflict_range(b"log/", b"log0").unwrap();
+    let c = build(b, &options).unwrap().unwrap();
+    assert_eq!(c.write_conflict_ranges, vec![r("log/", "log0")]);
+}
+
+#[test]
+fn versionstamped_mutations_count_their_offset_in_the_size() {
+    let key = stamped(2, 6, 2); // 22 bytes
+    let value = b"vv".to_vec();
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_key(&key, &value).unwrap();
+    let options = |size_limit| CommitOptions {
+        causal_write_risky: true,
+        size_limit,
+        ..CommitOptions::default()
+    };
+    // No conflict ranges at all: the size is the mutation's.
+    let size = MUTATION_REF_SIZE + 22 + 2;
+    assert!(build(b.clone(), &options(size)).is_ok());
+    assert_eq!(
+        build(b.clone(), &options(size - 1)).unwrap_err().code(),
+        error_code::TRANSACTION_TOO_LARGE
+    );
+
+    // A versionstamped value also has its key's write range (two key copies).
+    let mut b = CommitBuffer::new(limits());
+    b.set_versionstamped_value(b"kk", &key).unwrap();
+    let size = MUTATION_REF_SIZE + 2 + 22 + KEY_RANGE_REF_SIZE + 2 + 3;
+    assert!(build(b.clone(), &options(size)).is_ok());
+    assert_eq!(
+        build(b, &options(size - 1)).unwrap_err().code(),
+        error_code::TRANSACTION_TOO_LARGE
+    );
+}
+
+#[test]
+fn raw_mutations_are_checked_when_the_request_is_built() {
+    // `Committer::commit` takes mutations that never went through the buffer.
+    let bad = Mutation::new(MutationType::SET_VERSIONSTAMPED_KEY, "abc", "v").unwrap();
+    let e = prepare(
+        100,
+        vec![bad],
+        vec![],
+        vec![],
+        &CommitOptions::default(),
+        &limits(),
+        uid,
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), error_code::CLIENT_INVALID_OPERATION);
+    let good = Mutation::new(
+        MutationType::SET_VERSIONSTAMPED_VALUE,
+        "k",
+        stamped(0, 0, 0),
+    )
+    .unwrap();
+    let c = prepare(
+        100,
+        vec![good.clone()],
+        vec![],
+        vec![],
+        &CommitOptions::default(),
+        &limits(),
+        uid,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(c.mutations, vec![good]);
+}
+
+#[test]
+fn with_versionstamp_offset_appends_four_little_endian_bytes() {
+    assert_eq!(
+        with_versionstamp_offset(b"ab".to_vec(), 0x0102),
+        b"ab\x02\x01\0\0"
+    );
+    let key = with_versionstamp_offset([&b"x"[..], &[0xff; 10]].concat(), 1);
+    assert!(
+        CommitBuffer::new(limits())
+            .set_versionstamped_key(&key, b"")
+            .is_ok()
+    );
 }
 
 #[test]
