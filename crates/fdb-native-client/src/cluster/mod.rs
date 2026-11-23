@@ -143,8 +143,11 @@
 //! proxies are provisional unless the transaction set `USE_PROVISIONAL_PROXIES`.
 //! Every request path then waits for `onProxiesChanged()`, which `monitorClientDBInfoChange`
 //! (7.4:1010-1052) triggers when either proxy list of a new info differs.
-//! [`ClusterInfo::available_grv_proxies`], [`ClusterInfo::available_commit_proxies`] and
-//! [`ClusterMonitor::proxies`] are that rule.
+//! [`ClusterInfo::available_grv_proxies`] and [`ClusterInfo::available_commit_proxies`] are
+//! that rule; [`ClusterMonitor::grv_proxies`] and [`ClusterMonitor::commit_proxies`] wait for
+//! each (independently, as C++'s two getters are), [`ClusterMonitor::proxies`] for both, and
+//! [`ClusterMonitor::proxies_changed`] is `onProxiesChanged()`.
+//! [`ClusterInfo::first_commit_proxy`] is `firstCommitProxy`.
 //!
 //! ## Endpoints
 //!
@@ -165,23 +168,32 @@
 //!   is part of every published [`ClusterInfo`]. (C++'s multi-version client instead asks a
 //!   coordinator for its protocol version and loads the matching library.)
 //! * **Peer references.** The monitor holds a `PeerRef` to every address coordinator of the
-//!   current generation, and to the last resolved address of each hostname coordinator, as
-//!   C++'s `ClientLeaderRegInterface`s do: their connections stay up and failed ones are
-//!   probed. A new generation (a forward) releases the old ones.
+//!   current generation, as C++'s `ClientLeaderRegInterface`s do: their connections stay up
+//!   and failed ones are probed. A new generation (a forward) releases them. A hostname
+//!   coordinator's resolved address is referenced only while that coordinator is the one
+//!   being asked (C++ makes a temporary `RequestStream` per attempt), so an address the name
+//!   no longer resolves to is not kept connected and probed for the whole generation.
 //! * **Cluster file.** A [`ConnectionRecord`] with a path behaves like
 //!   `ClusterConnectionFile`: checked before each request and rewritten after a forward
-//!   (steps 3 and 5). The checks and the write are synchronous file I/O on the monitor's task,
-//!   as in C++ (they are rare and the file is at most 60000 bytes). A record without a path
-//!   is `ClusterConnectionMemoryRecord`: never checked, never written.
+//!   (steps 3 and 5), keeping the file's owner, group and mode. The checks and the write are
+//!   **blocking** synchronous file I/O on the monitor's task, as in C++'s network thread:
+//!   once per reply or failed attempt, on a file of at most 60000 bytes, but a slow file
+//!   system stalls the executor thread meanwhile (see [`ConnectionRecord`]). A record without
+//!   a path is `ClusterConnectionMemoryRecord`: never checked, never written.
 //! * **Deliberate differences.** A `forward` that is not a valid connection string makes C++'s
 //!   `ClusterConnectionString` constructor throw, which ends the monitor actor for good; here
 //!   it counts as a failure of that coordinator ([`MonitorError::InvalidForward`]) and the
 //!   next one is asked. Hostnames are resolved on every attempt (there is no DNS cache to
 //!   invalidate). `switchConnectionRecord` is not supported.
+//! * **Waiting for infos.** Each published [`ClusterInfo`] has a
+//!   [`sequence`](ClusterInfo::sequence) number. [`ClusterMonitor::changed_since`] / [`changed_after`](ClusterMonitor::changed_after)
+//!   compare with a sequence the caller holds, and a [`ClusterInfoWatch`] remembers what it
+//!   has seen, so no update is missed between two waits.
 //! * **Shutdown.** [`ClusterMonitor::shutdown`] (or dropping the monitor) aborts the task: an
 //!   outstanding request is cancelled (the transport forgets its reply token; nothing is sent
-//!   to the coordinator), the peer references are released, and every waiter gets
-//!   [`MonitorClosed`].
+//!   to the coordinator) and the peer references are released. The monitor counts as closed,
+//!   and waiters get [`MonitorClosed`], once the task's future has actually been dropped;
+//!   `shutdown` (from any number of callers) returns then.
 
 mod config;
 mod error;

@@ -46,9 +46,9 @@ pub enum RootError {
     /// CAs) are used only to complete a chain to one.
     #[error(
         "none of the {provided} CA certificates is a self-signed root: a trust anchor must be \
-         self-signed (subject equal to issuer, and an authority key identifier, if any, that does \
-         not name another key); an intermediate CA certificate alone cannot anchor a chain, so \
-         include the root that issued it"
+         self-signed (subject equal to issuer, an authority key identifier, if any, that does \
+         not name another key, and well-formed extensions); an intermediate CA certificate \
+         alone cannot anchor a chain, so include the root that issued it"
     )]
     NoAnchors {
         /// How many certificates were given.
@@ -56,9 +56,11 @@ pub enum RootError {
     },
 }
 
-/// A peer certificate that this verifier cannot accept although OpenSSL, which FDB uses, can.
-/// It is carried inside the rustls error ([`CertificateError::Other`]); each message says what
-/// to change.
+/// A peer certificate that this verifier cannot accept although OpenSSL, which FDB uses, can
+/// (or, for [`UnhandledCriticalExtension`](Self::UnhandledCriticalExtension) and
+/// [`Purpose`](Self::Purpose), one both refuse, with a reason worth spelling out). It is
+/// carried inside the rustls error ([`CertificateError::Other`]); each message says what to
+/// change.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CertificateRejected {
@@ -102,6 +104,16 @@ pub enum CertificateRejected {
     /// purpose): the keyUsage or extendedKeyUsage does not allow it.
     #[error("the peer's certificate is not valid for TLS server use: {0}")]
     Purpose(&'static str),
+    /// The peer's certificate has an RFC 3779 IP address or AS number extension
+    /// (`ipAddrBlock`, `autonomousSysNum`). OpenSSL accepts one when every certificate up the
+    /// chain covers the resources it lists; this verifier does not evaluate them and refuses
+    /// the certificate.
+    #[error(
+        "the peer's certificate has an RFC 3779 IP address or AS number extension \
+         (ipAddrBlock or autonomousSysNum), which this verifier does not evaluate although \
+         OpenSSL does; reissue the server certificate without it"
+    )]
+    IpAddressOrAsResources,
 }
 
 /// The peer's chain validated, but no `verify_peers` rule accepted its certificates. It is
@@ -162,16 +174,32 @@ pub trait PeerPolicy: fmt::Debug + Send + Sync {
 ///    that `openssl verify -purpose sslserver` rejects, with the exceptions listed under
 ///    "Differences". The server name is ignored and revocation is not checked.
 ///
-///    *Trust anchors.* Only a *self-signed* CA-file certificate can be one. Self-signed means,
-///    as for OpenSSL's `EXFLAG_SS`, that subject and issuer are identical and the authority
-///    key identifier, if present, does not contradict the certificate itself (a key
-///    identifier that differs from its own subject key identifier, or an issuer name or serial
-///    number that differs from its own). It must also be a CA (`CA:TRUE`, or a self-signed v1
+///    *Self-signed* means what OpenSSL's `EXFLAG_SS` means ([`PeerCert::is_self_signed`]):
+///    subject and issuer compare equal as `X509_NAME_cmp` compares them (canonically, so ASCII
+///    case, runs of white space and the string type do not matter), the authority key
+///    identifier, if present, does not contradict the certificate itself (a key identifier
+///    that differs from its own subject key identifier, or an issuer name or serial number
+///    that differs from its own), and the signature algorithm is one for the certificate's own
+///    kind of key. The signature itself is not part of it.
+///
+///    *Invalid* certificates are those OpenSSL marks `EXFLAG_INVALID`: one of
+///    `basicConstraints`, `keyUsage`, `extendedKeyUsage`, `nsCertType`, `subjectKeyIdentifier`,
+///    `authorityKeyIdentifier`, `subjectAltName`, `nameConstraints`, `cRLDistributionPoints`,
+///    `proxyCertInfo` and the RFC 3779 `ipAddrBlock` and `autonomousSysNum` appears twice or
+///    does not decode (as OpenSSL decodes it), the `pathLenConstraint` is negative, or the
+///    `keyUsage` has no bit set. OpenSSL can link such a certificate neither to an issuer nor
+///    to a subject, so no path through one is accepted, wherever it is: peer, intermediate,
+///    trust anchor or the root-as-peer below. *Proxy certificates* (`proxyCertInfo`) are
+///    refused wherever they are too, as FDB does not set `X509_V_FLAG_ALLOW_PROXY_CERTS`.
+///
+///    *Trust anchors.* Only a self-signed CA-file certificate that is neither invalid nor a
+///    proxy certificate can be one. It must also be a CA (`CA:TRUE`, or a self-signed v1
 ///    certificate; a keyUsage, if present, must include `keyCertSign`), have no *critical*
-///    extension outside OpenSSL's supported list (`nsCertType`, `keyUsage`, `subjectAltName`,
-///    `basicConstraints`, `certificatePolicies`, `extendedKeyUsage`, `policyConstraints`,
-///    `proxyCertInfo`, `nameConstraints`, `policyMappings`, `inhibitAnyPolicy` and the RFC 3779
-///    `ipAddrBlock` and `autonomousSysNum`; `X509_supported_extension` in
+///    extension outside OpenSSL 3.5's supported list (`nsCertType`, `keyUsage`,
+///    `subjectAltName`, `basicConstraints`, `certificatePolicies`, `cRLDistributionPoints`,
+///    `extendedKeyUsage`, the RFC 3779 `ipAddrBlock` and `autonomousSysNum`,
+///    `id-pkix-ocsp-nocheck`, `policyConstraints`, `proxyCertInfo`, `nameConstraints`,
+///    `policyMappings` and `inhibitAnyPolicy`; `X509_supported_extension` in
 ///    `crypto/x509/v3_purp.c`), and, if it has an `extendedKeyUsage`, that must include
 ///    `serverAuth` (OpenSSL 3 checks the anchor like any certificate of the chain; 1.1.1
 ///    did not). A self-signed certificate that fails these is not an anchor: certificates
@@ -179,24 +207,39 @@ pub trait PeerPolicy: fmt::Debug + Send + Sync {
 ///    Every other certificate in the CA file is offered, like a certificate the peer sent, as
 ///    a possible intermediate.
 ///
+///    *The peer's certificate* must not be invalid, a proxy certificate, or self-signed
+///    (OpenSSL's "self-signed certificate", error 18: it does not look for the issuer of a
+///    self-signed certificate, so a leaf that takes its root's name and has no key identifiers
+///    of its own is refused although the root signed it), unless it is itself a configured
+///    root (below).
+///
 ///    *Each path* webpki builds (signatures, validity, `basicConstraints`, `extendedKeyUsage`,
 ///    intermediates' `pathLenConstraint`, the name constraints that apply to the leaf's
 ///    alternative names) is then checked, and abandoned in favour of another candidate if
 ///    it fails, for:
+///    * no certificate of the path being invalid or a proxy certificate;
+///    * no intermediate being self-signed (OpenSSL stops building the chain there: "self-signed
+///      certificate in certificate chain", error 19) unless it is itself in the CA file, where
+///      OpenSSL would take it as the trust anchor. A key-rollover certificate, whose authority
+///      key identifier names the key above it, is not self-signed;
 ///    * the trust anchor's `pathLenConstraint`, which a webpki trust anchor does not carry: at
-///      most that many intermediates that are not self-issued;
+///      most that many intermediates that are not self-issued (subject and issuer
+///      byte-identical, a stricter reading than OpenSSL's canonical comparison);
 ///    * every intermediate being a CA by OpenSSL's `check_ca`, i.e. a `keyUsage`, if present,
 ///      has `keyCertSign` (webpki asks only for `CA:TRUE`);
 ///    * every certificate's authority key identifier fitting its issuer in the path
-///      (`X509_check_akid`: key identifier, issuer name and serial number);
+///      (`X509_check_akid`: key identifier; issuer name, compared canonically; serial number,
+///      compared by its content octets, so `00 FF` is not `FF`);
 ///    * the name constraints (`dNSName` and `rfc822Name` subtrees) of the intermediates and the
 ///      anchor, applied as OpenSSL's `check_name_constraints` does to the names webpki does not
 ///      look at: `emailAddress` attributes of every certificate's subject, and, for the peer's
 ///      certificate when it has no `dNSName` alternative name, each `commonName` that looks
 ///      like a host name (`NAME_CONSTRAINTS_check_CN`: two or more labels of letters, digits,
 ///      `_` and interior `-`) as a DNS name. A `commonName` that cannot be converted to
-///      UTF-8, or an `emailAddress` that is not an `IA5String`, is refused as OpenSSL
-///      refuses it.
+///      UTF-8 or has a NUL that is not trailing, or an `emailAddress` that is not an
+///      `IA5String`, is refused as OpenSSL refuses it; so is a certificate whose names
+///      (subject attributes plus alternative names) times a constraining CA's subtrees (of
+///      every type) exceed 2^20 (`NAME_CHECK_MAX`).
 /// 2. **Purpose** of the peer's certificate (OpenSSL's `ssl_server`): its extendedKeyUsage, if
 ///    present, must include `serverAuth` (or the legacy Netscape and Microsoft server-gated
 ///    crypto OIDs; `anyExtendedKeyUsage` alone is not enough, as in OpenSSL 3.5), its keyUsage,
@@ -205,24 +248,52 @@ pub trait PeerPolicy: fmt::Debug + Send + Sync {
 /// 3. **Rules**: [`VerifyPeers::evaluate`] with the peer's certificate and the self-signed
 ///    root the chain ended at.
 ///
-/// A peer certificate that is itself a self-signed certificate from the CA file is accepted
-/// as a one-certificate chain if it is in date, has no critical extension outside the list
-/// above, and passes the purpose check (the way `openssl req -x509` certificates are commonly
-/// used with FDB, with the certificate as its own CA file). It must be X.509 version 3
-/// ([`CertificateRejected::UnsupportedVersion`] otherwise): OpenSSL would accept a version 1
-/// certificate there, but rustls parses the server's certificate with webpki, so the
-/// handshake would fail anyway.
+/// A peer certificate that is itself a self-signed certificate from the CA file (byte for
+/// byte, and neither invalid nor a proxy certificate) is accepted as a one-certificate chain
+/// if it is in date, has no critical extension outside the list above, and passes the purpose
+/// check (the way `openssl req -x509` certificates are commonly used with FDB, with the
+/// certificate as its own CA file). This is the only way a self-signed peer certificate is
+/// accepted. It must be X.509 version 3 ([`CertificateRejected::UnsupportedVersion`]
+/// otherwise): OpenSSL would accept a version 1 certificate there, but rustls parses the
+/// server's certificate with webpki, so the handshake would fail anyway.
 ///
 /// `Check.Unexpired` has no effect: FDB never reads it back, and the expiry check is part of
 /// step 1.
 ///
 /// # Differences
 ///
-/// * *Stricter* than OpenSSL, because of webpki: see [`CertificateRejected`], and also a
-///   CA-file certificate whose subject equals its issuer but whose own signature does not
-///   verify (not treated as a self-signed root), a `directoryName` name constraint anywhere
-///   in the path (every certificate beneath it is refused), and a critical extension webpki
-///   does not process, such as `certificatePolicies` on an intermediate.
+/// * *Stricter* than OpenSSL, because of webpki: see [`CertificateRejected`], and also
+///   * a CA-file certificate whose subject equals its issuer but whose own signature does not
+///     verify (not treated as a self-signed root);
+///   * a critical extension webpki does not process, such as `certificatePolicies` on an
+///     intermediate;
+///   * name constraints webpki does not evaluate and refuses instead: a `directoryName`
+///     constraint anywhere in the path (every certificate beneath it is refused, permitted
+///     or excluded); an `rfc822Name` alternative name under `rfc822Name` constraints, and a
+///     `uniformResourceIdentifier` one under `uniformResourceIdentifier` constraints, even
+///     when the name satisfies them; a DNS name that webpki finds malformed (an empty label, a
+///     space or NUL, a misplaced dot or wildcard) in an alternative name or a constraint,
+///     under DNS constraints;
+///   * an intermediate whose `extendedKeyUsage` lists only the server-gated-crypto OIDs
+///     (`nsSGC`, `msSGC`) without `serverAuth`: OpenSSL accepts it, webpki asks for
+///     `serverAuth`.
+/// * *Stricter* than OpenSSL by choice, where emulating it is not worth the code:
+///   * an `id-on-SmtpUTF8Mailbox` alternative name under any `rfc822Name` constraint is
+///     refused (OpenSSL compares it with `nc_email_eai`, converting the constraint from
+///     A-labels to U-labels);
+///   * RFC 3779 IP address or AS number resources on the peer's certificate are refused
+///     ([`CertificateRejected::IpAddressOrAsResources`]; OpenSSL checks that the chain covers
+///     them). On an intermediate or the anchor they are ignored, as by OpenSSL;
+///   * BER encodings that OpenSSL's decoder tolerates in the extensions it decodes for every
+///     certificate (a constructed OCTET or character string, an indefinite length) make the
+///     certificate invalid here. No certificate tool writes them.
+/// * *Certificates OpenSSL cannot decode at all* (`d2i_X509` fails: an OID with a
+///   non-minimal subidentifier, a name attribute that is not valid UTF-8 or that is an
+///   INTEGER, and the like) are not refused for that alone; webpki and x509-parser accept
+///   them, and every other check applies. This is accepted: such a certificate cannot be
+///   what an FDB server presents, since the server loads its own certificate with OpenSSL,
+///   and it still has to chain, with valid signatures, to a configured anchor and pass every
+///   check above, so it lets no certificate in that a configured CA did not issue.
 /// * *Path building*: OpenSSL builds one path, choosing each issuer by name and, where the
 ///   certificates carry them, key identifiers. webpki backtracks over every candidate with
 ///   a matching name. A chain can therefore be accepted that OpenSSL cannot build: two roots
@@ -278,7 +349,12 @@ impl VerifyPeersVerifier {
             provided += 1;
             let invalid = |reason: String| RootError::Invalid { index, reason };
             let cert = PeerCert::from_der(der.as_ref()).map_err(|e| invalid(e.to_string()))?;
+            // OpenSSL can use neither an invalid certificate (`EXFLAG_INVALID`) nor a proxy
+            // certificate as a trust anchor or as the peer, so such a certificate is no root;
+            // as a candidate intermediate it fails the path checks.
             let self_signed = cert.is_self_signed()
+                && !cert.is_invalid()
+                && !cert.is_proxy()
                 && selfsig::check(der.as_ref(), algorithms.all) != SelfSignature::Invalid;
             if !self_signed {
                 extra.push(der);
@@ -320,6 +396,12 @@ impl VerifyPeersVerifier {
         &self.verify_peers
     }
 
+    /// Whether `der` is byte-identical to a certificate of the CA file.
+    fn is_in_ca_file(&self, der: &[u8]) -> bool {
+        self.roots.iter().any(|r| r.der.as_ref() == der)
+            || self.extra_intermediates.iter().any(|c| c.as_ref() == der)
+    }
+
     /// Validates the chain and returns the index (in `roots`) of the self-signed root it
     /// ends at. `leaf` is `end_entity` parsed.
     fn validate_chain(
@@ -345,8 +427,31 @@ impl VerifyPeersVerifier {
             if root.has_unsupported_critical_extension() {
                 return Err(rejected(CertificateRejected::UnhandledCriticalExtension));
             }
+            if root.has_ip_or_as_resources() {
+                return Err(rejected(CertificateRejected::IpAddressOrAsResources));
+            }
             check_validity(root, now).map_err(webpki_error)?;
             return Ok(index);
+        }
+
+        // What OpenSSL refuses of the peer's certificate whatever the path: a malformed or
+        // duplicated extension of the kinds it decodes (it then finds no issuer), a proxy
+        // certificate, and a self-signed certificate that is not itself in the CA file
+        // ("self-signed certificate", error 18: OpenSSL does not look for an issuer of a
+        // self-signed certificate, so one whose names and key identifiers mimic a root's is
+        // not taken as issued by that root). RFC 3779 resources are refused as well, as this
+        // verifier does not evaluate them.
+        if leaf.is_invalid() {
+            return Err(CertificateError::BadEncoding.into());
+        }
+        if leaf.is_proxy() {
+            return Err(webpki_error(webpki::Error::ExtensionValueInvalid));
+        }
+        if leaf.is_self_signed() {
+            return Err(CertificateError::UnknownIssuer.into());
+        }
+        if leaf.has_ip_or_as_resources() {
+            return Err(rejected(CertificateRejected::IpAddressOrAsResources));
         }
 
         let end_entity = EndEntityCert::try_from(end_entity).map_err(webpki_error)?;
@@ -373,7 +478,11 @@ impl VerifyPeersVerifier {
                 .map(|c| PeerCert::from_der(c.der().as_ref()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| webpki::Error::BadDer)?;
-            profile::check_path(leaf, &intermediates, &root.cert)
+            let in_ca_file: Vec<bool> = path
+                .intermediate_certificates()
+                .map(|c| self.is_in_ca_file(c.der().as_ref()))
+                .collect();
+            profile::check_path(leaf, &intermediates, &in_ca_file, &root.cert)
                 .map_err(profile::PathProblem::to_webpki)?;
             chosen.set(Some(self.anchor_roots[index]));
             Ok(())

@@ -100,7 +100,13 @@ impl<R: Runtime> ClusterMonitor<R> {
             config,
             record,
         };
-        let task = rt.spawn(task.run());
+        // Owned by the spawned future, so that the state is closed when the future is dropped
+        // (it ended, was aborted, or panicked), even if it was never polled.
+        let closed_on_end = CloseOnDrop(shared.clone());
+        let task = rt.spawn(async move {
+            let _closed_on_end = closed_on_end;
+            task.run().await;
+        });
         ClusterMonitor {
             shared,
             task: Mutex::new(Some(task)),
@@ -123,36 +129,98 @@ impl<R: Runtime> ClusterMonitor<R> {
         ClusterInfoWatch::new(self.shared.clone(), 0)
     }
 
-    /// Waits for the next info published after this call.
-    pub async fn changed(&self) -> Result<Arc<ClusterInfo>, MonitorClosed> {
-        let seen = self.shared.lock().sequence;
-        ClusterInfoWatch::new(self.shared.clone(), seen)
-            .changed()
-            .await
+    /// Resolves with the latest info once its [`sequence`](ClusterInfo::sequence) is greater
+    /// than `sequence`: at once if it already is. `changed_after(0)` is the first info.
+    /// Nothing is missed whenever the future is first polled, since the comparison is with
+    /// the sequence given, not with the state at the time of the call.
+    pub fn changed_after(
+        &self,
+        sequence: u64,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.wait_for(move |info| (info.sequence > sequence).then(|| info.clone()))
+    }
+
+    /// [`changed_after`](Self::changed_after) `info`'s sequence: the next info after `info`
+    /// (any newer one, even if it carries the same id: a coordinator re-sends its info every
+    /// `CLIENT_REGISTER_INTERVAL`).
+    pub fn changed_since(
+        &self,
+        info: &ClusterInfo,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.changed_after(info.sequence)
+    }
+
+    /// C++'s `onProxiesChanged()` (triggered by `monitorClientDBInfoChange`, NativeAPI
+    /// 7.4:1010-1052): resolves with the first info whose GRV proxies or commit proxies, the
+    /// ones the client uses ([`ClusterInfo::grv_proxies`], [`ClusterInfo::commit_proxies`]),
+    /// differ from `since`'s, compared by proxy id and order. At once if the current info's
+    /// already do. A transaction waiting for proxies races this against its request.
+    pub fn proxies_changed(
+        &self,
+        since: &ClusterInfo,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        let grv = since.grv_proxy_ids();
+        let commit = since.commit_proxy_ids();
+        self.wait_for(move |info| {
+            (info.grv_proxy_ids() != grv || info.commit_proxy_ids() != commit).then(|| info.clone())
+        })
     }
 
     /// Resolves with `f`'s first `Some`, evaluated on the current info and on every new one.
     /// `f` runs under the monitor's lock: keep it short, and do not call the monitor from it.
-    pub async fn wait_for<T>(
-        &self,
-        mut f: impl FnMut(&Arc<ClusterInfo>) -> Option<T> + Unpin,
-    ) -> Result<T, MonitorClosed> {
+    pub fn wait_for<'a, T>(
+        &'a self,
+        mut f: impl FnMut(&Arc<ClusterInfo>) -> Option<T> + Unpin + Send + 'a,
+    ) -> impl Future<Output = Result<T, MonitorClosed>> + Send + 'a
+    where
+        T: Send + 'a,
+    {
         self.shared
             .wait(move |state| state.info.as_ref().and_then(&mut f))
-            .await
     }
 
     /// The current info, or the first one to come.
-    pub async fn ready(&self) -> Result<Arc<ClusterInfo>, MonitorClosed> {
-        self.wait_for(|info| Some(info.clone())).await
+    pub fn ready(
+        &self,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.wait_for(|info| Some(info.clone()))
     }
 
-    /// The current info if it has usable GRV and commit proxies, or the first one that does
-    /// ([`ClusterInfo::has_proxies`]): what a transaction waits for during a recovery
-    /// (`onProxiesChanged`).
-    pub async fn proxies(&self, use_provisional: bool) -> Result<Arc<ClusterInfo>, MonitorClosed> {
-        self.wait_for(|info| info.has_proxies(use_provisional).then(|| info.clone()))
-            .await
+    /// The current info if it has usable GRV **and** commit proxies, or the first one that
+    /// does ([`ClusterInfo::has_proxies`]).
+    pub fn proxies(
+        &self,
+        use_provisional: bool,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.wait_for(move |info| info.has_proxies(use_provisional).then(|| info.clone()))
+    }
+
+    /// The current info if it has usable GRV proxies, or the first one that does
+    /// ([`ClusterInfo::available_grv_proxies`]; C++'s `getGrvProxies` returning non-null).
+    /// Independent of the commit proxies.
+    pub fn grv_proxies(
+        &self,
+        use_provisional: bool,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.wait_for(move |info| {
+            info.available_grv_proxies(use_provisional)
+                .is_some()
+                .then(|| info.clone())
+        })
+    }
+
+    /// The current info if it has usable commit proxies, or the first one that does
+    /// ([`ClusterInfo::available_commit_proxies`]; C++'s `getCommitProxiesFuture`).
+    /// Independent of the GRV proxies.
+    pub fn commit_proxies(
+        &self,
+        use_provisional: bool,
+    ) -> impl Future<Output = Result<Arc<ClusterInfo>, MonitorClosed>> + Send + '_ {
+        self.wait_for(move |info| {
+            info.available_commit_proxies(use_provisional)
+                .is_some()
+                .then(|| info.clone())
+        })
     }
 
     /// What the monitor is doing.
@@ -166,14 +234,16 @@ impl<R: Runtime> ClusterMonitor<R> {
         self.shared.lock().status.connection_string.clone()
     }
 
-    /// Whether the monitor was shut down.
+    /// Whether the monitor's task has ended (after [`shutdown`](Self::shutdown) or a drop
+    /// took effect, or if it panicked). From then on waits fail with [`MonitorClosed`].
     pub fn is_closed(&self) -> bool {
         self.shared.lock().closed
     }
 
     /// Stops the monitor and waits for its task to end: the outstanding request is cancelled,
     /// the coordinator references are released, and waiters get [`MonitorClosed`]. The last
-    /// info stays readable. Idempotent.
+    /// info stays readable. Idempotent; concurrent callers all return once the task has
+    /// ended.
     pub async fn shutdown(&self) {
         let task = self
             .task
@@ -181,16 +251,18 @@ impl<R: Runtime> ClusterMonitor<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(task) = task {
+            // Dropping the handle afterwards only detaches: the abort stands.
             task.abort();
-            // Aborted (or panicked): either way it has ended.
-            let _ = task.await;
         }
-        self.shared.close();
+        // The task's future closes the state when it is dropped, which is when the abort
+        // has taken effect (or the task panicked).
+        let _ = self.shared.wait(|state| state.closed.then_some(())).await;
     }
 }
 
 impl<R: Runtime> Drop for ClusterMonitor<R> {
-    /// Stops the task without waiting for it.
+    /// Aborts the task without waiting for it. Waiters get [`MonitorClosed`] once the abort
+    /// has taken effect (the task's future is dropped at its next suspension point).
     fn drop(&mut self) {
         let task = self
             .task
@@ -200,7 +272,6 @@ impl<R: Runtime> Drop for ClusterMonitor<R> {
         if let Some(task) = task {
             task.abort();
         }
-        self.shared.close();
     }
 }
 
@@ -242,7 +313,6 @@ struct MonitorTask<R: Runtime, W> {
 impl<R: Runtime, W: StreamWrapper<R::Stream>> MonitorTask<R, W> {
     /// `monitorProxies`.
     async fn run(mut self) {
-        let _close = CloseOnDrop(self.shared.clone());
         let mut info = GenerationInfo::default();
         loop {
             info = self.one_generation(info).await;
@@ -270,15 +340,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> MonitorTask<R, W> {
         let mut coordinators = cs.coordinators().to_vec();
         self.rng.shuffle(&mut coordinators);
         let n = coordinators.len();
-        // Like the generation's `ClientLeaderRegInterface`s: the address coordinators now,
-        // each hostname's address once resolved.
-        let mut references: Vec<Option<PeerRef>> = coordinators
+        // Like the generation's `ClientLeaderRegInterface`s, the address coordinators are
+        // referenced for the whole generation. A hostname's resolved address is referenced
+        // only while that coordinator is the one being asked: the next attempt may resolve to
+        // another address, and an old one should not be kept connected and probed.
+        let _references: Vec<PeerRef> = coordinators
             .iter()
-            .map(|c| {
-                c.resolved()
-                    .map(|r| self.peers.peer(&network_address(r)).reference())
-            })
+            .filter_map(Coordinator::resolved)
+            .map(|r| self.peers.peer(&network_address(r)).reference())
             .collect();
+        let mut _current_host: Option<PeerRef> = None;
         let mut sampler = ProxySampler::default();
         let mut index = 0;
         let mut success_index = 0;
@@ -313,9 +384,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> MonitorTask<R, W> {
                 Err(error) => Err(error),
                 Ok(coordinator) => {
                     let peer = self.peers.peer(&network_address(coordinator));
-                    if coordinators[index].is_host() {
-                        references[index] = Some(peer.reference());
-                    }
+                    _current_host = coordinators[index].is_host().then(|| peer.reference());
                     self.update_status(|status| status.coordinator = Some(coordinator));
                     match open_database(&peer, request).await {
                         Err(error) => Err(MonitorError::Request { coordinator, error }),
@@ -377,6 +446,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> MonitorTask<R, W> {
                         status.failures += 1;
                         status.last_error = Some(error);
                     });
+                    // Moving on: a hostname coordinator's address is no longer needed.
+                    _current_host = None;
                     index = (index + 1) % n;
                     if index == success_index {
                         all_connections_failed = true;

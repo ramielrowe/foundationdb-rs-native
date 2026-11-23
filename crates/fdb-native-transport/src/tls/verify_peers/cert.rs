@@ -6,7 +6,8 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::FromDer;
 use x509_parser::x509::{AttributeTypeAndValue, X509Name, X509Version};
 
-use super::profile::{self, Akid, NameConstraintsInfo};
+use super::exts::{self, AuthorityKeyId, GeneralName as Gn};
+use super::profile::{self, NameConstraintsInfo};
 use super::rules::{Field, MatchType};
 
 /// The [`AsnString::tag`] of a value that is not a universal, primitive ASN.1 type.
@@ -162,6 +163,18 @@ struct KeyUsageBits {
     key_cert_sign: bool,
 }
 
+impl KeyUsageBits {
+    /// From OpenSSL's `ex_kusage` ([`exts::key_usage`]).
+    fn from_openssl(bits: u16) -> KeyUsageBits {
+        KeyUsageBits {
+            digital_signature: bits & 0x80 != 0,
+            key_encipherment: bits & 0x20 != 0,
+            key_agreement: bits & 0x08 != 0,
+            key_cert_sign: bits & 0x04 != 0,
+        }
+    }
+}
+
 /// What OpenSSL's `X509_check_purpose` and chain checks look at, extracted once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Profile {
@@ -169,10 +182,23 @@ struct Profile {
     /// Whether the certificate is X.509 version 3, the only version webpki (and so rustls)
     /// accepts for a certificate it validates.
     v3: bool,
+    /// OpenSSL's `EXFLAG_INVALID`: one of the extensions OpenSSL decodes for every certificate
+    /// is duplicated or does not decode, `pathLenConstraint` is negative, or `keyUsage` has
+    /// no bit set (see [`exts`]). OpenSSL cannot link such a certificate to an issuer or to a
+    /// subject, so it is never part of a path OpenSSL accepts.
+    invalid: bool,
+    /// A `proxyCertInfo` extension (RFC 3820), in any form: OpenSSL refuses proxy
+    /// certificates unless `X509_V_FLAG_ALLOW_PROXY_CERTS` is set, which FDB does not do.
+    proxy: bool,
+    /// An RFC 3779 `ipAddrBlock` or `autonomousSysNum` extension.
+    ip_or_as_resources: bool,
+    /// The signature algorithm is one for the certificate's own kind of key
+    /// (`check_sig_alg_match`).
+    signature_matches_key: bool,
     /// basicConstraints `cA`.
     ca: Ext<bool>,
     /// basicConstraints `pathLenConstraint`, if `cA` is true and it is present.
-    path_len: Option<u32>,
+    path_len: Option<u64>,
     key_usage: Ext<KeyUsageBits>,
     /// Whether the extendedKeyUsage allows a TLS server: it lists `serverAuth` or one of the
     /// legacy server-gated-crypto OIDs. `anyExtendedKeyUsage` alone does not (see
@@ -190,6 +216,10 @@ impl Profile {
     const ABSENT: Profile = Profile {
         v1: false,
         v3: true,
+        invalid: false,
+        proxy: false,
+        ip_or_as_resources: false,
+        signature_matches_key: true,
         ca: Ext::Absent,
         path_len: None,
         key_usage: Ext::Absent,
@@ -211,22 +241,29 @@ pub struct PeerCert {
     alt_names: Option<Vec<AltName>>,
     not_before: i64,
     not_after: i64,
-    /// The subject and issuer names are byte-identical (OpenSSL's `EXFLAG_SI`).
+    /// The subject and issuer names are byte-identical. OpenSSL's `EXFLAG_SI` compares them
+    /// canonically; this stricter reading is what decides which intermediates the anchor's
+    /// `pathLenConstraint` and name constraints skip.
     self_issued: bool,
-    /// Self-issued and the authority key identifier, if any, does not contradict the
-    /// certificate's own identity (OpenSSL's `EXFLAG_SS`).
+    /// OpenSSL's `EXFLAG_SS`: see [`is_self_signed`](Self::is_self_signed).
     self_signed: bool,
     profile: Profile,
     /// subjectKeyIdentifier.
     skid: Ext<Vec<u8>>,
     /// authorityKeyIdentifier.
-    akid: Ext<Akid>,
-    /// The serial number's content octets, leading zero octets removed.
+    akid: Ext<AuthorityKeyId>,
+    /// The serial number's content octets.
     serial: Vec<u8>,
-    /// The issuer name's DER.
-    issuer_raw: Vec<u8>,
+    /// The issuer name in OpenSSL's canonical form ([`exts::canonical_name`]), `None` if
+    /// OpenSSL could not decode it.
+    issuer_canonical: Option<Vec<u8>>,
     /// The subject's `emailAddress` attributes.
     subject_emails: Vec<AsnString>,
+    /// The number of subject attributes plus the number of subjectAltName entries, which
+    /// OpenSSL's `NAME_CONSTRAINTS_check` bounds (`NAME_CHECK_MAX`).
+    name_count: usize,
+    /// A subjectAltName `otherName` of type `id-on-SmtpUTF8Mailbox`.
+    smtp_utf8_mailbox: bool,
 }
 
 /// A certificate that could not be parsed.
@@ -267,6 +304,13 @@ impl PeerCert {
             }
             _ => None,
         };
+        let san = match decode(find(cert, OID_SAN), exts::subject_alt_name) {
+            Ext::Present(names) => names,
+            _ => Vec::new(),
+        };
+        let subject_canonical = exts::canonical_name(cert.subject().as_raw());
+        let issuer_canonical = exts::canonical_name(cert.issuer().as_raw());
+        let self_issued = cert.subject().as_raw() == cert.issuer().as_raw();
         let mut out = PeerCert {
             subject: name_entries(cert.subject()),
             issuer: name_entries(cert.issuer()),
@@ -275,18 +319,27 @@ impl PeerCert {
             alt_names,
             not_before: cert.validity().not_before.timestamp(),
             not_after: cert.validity().not_after.timestamp(),
-            self_issued: cert.subject().as_raw() == cert.issuer().as_raw(),
+            self_issued,
             self_signed: false,
             profile: profile(cert),
-            skid: profile::subject_key_identifier(cert),
-            akid: profile::authority_key_identifier(cert),
-            serial: profile::trim_leading_zeros(cert.raw_serial()).to_vec(),
-            issuer_raw: cert.issuer().as_raw().to_vec(),
+            skid: decode(find(cert, OID_SKID), |v| {
+                exts::subject_key_identifier(v).map(<[u8]>::to_vec)
+            }),
+            akid: decode(find(cert, OID_AKID), exts::authority_key_identifier),
+            serial: cert.raw_serial().to_vec(),
+            issuer_canonical: issuer_canonical.clone(),
             subject_emails: email_entries(cert.subject()),
+            name_count: cert.subject().iter_attributes().count() + san.len(),
+            smtp_utf8_mailbox: san.contains(&Gn::SmtpUtf8Mailbox),
         };
-        // OpenSSL's `ossl_x509v3_cache_extensions`: a self-issued certificate is also
-        // self-signed unless its authority key identifier names somebody else.
-        out.self_signed = out.self_issued && profile::akid_allows(&out.akid, &out);
+        // OpenSSL's `ossl_x509v3_cache_extensions`: a certificate whose subject and issuer
+        // compare equal (`X509_NAME_cmp`, canonically) is self-signed unless its authority key
+        // identifier names somebody else or its signature algorithm is for another kind of key.
+        let names_equal =
+            self_issued || (subject_canonical.is_some() && subject_canonical == issuer_canonical);
+        out.self_signed = names_equal
+            && profile::akid_allows(&out.akid, &out)
+            && out.profile.signature_matches_key;
         out
     }
 
@@ -397,8 +450,10 @@ impl PeerCert {
             skid: Ext::Absent,
             akid: Ext::Absent,
             serial: Vec::new(),
-            issuer_raw: Vec::new(),
+            issuer_canonical: None,
             subject_emails: Vec::new(),
+            name_count: 0,
+            smtp_utf8_mailbox: false,
         }
     }
 
@@ -413,18 +468,38 @@ impl PeerCert {
     }
 
     /// Whether OpenSSL would call this certificate self-signed (`EXFLAG_SS`): the subject and
-    /// issuer names are byte-identical, and the authority key identifier, if there is one,
-    /// does not contradict the certificate itself (`X509_check_akid`: a key identifier that
-    /// differs from the subject key identifier, or an issuer name or serial number that
-    /// differs from the certificate's own).
+    /// issuer names are equal as `X509_NAME_cmp` compares them (canonically: string type,
+    /// ASCII case and runs of white space do not matter), the authority key identifier, if
+    /// there is one, does not contradict the certificate itself (`X509_check_akid`: a key
+    /// identifier that differs from the subject key identifier, or an issuer name or serial
+    /// number that differs from the certificate's own), and the signature algorithm is one for
+    /// the certificate's own kind of key (`check_sig_alg_match`).
     ///
-    /// The signature is not looked at.
+    /// The signature itself is not verified.
     pub fn is_self_signed(&self) -> bool {
         self.self_signed
     }
 
-    /// Whether the subject and issuer names are byte-identical (`EXFLAG_SI`), which is
-    /// all OpenSSL asks of a key-rollover certificate in the middle of a chain.
+    /// OpenSSL's `EXFLAG_INVALID`: an extension OpenSSL decodes for every certificate is
+    /// duplicated or malformed (see [`Profile::invalid`]).
+    pub(super) fn is_invalid(&self) -> bool {
+        self.profile.invalid
+    }
+
+    /// Whether the certificate has a `proxyCertInfo` extension.
+    pub(super) fn is_proxy(&self) -> bool {
+        self.profile.proxy
+    }
+
+    /// Whether the certificate has an RFC 3779 `ipAddrBlock` or `autonomousSysNum` extension.
+    pub(super) fn has_ip_or_as_resources(&self) -> bool {
+        self.profile.ip_or_as_resources
+    }
+
+    /// Whether the subject and issuer names are byte-identical (OpenSSL's `EXFLAG_SI` compares
+    /// them canonically), which is all OpenSSL asks of a key-rollover certificate in the middle
+    /// of a chain to skip it for the anchor's `pathLenConstraint` and for name constraints.
+    /// Byte-identical is the stricter reading for both: fewer certificates are skipped.
     pub(super) fn is_self_issued(&self) -> bool {
         self.self_issued
     }
@@ -441,7 +516,7 @@ impl PeerCert {
     }
 
     /// The `pathLenConstraint` of a CA certificate, if it has one.
-    pub(super) fn path_len(&self) -> Option<u32> {
+    pub(super) fn path_len(&self) -> Option<u64> {
         self.profile.path_len
     }
 
@@ -453,7 +528,7 @@ impl PeerCert {
         &self.skid
     }
 
-    pub(super) fn authority_key_identifier(&self) -> &Ext<Akid> {
+    pub(super) fn authority_key_identifier(&self) -> &Ext<AuthorityKeyId> {
         &self.akid
     }
 
@@ -461,12 +536,20 @@ impl PeerCert {
         &self.serial
     }
 
-    pub(super) fn issuer_raw(&self) -> &[u8] {
-        &self.issuer_raw
+    pub(super) fn issuer_canonical(&self) -> Option<&[u8]> {
+        self.issuer_canonical.as_deref()
     }
 
     pub(super) fn subject_emails(&self) -> &[AsnString] {
         &self.subject_emails
+    }
+
+    pub(super) fn name_count(&self) -> usize {
+        self.name_count
+    }
+
+    pub(super) fn has_smtp_utf8_mailbox(&self) -> bool {
+        self.smtp_utf8_mailbox
     }
 
     /// The subject's recognised attributes, in certificate order.
@@ -493,54 +576,108 @@ impl PeerCert {
     }
 }
 
+const OID_BC: &str = "2.5.29.19";
+const OID_KU: &str = "2.5.29.15";
+const OID_EKU: &str = "2.5.29.37";
+const OID_NS_CERT_TYPE: &str = "2.16.840.1.113730.1.1";
+const OID_SKID: &str = "2.5.29.14";
+const OID_AKID: &str = "2.5.29.35";
+const OID_SAN: &str = "2.5.29.17";
+const OID_NC: &str = "2.5.29.30";
+const OID_CRLDP: &str = "2.5.29.31";
+const OID_PROXY_CERT_INFO: &str = "1.3.6.1.5.5.7.1.14";
+const OID_IP_ADDR_BLOCKS: &str = "1.3.6.1.5.5.7.1.7";
+const OID_AS_IDENTIFIERS: &str = "1.3.6.1.5.5.7.1.8";
+
+/// The value of the one extension of the certificate with this OID: none, one, or a duplicate
+/// (invalid, as `X509_get_ext_d2i` finds it).
+fn find<'a>(cert: &X509Certificate<'a>, oid: &str) -> Ext<&'a [u8]> {
+    let mut found = cert
+        .extensions()
+        .iter()
+        .filter(|ext| ext.oid.to_id_string() == oid);
+    match (found.next(), found.next()) {
+        (None, _) => Ext::Absent,
+        (Some(ext), None) => Ext::Present(ext.value),
+        (Some(_), Some(_)) => Ext::Invalid,
+    }
+}
+
+/// An extension's value decoded by `f`; a value `f` refuses is invalid.
+fn decode<'a, T>(ext: Ext<&'a [u8]>, f: impl FnOnce(&'a [u8]) -> Option<T>) -> Ext<T> {
+    match ext {
+        Ext::Absent => Ext::Absent,
+        Ext::Invalid => Ext::Invalid,
+        Ext::Present(value) => f(value).map_or(Ext::Invalid, Ext::Present),
+    }
+}
+
+fn map<T, U>(ext: Ext<T>, f: impl FnOnce(T) -> U) -> Ext<U> {
+    match ext {
+        Ext::Absent => Ext::Absent,
+        Ext::Invalid => Ext::Invalid,
+        Ext::Present(v) => Ext::Present(f(v)),
+    }
+}
+
 fn profile(cert: &X509Certificate<'_>) -> Profile {
-    let ca = match cert.basic_constraints() {
-        Ok(Some(bc)) => Ext::Present(bc.value.ca),
-        Ok(None) => Ext::Absent,
-        Err(_) => Ext::Invalid,
+    // Decoded as OpenSSL decodes them: x509-parser is more lenient in places, and its
+    // `basic_constraints()` hides a malformed extension.
+    let bc = decode(find(cert, OID_BC), exts::basic_constraints);
+    let ku = decode(find(cert, OID_KU), exts::key_usage);
+    let eku = decode(find(cert, OID_EKU), exts::extended_key_usage);
+    let ns = decode(find(cert, OID_NS_CERT_TYPE), exts::ns_cert_type);
+    let nc = decode(find(cert, OID_NC), exts::name_constraints);
+    let fails = |oid: &str, ok: fn(&[u8]) -> bool| match find(cert, oid) {
+        Ext::Absent => false,
+        Ext::Present(value) => !ok(value),
+        Ext::Invalid => true,
     };
-    let key_usage = match cert.key_usage() {
-        Ok(Some(ku)) => Ext::Present(KeyUsageBits {
-            digital_signature: ku.value.digital_signature(),
-            key_encipherment: ku.value.key_encipherment(),
-            key_agreement: ku.value.key_agreement(),
-            key_cert_sign: ku.value.key_cert_sign(),
-        }),
-        Ok(None) => Ext::Absent,
-        Err(_) => Ext::Invalid,
-    };
-    // nsSGC and msSGC: the "server gated crypto" OIDs OpenSSL still honours. A bare
-    // anyExtendedKeyUsage does not count: `xku_reject` looks for the server bits only, and
-    // OpenSSL 3.5 (`openssl verify -purpose sslserver`) refuses a leaf, an intermediate and a
-    // trust anchor whose only EKU is anyExtendedKeyUsage, as webpki does.
-    let eku_allows_server = match cert.extended_key_usage() {
-        Ok(Some(eku)) => Ext::Present(
-            eku.value.server_auth
-                || eku.value.other.iter().any(|oid| {
-                    let id = oid.to_id_string();
-                    id == "2.16.840.1.113730.4.1" || id == "1.3.6.1.4.1.311.10.3.3"
-                }),
-        ),
-        Ok(None) => Ext::Absent,
-        Err(_) => Ext::Invalid,
-    };
-    let path_len = match cert.basic_constraints() {
-        Ok(Some(bc)) if bc.value.ca => bc.value.path_len_constraint,
-        _ => None,
-    };
+    let invalid = matches!(bc, Ext::Invalid)
+        || matches!(bc, Ext::Present(bc) if bc.negative_path_len)
+        || matches!(ku, Ext::Invalid | Ext::Present(0))
+        || matches!(eku, Ext::Invalid)
+        || matches!(ns, Ext::Invalid)
+        || matches!(nc, Ext::Invalid)
+        || fails(OID_SKID, |v| exts::subject_key_identifier(v).is_some())
+        || fails(OID_AKID, |v| exts::authority_key_identifier(v).is_some())
+        || fails(OID_SAN, |v| exts::subject_alt_name(v).is_some())
+        || fails(OID_CRLDP, exts::crl_distribution_points_ok)
+        || fails(OID_IP_ADDR_BLOCKS, exts::ip_addr_blocks_ok)
+        || fails(OID_AS_IDENTIFIERS, exts::as_identifiers_ok);
+    // serverAuth, and nsSGC and msSGC: the "server gated crypto" OIDs OpenSSL still honours.
+    // A bare anyExtendedKeyUsage does not count: `xku_reject` looks for the server bits only,
+    // and OpenSSL 3.5 (`openssl verify -purpose sslserver`) refuses a leaf, an intermediate
+    // and a trust anchor whose only EKU is anyExtendedKeyUsage, as webpki does.
+    const SERVER_EKUS: [&[u8]; 3] = [
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01],
+        &[0x60, 0x86, 0x48, 0x01, 0x86, 0xF8, 0x42, 0x04, 0x01],
+        &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x03, 0x03],
+    ];
+    let has = |oid: &str| !matches!(find(cert, oid), Ext::Absent);
     Profile {
         v1: cert.version() == X509Version::V1,
         v3: cert.version() == X509Version::V3,
-        ca,
-        path_len,
-        key_usage,
-        eku_allows_server,
-        ns_ssl_server: profile::ns_cert_type_ssl_server(cert),
+        invalid,
+        proxy: has(OID_PROXY_CERT_INFO),
+        ip_or_as_resources: has(OID_IP_ADDR_BLOCKS) || has(OID_AS_IDENTIFIERS),
+        signature_matches_key: exts::signature_matches_key(
+            &cert.tbs_certificate.signature.algorithm.to_id_string(),
+            &cert.public_key().algorithm.algorithm.to_id_string(),
+        ),
+        ca: map(bc, |bc| bc.ca),
+        path_len: match bc {
+            Ext::Present(bc) if bc.ca => bc.path_len,
+            _ => None,
+        },
+        key_usage: map(ku, KeyUsageBits::from_openssl),
+        eku_allows_server: map(eku, |oids| oids.iter().any(|o| SERVER_EKUS.contains(o))),
+        ns_ssl_server: map(ns, |bits| bits & 0x40 != 0),
         unsupported_critical: cert
             .extensions()
             .iter()
             .any(|ext| ext.critical && !profile::is_supported_extension(&ext.oid.to_id_string())),
-        name_constraints: profile::name_constraints(cert),
+        name_constraints: map(nc, |subtrees| NameConstraintsInfo::new(&subtrees)),
     }
 }
 

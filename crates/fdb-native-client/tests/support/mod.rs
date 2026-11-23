@@ -287,6 +287,19 @@ impl FakeCoordinator {
         self.announced.lock().unwrap().clone()
     }
 
+    /// Makes the coordinator speak `version` on its next connections (an upgrade); the
+    /// current ones keep theirs until closed.
+    pub fn set_version(&self, version: ProtocolVersion) {
+        self.version.store(version.0, Ordering::SeqCst);
+    }
+
+    /// Hangs up every connection, still listening (a restart).
+    pub fn close_connections(&self) {
+        for conn in self.conns.lock().unwrap().drain(..) {
+            let _ = conn.send(Cmd::Close);
+        }
+    }
+
     /// Stops listening and hangs up every connection: the coordinator is down.
     pub fn stop(&self) {
         self.net.unlisten(self.addr);

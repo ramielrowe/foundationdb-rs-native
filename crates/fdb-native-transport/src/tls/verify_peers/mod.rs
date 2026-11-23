@@ -108,29 +108,45 @@
 //!   offset.
 //! * **Chain validation** is webpki's, with OpenSSL's remaining checks added so that no chain
 //!   is accepted that OpenSSL 3 (`openssl verify -purpose sslserver`) rejects (see
-//!   [`VerifyPeersVerifier`] for the full list): only a *self-signed* CA-file certificate (the
-//!   names match and an authority key identifier, if any, does not name another key) that is
+//!   [`VerifyPeersVerifier`] for the full list): only a *self-signed* CA-file certificate (as
+//!   OpenSSL's `EXFLAG_SS`: the names compare equal canonically, an authority key identifier,
+//!   if any, does not name another key, and the signature algorithm suits the key) that is
 //!   CA-capable, has no critical extension OpenSSL does not support, and has no
 //!   `extendedKeyUsage` or one with `serverAuth`, is a trust anchor, and its validity period
 //!   is checked; the other CA-file certificates (intermediates) only complete chains; `R.`
-//!   criteria see the self-signed root. Each path webpki finds is then checked for the anchor's
-//!   `pathLenConstraint`, every intermediate's `keyCertSign`, authority key identifiers, and
-//!   name constraints on the subject's `emailAddress` and host-name-like `commonName`s. The
-//!   peer's certificate must also be valid for TLS server use (`keyUsage`,
-//!   `extendedKeyUsage` and `nsCertType`, as OpenSSL's `ssl_server` purpose). A peer that is
-//!   itself a configured, self-signed, in-date root is accepted as OpenSSL does (webpki alone
-//!   would reject a `CA:TRUE` certificate as an end entity), if it is version 3 and has no
-//!   unsupported critical extension. Revocation is not checked, as in FDB.
+//!   criteria see the self-signed root. A certificate with a duplicated or malformed extension
+//!   of the kinds OpenSSL decodes for every certificate (`EXFLAG_INVALID`), or a proxy
+//!   certificate, is refused wherever it is. Each path webpki finds is then checked for
+//!   self-signed intermediates and peer certificates (which OpenSSL does not chain further),
+//!   the anchor's `pathLenConstraint`, every intermediate's `keyCertSign`, authority key
+//!   identifiers, and name constraints on the subject's `emailAddress` and host-name-like
+//!   `commonName`s. The peer's certificate must also be valid for TLS server use
+//!   (`keyUsage`, `extendedKeyUsage` and `nsCertType`, as OpenSSL's `ssl_server` purpose). A
+//!   peer that is itself a configured, self-signed, in-date root is accepted as OpenSSL does
+//!   (webpki alone would reject a `CA:TRUE` certificate as an end entity), if it is version 3
+//!   and has no unsupported critical extension. Revocation is not checked, as in FDB.
 //! * **Certificates webpki is stricter about** than OpenSSL are refused, with errors that say
 //!   what to change where they can ([`CertificateRejected`]): an end-entity certificate with
 //!   `CA:TRUE` issued by another CA, X.509 version 1 end-entity or intermediate certificates
 //!   (a self-signed v1 root in the CA file is a fine trust anchor, but is refused as the
 //!   server's own certificate: rustls would fail the handshake anyway), a `directoryName`
-//!   name constraint anywhere in the path (permitted or excluded), a critical extension webpki
-//!   does not process, such as `certificatePolicies` on an intermediate, and a CA-file
+//!   name constraint anywhere in the path (permitted or excluded), an `rfc822Name` alternative
+//!   name under `rfc822Name` constraints and a `uniformResourceIdentifier` one under URI
+//!   constraints (webpki does not evaluate either and refuses), a DNS name webpki finds
+//!   malformed in an alternative name or constraint under DNS constraints, an intermediate
+//!   whose `extendedKeyUsage` has only the server-gated-crypto OIDs, a critical extension
+//!   webpki does not process, such as `certificatePolicies` on an intermediate, and a CA-file
 //!   certificate with a bad self-signature, which is not treated as a root (OpenSSL never
 //!   checks it). Also unsupported by the underlying libraries: RSA keys under 2048 bits, SHA-1
 //!   signatures, DSA, Ed448, and (with the `ring` provider) P-521.
+//! * **Stricter by choice**: an `id-on-SmtpUTF8Mailbox` alternative name under `rfc822Name`
+//!   constraints, and RFC 3779 IP address or AS number resources on the peer's certificate,
+//!   are refused rather than evaluated as OpenSSL evaluates them; BER-only encodings in the
+//!   extensions OpenSSL decodes for every certificate make it invalid here.
+//! * **Certificates OpenSSL cannot decode** at all (a non-minimal OID, a name attribute that
+//!   is not valid UTF-8 or is an INTEGER) are not refused for that alone, if webpki takes
+//!   them and every other check passes. An FDB server cannot present one (it loads its own
+//!   certificate with OpenSSL), and the chain still has to reach a configured anchor.
 //! * **Path building** differs, and webpki finds more: OpenSSL builds one path, picking issuers
 //!   by name (and by key identifier where the certificates carry them), while webpki backtracks
 //!   over every candidate. Two roots with the same subject and no key identifiers, where
@@ -143,9 +159,10 @@
 //!   of the chain only), so a CA file certificate with a `clientAuth`-only `extendedKeyUsage` or
 //!   an unhandled critical extension anchored a chain there; 3.x checks every certificate, and
 //!   so does this verifier.
-//! * **Name matching of malformed certificates.** A subjectAltName with any undecodable name
-//!   is treated as absent (OpenSSL fails to decode the extension), and a name attribute whose
-//!   value is not a universal primitive string never matches.
+//! * **Name matching of malformed certificates.** A subjectAltName that OpenSSL cannot decode
+//!   makes the certificate invalid, so chain validation refuses it; one that x509-parser
+//!   cannot decode is treated as absent by the rules. A name attribute whose value is not a
+//!   universal primitive string never matches.
 //! * There is no option to skip chain validation for `Check.Valid=0`: FDB does not skip it.
 //!
 //! # Differences between 7.4 and 8.0
@@ -160,6 +177,7 @@
 
 mod cert;
 mod eval;
+mod exts;
 mod profile;
 mod rules;
 mod selfsig;
