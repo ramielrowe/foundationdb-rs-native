@@ -1,9 +1,10 @@
 //! Maps and sets: `std::map`, `std::set`, `std::unordered_map` and `std::unordered_set`.
 //!
 //! All four are vectors on the wire (`vector_like_traits` in `flat_buffers.h`): a set is a
-//! vector of its keys, a map a vector of offsets to `std::pair` tables with two slots
-//! (`first`, `second`). `std::pair` is a table whatever its members are (only `std::tuple`
-//! is a struct), so a map of scalars still has one table per entry.
+//! vector of its keys, a map a vector of offsets to `std::pair` tables whose two members
+//! (`first`, `second`) are its fields, in order (a union member, such as an `Option`
+//! value, takes two slots as in any table). `std::pair` is a table whatever its members
+//! are (only `std::tuple` is a struct), so a map of scalars still has one table per entry.
 //!
 //! Decoding follows the C++ readers, which build the container with `insert(hint, value)`
 //! in wire order: an entry whose key is already present is dropped, so **the first of
@@ -36,7 +37,8 @@
 //! ```
 //!
 //! ```compile_fail
-//! // A set of unions has no wire form (use a Vec).
+//! // C++ writes a std::set of Optional/variant as a vector of unions; this crate does not
+//! // support that for sets (use a Vec of the alternatives).
 //! let set: std::collections::BTreeSet<Option<u8>> = Default::default();
 //! let _ = fdb_native_wire::encode_with_identifier(&set, 1);
 //! ```
@@ -44,7 +46,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 
-use crate::codec::preallocation;
+use crate::codec::hash_preallocation;
 use crate::{
     Decode, DecodeError, Encode, EncodeError, FileIdentified, FileIdentifier, ObjectRef, Reader,
     Shape, Wire, Wrapper, Writer,
@@ -183,7 +185,7 @@ where
             },
             |count| {
                 Ok(HashMap::with_capacity_and_hasher(
-                    preallocation::<(K, V)>(count),
+                    hash_preallocation::<(K, V)>(count),
                     S::default(),
                 ))
             },
@@ -223,7 +225,7 @@ where
             },
             |count| {
                 Ok(HashSet::with_capacity_and_hasher(
-                    preallocation::<T>(count),
+                    hash_preallocation::<T>(count),
                     S::default(),
                 ))
             },

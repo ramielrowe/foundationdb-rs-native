@@ -1,11 +1,11 @@
 //! The decoder: a bounds-checked, layout-tolerant reader.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::{Decode, DecodeError, ProtocolVersion, Shape, StrictCheck};
+use crate::{Decode, DecodeError, ProtocolVersion, Shape, StrictCheck, Wire};
 
 /// Tables may nest at most this deep below the root table (the `too_deep` check).
 pub const MAX_DEPTH: usize = 64;
@@ -43,7 +43,9 @@ pub const MAX_DEPTH: usize = 64;
 ///
 /// The budget is shared with the [`VectorView`](crate::VectorView)s a decode creates: a
 /// view charges it as its elements are read, after the decode that created it has
-/// returned. Calling [`Reader::root`] again refills it for every view of this reader.
+/// returned, and the views of one decode draw on one budget. Calling [`Reader::root`]
+/// again starts a new budget for the new decode; views of earlier decodes keep theirs
+/// (spent or not).
 ///
 /// ```
 /// use fdb_native_wire::{encode_with_identifier, Reader};
@@ -59,9 +61,15 @@ pub struct Reader<'de> {
     buf: &'de [u8],
     protocol_version: Option<ProtocolVersion>,
     depth: Cell<usize>,
-    /// Work units left. Shared (and atomic) so that lazy views, which outlive the borrow of
-    /// the reader that created them, charge the same budget.
-    budget: Arc<AtomicUsize>,
+    /// Work units left, until a lazy view is created (`is_shared`).
+    budget: Cell<usize>,
+    /// Whether the budget lives in `shared` now. A decode that creates no lazy view never
+    /// pays for atomics or an allocation.
+    is_shared: Cell<bool>,
+    /// The budget once shared (atomic) with the lazy views of the current decode, which
+    /// outlive the borrow of the reader that created them. Dropped by [`Reader::root`], so
+    /// each decode's views keep their own budget.
+    shared: RefCell<Option<Arc<AtomicUsize>>>,
 }
 
 impl<'de> Reader<'de> {
@@ -75,7 +83,9 @@ impl<'de> Reader<'de> {
             buf: bytes,
             protocol_version: None,
             depth: Cell::new(0),
-            budget: Arc::new(AtomicUsize::new(work_limit(bytes.len()))),
+            budget: Cell::new(work_limit(bytes.len())),
+            is_shared: Cell::new(false),
+            shared: RefCell::new(None),
         })
     }
 
@@ -118,8 +128,10 @@ impl<'de> Reader<'de> {
     /// The synthetic root table. Its fields are the items the message was written with
     /// (usually one). Each call starts a new [work limit](Reader#work-limit) budget.
     pub fn root(&self) -> Result<TableReader<'_, 'de>, DecodeError> {
-        self.budget
-            .store(work_limit(self.buf.len()), Ordering::Relaxed);
+        // A fresh budget: views of earlier decodes keep (and may have spent) theirs.
+        self.budget.set(work_limit(self.buf.len()));
+        self.is_shared.set(false);
+        self.shared.replace(None);
         self.table(0)
     }
 
@@ -202,8 +214,11 @@ impl<'de> Reader<'de> {
     /// that many bytes, borrowed from the buffer. Blob codecs decode their payload from
     /// this.
     pub fn blob(&self, at: usize) -> Result<&'de [u8], DecodeError> {
-        let range = self.blob_range(at)?;
-        self.slice(range.start, range.len())
+        let start = self.follow(at, 4)?;
+        let len = u32::from_le_bytes(self.array(start)?) as usize;
+        let bytes = self.slice(start + 4, len)?;
+        self.charge(len + 4)?;
+        Ok(bytes)
     }
 
     /// Where the payload of the string or blob pointed at by the offset at position `at`
@@ -319,7 +334,7 @@ impl<'de> Reader<'de> {
     /// element's wire size; each [`Decode::decode_element`] call charges the element
     /// it decodes (an inline element is already paid for here). The count is untrusted
     /// until the elements decode, so do not reserve memory for it.
-    pub fn vector_header<T: Decode<'de>>(&self, at: usize) -> Result<VectorHeader, DecodeError> {
+    pub fn vector_header<T: Wire>(&self, at: usize) -> Result<VectorHeader, DecodeError> {
         let stride = match T::SHAPE {
             // A zero-size element would let the count alone decide the allocation.
             Shape::Inline { size: 0, .. } => {
@@ -457,22 +472,41 @@ impl<'de> Reader<'de> {
     }
 
     fn charge(&self, units: usize) -> Result<(), DecodeError> {
-        self.budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                left.checked_sub(units)
-            })
-            .map(|_| ())
-            .map_err(|_| DecodeError::WorkLimit)
+        if !self.is_shared.get() {
+            return match self.budget.get().checked_sub(units) {
+                Some(left) => {
+                    self.budget.set(left);
+                    Ok(())
+                }
+                None => Err(DecodeError::WorkLimit),
+            };
+        }
+        match &*self.shared.borrow() {
+            Some(shared) => shared
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(units)
+                })
+                .map(|_| ())
+                .map_err(|_| DecodeError::WorkLimit),
+            None => Err(DecodeError::WorkLimit),
+        }
     }
 
     /// What a lazy view needs to read more of the message after this borrow of the
-    /// reader has ended.
+    /// reader has ended. The first call of a decode moves the remaining budget into a
+    /// shared atomic, which every view of the decode (and this reader) charges from then
+    /// on.
     pub(crate) fn detach(&self) -> Detached<'de> {
+        let mut shared = self.shared.borrow_mut();
+        let budget = shared.get_or_insert_with(|| {
+            self.is_shared.set(true);
+            Arc::new(AtomicUsize::new(self.budget.get()))
+        });
         Detached {
             buf: self.buf,
             protocol_version: self.protocol_version,
             depth: self.depth.get(),
-            budget: Arc::clone(&self.budget),
+            budget: Arc::clone(budget),
         }
     }
 }
@@ -496,7 +530,9 @@ impl<'de> Detached<'de> {
             buf: self.buf,
             protocol_version: self.protocol_version,
             depth: Cell::new(self.depth),
-            budget: Arc::clone(&self.budget),
+            budget: Cell::new(0),
+            is_shared: Cell::new(true),
+            shared: RefCell::new(Some(Arc::clone(&self.budget))),
         }
     }
 }
@@ -541,7 +577,9 @@ impl VectorHeader {
 
     /// The position of element `index` for [`Decode::decode_element`], or `None` if
     /// `index >= len()`. Every position returned lies within the buffer, with the whole
-    /// element (inline) or its offset (tables, strings, vectors) inside it.
+    /// element (inline) or its offset (tables, strings, vectors) inside it. That holds
+    /// for the [`Reader`] (buffer) that produced this header only: a position is not
+    /// checked against any other message.
     pub fn position(&self, index: usize) -> Option<usize> {
         // len * stride was checked to fit in the buffer, so this cannot overflow.
         (index < self.len).then(|| self.first + index * self.stride)

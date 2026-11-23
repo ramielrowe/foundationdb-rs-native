@@ -256,6 +256,10 @@ impl Writer {
                 Some(_) => Err(LONG),
             };
         }
+        // Do not reserve space for items that cannot come.
+        if items.size_hint().1.is_some_and(|most| most < count) {
+            return Err(SHORT);
+        }
         let count32 = u32::try_from(count).map_err(|_| EncodeError::TooLarge)?;
         match <I::Item as Wire>::SHAPE {
             Shape::Inline { size, align } => {

@@ -85,7 +85,7 @@
 //! plus `&T` and `Box<T>`.
 //!
 //! **Maps and sets** are vectors on the wire: a set is a vector of its keys, a map a vector
-//! of two-slot pair tables. They decode like C++ builds them, inserting in wire order, so
+//! of `{first, second}` pair tables. They decode like C++ builds them, inserting in wire order, so
 //! the first of several entries with one key wins and the wire order need not be sorted.
 //! Only `HashSet` has a [file identifier](FileIdentified) (code 6), as in FDB. They are
 //! encoded straight from the container's iterator with [`Writer::vector_iter`], which a

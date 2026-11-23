@@ -600,13 +600,9 @@ fn a_large_count_allocates_nothing_and_fails_at_the_first_bad_element() {
         view.get(999_999).err(),
         Some(DecodeError::Strict(StrictCheck::ZeroUoffset))
     );
-    // The size hint, which `collect` reserves from, is capped at 64 KiB of results.
-    let (lower, upper) = view.iter().size_hint();
-    assert_eq!(upper, Some(1 << 20));
-    assert!(
-        lower * size_of::<Result<Big, DecodeError>>() <= 64 * 1024,
-        "{lower}"
-    );
+    // The size hint, which `collect` reserves from, promises nothing (the iterator stops at
+    // the first bad element), so a hostile count reserves nothing.
+    assert_eq!(view.iter().size_hint(), (0, Some(1 << 20)));
     // One error, then the iterator is done.
     let results: Vec<Result<Big, DecodeError>> = view.iter().collect();
     assert_eq!(results.len(), 1);
@@ -715,9 +711,10 @@ fn aliasing_is_charged_per_read_like_eager_decoding() {
         assert!(gets < 1000, "re-reading an element never stops");
     }
     assert_eq!(view.get(1), Err(DecodeError::WorkLimit));
-    // A new decode from the root refills the budget for this reader's views.
-    drop(r.root().unwrap());
-    assert!(view.get(0).is_ok());
+    // A later decode from the root gets a fresh budget; this view keeps its spent one.
+    let fresh: VectorView<&[u8]> = r.decode_root().unwrap();
+    assert!(fresh.get(0).is_ok());
+    assert_eq!(view.get(0), Err(DecodeError::WorkLimit));
 }
 
 #[test]
@@ -893,4 +890,345 @@ fn lazy_elements_keep_the_nesting_limit() {
         }
     }
     assert!(boundary.is_some(), "the chain never got too deep");
+}
+
+// ---------------------------------------------------------------------------------------
+// Views in tables, nested views, budgets, and re-encoding.
+
+/// Reads every vector of `l` to the end.
+fn read_all(l: &LazyVectors<'_>) -> Result<(), DecodeError> {
+    all(&l.v_u8)?;
+    all(&l.v_u16)?;
+    all(&l.v_i32)?;
+    all(&l.v_u64)?;
+    all(&l.v_f64)?;
+    all(&l.v_str)?;
+    all(&l.v_table)?;
+    all(&l.v_empty_u32)?;
+    all(&l.v_empty_str)?;
+    all(&l.v_empty_table)?;
+    all(&l.v_bool)?;
+    Ok(())
+}
+
+/// A table of views and the eager table over the same bytes agree.
+fn check_table_views(bytes: &[u8]) -> Result<(), TestCaseError> {
+    let eager = Reader::new(bytes).map_err(fail)?.decode_root::<Vectors>();
+    let lazy = Reader::new(bytes)
+        .map_err(fail)?
+        .decode_root::<LazyVectors>();
+    match (eager, lazy) {
+        (Ok(v), Ok(l)) => {
+            prop_assert_eq!(same(&all(&l.v_u8).map_err(fail)?), same(&v.v_u8));
+            prop_assert_eq!(same(&all(&l.v_u16).map_err(fail)?), same(&v.v_u16));
+            prop_assert_eq!(same(&all(&l.v_i32).map_err(fail)?), same(&v.v_i32));
+            prop_assert_eq!(same(&all(&l.v_u64).map_err(fail)?), same(&v.v_u64));
+            prop_assert_eq!(same(&all(&l.v_f64).map_err(fail)?), same(&v.v_f64));
+            prop_assert_eq!(same(&all(&l.v_str).map_err(fail)?), same(&v.v_str));
+            prop_assert_eq!(same(&all(&l.v_table).map_err(fail)?), same(&v.v_table));
+            prop_assert_eq!(
+                same(&all(&l.v_empty_u32).map_err(fail)?),
+                same(&v.v_empty_u32)
+            );
+            prop_assert_eq!(
+                same(&all(&l.v_empty_str).map_err(fail)?),
+                same(&v.v_empty_str)
+            );
+            prop_assert_eq!(
+                same(&all(&l.v_empty_table).map_err(fail)?),
+                same(&v.v_empty_table)
+            );
+            prop_assert_eq!(same(&all(&l.v_bool).map_err(fail)?), same(&v.v_bool));
+        }
+        (Err(_), Err(_)) => {}
+        (Err(e), Ok(l)) => {
+            prop_assert!(
+                read_all(&l).is_err(),
+                "eager failed ({e}) but every view reads"
+            );
+        }
+        (Ok(_), Err(e)) => return Err(fail(format!("eager decode succeeded, views failed: {e}"))),
+    }
+    Ok(())
+}
+
+#[test]
+fn views_in_tables_match_eager_tables_on_mutated_bytes() {
+    let strategy = (Vectors::arb(), prop::collection::vec(mutation(), 1..4));
+    runner(3000)
+        .run(&strategy, |(v, mutations)| {
+            let mut bytes = encode(&v).map_err(fail)?;
+            mutate(&mut bytes, &mutations);
+            if bytes.len() < 8 {
+                return Ok(());
+            }
+            check_table_views(&bytes)
+        })
+        .unwrap();
+}
+
+/// `Vec<Vec<T>>` and `VectorView<VectorView<T>>` over the same bytes agree.
+fn check_nested<'de, T: Decode<'de> + Debug>(bytes: &'de [u8]) -> Result<(), TestCaseError> {
+    let eager = Reader::new(bytes)
+        .map_err(fail)?
+        .decode_root::<Vec<Vec<T>>>();
+    let reader = Reader::new(bytes).map_err(fail)?;
+    let lazy = reader.decode_root::<VectorView<VectorView<T>>>();
+    let walk = |outer: &VectorView<'de, VectorView<'de, T>>| -> Result<Vec<Vec<T>>, DecodeError> {
+        outer.iter().map(|inner| all(&inner?)).collect()
+    };
+    match (eager, lazy) {
+        (Ok(v), Ok(outer)) => {
+            prop_assert_eq!(outer.len(), v.len());
+            prop_assert_eq!(same(&walk(&outer).map_err(fail)?), same(&v));
+            // By index, inner by index.
+            for (i, inner) in v.iter().enumerate() {
+                let view = outer.get(i).map_err(fail)?;
+                prop_assert_eq!(view.len(), inner.len());
+                for (j, item) in inner.iter().enumerate() {
+                    prop_assert_eq!(same(&view.get(j).map_err(fail)?), same(item));
+                }
+            }
+        }
+        (Err(_), Err(_)) => {}
+        (Err(e), Ok(outer)) => {
+            prop_assert!(
+                walk(&outer).is_err(),
+                "eager failed ({e}) but the views read"
+            );
+        }
+        (Ok(_), Err(e)) => return Err(fail(format!("eager decode succeeded, views failed: {e}"))),
+    }
+    Ok(())
+}
+
+macro_rules! nested_equivalence {
+    ($($name:ident: $arb:ty => $dec:ty),* $(,)?) => {$(
+        #[test]
+        fn $name() {
+            let strategy = (
+                prop::collection::vec(prop::collection::vec(<$arb as Arb>::arb(), 0..4), 0..4),
+                prop::collection::vec(mutation(), 0..4),
+            );
+            runner(500)
+                .run(&strategy, |(items, mutations)| {
+                    let mut bytes = encode_with_identifier(&items, 1).map_err(fail)?;
+                    mutate(&mut bytes, &mutations);
+                    if bytes.len() < 8 {
+                        return Ok(());
+                    }
+                    check_nested::<$dec>(&bytes)
+                })
+                .unwrap_or_else(|e| panic!("{}: {e}", stringify!($name)));
+        }
+    )*};
+}
+
+nested_equivalence! {
+    nested_views_of_u32: u32 => u32,
+    nested_views_of_bool: bool => bool,
+    nested_views_of_bytes: Bytes => Bytes,
+    nested_views_of_borrowed: &'static [u8] => &[u8],
+    nested_views_of_tables: Small => Small,
+    nested_views_of_nested2: Nested2 => Nested2,
+}
+
+#[test]
+fn views_of_one_decode_share_a_budget_and_later_decodes_get_their_own() {
+    // Two views over strings aliased 2000 times: reading A to exhaustion starves B (they
+    // draw on the decode's one budget), but a later decode from the root has a fresh budget
+    // and does not revive A.
+    let mut w = Writer::new();
+    let blob = w.blob(&[b'x'; 2000]).unwrap();
+    let v = w.vector(&vec![Alias(blob); 300]).unwrap();
+    let mut root = w.table();
+    root.field(&Alias(v)).unwrap();
+    root.field(&Alias(v)).unwrap();
+    let root = root.finish().unwrap();
+    let bytes = w.finish(root, 1).unwrap();
+
+    // The root's two members are the two views.
+    let r = Reader::new(&bytes).unwrap();
+    let mut root = r.root().unwrap();
+    let a: VectorView<&[u8]> = root.field().unwrap();
+    let b: VectorView<&[u8]> = root.field().unwrap();
+    drop(root);
+
+    // A alone could read about (4 * len + 1024) / 2004 elements.
+    let read_a = a.iter().take_while(Result::is_ok).count();
+    assert!(read_a > 0 && read_a < 300, "{read_a}");
+    assert_eq!(a.get(0), Err(DecodeError::WorkLimit));
+    // B, a view of the same decode, is starved.
+    assert_eq!(b.get(0), Err(DecodeError::WorkLimit));
+
+    // A new decode from the root: fresh budget for its views, and A stays spent.
+    let r2_root = r.root().unwrap();
+    drop(r2_root);
+    assert_eq!(a.get(0), Err(DecodeError::WorkLimit));
+    assert_eq!(b.get(0), Err(DecodeError::WorkLimit));
+    let fresh: VectorView<&[u8]> = r.decode_root().unwrap();
+    assert!(fresh.get(0).is_ok());
+    // ... and spending the fresh budget does not touch the old views' (still spent) or the
+    // reader's: reading `fresh` to the end ends in WorkLimit, not a panic.
+    assert!(all(&fresh).is_err());
+}
+
+// ---------------------------------------------------------------------------------------
+// A table in exactly the shape the derive generates, holding views.
+
+/// The tables of a message with its vectors left lazy.
+#[derive(Debug)]
+struct Holder<'a> {
+    rows: VectorView<'a, Small>,
+    names: VectorView<'a, &'a [u8]>,
+    n: u32,
+}
+
+impl<'a> Wire for Holder<'a> {
+    const SHAPE: Shape = Shape::Table;
+}
+
+impl<'a> Encode for Holder<'a> {
+    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+        let mut t = w.table();
+        t.field(&self.rows)?;
+        t.field(&self.names)?;
+        t.field(&self.n)?;
+        t.finish()
+    }
+}
+
+impl<'__fdb_de: 'a, 'a> Decode<'__fdb_de> for Holder<'a> {
+    fn absent() -> Self {
+        Holder {
+            rows: Decode::absent(),
+            names: Decode::absent(),
+            n: Decode::absent(),
+        }
+    }
+    fn decode_object(r: &Reader<'__fdb_de>, at: usize) -> Result<Self, DecodeError> {
+        let mut t = r.table(at)?;
+        Ok(Holder {
+            rows: t.field()?,
+            names: t.field()?,
+            n: t.field()?,
+        })
+    }
+}
+
+/// The same table with `Vec`s.
+#[derive(Debug, PartialEq)]
+struct EagerHolder<'a> {
+    rows: Vec<Small>,
+    names: Vec<&'a [u8]>,
+    n: u32,
+}
+
+impl Wire for EagerHolder<'_> {
+    const SHAPE: Shape = Shape::Table;
+}
+
+impl Encode for EagerHolder<'_> {
+    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+        let mut t = w.table();
+        t.field(&self.rows)?;
+        t.field(&self.names)?;
+        t.field(&self.n)?;
+        t.finish()
+    }
+}
+
+impl<'de: 'a, 'a> Decode<'de> for EagerHolder<'a> {
+    fn absent() -> Self {
+        EagerHolder {
+            rows: vec![],
+            names: vec![],
+            n: 0,
+        }
+    }
+    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+        let mut t = r.table(at)?;
+        Ok(EagerHolder {
+            rows: t.field()?,
+            names: t.field()?,
+            n: t.field()?,
+        })
+    }
+}
+
+#[test]
+fn a_view_field_in_a_derive_shaped_table_round_trips() {
+    let strategy = (
+        Vec::<Small>::arb(),
+        prop::collection::vec(prop::collection::vec(any::<u8>(), 0..5), 0..6),
+        any::<u32>(),
+    );
+    runner(300)
+        .run(&strategy, |(rows, names, n)| {
+            let eager = EagerHolder {
+                rows,
+                names: names.iter().map(Vec::as_slice).collect(),
+                n,
+            };
+            let bytes = encode_with_identifier(&eager, 5).map_err(fail)?;
+            // Decode with views, re-encode (the views are read and written element by
+            // element), and decode that eagerly again.
+            let holder: Holder = Reader::new(&bytes)
+                .and_then(|r| r.decode_root())
+                .map_err(fail)?;
+            let again = encode_with_identifier(&holder, 5).map_err(fail)?;
+            let back: EagerHolder = Reader::new(&again)
+                .and_then(|r| r.decode_root())
+                .map_err(fail)?;
+            prop_assert_eq!(&back, &eager);
+            // And the views of the decoded message read the same as the eager value.
+            prop_assert_eq!(all(&holder.rows).map_err(fail)?, eager.rows);
+            prop_assert_eq!(all(&holder.names).map_err(fail)?, eager.names);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The header of `Holder::names` (slot 1).
+struct NamesHeader(VectorHeader);
+
+impl Wire for NamesHeader {
+    const SHAPE: Shape = Shape::Table;
+}
+
+impl<'de> Decode<'de> for NamesHeader {
+    fn absent() -> Self {
+        panic!("a Holder table is present")
+    }
+    fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
+        let mut t = r.table(at)?;
+        t.skip(1);
+        Ok(NamesHeader(t.field::<Header>()?.0))
+    }
+}
+
+#[test]
+fn re_encoding_a_view_reports_the_element_that_failed() {
+    let eager = EagerHolder {
+        rows: vec![],
+        names: vec![b"a", b"bb", b"ccc"],
+        n: 7,
+    };
+    let bytes = encode_with_identifier(&eager, 5).unwrap();
+    let NamesHeader(h) = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    // Break element 1 of `names`: a zero offset.
+    let mut bad = bytes.clone();
+    let at = h.position(1).unwrap();
+    bad[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+    let broken: Holder = Reader::new(&bad).unwrap().decode_root().unwrap();
+    assert_eq!(
+        encode_with_identifier(&broken, 5),
+        Err(EncodeError::ViewElement(DecodeError::Strict(
+            StrictCheck::ZeroUoffset
+        )))
+    );
+    // The message is still fine up to that element, and the writer reusable.
+    assert_eq!(broken.names.get(0).unwrap(), b"a");
+    let intact: Holder = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert!(encode_with_identifier(&intact, 5).is_ok());
 }

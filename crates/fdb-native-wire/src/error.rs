@@ -149,4 +149,9 @@ pub enum EncodeError {
     /// An [`ObjectRef`](crate::ObjectRef) does not belong to this writer's current message.
     #[error("object reference does not belong to this message")]
     ForeignRef,
+    /// Re-encoding a [`VectorView`](crate::VectorView) failed because one of its elements
+    /// does not decode (the message it views is malformed there, or its work budget is
+    /// spent).
+    #[error("cannot re-encode a vector view: an element failed to decode: {0}")]
+    ViewElement(DecodeError),
 }

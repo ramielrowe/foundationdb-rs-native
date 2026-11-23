@@ -478,6 +478,64 @@ fn map_with_aliased_pairs_decodes_within_the_work_limit() {
 // ---------------------------------------------------------------------------------------
 // The iterator-based writer.
 
+#[test]
+fn hash_containers_reserve_within_the_documented_cap() {
+    // A million zero elements decode into one entry; what was reserved for the count (a hash
+    // table rounds its capacity up to a power of two of buckets of element + 1 control
+    // byte each) stays within 64 KiB.
+    fn reserved<T>(set_capacity: usize) -> usize {
+        (set_capacity * 8 / 7).next_power_of_two() * (size_of::<T>() + 1)
+    }
+    let bytes = encode_with_identifier(&vec![0u32; 1 << 20], 1).unwrap();
+    let r = Reader::new(&bytes).unwrap();
+    let set: HashSet<u32> = r.decode_root().unwrap();
+    assert_eq!(set.len(), 1);
+    assert!(
+        reserved::<u32>(set.capacity()) <= 64 * 1024,
+        "{}",
+        set.capacity()
+    );
+    let bytes = encode_with_identifier(&vec![0u64; 1 << 20], 1).unwrap();
+    let set: HashSet<u64> = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert!(
+        reserved::<u64>(set.capacity()) <= 64 * 1024,
+        "{}",
+        set.capacity()
+    );
+    let bytes = encode_with_identifier(&vec![(0u64, 0u64, 0u64); 1 << 18], 1).unwrap();
+    let set: HashSet<(u64, u64, u64)> = Reader::new(&bytes).unwrap().decode_root().unwrap();
+    assert!(
+        reserved::<(u64, u64, u64)>(set.capacity()) <= 64 * 1024,
+        "{}",
+        set.capacity()
+    );
+}
+
+#[test]
+fn vector_counted_refuses_an_impossible_count_before_reserving() {
+    // A count the iterator cannot reach is an error up front, not after reserving
+    // `count * size` bytes (here 8 GiB).
+    let mut w = Writer::new();
+    assert!(matches!(
+        w.vector_counted(1 << 30, 0..3u64),
+        Err(EncodeError::InvalidShape(_))
+    ));
+    w.reset();
+    assert!(matches!(
+        w.vector_counted(
+            1 << 30,
+            std::iter::repeat_n(
+                Small {
+                    x: 0,
+                    name: Bytes::default()
+                },
+                3
+            )
+        ),
+        Err(EncodeError::InvalidShape(_))
+    ));
+}
+
 fn finish_vector(w: &mut Writer, v: ObjectRef) -> Vec<u8> {
     let mut root = w.table();
     root.field(&Alias(v)).unwrap();

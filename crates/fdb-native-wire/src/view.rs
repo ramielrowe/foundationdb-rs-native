@@ -4,9 +4,10 @@ use core::fmt;
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
 
-use crate::codec::preallocation;
 use crate::reader::Detached;
-use crate::{Decode, DecodeError, Reader, Shape, VectorHeader, Wire};
+use crate::{
+    Decode, DecodeError, Encode, EncodeError, ObjectRef, Reader, Shape, VectorHeader, Wire, Writer,
+};
 
 /// A vector whose elements are decoded when they are read, not when the vector is.
 ///
@@ -37,31 +38,40 @@ use crate::{Decode, DecodeError, Reader, Shape, VectorHeader, Wire};
 ///   in the message) is checked when the view is decoded. Each element is checked when it
 ///   is read, with every check [`Reader`] makes (offsets, vtables, bool bytes, nesting
 ///   depth, ...), so a bad element is an `Err` from [`VectorView::get`] or the iterator at
-///   that element, never a panic and never a read outside the message. Elements that are
-///   never read are never checked: a view that decoded proves only that its header is
-///   sound. Run [`iter`](VectorView::iter) to the end if you need the whole vector
-///   validated.
-/// - **Work limit.** The view shares the [work budget](Reader#work-limit) of the reader
-///   that decoded it. Decoding the view charges the header (4 + count × element wire size,
-///   as for a `Vec`); reading an element charges what decoding that element costs,
-///   **every time it is read**. A message that aliases one large object from many
-///   elements, or nests aliases, therefore stops with [`DecodeError::WorkLimit`] after the
-///   same total work as an eager decode however the elements are visited, and re-reading
-///   an element over and over cannot do unbounded work either. The price: a loop that
-///   re-reads one table element spends the budget (about the element's size each time)
-///   and ends in `WorkLimit` after roughly 4 × the message length units, so keep a
-///   decoded element if you need it again. Scalar elements are paid for by the header and
-///   can be re-read freely. Calling [`Reader::root`] again refills the budget.
+///   that element, never a panic and never a read outside the message. **Elements that are
+///   never read are never checked**, so a view accepts messages that eager decoding of the
+///   same field rejects (and so does a table holding the view): a view that decoded proves
+///   only that its header is sound. Run [`iter`](VectorView::iter) to the end if you need
+///   the whole vector validated.
+/// - **Work limit.** The view shares the [work budget](Reader#work-limit) of the decode
+///   that created it (the views of one decode share one budget; a later
+///   [`Reader::root`] starts a new budget and does not refill the old one). Decoding the
+///   view charges the header (4 + count × element wire size, as for a `Vec`); reading an
+///   element charges what decoding that element costs, **every time it is read**. A
+///   message that aliases one large object from many elements, or nests aliases,
+///   therefore stops with [`DecodeError::WorkLimit`] after the same total work as an eager
+///   decode however the elements are visited, and re-reading an element over and over
+///   cannot do unbounded work either. The price: **re-reads count toward the limit, so a
+///   perfectly valid message read enough times ends in `WorkLimit`**. One pass over a
+///   view costs about what decoding it eagerly would; the budget is 4 × the message
+///   length + 1024 units, so five full passes over a message that is mostly small tables
+///   already exhaust it. Keep a decoded element (or `collect`) if you need it again.
+///   Scalar elements are paid for by the header and can be re-read freely.
 /// - **No allocation from the count.** The view holds the header and a handle on the
-///   message, nothing sized by the count, and the lower bound of the iterator's
-///   `size_hint` is capped at 64 KiB of results, so `collect` on a message claiming
-///   billions of elements reserves little and allocates only as elements actually decode.
+///   message, nothing sized by the count, and the iterator's `size_hint` has no lower
+///   bound, so `collect` on a message claiming billions of elements reserves nothing up
+///   front and allocates only as elements actually decode.
 /// - **Depth.** Elements are decoded at the nesting depth of the table that held the view,
 ///   so the limit of [`MAX_DEPTH`](crate::MAX_DEPTH) tables applies as in an eager decode.
 ///
 /// The elements must not be unions (use `Vec` for a vector of unions). A view is `Send`
-/// and `Sync` and cheap to clone (clones share the message and the budget). It is decode
-/// only.
+/// and `Sync` and cheap to clone (clones share the message and the budget).
+///
+/// As a table field it works in `derive`d and hand-written tables like `Vec<T>` does
+/// (`Decode<'de>` for `VectorView<'a, T>` needs only `'de: 'a`). It can also be encoded: the
+/// elements are decoded one at a time and written with [`Writer::vector_counted`], so a
+/// message can be forwarded with its views intact; an element that fails to decode
+/// fails the encode with [`EncodeError::ViewElement`](crate::EncodeError::ViewElement).
 pub struct VectorView<'de, T> {
     /// What element reads continue from; `None` for an empty or absent vector.
     source: Option<Detached<'de>>,
@@ -145,7 +155,7 @@ impl<T: Wire> Wire for VectorView<'_, T> {
     };
 }
 
-impl<'de, T: Decode<'de>> Decode<'de> for VectorView<'de, T> {
+impl<'de: 'a, 'a, T: Decode<'a>> Decode<'de> for VectorView<'a, T> {
     fn absent() -> Self {
         VectorView {
             source: None,
@@ -157,10 +167,31 @@ impl<'de, T: Decode<'de>> Decode<'de> for VectorView<'de, T> {
     fn decode_object(r: &Reader<'de>, at: usize) -> Result<Self, DecodeError> {
         let header = r.vector_header::<T>(at)?;
         Ok(VectorView {
+            // `Detached` is covariant: a `'de` borrow serves as an `'a` one.
             source: (!header.is_empty()).then(|| r.detach()),
             header,
             items: PhantomData,
         })
+    }
+}
+
+/// Re-encodes the vector: each element is decoded (charging the work budget) and written
+/// from an iterator, without collecting them.
+impl<'a, T: Decode<'a> + Encode> Encode for VectorView<'a, T> {
+    fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+        let error = core::cell::Cell::new(None);
+        let elements = self.iter().map_while(|element| match element {
+            Ok(element) => Some(element),
+            Err(e) => {
+                error.set(Some(e));
+                None
+            }
+        });
+        match w.vector_counted(self.len(), elements) {
+            Ok(r) => Ok(r),
+            // The iterator ended early because an element failed: that is the cause.
+            Err(e) => Err(error.take().map_or(e, EncodeError::ViewElement)),
+        }
     }
 }
 
@@ -198,14 +229,14 @@ impl<'de, T: Decode<'de>> Iterator for VectorIter<'_, 'de, T> {
         Some(item)
     }
 
-    /// The upper bound is the number of elements left; the lower bound is capped (at 64 KiB
-    /// of results) so that collecting a hostile count cannot reserve more.
+    /// The upper bound is the number of elements left. There is no lower bound: the
+    /// iterator stops at the first element that fails to decode, so it cannot promise any
+    /// (and a hostile count must not make `collect` reserve memory).
     fn size_hint(&self) -> (usize, Option<usize>) {
         if self.failed {
             return (0, Some(0));
         }
-        let left = self.view.header.len().saturating_sub(self.next);
-        (preallocation::<Result<T, DecodeError>>(left), Some(left))
+        (0, Some(self.view.header.len().saturating_sub(self.next)))
     }
 }
 
