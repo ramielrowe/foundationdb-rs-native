@@ -1,0 +1,117 @@
+{
+  "format_version": 1,
+  "name": "containers",
+  "group": "vectors",
+  "kind": "positive",
+  "description": "std::map is a vector of pair tables {first, second} in key order; std::set is a vector of its keys in order; a vector of vectors is a vector of offsets.",
+  "cpp_type": "Containers",
+  "file_identifier": 1039109,
+  "file_identifier_hex": "0x000fdb05",
+  "size": 176,
+  "bytes": "2400000005db0f000000000008000c00040008000a001000040008000c00060008000400060000000400000018000000400000002c00000004000000030000001800000010000000040000000100000003000000000000000200000001000200030000000a000000140000001e00000002000000200000000400000070000000030000000400000005000000746872656500000088000000ffffffff04000000090000006d696e7573206f6e65000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Containers>",
+        "value": [
+          {
+            "field": "m",
+            "slot": 0,
+            "type": "vector<table<pair<i32,bytes>>>",
+            "value": [
+              {
+                "type": "table<pair<i32,bytes>>",
+                "value": [
+                  {
+                    "field": "first",
+                    "slot": 0,
+                    "type": "i32",
+                    "value": -1
+                  },
+                  {
+                    "field": "second",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "6d696e7573206f6e65"
+                  }
+                ]
+              },
+              {
+                "type": "table<pair<i32,bytes>>",
+                "value": [
+                  {
+                    "field": "first",
+                    "slot": 0,
+                    "type": "i32",
+                    "value": 3
+                  },
+                  {
+                    "field": "second",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "7468726565"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "s",
+            "slot": 1,
+            "type": "vector<u32>",
+            "value": [
+              {
+                "type": "u32",
+                "value": 10
+              },
+              {
+                "type": "u32",
+                "value": 20
+              },
+              {
+                "type": "u32",
+                "value": 30
+              }
+            ]
+          },
+          {
+            "field": "nested",
+            "slot": 2,
+            "type": "vector<vector<u16>>",
+            "value": [
+              {
+                "type": "vector<u16>",
+                "value": [
+                  {
+                    "type": "u16",
+                    "value": 1
+                  },
+                  {
+                    "type": "u16",
+                    "value": 2
+                  }
+                ]
+              },
+              {
+                "type": "vector<u16>",
+                "value": []
+              },
+              {
+                "type": "vector<u16>",
+                "value": [
+                  {
+                    "type": "u16",
+                    "value": 3
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

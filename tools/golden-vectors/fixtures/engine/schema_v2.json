@@ -1,0 +1,67 @@
+{
+  "format_version": 1,
+  "name": "schema_v2",
+  "group": "tolerance",
+  "kind": "positive",
+  "description": "SchemaV2 written and read as itself (reference for the two tolerance vectors).",
+  "cpp_type": "SchemaV2",
+  "file_identifier": 1039127,
+  "file_identifier_hex": "0x000fdb17",
+  "size": 112,
+  "bytes": "2400000017db0f0000000000000010001d000c00100004001c001400180006000800040006000000040000001e0000006300000000000000070000002c0000001c0000000c0000000100000000000000020000000100000002000000050000006578747261000000030000006e657700",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SchemaV2>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "i32",
+            "value": 7
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "bytes",
+            "value": "6e6577"
+          },
+          {
+            "field": "c",
+            "slot": 2,
+            "type": "u64",
+            "value": 99
+          },
+          {
+            "field": "d",
+            "slot": 3,
+            "type": "optional<bytes>",
+            "tag": 1,
+            "value": {
+              "type": "bytes",
+              "value": "6578747261"
+            }
+          },
+          {
+            "field": "e",
+            "slot": 5,
+            "type": "vector<u32>",
+            "value": [
+              {
+                "type": "u32",
+                "value": 1
+              },
+              {
+                "type": "u32",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

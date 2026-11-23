@@ -1,0 +1,82 @@
+{
+  "format_version": 1,
+  "name": "truncated_vtable",
+  "group": "tolerance",
+  "kind": "positive",
+  "description": "untrusted_good with the vtable length of the Untrusted table (the first u16 of its vtable) cut from 20 to 8, so it covers only slots 0 and 1: s and v decode, every later field reads as its default. Readers must bounds-check slot indexes against the vtable length.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 224,
+  "bytes": "24000000921000000000080021000400080020000c001000140018001c00060008000400060000000400000022000000a000000070000000680000005400000040000000340000000800000001000000030000001c000000140000000400000005000000646566676800000000000000030000006162630003000000010001000300000018000000000000000c000000030000000100010003000000010000000700000005000000010000000000000002000000000000000300000000000000040000000000000005000000000000000b00000068656c6c6f20776f726c6400",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Untrusted>",
+        "value": [
+          {
+            "field": "s",
+            "slot": 0,
+            "type": "bytes",
+            "value": "68656c6c6f20776f726c64"
+          },
+          {
+            "field": "v",
+            "slot": 1,
+            "type": "vector<i64>",
+            "value": [
+              {
+                "type": "i64",
+                "value": 1
+              },
+              {
+                "type": "i64",
+                "value": 2
+              },
+              {
+                "type": "i64",
+                "value": 3
+              },
+              {
+                "type": "i64",
+                "value": 4
+              },
+              {
+                "type": "i64",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "field": "o",
+            "slot": 2,
+            "type": "optional<i32>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "vo",
+            "slot": 4,
+            "type": "vector<optional<i32>>",
+            "value": []
+          },
+          {
+            "field": "b",
+            "slot": 6,
+            "type": "vector<bool>",
+            "value": []
+          },
+          {
+            "field": "strs",
+            "slot": 7,
+            "type": "vector<bytes>",
+            "value": []
+          }
+        ]
+      }
+    ]
+  }
+}

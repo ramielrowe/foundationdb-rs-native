@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "name": "array_length_17",
+  "group": "malformed",
+  "kind": "negative",
+  "description": "RejectsArrayLengthMismatch: WireBytes{vector<u8> of length 17} read as FixedBytes{array<u8,16>}.",
+  "cpp_type": "FixedBytes",
+  "file_identifier": 4343,
+  "file_identifier_hex": "0x000010f7",
+  "size": 56,
+  "bytes": "10000000f7100000000006000800040006000000040000000e0000000400000011000000ababababababababababababababababab000000",
+  "mutation": {
+    "op": "schema_mismatch",
+    "writer_cpp_type": "WireBytes"
+  },
+  "expect": "reject",
+  "reason": "array length mismatch"
+}

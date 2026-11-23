@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "string_offset_0xffffffff",
+  "group": "malformed",
+  "kind": "negative",
+  "description": "RejectsHostileStringOffsetAndLength: the string field's relative offset (at byte 48) replaced by 0xffffffff.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 112,
+  "bytes": "24000000921000000000140021000400080020000c001000140018001c00060008000400060000000400000022000000ffffffff28000000000000001c000000140000000c0000001400000000000000000000000000000000000000000000000b00000068656c6c6f20776f726c6400",
+  "mutation": {
+    "op": "overwrite_u32",
+    "pos": 48,
+    "value": 4294967295
+  },
+  "expect": "reject",
+  "reason": "read outside of buffer"
+}

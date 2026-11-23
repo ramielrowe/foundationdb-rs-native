@@ -1,0 +1,66 @@
+{
+  "format_version": 1,
+  "name": "arena_refs",
+  "group": "layout",
+  "kind": "positive",
+  "description": "VectorRef<StringRef>, StringRef and VectorRef<i64> followed by an Arena. The Arena is the last serializer argument and takes no vtable slot (its slot is null in the dump).",
+  "cpp_type": "ArenaHolder",
+  "file_identifier": 1039121,
+  "file_identifier_hex": "0x000fdb11",
+  "size": 112,
+  "bytes": "1c00000011db0f00000000000a001000040008000c000600080004000600000004000000180000002c0000001c0000000400000002000000ffffffffffffffff00000000000100000600000073696e676c650000020000001000000004000000030000004261720003000000466f6f00",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<ArenaHolder>",
+        "value": [
+          {
+            "field": "keys",
+            "slot": 0,
+            "type": "vector<bytes>",
+            "value": [
+              {
+                "type": "bytes",
+                "value": "466f6f"
+              },
+              {
+                "type": "bytes",
+                "value": "426172"
+              }
+            ]
+          },
+          {
+            "field": "single",
+            "slot": 1,
+            "type": "bytes",
+            "value": "73696e676c65"
+          },
+          {
+            "field": "nums",
+            "slot": 2,
+            "type": "vector<i64>",
+            "value": [
+              {
+                "type": "i64",
+                "value": -1
+              },
+              {
+                "type": "i64",
+                "value": 1099511627776
+              }
+            ]
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

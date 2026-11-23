@@ -1,0 +1,96 @@
+{
+  "format_version": 1,
+  "name": "array_length_16",
+  "group": "malformed",
+  "kind": "positive",
+  "description": "RejectsArrayLengthMismatch: a 16-element vector<u8> reads fine as array<u8,16>.",
+  "cpp_type": "FixedBytes",
+  "file_identifier": 4343,
+  "file_identifier_hex": "0x000010f7",
+  "size": 56,
+  "bytes": "14000000f710000000000000000006000800040006000000040000000e0000000400000010000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "writer_cpp_type": "WireBytes",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<FixedBytes>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "array<u8,16>",
+            "value": [
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              },
+              {
+                "type": "u8",
+                "value": 205
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

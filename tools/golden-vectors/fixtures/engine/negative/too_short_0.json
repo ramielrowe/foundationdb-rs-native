@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "name": "too_short_0",
+  "group": "malformed",
+  "kind": "negative",
+  "description": "A buffer of 0 bytes, shorter than the root offset + file identifier header.",
+  "cpp_type": "Untrusted",
+  "file_identifier": 4242,
+  "file_identifier_hex": "0x00001092",
+  "size": 0,
+  "bytes": "",
+  "mutation": {
+    "op": "truncate",
+    "len": 0
+  },
+  "expect": "reject",
+  "reason": "buffer too short for header"
+}

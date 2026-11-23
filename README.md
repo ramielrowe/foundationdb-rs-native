@@ -22,6 +22,14 @@ FoundationDB 7.4 and 8.0.
 | `fdb-native-testkit` | Docker test harness (not published) |
 | `fdb-native-stacktester` | Binding tester stack machine binary (not published) |
 
+## Golden vectors
+
+[`tools/golden-vectors/`](tools/golden-vectors/) is a dev-only C++ tool that builds against
+FoundationDB's own serializer headers and writes golden flatbuffers-dialect vectors (bytes plus
+decoded field dumps, and malformed-input cases) to `tools/golden-vectors/fixtures/`. The fixtures
+are checked in; the Rust crates never build or run the tool. See its
+[README](tools/golden-vectors/README.md) for the fixture format and how to regenerate.
+
 ## Testing
 
 Requires [cargo-nextest](https://nexte.st/).

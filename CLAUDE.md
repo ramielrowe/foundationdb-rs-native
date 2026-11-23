@@ -84,6 +84,12 @@ targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crate
 - `fdb-native-testkit`: Docker test harness (`publish = false`).
 - `fdb-native-stacktester`: binary for the bindingtester stack machine (`publish = false`).
 
+Outside the workspace, `tools/golden-vectors/` is a dev-only C++ tool that compiles FDB's
+flatbuffers headers and writes golden vectors to `tools/golden-vectors/fixtures/`. The fixtures
+are checked in and Rust tests read them as files; nothing in the workspace builds the tool. Its
+README documents the fixture format and the wire-format details the `wire` codec must match.
+Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check`.
+
 ## Conventions & Patterns
 
 - Shared package metadata comes from `[workspace.package]`; every crate sets `lints.workspace = true`.

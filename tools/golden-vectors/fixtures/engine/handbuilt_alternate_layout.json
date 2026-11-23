@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "name": "handbuilt_alternate_layout",
+  "group": "tolerance",
+  "kind": "positive",
+  "description": "Hand-built SchemaV1{a = 0x01020304, b = \"hello\"} in a layout the C++ writer never produces: vtables placed after their tables (negative soffset), fields in declaration order, vtables not shared. The C++ reader accepts it, so readers must not assume C++'s layout.",
+  "cpp_type": "SchemaV1",
+  "file_identifier": 1039127,
+  "file_identifier_hex": "0x000fdb17",
+  "size": 56,
+  "bytes": "0800000017db0f00e0ffffff04000000e2ffffff04030201040000000500000068656c6c6f00000006000800040008000c00040008000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SchemaV1>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "i32",
+            "value": 16909060
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "bytes",
+            "value": "68656c6c6f"
+          }
+        ]
+      }
+    ]
+  }
+}

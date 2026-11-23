@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "name": "error_or_void_success",
+  "group": "error_or",
+  "kind": "positive",
+  "description": "ErrorOr<EnsureTable<Void>> success, the reply to a ReplyPromise<Void>: tag 2, offset to an empty table (just its 4-byte vtable offset). File identifier (2 << 24) | 2010442.",
+  "cpp_type": "ErrorOr<EnsureTable<Void>>",
+  "file_identifier": 35564874,
+  "file_identifier_hex": "0x021ead4a",
+  "size": 48,
+  "bytes": "200000004aad1e020000000000000400040006000600040008000900080004000800000008000000020000001e000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<Void>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<Void>>",
+          "value": {
+            "type": "table<Void>",
+            "value": []
+          }
+        }
+      }
+    ]
+  }
+}

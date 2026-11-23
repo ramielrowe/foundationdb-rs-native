@@ -1,0 +1,71 @@
+{
+  "format_version": 1,
+  "name": "request_like",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "A request-shaped message: StringRef, i64, Optional<UID>, ReplyPromise<Inner> (a table holding the reply token UID), then Arena (no slot). Mirrors e.g. GetValueRequest's shape.",
+  "cpp_type": "RequestLike",
+  "file_identifier": 1039119,
+  "file_identifier_hex": "0x000fdb0f",
+  "size": 128,
+  "bytes": "240000000fdb0f0000000e0019000c00040018001000140006001400040006000800040006000000040000002200000002000000010000003c000000280000000c0000000100000000000000340000005555555555555555666666666666666600000000bc0a000000000000ef0d00000000000008000000736f6d652f6b6579",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<RequestLike>",
+        "value": [
+          {
+            "field": "key",
+            "slot": 0,
+            "type": "bytes",
+            "value": "736f6d652f6b6579"
+          },
+          {
+            "field": "version",
+            "slot": 1,
+            "type": "i64",
+            "value": 4294967298
+          },
+          {
+            "field": "debugID",
+            "slot": 2,
+            "type": "optional<uid>",
+            "tag": 1,
+            "value": {
+              "type": "uid",
+              "value": {
+                "first": 2748,
+                "second": 3567
+              }
+            }
+          },
+          {
+            "field": "reply",
+            "slot": 4,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6148914691236517205,
+                  "second": 7378697629483820646
+                }
+              }
+            ]
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

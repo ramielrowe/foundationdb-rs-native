@@ -1,0 +1,291 @@
+{
+  "format_version": 1,
+  "name": "vectors",
+  "group": "vectors",
+  "kind": "positive",
+  "description": "Vectors of scalars of each width, strings, tables; empty vectors of scalars, strings and tables; std::vector<bool> (one byte per element); std::array<u8,16> (same wire form as a vector; the reader rejects a length other than 16). Vector element data is aligned to max(4, element alignment) with the u32 count immediately before it.",
+  "cpp_type": "Vectors",
+  "file_identifier": 1039108,
+  "file_identifier_hex": "0x000fdb04",
+  "size": 312,
+  "bytes": "3400000004db0f00000008000c00040008001c003400040008000c001000140018001c002000240028002c00300006000800040006000000040000002a000000f0000000e0000000c8000000b00000009400000068000000380000007c00000078000000740000001c0000000400000010000000a0a1a2a3a4a5a6a7a8a9aaabacadaeaf05000000010001010000000002000000140000000400000092000000feffffff340000009e0000000100000004000000030000006f6e6500030000001c000000140000000400000005000000626364656600000000000000010000006100000002000000000000000000e03f000000000000f0bf00000000020000000807060504030201090000000000000004000000ffffffff0000000001000000ffffff7f0300000011112222333300000300000001020300",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Vectors>",
+        "value": [
+          {
+            "field": "v_u8",
+            "slot": 0,
+            "type": "vector<u8>",
+            "value": [
+              {
+                "type": "u8",
+                "value": 1
+              },
+              {
+                "type": "u8",
+                "value": 2
+              },
+              {
+                "type": "u8",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "field": "v_u16",
+            "slot": 1,
+            "type": "vector<u16>",
+            "value": [
+              {
+                "type": "u16",
+                "value": 4369
+              },
+              {
+                "type": "u16",
+                "value": 8738
+              },
+              {
+                "type": "u16",
+                "value": 13107
+              }
+            ]
+          },
+          {
+            "field": "v_i32",
+            "slot": 2,
+            "type": "vector<i32>",
+            "value": [
+              {
+                "type": "i32",
+                "value": -1
+              },
+              {
+                "type": "i32",
+                "value": 0
+              },
+              {
+                "type": "i32",
+                "value": 1
+              },
+              {
+                "type": "i32",
+                "value": 2147483647
+              }
+            ]
+          },
+          {
+            "field": "v_u64",
+            "slot": 3,
+            "type": "vector<u64>",
+            "value": [
+              {
+                "type": "u64",
+                "value": 72623859790382856
+              },
+              {
+                "type": "u64",
+                "value": 9
+              }
+            ]
+          },
+          {
+            "field": "v_f64",
+            "slot": 4,
+            "type": "vector<f64>",
+            "value": [
+              {
+                "type": "f64",
+                "value": 0.5
+              },
+              {
+                "type": "f64",
+                "value": -1.0
+              }
+            ]
+          },
+          {
+            "field": "v_str",
+            "slot": 5,
+            "type": "vector<bytes>",
+            "value": [
+              {
+                "type": "bytes",
+                "value": "61"
+              },
+              {
+                "type": "bytes",
+                "value": ""
+              },
+              {
+                "type": "bytes",
+                "value": "6263646566"
+              }
+            ]
+          },
+          {
+            "field": "v_table",
+            "slot": 6,
+            "type": "vector<table<Small>>",
+            "value": [
+              {
+                "type": "table<Small>",
+                "value": [
+                  {
+                    "field": "x",
+                    "slot": 0,
+                    "type": "i32",
+                    "value": 1
+                  },
+                  {
+                    "field": "name",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": "6f6e65"
+                  }
+                ]
+              },
+              {
+                "type": "table<Small>",
+                "value": [
+                  {
+                    "field": "x",
+                    "slot": 0,
+                    "type": "i32",
+                    "value": -2
+                  },
+                  {
+                    "field": "name",
+                    "slot": 1,
+                    "type": "bytes",
+                    "value": ""
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "field": "v_empty_u32",
+            "slot": 7,
+            "type": "vector<u32>",
+            "value": []
+          },
+          {
+            "field": "v_empty_str",
+            "slot": 8,
+            "type": "vector<bytes>",
+            "value": []
+          },
+          {
+            "field": "v_empty_table",
+            "slot": 9,
+            "type": "vector<table<Small>>",
+            "value": []
+          },
+          {
+            "field": "v_bool",
+            "slot": 10,
+            "type": "vector<bool>",
+            "value": [
+              {
+                "type": "bool",
+                "value": true
+              },
+              {
+                "type": "bool",
+                "value": false
+              },
+              {
+                "type": "bool",
+                "value": true
+              },
+              {
+                "type": "bool",
+                "value": true
+              },
+              {
+                "type": "bool",
+                "value": false
+              }
+            ]
+          },
+          {
+            "field": "fixed16",
+            "slot": 11,
+            "type": "array<u8,16>",
+            "value": [
+              {
+                "type": "u8",
+                "value": 160
+              },
+              {
+                "type": "u8",
+                "value": 161
+              },
+              {
+                "type": "u8",
+                "value": 162
+              },
+              {
+                "type": "u8",
+                "value": 163
+              },
+              {
+                "type": "u8",
+                "value": 164
+              },
+              {
+                "type": "u8",
+                "value": 165
+              },
+              {
+                "type": "u8",
+                "value": 166
+              },
+              {
+                "type": "u8",
+                "value": 167
+              },
+              {
+                "type": "u8",
+                "value": 168
+              },
+              {
+                "type": "u8",
+                "value": 169
+              },
+              {
+                "type": "u8",
+                "value": 170
+              },
+              {
+                "type": "u8",
+                "value": 171
+              },
+              {
+                "type": "u8",
+                "value": 172
+              },
+              {
+                "type": "u8",
+                "value": 173
+              },
+              {
+                "type": "u8",
+                "value": 174
+              },
+              {
+                "type": "u8",
+                "value": 175
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

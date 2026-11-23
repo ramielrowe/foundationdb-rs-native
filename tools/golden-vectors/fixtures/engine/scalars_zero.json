@@ -1,0 +1,90 @@
+{
+  "format_version": 1,
+  "name": "scalars_zero",
+  "group": "scalars",
+  "kind": "positive",
+  "description": "All-zero scalars. Default values are still written: FDB never omits a field from the vtable.",
+  "cpp_type": "Scalars",
+  "file_identifier": 1039105,
+  "file_identifier_hex": "0x000fdb01",
+  "size": 104,
+  "bytes": "2c00000001db0f00000000001a002f002c002d002e0028002a001c00200004000c0024001400060008000400060000000400000028000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Scalars>",
+        "value": [
+          {
+            "field": "b",
+            "slot": 0,
+            "type": "bool",
+            "value": false
+          },
+          {
+            "field": "u8",
+            "slot": 1,
+            "type": "u8",
+            "value": 0
+          },
+          {
+            "field": "i8",
+            "slot": 2,
+            "type": "i8",
+            "value": 0
+          },
+          {
+            "field": "u16",
+            "slot": 3,
+            "type": "u16",
+            "value": 0
+          },
+          {
+            "field": "i16",
+            "slot": 4,
+            "type": "i16",
+            "value": 0
+          },
+          {
+            "field": "u32",
+            "slot": 5,
+            "type": "u32",
+            "value": 0
+          },
+          {
+            "field": "i32",
+            "slot": 6,
+            "type": "i32",
+            "value": 0
+          },
+          {
+            "field": "u64",
+            "slot": 7,
+            "type": "u64",
+            "value": 0
+          },
+          {
+            "field": "i64",
+            "slot": 8,
+            "type": "i64",
+            "value": 0
+          },
+          {
+            "field": "f32",
+            "slot": 9,
+            "type": "f32",
+            "value": 0.0
+          },
+          {
+            "field": "f64",
+            "slot": 10,
+            "type": "f64",
+            "value": 0.0
+          }
+        ]
+      }
+    ]
+  }
+}

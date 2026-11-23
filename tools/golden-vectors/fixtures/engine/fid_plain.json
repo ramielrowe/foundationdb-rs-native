@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "name": "fid_plain",
+  "group": "file_identifier",
+  "kind": "positive",
+  "description": "Plain table Inner: file identifier 0x000fdb0a (< 2^24).",
+  "cpp_type": "Inner",
+  "file_identifier": 1039114,
+  "file_identifier_hex": "0x000fdb0a",
+  "size": 56,
+  "bytes": "1c0000000adb0f0000000000000008000c000400080006000800040006000000040000001600000001000000040000000100000078000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Inner>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "u32",
+            "value": 1
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "bytes",
+            "value": "78"
+          }
+        ]
+      }
+    ]
+  }
+}

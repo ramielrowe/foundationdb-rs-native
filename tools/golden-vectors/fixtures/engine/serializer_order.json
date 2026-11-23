@@ -1,0 +1,48 @@
+{
+  "format_version": 1,
+  "name": "serializer_order",
+  "group": "layout",
+  "kind": "positive",
+  "description": "Declaration order is a, b, c, d but serialize() calls serializer(ar, d, c, a, b): slots follow the serializer argument order (slot 0 = d, 1 = c, 2 = a, 3 = b).",
+  "cpp_type": "OrderDemo",
+  "file_identifier": 1039120,
+  "file_identifier_hex": "0x000fdb10",
+  "size": 64,
+  "bytes": "1c00000010db0f0000000c00130010000c001200040006000800040006000000040000001a000000bbbbbbbbbbbbbbbb08000000ddddaa000200000063630000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<OrderDemo>",
+        "value": [
+          {
+            "field": "d",
+            "slot": 0,
+            "type": "u16",
+            "value": 56797
+          },
+          {
+            "field": "c",
+            "slot": 1,
+            "type": "bytes",
+            "value": "6363"
+          },
+          {
+            "field": "a",
+            "slot": 2,
+            "type": "u8",
+            "value": 170
+          },
+          {
+            "field": "b",
+            "slot": 3,
+            "type": "u64",
+            "value": 13527612320720337851
+          }
+        ]
+      }
+    ]
+  }
+}

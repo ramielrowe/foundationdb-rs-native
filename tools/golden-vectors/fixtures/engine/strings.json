@@ -1,0 +1,60 @@
+{
+  "format_version": 1,
+  "name": "strings",
+  "group": "strings",
+  "kind": "positive",
+  "description": "std::string and StringRef share one wire form: u32 length, bytes, zero padding to 4, no NUL terminator. All empty strings/vectors in a message share one encoded empty blob (the first one written).",
+  "cpp_type": "Strings",
+  "file_identifier": 1039106,
+  "file_identifier_hex": "0x000fdb02",
+  "size": 112,
+  "bytes": "2000000002db0f00000010001c00040008000c0010001400180006000800040006000000040000001e0000003800000030000000240000002800000010000000040000000400000061626364050000000001fffe7f0000000300000061626300000000000500000068656c6c6f000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<Strings>",
+        "value": [
+          {
+            "field": "s",
+            "slot": 0,
+            "type": "bytes",
+            "value": "68656c6c6f"
+          },
+          {
+            "field": "empty",
+            "slot": 1,
+            "type": "bytes",
+            "value": ""
+          },
+          {
+            "field": "ref",
+            "slot": 2,
+            "type": "bytes",
+            "value": "616263"
+          },
+          {
+            "field": "emptyRef",
+            "slot": 3,
+            "type": "bytes",
+            "value": ""
+          },
+          {
+            "field": "binary",
+            "slot": 4,
+            "type": "bytes",
+            "value": "0001fffe7f"
+          },
+          {
+            "field": "len4",
+            "slot": 5,
+            "type": "bytes",
+            "value": "61626364"
+          }
+        ]
+      }
+    ]
+  }
+}

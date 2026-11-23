@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "name": "vector_bool_nonzero",
+  "group": "vectors",
+  "kind": "positive",
+  "description": "A vector<bool> message whose element bytes were changed to 02 00 ff 80: the vector<bool> reader maps every nonzero byte to true, so this decodes as [true, false, true, true].",
+  "cpp_type": "std::vector<bool>",
+  "file_identifier": 1039205,
+  "file_identifier_hex": "0x000fdb65",
+  "size": 32,
+  "bytes": "1000000065db0f0000000600080004000600000004000000040000000200ff80",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "vector<bool>",
+        "value": [
+          {
+            "type": "bool",
+            "value": true
+          },
+          {
+            "type": "bool",
+            "value": false
+          },
+          {
+            "type": "bool",
+            "value": true
+          },
+          {
+            "type": "bool",
+            "value": true
+          }
+        ]
+      }
+    ]
+  }
+}

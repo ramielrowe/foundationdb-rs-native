@@ -1,0 +1,37 @@
+{
+  "format_version": 1,
+  "name": "tolerance_new_writer_old_reader",
+  "group": "tolerance",
+  "kind": "positive",
+  "description": "Written as SchemaV2, read as SchemaV1: the extra trailing slots are ignored. Note field a and b sit at different physical offsets than in SchemaV1 because c (8 bytes) sorts first.",
+  "cpp_type": "SchemaV1",
+  "file_identifier": 1039127,
+  "file_identifier_hex": "0x000fdb17",
+  "size": 112,
+  "bytes": "2400000017db0f0000000000000010001d000c00100004001c001400180006000800040006000000040000001e0000006300000000000000070000002c0000001c0000000c0000000100000000000000020000000100000002000000050000006578747261000000030000006e657700",
+  "writer_cpp_type": "SchemaV2",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SchemaV1>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "i32",
+            "value": 7
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "bytes",
+            "value": "6e6577"
+          }
+        ]
+      }
+    ]
+  }
+}

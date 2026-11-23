@@ -1,0 +1,60 @@
+{
+  "format_version": 1,
+  "name": "nested_compat_y1_as_y2",
+  "group": "tolerance",
+  "kind": "positive",
+  "description": "flow/FlatBuffers/nestedCompat: X<Y1> read as X<Y2>; Y2 adds a trailing variant, which reads as its default (a variant missing from the vtable becomes alternative 0 default-constructed; the dump shows tag 1 value 0).",
+  "cpp_type": "X<Y2>",
+  "file_identifier": 1039209,
+  "file_identifier_hex": "0x000fdb69",
+  "size": 56,
+  "bytes": "1800000069db0f000a001000040008000c000600080004000600000004000000180000000100000008000000030000001e00000002000000",
+  "writer_cpp_type": "X<Y1>",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<X<Y2>>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "i32",
+            "value": 1
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "table<Y2>",
+            "value": [
+              {
+                "field": "a",
+                "slot": 0,
+                "type": "i32",
+                "value": 2
+              },
+              {
+                "field": "b",
+                "slot": 1,
+                "type": "variant<i32>",
+                "tag": 1,
+                "value": {
+                  "type": "i32",
+                  "value": 0
+                }
+              }
+            ]
+          },
+          {
+            "field": "c",
+            "slot": 2,
+            "type": "i32",
+            "value": 3
+          }
+        ]
+      }
+    ]
+  }
+}

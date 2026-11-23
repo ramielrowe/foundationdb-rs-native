@@ -1,0 +1,81 @@
+{
+  "format_version": 1,
+  "name": "vtable_dedup",
+  "group": "layout",
+  "kind": "positive",
+  "description": "DedupA{i32}, DedupB{u32}, DedupC{f32} and the root wrapper (one offset) all have the vtable {6, 8, 4}; it is emitted once and shared. Vtables are deduplicated by (size, alignment) of their fields, not by type.",
+  "cpp_type": "DedupHolder",
+  "file_identifier": 1039126,
+  "file_identifier_hex": "0x000fdb16",
+  "size": 96,
+  "bytes": "1c00000016db0f0000000c001400040008000c00100006000800040006000000040000001a0000003000000024000000180000000400000001000000040000002a0000000400000032000000000040403a000000020000004200000001000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<DedupHolder>",
+        "value": [
+          {
+            "field": "a",
+            "slot": 0,
+            "type": "table<DedupA>",
+            "value": [
+              {
+                "field": "x",
+                "slot": 0,
+                "type": "i32",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "b",
+            "slot": 1,
+            "type": "table<DedupB>",
+            "value": [
+              {
+                "field": "y",
+                "slot": 0,
+                "type": "u32",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "field": "c",
+            "slot": 2,
+            "type": "table<DedupC>",
+            "value": [
+              {
+                "field": "z",
+                "slot": 0,
+                "type": "f32",
+                "value": 3.0
+              }
+            ]
+          },
+          {
+            "field": "va",
+            "slot": 3,
+            "type": "vector<table<DedupA>>",
+            "value": [
+              {
+                "type": "table<DedupA>",
+                "value": [
+                  {
+                    "field": "x",
+                    "slot": 0,
+                    "type": "i32",
+                    "value": 4
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

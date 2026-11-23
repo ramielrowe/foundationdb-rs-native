@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "name": "root_vectorref_stringref",
+  "group": "layout",
+  "kind": "positive",
+  "description": "flow/FlatBuffers/VectorRef: a VectorRef<StringRef> as the root, file identifier (3 << 24) | 13300811.",
+  "cpp_type": "VectorRef<StringRef>",
+  "file_identifier": 63632459,
+  "file_identifier_hex": "0x03caf44b",
+  "size": 56,
+  "bytes": "140000004bf4ca030000000000000600080004000600000004000000020000001000000004000000030000004261720003000000466f6f00",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "vector<bytes>",
+        "value": [
+          {
+            "type": "bytes",
+            "value": "466f6f"
+          },
+          {
+            "type": "bytes",
+            "value": "426172"
+          }
+        ]
+      }
+    ]
+  }
+}
