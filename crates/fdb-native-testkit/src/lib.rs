@@ -132,10 +132,11 @@
 //! `IP:4500`; the address a client dials is that with the TLS flag, and
 //! [`FdbContainer::cluster_string`] ends in `:tls`.
 //!
-//! # Future work
+//! # Multi-process clusters
 //!
-//! A compose-based multi-process cluster variant (several `fdbserver` processes, redundancy
-//! modes beyond `single`, fault-injection scenarios) is not implemented yet.
+//! [`FdbCluster`] starts several `fdbserver` containers that form one cluster, for fault tests
+//! (kill, pause, exclude, coordinator changes, shard moves). See the [`cluster`] module docs for
+//! the recipe, the per-image details and the API.
 
 use std::env;
 use std::fmt;
@@ -150,8 +151,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
+pub mod cluster;
 pub mod tls;
 
+pub use cluster::{
+    ClusterHealth, FdbCluster, FdbClusterBuilder, Redundancy, StorageEngine, serde_json,
+};
 pub use tls::{CONTAINER_TLS_DIR, Identity, TestPki, TlsCluster};
 
 /// Environment variable selecting the Docker image.
@@ -276,6 +281,30 @@ pub enum Error {
         /// The address after.
         after: IpAddr,
     },
+    /// A cluster was configured impossibly (process count, coordinator choice, ...).
+    #[error("invalid cluster configuration: {0}")]
+    InvalidConfig(String),
+    /// An `fdbcli` command ran but did not do what was asked.
+    #[error("fdbcli `{command}` did not succeed: {output:?}")]
+    Fdbcli {
+        /// The fdbcli command.
+        command: String,
+        /// Its (trimmed) output.
+        output: String,
+    },
+    /// `status json` could not be fetched or understood.
+    #[error("cannot read cluster status: {0}")]
+    Status(String),
+    /// A multi-process cluster did not reach the wanted state before the deadline.
+    #[error("cluster not {wanted} within {timeout:?} (last state: {last})")]
+    ClusterNotReady {
+        /// What was being waited for.
+        wanted: &'static str,
+        /// The timeout that elapsed.
+        timeout: Duration,
+        /// A summary of the last state seen.
+        last: String,
+    },
 }
 
 /// Result alias for this crate.
@@ -373,13 +402,35 @@ fn docker_raw(args: &[&str], timeout: Duration) -> Result<Output> {
 }
 
 /// Runs `cmd`, killing it if it has not exited after `timeout`.
-fn run_bounded(mut cmd: Command, label: &str, timeout: Duration) -> Result<Output> {
+fn run_bounded(cmd: Command, label: &str, timeout: Duration) -> Result<Output> {
+    run_bounded_input(cmd, label, timeout, None)
+}
+
+/// Like [`run_bounded`], feeding `input` to the command's standard input (then closing it).
+fn run_bounded_input(
+    mut cmd: Command,
+    label: &str,
+    timeout: Duration,
+    input: Option<Vec<u8>>,
+) -> Result<Output> {
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(Error::Spawn)?;
+    // Written on its own thread so a command that stops reading cannot block the deadline loop;
+    // the pipe is closed when the thread ends (or when the child is killed).
+    let writer = input.zip(child.stdin.take()).map(|(input, mut stdin)| {
+        thread::spawn(move || {
+            // Best effort: the command may exit without reading everything.
+            let _ = stdin.write_all(&input);
+        })
+    });
 
     fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
         thread::spawn(move || {
@@ -415,6 +466,9 @@ fn run_bounded(mut cmd: Command, label: &str, timeout: Duration) -> Result<Outpu
             }
         }
     };
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
     Ok(Output {
@@ -422,6 +476,13 @@ fn run_bounded(mut cmd: Command, label: &str, timeout: Duration) -> Result<Outpu
         stdout,
         stderr,
     })
+}
+
+/// Runs `docker <args>` with `input` on stdin and a hard timeout; returns the raw output.
+fn docker_raw_input(args: &[&str], input: Vec<u8>, timeout: Duration) -> Result<Output> {
+    let mut cmd = Command::new(DOCKER);
+    cmd.args(args);
+    run_bounded_input(cmd, &args.join(" "), timeout, Some(input))
 }
 
 /// Runs `docker <args>`, requiring success, and returns stdout.

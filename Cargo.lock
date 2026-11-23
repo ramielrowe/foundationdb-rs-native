@@ -416,6 +416,7 @@ name = "fdb-native-testkit"
 version = "0.0.0"
 dependencies = [
  "rcgen",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

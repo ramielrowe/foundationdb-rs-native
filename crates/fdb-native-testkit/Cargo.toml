@@ -13,5 +13,6 @@ workspace = true
 
 [dependencies]
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+serde_json = "1.0.154"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
