@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use fdb_native_schema::{SpanContext, TraceFlags, v7_4};
 use fdb_native_wire::{
-    Decode, Endpoint, EnsureTable, ErrorOr, FdbError, IdempotencyIdRef, IpAddress, NetworkAddress,
-    NetworkAddressList, ReplyPromise, RequestStream, Tag, TagSetRef, Uid, VectorView,
-    VersionVector, Wire,
+    Decode, Endpoint, EnsureTable, ErrorOr, FdbError, IdempotencyIdRef, IpAddress,
+    KeyValueVectorRef, NetworkAddress, NetworkAddressList, ReplyPromise, RequestStream, Tag,
+    TagSetRef, Uid, VectorView, VersionVector, Wire,
 };
 use serde_json::{Map, Value, json};
 
@@ -499,6 +499,20 @@ impl Dump for VersionVector {
     }
 }
 
+/// `VectorRef<KeyValueRef, VecSerStrategy::String>`: one blob, dumped as its pairs.
+impl Dump for KeyValueVectorRef<'_> {
+    fn type_name() -> String {
+        "preserialized_kv_vector".into()
+    }
+    fn node(&self) -> Value {
+        let pairs = self
+            .iter()
+            .map(|kv| json!({ "key": hex_encode(kv.key), "value": hex_encode(kv.value) }))
+            .collect();
+        node(Self::type_name(), Value::Array(pairs))
+    }
+}
+
 impl Dump for IdempotencyIdRef<'_> {
     fn type_name() -> String {
         "bytes".into()
@@ -588,8 +602,9 @@ macro_rules! dump_table {
 // Shared by both versions (v7_4 re-exports them, as does v8_0).
 use v7_4::{
     ClientTagThrottleLimits, ClientTrCommitCostEstimation, ClientVersionRef, CommitID,
-    CommitProxyInterface, CommitTransactionRef, GetValueReply, GrvProxyInterface, Hostname,
-    LocalityData, OpenDatabaseCoordRequest, StorageServerInterface, VersionHistory,
+    CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyValuesReply, GetValueReply,
+    GrvProxyInterface, Hostname, KeySelectorRef, LocalityData, OpenDatabaseCoordRequest,
+    StorageServerInterface, VersionHistory, WatchValueReply,
 };
 
 dump_table!("SpanContext" SpanContext { trace_id = "traceID", span_id = "spanID", flags = "m_Flags" });
@@ -621,6 +636,17 @@ dump_table!("ClientTagThrottleLimits" ClientTagThrottleLimits { tps_rate = "tpsR
 dump_table!("GetValueReply" GetValueReply<'a> {
     penalty = "penalty", error = "error", value = "value", cached = "cached",
 });
+dump_table!("KeySelectorRef" KeySelectorRef<'a> {
+    key = "key", or_equal = "orEqual", offset = "offset",
+});
+dump_table!("GetKeyReply" GetKeyReply<'a> {
+    penalty = "penalty", error = "error", sel = "sel", cached = "cached",
+});
+dump_table!("GetKeyValuesReply" GetKeyValuesReply<'a> {
+    penalty = "penalty", error = "error", data = "data", version = "version", more = "more",
+    cached = "cached",
+} @arena);
+dump_table!("WatchValueReply" WatchValueReply { version = "version", cached = "cached" });
 dump_table!("ClientTrCommitCostEstimation" ClientTrCommitCostEstimation {
     ops_count = "opsCount", write_costs = "writeCosts", clear_idx_costs = "clearIdxCosts",
     expensive_cost_est_count = "expensiveCostEstCount",
@@ -658,9 +684,10 @@ impl<R: Dump + Wire> Dump for v7_4::GetKeyServerLocationsReply<'_, R> {
 mod release_7_4 {
     use super::*;
     use fdb_native_schema::v7_4::{
-        ClientDBInfo, CommitTransactionRequest, EncryptKeyProxyInterface,
-        GetKeyServerLocationsRequest, GetReadVersionReply, GetReadVersionRequest, GetValueRequest,
-        ReadOptions, TenantInfo, TenantMode, WipedString,
+        ClientDBInfo, CommitTransactionRequest, EncryptKeyProxyInterface, GetKeyRequest,
+        GetKeyServerLocationsRequest, GetKeyValuesRequest, GetReadVersionReply,
+        GetReadVersionRequest, GetValueRequest, ReadOptions, TenantInfo, TenantMode,
+        WatchValueRequest, WipedString,
     };
 
     dump_table!("WipedString" WipedString<'a> { ws = "ws" } @arena);
@@ -707,14 +734,30 @@ mod release_7_4 {
         span_context = "spanContext", tenant_info = "tenantInfo",
         idempotency_id = "idempotencyId",
     } @arena);
+    dump_table!("GetKeyRequest" GetKeyRequest<'a> {
+        sel = "sel", version = "version", tags = "tags", reply = "reply",
+        span_context = "spanContext", tenant_info = "tenantInfo", options = "options",
+        ss_latest_commit_versions = "ssLatestCommitVersions",
+    } @arena);
+    dump_table!("GetKeyValuesRequest" GetKeyValuesRequest<'a> {
+        begin = "begin", end = "end", version = "version", limit = "limit",
+        limit_bytes = "limitBytes", tags = "tags", reply = "reply",
+        span_context = "spanContext", tenant_info = "tenantInfo", options = "options",
+        ss_latest_commit_versions = "ssLatestCommitVersions",
+    } @arena);
+    dump_table!("WatchValueRequest" WatchValueRequest<'a> {
+        key = "key", value = "value", version = "version", tags = "tags", debug_id = "debugID",
+        reply = "reply", span_context = "spanContext", tenant_info = "tenantInfo",
+    });
 }
 
 /// The 8.0-only types.
 mod release_8_0 {
     use super::*;
     use fdb_native_schema::v8_0::{
-        CdcProxyInterface, ClientDBInfo, CommitTransactionRequest, GetKeyServerLocationsRequest,
-        GetReadVersionReply, GetReadVersionRequest, GetValueRequest, ReadOptions,
+        CdcProxyInterface, ClientDBInfo, CommitTransactionRequest, GetKeyRequest,
+        GetKeyServerLocationsRequest, GetKeyValuesRequest, GetReadVersionReply,
+        GetReadVersionRequest, GetValueRequest, ReadOptions, WatchValueRequest,
     };
 
     dump_table!("CDCProxyInterface" CdcProxyInterface<'a> {
@@ -759,4 +802,19 @@ mod release_8_0 {
         commit_cost_estimation = "commitCostEstimation", tag_set = "tagSet",
         span_context = "spanContext", idempotency_id = "idempotencyId",
     } @arena);
+    dump_table!("GetKeyRequest" GetKeyRequest<'a> {
+        sel = "sel", version = "version", tags = "tags", reply = "reply",
+        span_context = "spanContext", options = "options",
+        ss_latest_commit_versions = "ssLatestCommitVersions",
+    } @arena);
+    dump_table!("GetKeyValuesRequest" GetKeyValuesRequest<'a> {
+        begin = "begin", end = "end", version = "version", limit = "limit",
+        limit_bytes = "limitBytes", tags = "tags", reply = "reply",
+        span_context = "spanContext", options = "options",
+        ss_latest_commit_versions = "ssLatestCommitVersions", task_id = "taskID",
+    } @arena);
+    dump_table!("WatchValueRequest" WatchValueRequest<'a> {
+        key = "key", value = "value", version = "version", tags = "tags", debug_id = "debugID",
+        reply = "reply", span_context = "spanContext",
+    });
 }

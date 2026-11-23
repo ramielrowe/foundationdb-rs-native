@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use fdb_native_wire::{
-    Decode, DecodeError, Encode, EncodeError, FdbError, NetworkAddress, ObjectRef, Reader,
-    ReplyPromise, RequestStream, Shape, Tag, Uid, VectorView, Wire, Writer,
+    Decode, DecodeError, Encode, EncodeError, FdbError, KeyValueVectorRef, NetworkAddress,
+    ObjectRef, Reader, ReplyPromise, RequestStream, Shape, Tag, Uid, VectorView, Wire, Writer,
 };
 
 use crate::SchemaVersion;
@@ -881,6 +881,219 @@ impl<'a> From<&domain::GetValueReply<'a>> for GetValueReply<'a> {
             penalty: r.penalty,
             error: r.error,
             value: r.value,
+            cached: r.cached,
+        }
+    }
+}
+
+/// `KeySelectorRef` (`serializer(ar, key, orEqual, offset)`): the key a selector is anchored
+/// at, whether the anchor itself counts (`orEqual`), and how many keys to move from it
+/// (`offset`). `KeySelector`, the `Standalone` form, has the same wire form.
+///
+/// Absent: `KeySelectorRef() : orEqual(false), offset(0)` with an empty key (7.4 and 8.0):
+/// zero.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeySelectorRef<'a> {
+    /// `key`.
+    pub key: &'a [u8],
+    /// `orEqual`.
+    pub or_equal: bool,
+    /// `offset`.
+    pub offset: i32,
+}
+
+impl<'a> From<&'a domain::KeySelector> for KeySelectorRef<'a> {
+    fn from(s: &'a domain::KeySelector) -> Self {
+        KeySelectorRef {
+            key: &s.key,
+            or_equal: s.or_equal,
+            offset: s.offset,
+        }
+    }
+}
+
+impl<'a> From<KeySelectorRef<'a>> for domain::KeySelectorRef<'a> {
+    fn from(s: KeySelectorRef<'a>) -> Self {
+        domain::KeySelectorRef {
+            key: s.key,
+            or_equal: s.or_equal,
+            offset: s.offset,
+        }
+    }
+}
+
+impl<'a> From<domain::KeySelectorRef<'a>> for KeySelectorRef<'a> {
+    fn from(s: domain::KeySelectorRef<'a>) -> Self {
+        KeySelectorRef {
+            key: s.key,
+            or_equal: s.or_equal,
+            offset: s.offset,
+        }
+    }
+}
+
+impl From<KeySelectorRef<'_>> for domain::KeySelector {
+    fn from(s: KeySelectorRef<'_>) -> Self {
+        domain::KeySelector {
+            key: s.key.to_vec(),
+            or_equal: s.or_equal,
+            offset: s.offset,
+        }
+    }
+}
+
+/// `GetKeyReply` (`serializer(ar, LoadBalancedReply::penalty, LoadBalancedReply::error, sel,
+/// cached)`): the selector the server resolved the request's selector to (`sel` is a
+/// `KeySelector`). The key borrows from the message. [`Default`] is `GetKeyReply()`.
+///
+/// Absent: `GetKeyReply() : cached(false)` over `LoadBalancedReply()`, that is, `penalty =
+/// 1.0` (7.4 and 8.0), not zero, and a default `KeySelector()`. A present reply whose
+/// `penalty` slot is missing reads `0.0`.
+#[derive(Wire, Clone, Copy, Debug, PartialEq)]
+#[fdb(file_identifier = 11226513, absent = "default")]
+pub struct GetKeyReply<'a> {
+    /// `penalty`.
+    pub penalty: f64,
+    /// `error`.
+    pub error: Option<FdbError>,
+    /// `sel`.
+    pub sel: KeySelectorRef<'a>,
+    /// `cached`.
+    pub cached: bool,
+}
+
+impl Default for GetKeyReply<'_> {
+    /// `GetKeyReply()`: `penalty` 1.0, no error, a default selector.
+    fn default() -> Self {
+        GetKeyReply {
+            penalty: 1.0,
+            error: None,
+            sel: KeySelectorRef::default(),
+            cached: false,
+        }
+    }
+}
+
+impl<'a> From<GetKeyReply<'a>> for domain::GetKeyReply<'a> {
+    fn from(r: GetKeyReply<'a>) -> Self {
+        domain::GetKeyReply {
+            penalty: r.penalty,
+            error: r.error,
+            sel: r.sel.into(),
+            cached: r.cached,
+        }
+    }
+}
+
+impl<'a> From<&domain::GetKeyReply<'a>> for GetKeyReply<'a> {
+    fn from(r: &domain::GetKeyReply<'a>) -> Self {
+        GetKeyReply {
+            penalty: r.penalty,
+            error: r.error,
+            sel: r.sel.into(),
+            cached: r.cached,
+        }
+    }
+}
+
+/// `GetKeyValuesReply` (`serializer(ar, LoadBalancedReply::penalty, LoadBalancedReply::error,
+/// data, version, more, cached, arena)`). `data` is a `VectorRef<KeyValueRef,
+/// VecSerStrategy::String>`: one pre-serialized blob, which is not parsed into a vector. A
+/// [`KeyValueVectorRef`] validates it and iterates the pairs in place, borrowing from the
+/// message. [`Default`] is `GetKeyValuesReply()`.
+///
+/// Absent: `GetKeyValuesReply() : version(invalidVersion), more(false), cached(false)` over
+/// `LoadBalancedReply()` (7.4 and 8.0): `penalty` is 1.0 and `version` -1, not zero, and `data`
+/// is empty. A present reply whose `penalty` or `version` slot is missing reads zero.
+#[derive(Wire, Clone, Copy, Debug, PartialEq)]
+#[fdb(file_identifier = 1783066, absent = "default")]
+pub struct GetKeyValuesReply<'a> {
+    /// `penalty`.
+    pub penalty: f64,
+    /// `error`.
+    pub error: Option<FdbError>,
+    /// `data`.
+    pub data: KeyValueVectorRef<'a>,
+    /// `version`: the version the read was served at (useful when `latestVersion` was
+    /// requested).
+    pub version: i64,
+    /// `more`: whether the range holds more rows than the reply does.
+    pub more: bool,
+    /// `cached`.
+    pub cached: bool,
+    /// `arena`.
+    #[fdb(arena)]
+    pub arena: (),
+}
+
+impl Default for GetKeyValuesReply<'_> {
+    /// `GetKeyValuesReply()`: `penalty` 1.0, `version = invalidVersion`, no rows.
+    fn default() -> Self {
+        GetKeyValuesReply {
+            penalty: 1.0,
+            error: None,
+            data: KeyValueVectorRef::EMPTY,
+            version: domain::INVALID_VERSION,
+            more: false,
+            cached: false,
+            arena: (),
+        }
+    }
+}
+
+impl<'a> From<GetKeyValuesReply<'a>> for domain::GetKeyValuesReply<'a> {
+    fn from(r: GetKeyValuesReply<'a>) -> Self {
+        domain::GetKeyValuesReply {
+            penalty: r.penalty,
+            error: r.error,
+            data: r.data,
+            version: r.version,
+            more: r.more,
+            cached: r.cached,
+        }
+    }
+}
+
+impl<'a> From<&domain::GetKeyValuesReply<'a>> for GetKeyValuesReply<'a> {
+    fn from(r: &domain::GetKeyValuesReply<'a>) -> Self {
+        GetKeyValuesReply {
+            penalty: r.penalty,
+            error: r.error,
+            data: r.data,
+            version: r.version,
+            more: r.more,
+            cached: r.cached,
+            arena: (),
+        }
+    }
+}
+
+/// `WatchValueReply` (`serializer(ar, version, cached)`), file identifier 3: the version at
+/// which the watched key stopped having the watched value.
+///
+/// Absent: `WatchValueReply() = default` with `bool cached = false` (7.4 and 8.0): zero.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 3)]
+pub struct WatchValueReply {
+    /// `version`.
+    pub version: i64,
+    /// `cached`.
+    pub cached: bool,
+}
+
+impl From<WatchValueReply> for domain::WatchValueReply {
+    fn from(r: WatchValueReply) -> Self {
+        domain::WatchValueReply {
+            version: r.version,
+            cached: r.cached,
+        }
+    }
+}
+
+impl From<&domain::WatchValueReply> for WatchValueReply {
+    fn from(r: &domain::WatchValueReply) -> Self {
+        WatchValueReply {
+            version: r.version,
             cached: r.cached,
         }
     }
