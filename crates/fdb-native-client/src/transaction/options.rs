@@ -113,6 +113,22 @@ const MIN_SIZE_LIMIT: u64 = 32;
 /// except that the database's defaults are applied again. A full reset clears them all
 /// (and applies the defaults).
 ///
+/// ```no_run
+/// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+/// use fdb_native_client::TransactionOption;
+/// use std::time::Duration;
+///
+/// db.run(|tx, _| async move {
+///     tx.set_option(TransactionOption::Timeout(Duration::from_secs(5)))?;
+///     tx.set_option(TransactionOption::RetryLimit(10))?;
+///     tx.set_option(TransactionOption::ReadSystemKeys)?;
+///     tx.get(b"\xff/conf/storage_engine").await
+/// })
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
 /// [`Transaction::set_option`]: crate::Transaction::set_option
 /// [`Transaction::on_error`]: crate::Transaction::on_error
 /// [`Transaction::reset`]: crate::Transaction::reset

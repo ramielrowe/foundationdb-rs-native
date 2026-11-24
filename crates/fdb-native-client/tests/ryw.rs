@@ -20,11 +20,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::{KEY_SPACE_END, RangeLimits, RangeOptions, RangeRead, StreamingMode};
 use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, KeySelector, KeyValue, Transaction,
-    TransactionOption,
+    Database, DatabaseOptions, KeySelector, KeyValue, Transaction, TransactionOption,
 };
 use fdb_native_schema::domain::{
     ClientDbInfo, Commit, CommitId, CommitProxy, GetKey, GetKeyReply, GetKeyServerLocations,
@@ -873,6 +873,17 @@ fn code_of<T: std::fmt::Debug>(r: Result<T, fdb_native_client::Error>) -> u16 {
 
 const ADD: MutationType = MutationType::ADD_VALUE;
 
+/// The client's atomic operation of a mutation type as sent (`AndV2` and `MinV2` are what
+/// `BitAnd` and `Min` send).
+fn client_op(kind: MutationType) -> fdb_native_client::MutationType {
+    match kind {
+        MutationType::AND_V2 => fdb_native_client::MutationType::BitAnd,
+        MutationType::MIN_V2 => fdb_native_client::MutationType::Min,
+        kind => fdb_native_client::MutationType::from_code(i32::from(kind.0))
+            .unwrap_or_else(|| panic!("{kind:?} is not an atomic operation")),
+    }
+}
+
 async fn get(tx: &Transaction<MemRuntime>, key: &[u8]) -> Option<Vec<u8>> {
     within("get", tx.get(key))
         .await
@@ -918,7 +929,7 @@ fn kv(k: &[u8], v: &[u8]) -> KeyValue {
 /// Commits `tx` (with a write conflict range far from the keys read, so that the commit is
 /// sent) and returns the read conflict ranges it sent.
 async fn commit_reads(env: &Env, tx: &Transaction<MemRuntime>) -> Vec<KeyRange> {
-    tx.add_write_conflict_range(b"\xfe", b"\xfe\x00");
+    tx.add_write_conflict_range(b"\xfe", b"\xfe\x00").unwrap();
     let n = env.commit_count();
     within("commit", tx.commit()).await.expect("commit");
     assert_eq!(env.commit_count(), n + 1);
@@ -942,11 +953,11 @@ async fn reads_see_own_sets_clears_and_atomic_ops() {
         tx.clear(b"f");
         tx.clear_range(b"m", b"q");
         // A dependent operation: `v` (0x76) + 1.
-        tx.atomic_op(b"k", &[1], ADD);
+        tx.atomic_op(b"k", &[1], client_op(ADD));
         // On a key the database does not have: the operand.
-        tx.atomic_op(b"c", &[5], ADD);
+        tx.atomic_op(b"c", &[5], client_op(ADD));
         // On a cleared key: over nothing, no read needed.
-        tx.atomic_op(b"n", &[7], ADD);
+        tx.atomic_op(b"n", &[7], client_op(ADD));
 
         assert_eq!(get(&tx, b"a").await, Some(b"v".to_vec()));
         assert_eq!(get(&tx, b"b").await, Some(b"own-b".to_vec()));
@@ -982,7 +993,7 @@ async fn reads_see_own_sets_clears_and_atomic_ops() {
 
         // Later writes are seen by later reads.
         tx.set(b"a", b"again");
-        tx.atomic_op(b"k", &[1], ADD);
+        tx.atomic_op(b"k", &[1], client_op(ADD));
         assert_eq!(get(&tx, b"a").await, Some(b"again".to_vec()));
         assert_eq!(get(&tx, b"k").await, Some(vec![0x78]));
         assert_eq!(env.requests(), before);
@@ -1048,7 +1059,7 @@ async fn reverse_ranges_over_cached_uncached_and_written_segments() {
         assert_eq!(keys(&rows), ks(&[b"f", b"k"]));
         tx.set(b"h", b"own-h");
         tx.clear(b"q");
-        tx.atomic_op(b"x", &[1], ADD);
+        tx.atomic_op(b"x", &[1], client_op(ADD));
         tx.set(b"b", b"own-b");
         // `[f, n)` is known: read again, it needs no storage read.
         let before = env.requests();
@@ -1548,7 +1559,7 @@ async fn random_reads_and_writes_match_a_model() {
                     3 => {
                         let (k, v) = (g.key(), g.value());
                         let op = MODEL_OPS[g.below(MODEL_OPS.len() as u64) as usize];
-                        tx.atomic_op(&k, &v, op);
+                        tx.atomic_op(&k, &v, client_op(op));
                         let new = fdb_native_client::atomic::apply(
                             op,
                             model.get(&k).map(Vec::as_slice),
@@ -1857,7 +1868,7 @@ async fn read_conflict_ranges_match_cpp_for_a_corpus() {
                     C::Set(k) => tx.set(k, b"own"),
                     C::Clear(k) => tx.clear(k),
                     C::ClearRange(b, e) => tx.clear_range(b, e),
-                    C::Add(k) => tx.atomic_op(k, &[1], ADD),
+                    C::Add(k) => tx.atomic_op(k, &[1], client_op(ADD)),
                     C::Get(k) => {
                         get(&tx, k).await;
                     }
@@ -1881,7 +1892,7 @@ async fn read_conflict_ranges_match_cpp_for_a_corpus() {
                         .await
                         .unwrap();
                     }
-                    C::ReadConflict(b, e) => tx.add_read_conflict_range(b, e),
+                    C::ReadConflict(b, e) => tx.add_read_conflict_range(b, e).unwrap(),
                 }
             }
             assert_eq!(commit_reads(&env, &tx).await, expected, "{schema:?} {name}");
@@ -2122,7 +2133,72 @@ fn commit_corpus() -> Vec<CommitCase> {
             ]),
             ranges(&[(b"f", b"f\x00")]),
         ),
+        (
+            // `WriteMap::coalesce` (7.4:385-394, 8.0:424-433): `AppendIfFits` on
+            // `AppendIfFits` is one `AppendIfFits` of the operands joined by
+            // `doAppendIfFits`, which keeps the first alone when both do not fit together.
+            // So near the value size limit the coalesced operation is not the two applied in
+            // turn: see `append_if_fits_near_the_limit_keeps_what_cpp_keeps`.
+            "append-if-fits operations coalesce, near the value size limit too",
+            vec![
+                Atomic(b"a", MutationType::APPEND_IF_FITS, b"xyz"),
+                Atomic(b"a", MutationType::APPEND_IF_FITS, b"xyz"),
+                Atomic(b"c", MutationType::APPEND_IF_FITS, &BIG_60K),
+                Atomic(b"c", MutationType::APPEND_IF_FITS, &BIG_50K),
+            ],
+            vec![
+                m(MutationType::APPEND_IF_FITS, b"a", b"xyzxyz"),
+                m(MutationType::APPEND_IF_FITS, b"c", &BIG_60K),
+            ],
+            ranges(&[(b"a", b"a\x00"), (b"c", b"c\x00")]),
+            vec![],
+        ),
     ]
+}
+
+/// Operands of the near-limit `AppendIfFits` corpus case: together they are over the value
+/// size limit (100 000 bytes).
+static BIG_60K: [u8; 60_000] = [b'q'; 60_000];
+static BIG_50K: [u8; 50_000] = [b'r'; 50_000];
+
+/// What C++ (7.4's `libfdb_c`, run against a testkit cluster by the ygr.4 review's oracle)
+/// leaves of keys near the value size limit after two `AppendIfFits` each, coalesced into one
+/// as the corpus case above sends them: a key of 99 995 bytes with `xyz` appended twice
+/// keeps its 99 995 bytes (the coalesced `xyzxyz` does not fit), though the first `xyz` alone
+/// would have; a key of 10 bytes with 60 000 then 50 000 bytes appended gets the 60 000.
+#[test]
+fn append_if_fits_near_the_limit_keeps_what_cpp_keeps() {
+    use fdb_native_client::atomic::{VALUE_SIZE_LIMIT, apply};
+    let near = vec![b'q'; 99_995];
+    let coalesced = apply(
+        MutationType::APPEND_IF_FITS,
+        Some(&near),
+        b"xyzxyz",
+        VALUE_SIZE_LIMIT,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(coalesced.len(), 99_995);
+    // Applied one at a time, the first would fit.
+    let once = apply(
+        MutationType::APPEND_IF_FITS,
+        Some(&near),
+        b"xyz",
+        VALUE_SIZE_LIMIT,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(once.len(), 99_998);
+    let small = vec![b's'; 10];
+    let grown = apply(
+        MutationType::APPEND_IF_FITS,
+        Some(&small),
+        &BIG_60K,
+        VALUE_SIZE_LIMIT,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(grown.len(), 60_010);
 }
 
 /// Runs a commit corpus case's steps on `tx`.
@@ -2132,14 +2208,14 @@ async fn run_steps(tx: &Transaction<MemRuntime>, steps: &[W]) {
             W::Set(k, v) => tx.set(k, v),
             W::Clear(k) => tx.clear(k),
             W::ClearRange(b, e) => tx.clear_range(b, e),
-            W::Atomic(k, op, v) => tx.atomic_op(k, v, *op),
+            W::Atomic(k, op, v) => tx.atomic_op(k, v, client_op(*op)),
             W::Svk(k, v) => tx.set_versionstamped_key(k, v),
             W::Svv(k, v) => tx.set_versionstamped_value(k, v),
             W::NoConflict => tx
                 .set_option(TransactionOption::NextWriteNoWriteConflictRange)
                 .unwrap(),
-            W::WriteConflict(b, e) => tx.add_write_conflict_range(b, e),
-            W::ReadConflict(b, e) => tx.add_read_conflict_range(b, e),
+            W::WriteConflict(b, e) => tx.add_write_conflict_range(b, e).unwrap(),
+            W::ReadConflict(b, e) => tx.add_read_conflict_range(b, e).unwrap(),
             W::Get(k) => {
                 get(tx, k).await;
             }
@@ -2316,7 +2392,7 @@ async fn random_writes_commit_to_the_model() {
                 4 | 5 => {
                     let (k, v) = (g.key(), g.value());
                     let op = ALL_OPS[g.below(ALL_OPS.len() as u64) as usize];
-                    tx.atomic_op(&k, &v, op);
+                    tx.atomic_op(&k, &v, client_op(op));
                     let op = match op {
                         MutationType::MIN => MutationType::MIN_V2,
                         MutationType::AND => MutationType::AND_V2,
@@ -2510,19 +2586,19 @@ async fn approximate_size_is_what_libfdb_c_reports() {
                 Set(k, v) => tx.set(&under(&prefix, k), v),
                 Clear(k) => tx.clear(&under(&prefix, k)),
                 ClearRange(b, e) => tx.clear_range(&under(&prefix, b), &under(&prefix, e)),
-                Atomic(k, op, v) => tx.atomic_op(&under(&prefix, k), v, op),
+                Atomic(k, op, v) => tx.atomic_op(&under(&prefix, k), v, client_op(op)),
                 // `cNN/s`, the placeholder, `/x`, the offset.
                 Svk(_, v) => tx.set_versionstamped_key(&stamp_key(&under(&prefix, b"s"), b"/x"), v),
                 Svv(k, v) => tx.set_versionstamped_value(&under(&prefix, k), &v),
                 NoConflict => tx
                     .set_option(TransactionOption::NextWriteNoWriteConflictRange)
                     .unwrap(),
-                WriteConflict(b, e) => {
-                    tx.add_write_conflict_range(&under(&prefix, b), &under(&prefix, e))
-                }
-                ReadConflict(b, e) => {
-                    tx.add_read_conflict_range(&under(&prefix, b), &under(&prefix, e))
-                }
+                WriteConflict(b, e) => tx
+                    .add_write_conflict_range(&under(&prefix, b), &under(&prefix, e))
+                    .unwrap(),
+                ReadConflict(b, e) => tx
+                    .add_read_conflict_range(&under(&prefix, b), &under(&prefix, e))
+                    .unwrap(),
                 Get(k) => {
                     get(&tx, &under(&prefix, k)).await;
                 }

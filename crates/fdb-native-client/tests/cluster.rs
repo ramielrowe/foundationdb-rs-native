@@ -245,7 +245,7 @@ async fn cluster_get_range_reads_across_shards() {
     ] {
         for (reverse, want) in [(false, &keys), (true, &reversed)] {
             let o = RangeOptions::default().mode(mode).reverse(reverse);
-            let rows: Vec<KeyValue> = collect(tx.range_stream(fge(b"k"), fge(b"l"), o))
+            let rows: Vec<KeyValue> = collect(tx.get_ranges_keyvalues(fge(b"k"), fge(b"l"), o))
                 .await
                 .into_iter()
                 .map(Result::unwrap)

@@ -57,7 +57,7 @@ impl<R: Runtime> Transaction<R> {
     /// there, a key it cleared is not; the selectors resolve through them too), as
     /// `fdb_transaction_get_range` returns them. The read starts when `get_range` is called
     /// (see [`get`](Self::get)). [`get_ranges`](Self::get_ranges) and
-    /// [`range_stream`](Self::range_stream) read the whole range.
+    /// [`get_ranges_keyvalues`](Self::get_ranges_keyvalues) read the whole range.
     ///
     /// * **Limits** ([`RangeOptions`]): `fdb_c`'s. At most `limit` rows (0: no limit); about
     ///   `target_bytes` bytes, lowered to the streaming mode's batch size (each row counted
@@ -131,7 +131,7 @@ impl<R: Runtime> Transaction<R> {
     /// use futures_core::Stream;
     ///
     /// let tx = db.create_transaction();
-    /// let mut rows = tx.range_stream(
+    /// let mut rows = tx.get_ranges_keyvalues(
     ///     KeySelector::first_greater_or_equal(b"a".to_vec()),
     ///     KeySelector::first_greater_or_equal(b"b".to_vec()),
     ///     RangeOptions::default(),
@@ -143,7 +143,7 @@ impl<R: Runtime> Transaction<R> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn range_stream(
+    pub fn get_ranges_keyvalues(
         &self,
         begin: KeySelector,
         end: KeySelector,
@@ -355,8 +355,8 @@ impl<R: Runtime> Snapshot<'_, R> {
         RangeStream::new(self.tx.clone(), begin, end, options, true)
     }
 
-    /// [`Transaction::range_stream`] without read conflict ranges.
-    pub fn range_stream(
+    /// [`Transaction::get_ranges_keyvalues`] without read conflict ranges.
+    pub fn get_ranges_keyvalues(
         &self,
         begin: KeySelector,
         end: KeySelector,
@@ -375,6 +375,9 @@ type BatchFuture = Pin<Box<dyn Future<Output = Result<RangeResult, Error>> + Sen
 /// after its last row (forward: `firstGreaterThan(last)`; reverse: the end becomes
 /// `firstGreaterOrEqual(last)`). The stream ends after a batch without `more`, when the row
 /// limit is reached, or after an error (which it yields). Empty batches are not yielded.
+///
+/// `Send` (not `Sync`); it holds a handle to the transaction.
+#[must_use = "streams do nothing unless polled"]
 pub struct RangeStream<R: Runtime> {
     tx: Transaction<R>,
     snapshot: bool,
@@ -488,8 +491,28 @@ impl<R: Runtime> Stream for RangeStream<R> {
     }
 }
 
-/// The rows of a range, one at a time ([`Transaction::range_stream`]): the batches of a
+/// The rows of a range, one at a time ([`Transaction::get_ranges_keyvalues`]): the batches of a
 /// [`RangeStream`], flattened.
+///
+/// ```no_run
+/// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+/// use fdb_native_client::{KeySelector, RangeOptions};
+/// use futures_lite::StreamExt;
+///
+/// let tx = db.create_transaction();
+/// let mut rows = tx.get_ranges_keyvalues(
+///     KeySelector::first_greater_or_equal(b"users/".to_vec()),
+///     KeySelector::first_greater_or_equal(b"users0".to_vec()),
+///     RangeOptions::default(),
+/// );
+/// while let Some(row) = rows.next().await {
+///     let row = row?;
+///     println!("{:?} = {:?}", row.key, row.value);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "streams do nothing unless polled"]
 pub struct KeyValueStream<R: Runtime> {
     batches: RangeStream<R>,
     rows: VecDeque<KeyValue>,

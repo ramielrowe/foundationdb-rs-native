@@ -335,7 +335,7 @@ async fn docker_the_metadata_version_is_read_from_the_grv_reply_the_cache_and_st
     tx.atomic_op(
         METADATA_VERSION,
         &[0; 14],
-        MutationType::SET_VERSIONSTAMPED_VALUE,
+        MutationType::SetVersionstampedValue,
     );
     let stamp = tx.get_versionstamp();
     let result = within("commit", tx.commit()).await.unwrap();

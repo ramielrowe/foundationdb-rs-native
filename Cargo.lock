@@ -402,6 +402,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
+ "futures-lite",
  "proptest",
  "regex",
  "rpds",

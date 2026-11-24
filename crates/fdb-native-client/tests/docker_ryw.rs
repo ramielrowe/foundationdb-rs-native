@@ -96,8 +96,8 @@ async fn docker_ryw_reads_see_own_writes_over_the_database() {
     tx.set(b"r/b", b"own");
     tx.clear(b"r/c");
     tx.clear_range(b"r/h", b"r/j");
-    tx.atomic_op(b"r/g", &[5, 0], MutationType::ADD_VALUE);
-    tx.atomic_op(b"r/z", b"x", MutationType::APPEND_IF_FITS);
+    tx.atomic_op(b"r/g", &[5, 0], MutationType::Add);
+    tx.atomic_op(b"r/z", b"x", MutationType::AppendIfFits);
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> =
         base.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
     model.insert(b"r/b".to_vec(), b"own".to_vec());
@@ -482,7 +482,7 @@ async fn docker_ryw_read_conflict_ranges_match_cpp() {
                     .unwrap(),
             }
         }
-        tx.add_write_conflict_range(b"q/", b"q0");
+        tx.add_write_conflict_range(b"q/", b"q0").unwrap();
         // A write just before each expected range's end, and just after it.
         let probe = db.create_transaction();
         let mut conflicts = false;
@@ -605,8 +605,10 @@ async fn docker_ryw_write_conflict_ranges_match_cpp() {
             within("read version", reader.get_read_version())
                 .await
                 .unwrap();
-            reader.add_read_conflict_range(&p, &key_after(&p));
-            reader.add_write_conflict_range(b"wprobe", b"wprobe\x00");
+            reader.add_read_conflict_range(&p, &key_after(&p)).unwrap();
+            reader
+                .add_write_conflict_range(b"wprobe", b"wprobe\x00")
+                .unwrap();
             readers.push((p, reader));
         }
         let tx = db.create_transaction();
@@ -669,28 +671,24 @@ impl Gen {
     }
 }
 
-/// Every atomic operation (`Min` and `And` are sent as `MinV2` and `AndV2`).
+/// Every atomic operation (`Min` and `BitAnd` are sent as `MinV2` and `AndV2`), those two
+/// twice (the list had the version 1 and 2 types of each).
 const ALL_OPS: [MutationType; 12] = [
-    MutationType::ADD_VALUE,
-    MutationType::AND,
-    MutationType::AND_V2,
-    MutationType::OR,
-    MutationType::XOR,
-    MutationType::MAX,
-    MutationType::MIN,
-    MutationType::MIN_V2,
-    MutationType::BYTE_MIN,
-    MutationType::BYTE_MAX,
-    MutationType::APPEND_IF_FITS,
-    MutationType::COMPARE_AND_CLEAR,
+    MutationType::Add,
+    MutationType::BitAnd,
+    MutationType::BitAnd,
+    MutationType::BitOr,
+    MutationType::BitXor,
+    MutationType::Max,
+    MutationType::Min,
+    MutationType::Min,
+    MutationType::ByteMin,
+    MutationType::ByteMax,
+    MutationType::AppendIfFits,
+    MutationType::CompareAndClear,
 ];
 
 fn apply_model(model: &mut BTreeMap<Vec<u8>, Vec<u8>>, k: &[u8], op: MutationType, v: &[u8]) {
-    let op = match op {
-        MutationType::MIN => MutationType::MIN_V2,
-        MutationType::AND => MutationType::AND_V2,
-        other => other,
-    };
     let new = fdb_native_client::atomic::apply(
         op,
         model.get(k).map(Vec::as_slice),
@@ -801,6 +799,31 @@ async fn docker_ryw_random_atomic_operations_match_the_server() {
     }
 }
 
+/// Two `AppendIfFits` of one key coalesce into one (`WriteMap::coalesce`), so near the value
+/// size limit the server keeps what C++'s `libfdb_c` leaves (checked by the ygr.4 review's
+/// oracle), not what the two applied in turn would give: a key of 99 995 bytes with `xyz`
+/// appended twice keeps its 99 995 bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_ryw_append_if_fits_near_the_value_size_limit() {
+    let (_fdb, db) = start().await;
+    let near = vec![b'q'; 99_995];
+    let small = vec![b's'; 10];
+    load(&db, &[(b"aif/a", &near), (b"aif/c", &small)]).await;
+    let tx = db.create_transaction();
+    tx.atomic_op(b"aif/a", b"xyz", MutationType::AppendIfFits);
+    tx.atomic_op(b"aif/a", b"xyz", MutationType::AppendIfFits);
+    tx.atomic_op(b"aif/c", &[b'x'; 60_000], MutationType::AppendIfFits);
+    tx.atomic_op(b"aif/c", &[b'y'; 50_000], MutationType::AppendIfFits);
+    within("commit", tx.commit()).await.expect("commit");
+    let tx = db.create_transaction();
+    let a = within("get", tx.get(b"aif/a")).await.unwrap().unwrap();
+    assert_eq!(a, near);
+    let c = within("get", tx.get(b"aif/c")).await.unwrap().unwrap();
+    assert_eq!(c.len(), 60_010);
+    assert!(c.ends_with(&[b'x'; 60_000]));
+}
+
 /// A versionstamped key: the transaction's earlier writes in the range of keys it may take
 /// are sent first (`writeRangeToNativeTransaction`), its later ones after; a clear over it
 /// drops it (C++'s write map does), and the transaction's other writes go as usual.
@@ -821,7 +844,7 @@ async fn docker_ryw_versionstamped_keys_with_writes_around_them() {
     after.extend((read_version + 1).to_be_bytes());
     after.extend([0, 0, b'a']);
     tx.set(&before, b"before");
-    tx.atomic_op(&before, b"+", MutationType::APPEND_IF_FITS);
+    tx.atomic_op(&before, b"+", MutationType::AppendIfFits);
     tx.set_versionstamped_key(&key, b"stamped");
     tx.set(&after, b"after");
     tx.set(b"vs0", b"outside");
@@ -876,7 +899,7 @@ async fn docker_ryw_watches() {
 
     // A dependent write: the watch watches the database's value with the addition.
     let tx = db.create_transaction();
-    tx.atomic_op(b"wt/n", &[1, 0], MutationType::ADD_VALUE);
+    tx.atomic_op(b"wt/n", &[1, 0], MutationType::Add);
     let watch_n = within("watch", tx.watch(b"wt/n")).await.unwrap();
     let watch_k = within("watch", tx.watch(b"wt/k")).await.unwrap();
     within("commit", tx.commit()).await.unwrap();
@@ -892,7 +915,7 @@ async fn docker_ryw_watches() {
 
     // The watch's read conflict range: a change after the read version fails the commit.
     let tx = db.create_transaction();
-    tx.atomic_op(b"wt/n", &[1, 0], MutationType::ADD_VALUE);
+    tx.atomic_op(b"wt/n", &[1, 0], MutationType::Add);
     let watch = within("watch", tx.watch(b"wt/n")).await.unwrap();
     load(&db, &[(b"wt/n", &[9, 0])]).await;
     let e = within("commit", tx.commit()).await.unwrap_err();

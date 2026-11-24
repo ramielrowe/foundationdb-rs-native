@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use fdb_native_client::{ClusterInfo, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
+use fdb_native_client::cluster::{
+    ClusterInfo, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord,
+};
 use fdb_native_schema::domain::{GetReadVersion, INVALID_VERSION, ReadVersion};
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_testkit::FdbContainer;

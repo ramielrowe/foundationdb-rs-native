@@ -93,7 +93,7 @@
 //!   watchers fire; if it is older (the metadata was updated to a newer version meanwhile)
 //!   it goes around again (the "ABA" case); on `future_version` it goes around again, on
 //!   another error the watchers fail with it.
-//! * **`watchValue`** is [`Reader::watch_value`](crate::Reader::watch_value).
+//! * **`watchValue`** is [`Reader::watch_value`](crate::read::Reader::watch_value).
 //!
 //! ## Differences
 //!
@@ -102,7 +102,10 @@
 //!   `checkUsedDuringCommit` also makes the commit fail with it.
 //! * **The read runs as a task of its own** (as every non-snapshot read of the transaction
 //!   does): a `watch` future that is dropped or no longer polled does not hold the commit up;
-//!   the read still ends (and registers the watch, which is then dropped).
+//!   the read still ends (and registers the watch, which is then dropped). **Dropping the
+//!   future does not cancel the read**: it still adds its read conflict range, so the commit
+//!   can fail with `not_committed` because of a watch nobody waits for. C++ cancels the read
+//!   (and adds no range) when the watch's future is destroyed.
 //! * **The cap's slot** is given back when the watch's result is sent, or when its future is
 //!   dropped, as C++'s `watch` actor ends (not when the result is polled).
 //! * **`getFutureReferenceCount() == 1`.** `watchStorageServerResp` treats a metadata with
@@ -113,8 +116,7 @@
 //!   map with `operation_cancelled` (1101). Watches in transactions that are not committed
 //!   yet fail when the transaction does (its commit fails with `operation_cancelled`).
 //! * **Not ported:** switching the cluster file (`connectionFileChanged`, `restartWatch`),
-//!   tenants, watching `\xff/metadataVersion` (needs the metadata version key exception of
-//!   `get`), tags and debug ids.
+//!   tenants, tags and debug ids.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, poll_fn};

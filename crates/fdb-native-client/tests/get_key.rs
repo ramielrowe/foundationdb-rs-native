@@ -15,11 +15,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::KEY_SPACE_END;
-use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, KeySelector, Transaction, TransactionOption,
-};
+use fdb_native_client::{Database, DatabaseOptions, KeySelector, Transaction, TransactionOption};
 use fdb_native_schema::domain::{
     ClientDbInfo, Commit, CommitId, CommitProxy, GetKey, GetKeyReply, GetKeyServerLocations,
     GetReadVersion, GrvProxy, KeyRange, KeyServerLocations, ReadVersion, StorageServer, TenantMode,

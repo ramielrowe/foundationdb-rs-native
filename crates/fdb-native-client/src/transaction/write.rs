@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use fdb_native_schema::domain::{KeyRange, MutationType};
 use fdb_native_transport::runtime::Runtime;
 
+use super::mutation::MutationType as AtomicOp;
 use super::{METADATA_VERSION_REQUIRED_VALUE, ReadVersion, State, Transaction};
 use crate::atomic;
 use crate::commit::{KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, check_write, normalize_range};
@@ -37,6 +38,18 @@ const RANGE: u64 = KEY_RANGE_REF_SIZE;
 
 fn len(bytes: &[u8]) -> u64 {
     bytes.len() as u64
+}
+
+/// `KeyRangeRef(begin, end)`, which `fdb_transaction_add_conflict_range` builds before it
+/// calls the transaction: `inverted_range` (2005) at once, not deferred.
+fn check_not_inverted(begin: &[u8], end: &[u8]) -> Result<(), Error> {
+    if begin > end {
+        return Err(Error::with_message(
+            INVERTED_RANGE,
+            "begin is larger than end",
+        ));
+    }
+    Ok(())
 }
 
 impl State {
@@ -165,13 +178,33 @@ impl<R: Runtime> Transaction<R> {
     }
 
     /// `atomicOp(key, operand, op)`: an atomic operation on `key` when the transaction
-    /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`], and [`crate::atomic`] for
-    /// what each does to the value), including the two versionstamp operations (see
+    /// commits ([`Add`](AtomicOp::Add), [`BitAnd`](AtomicOp::BitAnd), ...; see
+    /// [`MutationType`](AtomicOp), and [`crate::atomic`] for what each does to the value),
+    /// including the two versionstamp operations (see
     /// [`set_versionstamped_key`](Self::set_versionstamped_key)). Deferred errors:
-    /// `invalid_mutation_type` (2018) if `op` is not an atomic operation, `key_too_large`,
-    /// `value_too_large`, `key_outside_legal_range`, and for the versionstamp operations
-    /// `client_invalid_operation` (2000) if the 4-byte offset is invalid.
-    pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: MutationType) {
+    /// `key_too_large`, `value_too_large`, `key_outside_legal_range`, and for the
+    /// versionstamp operations `client_invalid_operation` (2000) if the 4-byte offset is
+    /// invalid.
+    ///
+    /// ```no_run
+    /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+    /// use fdb_native_client::MutationType;
+    ///
+    /// // Blind increments do not conflict with each other: no read conflict range.
+    /// db.run(|tx, _| async move {
+    ///     tx.atomic_op(b"hits", &1i64.to_le_bytes(), MutationType::Add);
+    ///     Ok(())
+    /// })
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: AtomicOp) {
+        self.atomic_op_wire(key, operand, op.into());
+    }
+
+    /// [`atomic_op`](Self::atomic_op) with the mutation type as sent.
+    fn atomic_op_wire(&self, key: &[u8], operand: &[u8], op: MutationType) {
         let written = self.write_then(|state, add_conflict| {
             if key == METADATA_VERSION_KEY {
                 // `ReadYourWritesTransaction::atomicOp` (7.4:2226-2230): only the versionstamp
@@ -188,20 +221,22 @@ impl<R: Runtime> Transaction<R> {
             } else if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            // `isAtomicOp`, then the sizes and the offsets.
-            if op == MutationType::SET_VALUE {
-                return Err(Error::with_message(
-                    INVALID_MUTATION_TYPE,
-                    "SetValue is not an atomic operation",
-                ));
-            }
+            // `isAtomicOp` and `apiVersionAtLeast(510)` (`Min` and `And` are `MinV2` and
+            // `AndV2`) hold by construction: the type comes from `AtomicOp` (or is one of
+            // the versionstamp operations), which has no `SetValue` and converts to the V2
+            // types. Then the sizes and the offsets.
+            debug_assert!(
+                ![
+                    MutationType::SET_VALUE,
+                    MutationType::CLEAR_RANGE,
+                    MutationType::MIN,
+                    MutationType::AND,
+                ]
+                .contains(&op),
+                "{op:?} is not an atomic operation this client sends"
+            );
             check_write(op, key, operand, state.buffer.limits())?;
-            // `apiVersionAtLeast(510)`: `Min` and `And` are `MinV2` and `AndV2`.
-            let kind = match op {
-                MutationType::MIN => MutationType::MIN_V2,
-                MutationType::AND => MutationType::AND_V2,
-                other => other,
-            };
+            let kind = op;
             let mut add_conflict = add_conflict;
             let mut k = Cow::Borrowed(key);
             if kind == MutationType::SET_VERSIONSTAMPED_KEY {
@@ -304,7 +339,7 @@ impl<R: Runtime> Transaction<R> {
     /// # }
     /// ```
     pub fn set_versionstamped_key(&self, key: &[u8], value: &[u8]) {
-        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_KEY);
+        self.atomic_op_wire(key, value, MutationType::SET_VERSIONSTAMPED_KEY);
     }
 
     /// `atomicOp(key, value, SetVersionstampedValue)`: when the transaction commits, sets
@@ -316,7 +351,7 @@ impl<R: Runtime> Transaction<R> {
     /// [`watch`](Self::watch) of the key fails with `accessed_unreadable` (1036) until a
     /// clear of it (its value is not known before the commit).
     pub fn set_versionstamped_value(&self, key: &[u8], value: &[u8]) {
-        self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_VALUE);
+        self.atomic_op_wire(key, value, MutationType::SET_VERSIONSTAMPED_VALUE);
     }
 
     /// `addReadConflictRange(begin, end)`: the commit conflicts if another transaction
@@ -324,11 +359,18 @@ impl<R: Runtime> Transaction<R> {
     ///
     /// With read-your-writes (`ReadYourWritesTransaction::addReadConflictRange`), the parts
     /// of the range the transaction has set or cleared are left out, as a read of them would
-    /// be (`updateConflictMap`), and the range joins the reads' ranges. Errors (deferred):
-    /// `key_outside_legal_range` (2004) for a key after `\xff` (`\xff\xff` with the system
-    /// key options; the range of `\xff/metadataVersion` is always allowed), `inverted_range`
-    /// (2005).
-    pub fn add_read_conflict_range(&self, begin: &[u8], end: &[u8]) {
+    /// be (`updateConflictMap`), and the range joins the reads' ranges.
+    ///
+    /// # Errors
+    ///
+    /// As `fdb_transaction_add_conflict_range`: `inverted_range` (2005, `begin > end`) is
+    /// returned at once (`fdb_c` builds the `KeyRangeRef` before anything else) and the
+    /// transaction is unchanged. The other errors are deferred (see the [module
+    /// documentation](super)): `key_outside_legal_range` (2004) for a key after `\xff`
+    /// (`\xff\xff` with the system key options; the range of `\xff/metadataVersion` is
+    /// always allowed), `used_during_commit`, ...
+    pub fn add_read_conflict_range(&self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
+        check_not_inverted(begin, end)?;
         self.write(|state| {
             let max = state.flags.max_read_key();
             let metadata_version = begin == METADATA_VERSION_KEY && end == key_after(begin);
@@ -357,11 +399,27 @@ impl<R: Runtime> Transaction<R> {
             );
             Ok(())
         });
+        Ok(())
+    }
+
+    /// `addReadConflictRange(key, keyAfter(key))`: [`add_read_conflict_range`] of the
+    /// single key `key` (`[key, key\x00)`), as the bindings' `add_read_conflict_key`.
+    ///
+    /// [`add_read_conflict_range`]: Self::add_read_conflict_range
+    pub fn add_read_conflict_key(&self, key: &[u8]) -> Result<(), Error> {
+        self.add_read_conflict_range(key, &key_after(key))
     }
 
     /// `addWriteConflictRange(begin, end)`: other transactions that read in
     /// `[begin, end)` conflict with this one, as if it had written there.
-    pub fn add_write_conflict_range(&self, begin: &[u8], end: &[u8]) {
+    ///
+    /// # Errors
+    ///
+    /// As [`add_read_conflict_range`](Self::add_read_conflict_range): `inverted_range` (2005)
+    /// at once, the rest deferred (`key_outside_legal_range` (2004) for a key after `\xff`,
+    /// or `\xff\xff` with the `AccessSystemKeys` option).
+    pub fn add_write_conflict_range(&self, begin: &[u8], end: &[u8]) -> Result<(), Error> {
+        check_not_inverted(begin, end)?;
         self.write(|state| {
             let max = state.flags.max_write_key();
             if begin > max || end > max {
@@ -386,6 +444,15 @@ impl<R: Runtime> Transaction<R> {
                 .add_conflict_range(&range.begin, &range.end);
             Ok(())
         });
+        Ok(())
+    }
+
+    /// `addWriteConflictRange(key, keyAfter(key))`: [`add_write_conflict_range`] of the
+    /// single key `key` (`[key, key\x00)`), as the bindings' `add_write_conflict_key`.
+    ///
+    /// [`add_write_conflict_range`]: Self::add_write_conflict_range
+    pub fn add_write_conflict_key(&self, key: &[u8]) -> Result<(), Error> {
+        self.add_write_conflict_range(key, &key_after(key))
     }
 
     /// `getApproximateSize()`: an estimate of the transaction's size so far, in bytes, as
@@ -397,6 +464,11 @@ impl<R: Runtime> Transaction<R> {
     /// will send (which is what the `SizeLimit` option and `transaction_too_large` (2101)
     /// apply to); a [`reset`](Self::reset) or [`on_error`](Self::on_error) brings it back to
     /// 0. Fails with the deferred error of a write, if any (as `fdb_c` does).
+    ///
+    /// Synchronous: C++'s `getApproximateSize()` is a counter of the read-your-writes layer,
+    /// which `fdb_c` (and the bindings over it) returns as a future only because every call
+    /// goes through its network thread. The value is the same: the writes made before the
+    /// call, and the read conflict ranges of the reads that have ended.
     pub fn approximate_size(&self) -> Result<u64, Error> {
         let state = self.state();
         self.check_handle(&state)?;

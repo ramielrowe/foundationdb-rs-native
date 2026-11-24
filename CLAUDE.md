@@ -67,7 +67,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
 cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'  # Docker-backed integration tests
 cargo test --doc --workspace                                   # doc tests (nextest skips them)
+cargo build --workspace --examples                             # examples (also checked by --all-targets)
 ```
+
+The TLS code is behind features of two crates: `fdb-native-transport/tls` and
+`fdb-native-client/tls` (the client's `cfg(feature = "tls")` code, the `tls` example and the
+client's TLS docker tests need the client's own feature). CI runs clippy, docs, MSRV checks,
+tests and the docker job with `--features fdb-native-transport/tls,fdb-native-client/tls` too.
+
+`fdb-native-client/examples/` are runnable examples (`cargo run -p fdb-native-client --example
+basic -- CLUSTER_FILE`); `tests/docker_examples.rs` includes each example's `run` with
+`#[path]` and calls it against a testkit container, so an example change is a test change.
 
 `fdb-native-wire`'s encoder is also checked against FDB's C++ readers by an ignored test binary,
 `cpp_crosscheck` (`#[ignore = "requires golden-vectors tool"]`, excluded from the Docker CI job).
@@ -145,6 +155,10 @@ The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/bin
 - Shared package metadata comes from `[workspace.package]`; every crate sets `lints.workspace = true`.
   Workspace lints: `unsafe_code = "forbid"`, `missing_debug_implementations`, `unreachable_pub`, clippy `all`.
 - Edition 2024, MSRV 1.85. No unstable rustfmt options.
+- **Client API**: `fdb-native-client`'s crate root re-exports the application API (`Database`,
+  `Transaction`, options, `Error`, ...); the lower layers (`read`, `commit`, `cluster`,
+  `cluster_file`, `watch`, `atomic`) are public modules for tools and tests and are not
+  re-exported. Its crate docs have the API design notes; record API changes in `CHANGELOG.md`.
 - **Docker-backed tests**: tests that need a live FDB container are marked
   `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`
   (excluding the `cpp_crosscheck` binary, which needs the golden-vectors tool instead).

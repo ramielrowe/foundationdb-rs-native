@@ -24,11 +24,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::{KEY_SPACE_END, RangeLimits, RangeOptions, RangeRead, StreamingMode};
 use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, KeySelector, KeyValue, Transaction,
-    TransactionOption,
+    Database, DatabaseOptions, KeySelector, KeyValue, Transaction, TransactionOption,
 };
 use fdb_native_schema::domain::{
     ClientDbInfo, Commit, CommitId, CommitProxy, GetKey, GetKeyReply, GetKeyServerLocations,
@@ -1133,7 +1133,7 @@ async fn streams_continue_after_more_in_both_directions() {
             let o = RangeOptions::default()
                 .mode(StreamingMode::Small)
                 .reverse(reverse);
-            let rows: Vec<KeyValue> = collect(tx.range_stream(fge(b""), fge(b"\xff"), o))
+            let rows: Vec<KeyValue> = collect(tx.get_ranges_keyvalues(fge(b""), fge(b"\xff"), o))
                 .await
                 .into_iter()
                 .map(Result::unwrap)
@@ -1157,7 +1157,7 @@ async fn streams_continue_after_more_in_both_directions() {
             assert!(batches.len() > 3, "{}", batches.len());
         }
         // Snapshot streams add no conflict range.
-        let rows = collect(tx.snapshot().range_stream(
+        let rows = collect(tx.snapshot().get_ranges_keyvalues(
             fge(b"c"),
             fge(b"d"),
             RangeOptions::default(),
@@ -1643,7 +1643,7 @@ async fn random_ranges_match_a_btreemap_over_random_shard_maps() {
                 // The whole range through a stream (the iterator mode, a row limit).
                 let o = RangeOptions::with_limit(rows.unwrap_or(0)).reverse(reverse);
                 let streamed: Vec<KeyValue> =
-                    collect(tx.snapshot().range_stream(b.clone(), e.clone(), o))
+                    collect(tx.snapshot().get_ranges_keyvalues(b.clone(), e.clone(), o))
                         .await
                         .into_iter()
                         .map(|r| r.unwrap_or_else(|e| panic!("{what}: {e}")))
@@ -1912,7 +1912,7 @@ async fn a_read_future_no_longer_polled_does_not_hold_the_commit() {
 
     // A range stream inside a `select` with a timer that wins.
     let tx = env.transaction();
-    let mut rows = tx.range_stream(fge(b"a"), fge(b"z"), RangeOptions::default());
+    let mut rows = tx.get_ranges_keyvalues(fge(b"a"), fge(b"z"), RangeOptions::default());
     let next = poll_fn(|cx| Pin::new(&mut rows).poll_next(cx));
     let timer = tokio::time::sleep(Duration::from_millis(1));
     tokio::select! {

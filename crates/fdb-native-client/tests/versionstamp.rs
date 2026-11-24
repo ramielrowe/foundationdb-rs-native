@@ -9,9 +9,10 @@ mod support;
 
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::commit::with_versionstamp_offset;
 use fdb_native_client::error::codes;
-use fdb_native_client::{ConnectionRecord, Database, DatabaseOptions, Error, MutationType};
+use fdb_native_client::{Database, DatabaseOptions, Error};
 use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{CommitId, KeyRange, Mutation, MutationType as Mt};
 use fdb_native_transport::peer::PeerManagerConfig;
@@ -156,13 +157,6 @@ async fn bad_offsets_are_deferred_client_invalid_operation_and_nothing_is_sent()
             assert_eq!(e.code(), codes::CLIENT_INVALID_OPERATION, "{bad:?}");
         }
     }
-    // Not an atomic operation.
-    let tx = env.db.create_transaction();
-    tx.atomic_op(b"k", b"v", MutationType::SET_VALUE);
-    assert_eq!(
-        tx.commit().await.unwrap_err().code(),
-        codes::INVALID_MUTATION_TYPE
-    );
     // The legal range applies to the raw key.
     let tx = env.db.create_transaction();
     tx.set_versionstamped_key(&with_stamp(b"\xff", b""), b"v");

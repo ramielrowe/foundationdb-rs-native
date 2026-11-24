@@ -11,9 +11,10 @@
 //!   see [`Error::from_request`]);
 //! * the client's own **logic** decided on one (`all_alternatives_failed`,
 //!   `database_locked`, `client_invalid_operation`, ...);
-//! * the **commit path** ([`Committer`](crate::Committer), [`CommitBuffer`](crate::CommitBuffer)):
-//!   `not_committed` (with the conflicting ranges, [`Error::conflicting_ranges`]),
-//!   `commit_unknown_result`, `key_too_large`, `transaction_too_large`, ...;
+//! * the **commit path** ([`Committer`](crate::commit::Committer),
+//!   [`CommitBuffer`](crate::commit::CommitBuffer)): `not_committed` (with the conflicting
+//!   ranges, [`Error::conflicting_ranges`]), `commit_unknown_result`, `key_too_large`,
+//!   `transaction_too_large`, ...;
 //! * **opening a database** (`no_cluster_file_found`, `connection_string_invalid`,
 //!   `tls_error`, ...; the cause is the [`source`](std::error::Error::source)).
 //!
@@ -38,8 +39,7 @@
 //!   `transaction_throttled_hot_shard`, `batch_transaction_throttled`, `process_behind`,
 //!   `tag_throttled`, `transaction_rejected_range_locked`, and on 7.4 `proxy_tag_throttled`.
 //! * [`is_retryable`](Error::is_retryable) is `RETRYABLE`, the union of the two.
-//! * [`transaction_retry`](Error::transaction_retry) (and
-//!   [`on_error`](Error::on_error)) is what `Transaction::onError`
+//! * [`transaction_retry`](Error::transaction_retry) is what `Transaction::onError`
 //!   does with the error (NativeAPI 7.4:8112-8167, 8.0:5908-5958): reset the transaction and
 //!   retry after the transaction's exponential backoff ([`TransactionRetry::Backoff`]) for
 //!   the codes listed there, after `FUTURE_VERSION_RETRY_DELAY` (10 ms, capped by the
@@ -61,7 +61,7 @@
 //! A request that may have reached the server without a reply saying what became of it is
 //! `request_maybe_delivered` for a read ([`Error::from_request`]); for a commit, C++'s
 //! `tryCommit` turns it into `commit_unknown_result` (NativeAPI 7.4:7060-7061, 8.0:4755-4756):
-//! [`Error::from_commit_request`]. The [`Committer`](crate::Committer) reports every commit
+//! [`Error::from_commit_request`]. The [`Committer`](crate::commit::Committer) reports every commit
 //! failure that way.
 //!
 //! ## Where the predicates know more than the code
@@ -351,7 +351,7 @@ impl Error {
     }
 
     /// The error a commit request gets when it fails the way `error` says (`tryCommit`'s
-    /// `catch`, as the [`Committer`](crate::Committer) classifies it):
+    /// `catch`, as the [`Committer`](crate::commit::Committer) classifies it):
     ///
     /// * a request that may have been delivered with no definite answer
     ///   ([`RequestError::maybe_delivered`]: a broken connection, a cancellation, an
@@ -495,7 +495,8 @@ impl Error {
 
     /// What `Transaction::onError` does with this error: `Some` if it resets the transaction
     /// and retries (and how long it waits first), `None` if it rethrows the error (or, for
-    /// `success`, fails with `client_invalid_operation`; see [`on_error`](Self::on_error)).
+    /// `success`, fails with `client_invalid_operation`, as
+    /// [`Transaction::on_error`](crate::Transaction::on_error) does).
     /// [`TransactionRetry::Backoff`] for `commit_unknown_result` means the transaction may
     /// already have committed. A commit that certainly was not delivered is retried with the
     /// backoff (C++ would have reported it as `commit_unknown_result`).
@@ -525,7 +526,7 @@ impl Error {
     /// `Transaction::onError(e)` as a result: `Ok` with how to wait before retrying the
     /// reset transaction, or `Err` with the error the transaction fails with: this one, or
     /// `client_invalid_operation` for `success` (C++: "onError(success)" is a misuse).
-    pub fn on_error(&self) -> Result<TransactionRetry, Error> {
+    pub(crate) fn on_error(&self) -> Result<TransactionRetry, Error> {
         if self.code == SUCCESS {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }

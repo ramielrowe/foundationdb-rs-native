@@ -155,6 +155,18 @@ impl RangeLimits {
 
 /// The arguments of `fdb_transaction_get_range` besides the selectors and `snapshot`: what a
 /// range read (or one batch of a range stream) asks for.
+///
+/// ```
+/// use fdb_native_client::{RangeOptions, StreamingMode};
+///
+/// // The last 10 rows, in one request.
+/// let options = RangeOptions::with_limit(10)
+///     .reverse(true)
+///     .mode(StreamingMode::WantAll);
+/// assert_eq!((options.limit, options.reverse), (10, true));
+/// // The default: no limit, the `Iterator` mode, from its first iteration.
+/// assert_eq!(RangeOptions::default().mode, StreamingMode::Iterator);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct RangeOptions {
@@ -187,6 +199,7 @@ impl Default for RangeOptions {
 
 impl RangeOptions {
     /// At most `limit` rows (0: no limit), the rest default.
+    #[must_use]
     pub fn with_limit(limit: u32) -> RangeOptions {
         RangeOptions {
             limit,
@@ -194,25 +207,36 @@ impl RangeOptions {
         }
     }
 
+    /// These options with at most `limit` rows (0: no limit).
+    #[must_use]
+    pub fn limit(mut self, limit: u32) -> RangeOptions {
+        self.limit = limit;
+        self
+    }
+
     /// These options with `mode`.
+    #[must_use]
     pub fn mode(mut self, mode: StreamingMode) -> RangeOptions {
         self.mode = mode;
         self
     }
 
     /// These options reading in reverse if `reverse`.
+    #[must_use]
     pub fn reverse(mut self, reverse: bool) -> RangeOptions {
         self.reverse = reverse;
         self
     }
 
     /// These options with `target_bytes`.
+    #[must_use]
     pub fn target_bytes(mut self, target_bytes: u32) -> RangeOptions {
         self.target_bytes = target_bytes;
         self
     }
 
     /// These options at `iteration`.
+    #[must_use]
     pub fn iteration(mut self, iteration: u32) -> RangeOptions {
         self.iteration = iteration;
         self
