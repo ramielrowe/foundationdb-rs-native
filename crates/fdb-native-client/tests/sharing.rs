@@ -377,3 +377,52 @@ async fn shutting_one_database_down_while_both_commit() {
     assert_eq!(cluster.connects(150), 1);
     b.shutdown().await;
 }
+
+/// Databases of clusters of different versions on one runtime share one manager, and a new
+/// connection to either announces its own cluster's version on the first try, not the one
+/// last negotiated with the other (b35.9).
+#[tokio::test(start_paused = true)]
+async fn a_new_connection_announces_its_own_clusters_version() {
+    const V74: ProtocolVersion = ProtocolVersion::V7_4;
+    const V80: ProtocolVersion = ProtocolVersion::V8_0;
+    let net = Net::new();
+    let rt = MemRuntime::new(&net);
+    // Cluster A is 7.4 at .1 (its coordinator) and .3, cluster B 8.0 at .2 and .4.
+    let a1 = FakeCoordinator::start(&net, sock(1, 4500), V74);
+    let a3 = FakeCoordinator::start(&net, sock(3, 4500), V74);
+    let b2 = FakeCoordinator::start(&net, sock(2, 4500), V80);
+    let b4 = FakeCoordinator::start(&net, sock(4, 4500), V80);
+    let db_a = Database::from_record(
+        rt.clone(),
+        ConnectionRecord::memory("a:1@10.0.0.1:4500".parse().unwrap()),
+        options(),
+    )
+    .unwrap();
+    until("A's coordinator is connected", || a1.announced() == [V74]).await;
+    let db_b = Database::from_record(
+        rt.clone(),
+        ConnectionRecord::memory("b:2@10.0.0.2:4500".parse().unwrap()),
+        options(),
+    )
+    .unwrap();
+    assert!(db_a.peers().shares_connections_with(db_b.peers()));
+    // B knows nothing of its cluster yet: the guess is the manager's (7.4), wrong, and costs
+    // one reconnect.
+    until("B's coordinator is connected", || {
+        b2.announced() == [V74, V80]
+    })
+    .await;
+    assert_eq!(db_a.peers().cluster_version(), Some(V80));
+
+    // New addresses: A's announces 7.4 although 8.0 was negotiated last, then B's announces
+    // 8.0 although 7.4 was.
+    let pa = db_a.peers().peer(&address(3));
+    assert_eq!(pa.connect().await, Ok(V74));
+    assert_eq!(a3.announced(), [V74]);
+    assert_eq!(db_a.peers().cluster_version(), Some(V74));
+    let pb = db_b.peers().peer(&address(4));
+    assert_eq!(pb.connect().await, Ok(V80));
+    assert_eq!(b4.announced(), [V80]);
+    db_a.shutdown().await;
+    db_b.shutdown().await;
+}

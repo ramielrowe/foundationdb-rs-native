@@ -515,6 +515,8 @@ impl<R: Runtime> Database<R> {
         } else {
             connections::own(&rt, &options.peers, &material)?
         };
+        // The first announcement to a new address is guessed per cluster, not per process.
+        peers.set_cluster_key(&record.connection_string().key());
         let monitor = Arc::new(ClusterMonitor::start(
             rt.clone(),
             peers.clone(),

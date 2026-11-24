@@ -627,12 +627,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     fn first_version(&self) -> ProtocolVersion {
         let known = self.peer.status.read(|s| s.known_version);
         known
-            .or_else(|| self.shared.cluster_version())
+            .or_else(|| self.shared.guess_version(self.peer.cluster.as_ref()))
             .unwrap_or(self.shared.config.supported_versions[0])
     }
 
     fn learn_version(&self, version: ProtocolVersion) {
-        self.shared.set_cluster_version(version);
+        self.shared
+            .set_cluster_version(self.peer.cluster.as_ref(), version);
         self.update(|s| {
             let changed = s.known_version != Some(version);
             s.known_version = Some(version);
@@ -779,7 +780,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         self.demand = false;
         // The version we speak is the supported one the peer's is compatible with.
         let negotiated = self.shared.supported(version).unwrap_or(announced);
-        self.shared.set_cluster_version(negotiated);
+        self.shared
+            .set_cluster_version(self.peer.cluster.as_ref(), negotiated);
         self.shared
             .failures
             .set_address_failed(&self.peer.address, false, now);

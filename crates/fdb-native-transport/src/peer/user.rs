@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
 use super::watch::{WaitFor, Watch};
@@ -22,6 +23,8 @@ pub(crate) struct User {
     signal: Watch<bool>,
     /// How many `PeerManager` values of this user exist.
     pub(crate) clones: AtomicUsize,
+    /// The cluster this user's peers are of ([`PeerManager::set_cluster_key`](super::PeerManager::set_cluster_key)).
+    cluster: OnceLock<Arc<str>>,
 }
 
 type IsClosed = fn(&bool) -> Option<()>;
@@ -38,7 +41,17 @@ impl User {
             closed: AtomicBool::new(false),
             signal: Watch::new(false),
             clones: AtomicUsize::new(1),
+            cluster: OnceLock::new(),
         }
+    }
+
+    /// Sets the cluster key, once. Returns whether this call did.
+    pub(crate) fn set_cluster(&self, key: &str) -> bool {
+        self.cluster.set(Arc::from(key)).is_ok()
+    }
+
+    pub(crate) fn cluster(&self) -> Option<Arc<str>> {
+        self.cluster.get().cloned()
     }
 
     pub(crate) fn id(&self) -> u64 {

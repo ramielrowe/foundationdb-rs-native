@@ -344,6 +344,13 @@
 //! The peers shut down (as above) with the last user. [`PeerManager::users`] counts the users
 //! left and [`PeerManager::shares_connections_with`] tells whether two managers share.
 //!
+//! Peers are shared across clusters too (they share no addresses), and so is the guess of the
+//! version a new connection announces first (the one last negotiated with any address, else the
+//! first supported). With clusters of different versions in a process that guess flips between
+//! them, and a wrong one costs a reconnect. A user that names its cluster
+//! ([`PeerManager::set_cluster_key`]) has the peers it makes guess from the version last
+//! negotiated with that cluster's addresses first.
+//!
 //! The limits of a peer are the connection's, so the users share them: the command queue
 //! ([`command_queue_len`](PeerManagerConfig::command_queue_len)), the output buffer and the
 //! reply registry's cap on requests in flight
@@ -475,6 +482,9 @@ pub(crate) struct PeerShared {
     pub(crate) status: Watch<PeerStatus>,
     pub(crate) queue: CommandQueue,
     pub(crate) ctrl: mpsc::UnboundedSender<Ctrl>,
+    /// The cluster the user that made the peer said it is of, if it did
+    /// ([`PeerManager::set_cluster_key`]): the key of the version guess its connections make.
+    pub(crate) cluster: Option<Arc<str>>,
     /// C++'s `peerReferences`: -1 until the first reference, then the count.
     references: AtomicIsize,
     /// How many [`PeerHandle`]s exist (the manager's map holds none).
@@ -973,6 +983,9 @@ pub(crate) struct Shared<R: Runtime, W> {
     pub(crate) tls_throttle: tls_throttle::TlsThrottle,
     /// The version of the cluster, as last negotiated with any address.
     pub(crate) cluster_version: Mutex<Option<ProtocolVersion>>,
+    /// The version last negotiated with an address of each cluster that users named
+    /// ([`PeerManager::set_cluster_key`]).
+    cluster_versions: Mutex<HashMap<Arc<str>, ProtocolVersion>>,
     pub(crate) seed: u64,
     peers: Mutex<Peers<R>>,
     next_peer: AtomicU64,
@@ -1008,11 +1021,32 @@ impl<R: Runtime, W> Shared<R, W> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn set_cluster_version(&self, version: ProtocolVersion) {
+    /// Records the version negotiated with an address of `cluster` (the key of the peer's
+    /// user, if it named one).
+    pub(crate) fn set_cluster_version(&self, cluster: Option<&Arc<str>>, version: ProtocolVersion) {
         *self
             .cluster_version
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(version);
+        if let Some(cluster) = cluster {
+            self.cluster_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(cluster.clone(), version);
+        }
+    }
+
+    /// The version to announce first to a new address of `cluster`: the one last negotiated
+    /// with that cluster, else the manager's.
+    pub(crate) fn guess_version(&self, cluster: Option<&Arc<str>>) -> Option<ProtocolVersion> {
+        let own = cluster.and_then(|cluster| {
+            self.cluster_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(cluster)
+                .copied()
+        });
+        own.or_else(|| self.cluster_version())
     }
 
     fn lock_peers(&self) -> std::sync::MutexGuard<'_, Peers<R>> {
@@ -1269,6 +1303,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
                 failures: FailureMonitor::new(),
                 tls_throttle: Default::default(),
                 cluster_version: Mutex::new(None),
+                cluster_versions: Mutex::new(HashMap::new()),
                 seed,
                 peers: Mutex::new(Peers {
                     map: HashMap::new(),
@@ -1333,6 +1368,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
         &self.inner.config
     }
 
+    /// Tells the manager which cluster this user's peers are of (a key such as `description:id`
+    /// of its connection string; only compared for equality). A peer this user creates then
+    /// announces, to a new address, the version last negotiated with that cluster's other
+    /// addresses before it falls back to [`cluster_version`](Self::cluster_version), so that
+    /// databases of clusters of different versions sharing the connections do not mislead each
+    /// other's first announcement (a wrong guess costs one reconnect, never a request). Set
+    /// once, before the user's first [`peer`](Self::peer); later calls do nothing and return
+    /// `false`. See [Sharing](self#sharing).
+    pub fn set_cluster_key(&self, key: &str) -> bool {
+        self.user.set_cluster(key)
+    }
+
     /// The protocol version of the cluster as last negotiated with any address, if one has
     /// been.
     pub fn cluster_version(&self) -> Option<ProtocolVersion> {
@@ -1385,6 +1432,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
             status: Watch::new(status),
             queue: CommandQueue::new(shared.config.command_queue_len),
             ctrl: ctrl_tx,
+            cluster: self.user.cluster(),
             references: AtomicIsize::new(-1),
             handles: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
