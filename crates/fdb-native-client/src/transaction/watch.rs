@@ -145,7 +145,7 @@ impl<R: Runtime> Transaction<R> {
         if let Some(e) = state.used_during_commit() {
             return Err(e);
         }
-        state.check_alive(self.rt().now())?;
+        state.check_alive(|| self.rt().now())?;
         let start = ReadStart {
             epoch: state.epoch,
             use_provisional_proxies: state.flags.use_provisional_proxies,

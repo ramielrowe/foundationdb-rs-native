@@ -42,6 +42,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::LazyLock;
 
 use fdb_native_wire::{Bytes, KeyValue, KeyValueRef, SharedKeyValueVector};
 
@@ -478,15 +479,20 @@ impl Entry {
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotCache {
     /// Entries by begin key. There are always degenerate entries at the two ends,
-    /// `["", "")` and `[\xff\xff, \xff\xff\x00)`, which "reduce edge cases".
+    /// `["", "")` and `[\xff\xff, \xff\xff\x00)`, which "reduce edge cases". None at all
+    /// while nothing was ever inserted ([`untouched`](Self::untouched)): such a cache is read
+    /// as [`EMPTY`], so a new transaction allocates nothing for its cache.
     entries: BTreeMap<Vec<u8>, Entry>,
     /// The buffers the rows are in, kept until the cache is dropped (as C++'s rows are in the
     /// transaction's arena), also after the rows in one are replaced.
     buffers: Vec<Bytes>,
-    /// Nothing was ever inserted: every key up to `\xff\xff` is unknown (the point reads
-    /// of a new transaction need not search the map).
-    untouched: bool,
 }
+
+/// What every cache nothing was inserted into is: the two degenerate entries.
+static EMPTY: LazyLock<SnapshotCache> = LazyLock::new(|| SnapshotCache {
+    entries: SnapshotCache::boundary_entries(),
+    buffers: Vec::new(),
+});
 
 impl Default for SnapshotCache {
     fn default() -> SnapshotCache {
@@ -495,8 +501,16 @@ impl Default for SnapshotCache {
 }
 
 impl SnapshotCache {
-    /// An empty cache: all of `["", \xff\xff)` is unknown.
+    /// An empty cache: all of `["", \xff\xff)` is unknown. Allocates nothing.
     pub(crate) fn new() -> SnapshotCache {
+        SnapshotCache {
+            entries: BTreeMap::new(),
+            buffers: Vec::new(),
+        }
+    }
+
+    /// The entries of an empty cache.
+    fn boundary_entries() -> BTreeMap<Vec<u8>, Entry> {
         let mut entries = BTreeMap::new();
         entries.insert(
             Vec::new(),
@@ -512,16 +526,31 @@ impl SnapshotCache {
                 values: Vec::new(),
             },
         );
-        SnapshotCache {
-            entries,
-            buffers: Vec::new(),
-            untouched: true,
+        entries
+    }
+
+    /// Nothing was ever inserted: every key up to `\xff\xff` is unknown (the point reads
+    /// of a new transaction need not search the map).
+    fn untouched(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The cache as it is read: [`EMPTY`] if nothing was inserted.
+    fn view(&self) -> &SnapshotCache {
+        if self.untouched() { &EMPTY } else { self }
+    }
+
+    /// Gives an untouched cache its entries, before an insert.
+    fn materialize(&mut self) {
+        if self.untouched() {
+            self.entries = SnapshotCache::boundary_entries();
         }
     }
 
     /// `empty()`: is nothing known about the snapshot's contents?
     pub(crate) fn is_empty(&self) -> bool {
         !self
+            .view()
             .entries
             .iter()
             .any(|(begin, e)| *begin != e.end && begin.as_slice() < ALL_KEYS_END)
@@ -539,7 +568,7 @@ impl SnapshotCache {
     /// is known to be absent, `None` if it is unknown (the type of its segment, as
     /// [`segment_at`](Self::segment_at) finds it).
     pub(crate) fn lookup(&self, key: &[u8]) -> Option<Option<KeyValueRef<'_>>> {
-        if self.untouched && key < ALL_KEYS_END {
+        if self.untouched() && key < ALL_KEYS_END {
             return None;
         }
         let it = self.segment_at(key);
@@ -554,7 +583,7 @@ impl SnapshotCache {
     /// (or is absent, if `None`). Does nothing, returning `false`, when `key` is already known;
     /// the new entry is `[key, key + \x00)`.
     pub(crate) fn insert_key(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
-        let unknown = if self.untouched {
+        let unknown = if self.untouched() {
             key < ALL_KEYS_END
         } else {
             self.segment_at(key).is_unknown_range()
@@ -562,7 +591,7 @@ impl SnapshotCache {
         if !unknown {
             return false;
         }
-        self.untouched = false;
+        self.materialize();
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
@@ -650,6 +679,8 @@ impl SnapshotCache {
             values: rows,
         };
 
+        // (`itb` and `ite` may have been reading `EMPTY`: the entries erased are the same.)
+        self.materialize();
         let doomed: Vec<Vec<u8>> = self
             .entries
             .range::<[u8], _>((
@@ -664,7 +695,6 @@ impl SnapshotCache {
         // `begin != allKeys.begin && itb.it->beginKey == allKeys.begin`: the erased entry was
         // the one at the start of the key space. (C++ keeps this case; it cannot arise.)
         let add_begin = !new_begin.is_empty() && erase_from.is_empty();
-        self.untouched = false;
         self.entries.insert(new_begin, new_entry);
         if add_begin {
             self.entries.insert(
@@ -719,15 +749,16 @@ impl SnapshotCache {
     /// Checks the structure's invariants, for tests.
     #[cfg(test)]
     fn assert_invariants(&self) {
+        let cache = self.view();
         let mut prev_end: Option<&[u8]> = None;
         assert!(
-            self.entries.contains_key(&b""[..]),
+            cache.entries.contains_key(&b""[..]),
             "no entry at the start of the key space"
         );
-        let last = self.entries.iter().next_back().expect("entries");
+        let last = cache.entries.iter().next_back().expect("entries");
         assert_eq!(last.0.as_slice(), ALL_KEYS_END);
         assert_eq!(last.1.end.as_slice(), AFTER_ALL_KEYS);
-        for (begin, e) in &self.entries {
+        for (begin, e) in &cache.entries {
             assert!(begin <= &e.end, "entry {begin:?} ends before it begins");
             if let Some(p) = prev_end {
                 assert!(p <= begin.as_slice(), "entries overlap at {begin:?}");
@@ -781,6 +812,7 @@ impl<'a> SnapshotCacheIter<'a> {
     /// C++ `iterator(cache)`: at the (degenerate) first segment; use [`skip`](Self::skip) to
     /// position it.
     pub(crate) fn new(cache: &'a SnapshotCache) -> SnapshotCacheIter<'a> {
+        let cache = cache.view();
         let (begin, entry) = cache
             .entries
             .iter()
