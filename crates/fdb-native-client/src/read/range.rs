@@ -155,6 +155,18 @@ impl RangeLimits {
 
 /// The arguments of `fdb_transaction_get_range` besides the selectors and `snapshot`: what a
 /// range read (or one batch of a range stream) asks for.
+///
+/// ```
+/// use fdb_native_client::{RangeOptions, StreamingMode};
+///
+/// // The last 10 rows, in one request.
+/// let options = RangeOptions::with_limit(10)
+///     .reverse(true)
+///     .mode(StreamingMode::WantAll);
+/// assert_eq!((options.limit, options.reverse), (10, true));
+/// // The default: no limit, the `Iterator` mode, from its first iteration.
+/// assert_eq!(RangeOptions::default().mode, StreamingMode::Iterator);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct RangeOptions {
@@ -187,6 +199,7 @@ impl Default for RangeOptions {
 
 impl RangeOptions {
     /// At most `limit` rows (0: no limit), the rest default.
+    #[must_use]
     pub fn with_limit(limit: u32) -> RangeOptions {
         RangeOptions {
             limit,
@@ -194,25 +207,36 @@ impl RangeOptions {
         }
     }
 
+    /// These options with at most `limit` rows (0: no limit).
+    #[must_use]
+    pub fn limit(mut self, limit: u32) -> RangeOptions {
+        self.limit = limit;
+        self
+    }
+
     /// These options with `mode`.
+    #[must_use]
     pub fn mode(mut self, mode: StreamingMode) -> RangeOptions {
         self.mode = mode;
         self
     }
 
     /// These options reading in reverse if `reverse`.
+    #[must_use]
     pub fn reverse(mut self, reverse: bool) -> RangeOptions {
         self.reverse = reverse;
         self
     }
 
     /// These options with `target_bytes`.
+    #[must_use]
     pub fn target_bytes(mut self, target_bytes: u32) -> RangeOptions {
         self.target_bytes = target_bytes;
         self
     }
 
     /// These options at `iteration`.
+    #[must_use]
     pub fn iteration(mut self, iteration: u32) -> RangeOptions {
         self.iteration = iteration;
         self
@@ -337,6 +361,29 @@ impl RangeRead {
         out
     }
 
+    /// A result with these rows and flags, for tests of the code that reads one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        rows: Vec<KeyValue>,
+        more: bool,
+        read_to_begin: bool,
+        read_through_end: bool,
+        read_through: Option<Vec<u8>>,
+    ) -> RangeRead {
+        let mut read = RangeRead {
+            more,
+            read_to_begin,
+            read_through_end,
+            read_through,
+            ..RangeRead::default()
+        };
+        read.push(
+            KeyValueVector::from_pairs(rows.iter().map(|kv| KeyValueRef::new(&kv.key, &kv.value)))
+                .expect("rows"),
+        );
+        read
+    }
+
     fn push(&mut self, chunk: KeyValueVector) {
         if !chunk.is_empty() {
             self.len += chunk.len();
@@ -357,14 +404,14 @@ impl LoadBalanced for GetKeyValues {
     type Output = KeyValuesReply;
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_key_values;
 
-    fn split(reply: GetKeyValuesReply<'_>) -> LoadBalancedReply<KeyValuesReply> {
+    fn split(reply: GetKeyValuesReply<'_>, keep: bool) -> LoadBalancedReply<KeyValuesReply> {
         (
             reply.penalty,
             reply.error.map(|e| e.code),
-            KeyValuesReply {
+            keep.then(|| KeyValuesReply {
                 data: reply.data.into_owned(),
                 more: reply.more,
-            },
+            }),
         )
     }
 }
@@ -490,16 +537,18 @@ pub(crate) fn read_conflict_range(
     })
 }
 
-/// `GetRangeLimits` as `getRange` counts it down: `-1` is no limit.
+/// `GetRangeLimits` as `getRange` counts it down: `-1` is no limit. The read-your-writes
+/// layer builds its own (with a `minRows` above 1) and reads with
+/// [`Reader::get_range_with_raw_limits`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Limits {
-    rows: i64,
-    min_rows: i64,
-    bytes: i64,
+pub(crate) struct Limits {
+    pub(crate) rows: i64,
+    pub(crate) min_rows: i64,
+    pub(crate) bytes: i64,
 }
 
 impl Limits {
-    fn new(limits: RangeLimits) -> Limits {
+    pub(crate) fn new(limits: RangeLimits) -> Limits {
         // C++'s limits are `int`s: larger ones are as good as none.
         let cap = |n: u32| i64::from(n.min(i32::MAX as u32));
         Limits {
@@ -509,21 +558,29 @@ impl Limits {
         }
     }
 
-    fn has_row_limit(&self) -> bool {
+    pub(crate) fn has_row_limit(&self) -> bool {
         self.rows != -1
     }
 
-    fn has_byte_limit(&self) -> bool {
+    pub(crate) fn has_byte_limit(&self) -> bool {
         self.bytes != -1
     }
 
     /// `isReached`.
-    fn is_reached(&self) -> bool {
+    pub(crate) fn is_reached(&self) -> bool {
         self.rows == 0 || (self.bytes == 0 && self.min_rows == 0)
     }
 
+    /// `isValid`.
+    pub(crate) fn is_valid(&self) -> bool {
+        (self.rows >= 0 || self.rows == -1)
+            && (self.bytes >= 0 || self.bytes == -1)
+            && self.min_rows >= 0
+            && (self.min_rows <= self.rows || self.rows == -1)
+    }
+
     /// `hasSatisfiedMinRows`.
-    fn has_satisfied_min_rows(&self) -> bool {
+    pub(crate) fn has_satisfied_min_rows(&self) -> bool {
         self.has_byte_limit() && self.min_rows == 0
     }
 
@@ -563,8 +620,9 @@ impl Limits {
     }
 }
 
-/// Both futures' results, or the first error (`a`'s if both fail): `wait(fb); wait(fe)` on
-/// two futures started together.
+/// Both futures' results, or an error as `wait(fb); wait(fe)` on two futures started
+/// together reports it: `a`'s as soon as `a` fails; `b`'s only once `a` succeeded (so `a`'s
+/// if both fail, whichever fails first).
 async fn try_join<A, B, T, U>(a: A, b: B) -> Result<(T, U), Error>
 where
     A: Future<Output = Result<T, Error>>,
@@ -573,7 +631,7 @@ where
     let mut a = pin!(a);
     let mut b = pin!(b);
     let mut ra = None;
-    let mut rb = None;
+    let mut rb: Option<Result<U, Error>> = None;
     poll_fn(|cx| {
         if ra.is_none() {
             if let Poll::Ready(r) = a.as_mut().poll(cx) {
@@ -582,11 +640,12 @@ where
         }
         if rb.is_none() {
             if let Poll::Ready(r) = b.as_mut().poll(cx) {
-                rb = Some(r?);
+                rb = Some(r);
             }
         }
         match (ra.take(), rb.take()) {
-            (Some(x), Some(y)) => Poll::Ready(Ok((x, y))),
+            (Some(x), Some(Ok(y))) => Poll::Ready(Ok((x, y))),
+            (Some(_), Some(Err(e))) => Poll::Ready(Err(e)),
             (x, y) => {
                 ra = x;
                 rb = y;
@@ -657,12 +716,41 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
+        self.get_range_with_raw_limits(
+            begin,
+            end,
+            Limits::new(limits),
+            reverse,
+            version,
+            use_provisional_proxies,
+        )
+        .await
+    }
+
+    /// [`get_range_with_limits`](Self::get_range_with_limits) with C++'s `GetRangeLimits`
+    /// as it is (`minRows` included), as the read-your-writes layer asks for its reads
+    /// (`RYWImpl::setRequestLimits`). `range_limits_invalid` (2012) for limits that are not
+    /// `isValid()`.
+    pub(crate) async fn get_range_with_raw_limits(
+        &self,
+        begin: &KeySelector,
+        end: &KeySelector,
+        limits: Limits,
+        reverse: bool,
+        version: i64,
+        use_provisional_proxies: bool,
+    ) -> Result<RangeRead, Error> {
+        if version <= 0 {
+            return Err(Error::new(CLIENT_INVALID_OPERATION));
+        }
         if begin.key.as_slice() > KEY_SPACE_END || end.key.as_slice() > KEY_SPACE_END {
             return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
-        let limits = Limits::new(limits);
         if limits.is_reached() {
             return Ok(RangeRead::default());
+        }
+        if !limits.is_valid() {
+            return Err(Error::new(RANGE_LIMITS_INVALID));
         }
         let begin = remove_or_equal(begin);
         let end = remove_or_equal(end);
@@ -735,8 +823,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             }
             // Not in C++, which would look up the shard of `\xff\xff` (there is none): a
             // forward read whose begin resolves at or after the end of the key space has
-            // nothing more to read, and a reverse read whose end does reads up to it.
+            // nothing more to read, and a reverse read whose end does reads up to it. The
+            // forward read went through the end of the database (`readThroughEnd`, which C++
+            // reaches through `getRangeFallback`), so its read conflict range ends at
+            // `\xff\xff`, not after its last row.
             if !reverse && begin.key.as_slice() >= KEY_SPACE_END && !is_backward(&begin) {
+                output.read_through_end = true;
                 return Ok(output);
             }
             if reverse && end.key.as_slice() >= KEY_SPACE_END && !is_backward(&minus(&end, 1)) {
@@ -940,6 +1032,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     reverse,
                     version,
                     use_provisional,
+                    GetKeyValues::STREAM,
                 )
                 .await?;
             let mut shard = 0;
@@ -1043,22 +1136,24 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
 
     /// `getKeyRangeLocations` (NativeAPI 7.4:3505-3547, 8.0:1493-1534): the locations of at
     /// most `limit` shards of `keys`, from its end if `reverse`, each intersected with
-    /// `keys`: from the cache if it has them all (and none has a replica whose endpoint
-    /// failed on a healthy server, which is then forgotten), else from a commit proxy.
-    async fn key_range_locations(
+    /// `keys`: from the cache if it has them all (and none has a replica whose endpoint of
+    /// the storage stream `stream`, the request's `member`, failed on a healthy server: that
+    /// shard is then forgotten), else from a commit proxy.
+    pub(super) async fn key_range_locations(
         &self,
         keys: &KeyRange,
         limit: i32,
         reverse: bool,
         version: i64,
         use_provisional: bool,
+        stream: u32,
     ) -> Result<Vec<(KeyRange, Arc<Location>)>, Error> {
         if let Some(cached) = self.cached_locations(keys, limit as usize, reverse) {
             let mut found_failed = false;
             for (range, location) in &cached {
                 let mut refresh = false;
                 for server in &location.servers {
-                    let (address, token) = server.target_for(GetKeyValues::STREAM);
+                    let (address, token) = server.target_for(stream);
                     if self.check_only_endpoint_failed(address, token) {
                         refresh = true;
                     }
@@ -1386,5 +1481,35 @@ mod tests {
         assert_eq!(kvs.len(), 3);
         assert_eq!(kvs[2], KeyValue::new(b"c".to_vec(), b"3".to_vec()));
         assert_eq!(RangeRead::default().continuation(false), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_join_reports_errors_as_wait_fb_then_fe() {
+        use std::time::Duration;
+        use tokio::time::sleep;
+        let fail = |code, ms| async move {
+            sleep(Duration::from_millis(ms)).await;
+            Err::<(), _>(Error::new(code))
+        };
+        let ok = |ms| async move {
+            sleep(Duration::from_millis(ms)).await;
+            Ok::<(), Error>(())
+        };
+        // Both fail, the end first: the begin's error (C++ waits for `fb` first).
+        let e = try_join(fail(1, 20), fail(2, 10)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        let e = try_join(fail(1, 10), fail(2, 20)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        // Only the end fails: its error, once the begin succeeded.
+        let started = tokio::time::Instant::now();
+        let e = try_join(ok(30), fail(2, 10)).await.unwrap_err();
+        assert_eq!(e.code(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        // The begin fails: at once.
+        let started = tokio::time::Instant::now();
+        let e = try_join(fail(1, 10), ok(30)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        assert!(started.elapsed() < Duration::from_millis(30));
+        assert!(try_join(ok(1), ok(2)).await.is_ok());
     }
 }

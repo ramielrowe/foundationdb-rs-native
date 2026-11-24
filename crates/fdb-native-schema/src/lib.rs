@@ -39,7 +39,8 @@
 //! (with `StorageServerInterface`), `GetValueRequest` → `GetValueReply`, `GetKeyRequest` →
 //! `GetKeyReply` (with `KeySelectorRef`), `GetKeyValuesRequest` → `GetKeyValuesReply` (whose
 //! rows stay in the message's pre-serialized blob and are read in place),
-//! `WatchValueRequest` → `WatchValueReply` and `CommitTransactionRequest` → `CommitID`.
+//! `WatchValueRequest` → `WatchValueReply`, `WaitMetricsRequest` → `StorageMetrics`,
+//! `SplitRangeRequest` → `SplitRangeReply` and `CommitTransactionRequest` → `CommitID`.
 //! Interfaces carry one endpoint each; the others are adjusted endpoints whose indices are in
 //! [`streams`] (the domain interfaces' `endpoints()` computes them).
 //!

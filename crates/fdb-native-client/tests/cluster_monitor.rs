@@ -9,10 +9,10 @@ mod support;
 use std::time::Duration;
 
 use fdb_native_client::cluster::CLUSTER_FILE_HEADER;
-use fdb_native_client::{
-    ClusterConnectionString, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord, MonitorClosed,
-    MonitorError,
+use fdb_native_client::cluster::{
+    ClusterMonitor, ClusterMonitorConfig, ConnectionRecord, MonitorClosed, MonitorError,
 };
+use fdb_native_client::cluster_file::ClusterConnectionString;
 use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{ClientDbInfo, Hostname};
 use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};

@@ -38,6 +38,9 @@ pub struct CommitBuffer {
     write_conflicts: Vec<KeyRange>,
     /// C++'s `extraConflictRanges`: the read conflict ranges of `getKey` and `getRange`.
     extra_read_conflicts: Vec<KeyRange>,
+    /// The write in progress adds no write conflict range (`AddConflictRange::False`, from
+    /// the `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option).
+    skip_write_conflict: bool,
 }
 
 impl CommitBuffer {
@@ -49,6 +52,28 @@ impl CommitBuffer {
             read_conflicts: Vec::new(),
             write_conflicts: Vec::new(),
             extra_read_conflicts: Vec::new(),
+            skip_write_conflict: false,
+        }
+    }
+
+    /// Whether the writes that follow add no write conflict range (`AddConflictRange::False`,
+    /// from the `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option): `set`, `clear`, `clear_range` and
+    /// `atomic_op` still add their mutations. [`add_write_conflict_range`](Self::add_write_conflict_range)
+    /// is not affected.
+    pub(crate) fn set_skip_write_conflict(&mut self, skip: bool) {
+        self.skip_write_conflict = skip;
+    }
+
+    /// Whether the writes that follow add no write conflict range
+    /// ([`set_skip_write_conflict`](Self::set_skip_write_conflict)).
+    pub(crate) fn skip_write_conflict(&self) -> bool {
+        self.skip_write_conflict
+    }
+
+    /// The write conflict range of a write, unless it is to have none.
+    fn add_write_conflict(&mut self, range: KeyRange) {
+        if !self.skip_write_conflict {
+            self.write_conflicts.push(range);
         }
     }
 
@@ -73,7 +98,7 @@ impl CommitBuffer {
             param1: range.begin.clone(),
             param2: range.end.clone(),
         });
-        self.write_conflicts.push(range);
+        self.add_write_conflict(range);
     }
 
     /// `Transaction::clear(range)`. `inverted_range` if `begin > end`.
@@ -86,7 +111,7 @@ impl CommitBuffer {
         };
         // The same truncation `commit` applies; the mutation's range is the conflict range.
         if let Some(m) = check_mutation(m, &self.limits)? {
-            self.write_conflicts.push(KeyRange {
+            self.add_write_conflict(KeyRange {
                 begin: m.param1.clone(),
                 end: m.param2.clone(),
             });
@@ -135,7 +160,9 @@ impl CommitBuffer {
     fn push_mutation(&mut self, m: Mutation, write: Option<KeyRange>) -> Result<(), Error> {
         if let Some(m) = check_mutation(m, &self.limits)? {
             self.mutations.push(m);
-            self.write_conflicts.extend(write);
+            if let Some(write) = write {
+                self.add_write_conflict(write);
+            }
         }
         Ok(())
     }

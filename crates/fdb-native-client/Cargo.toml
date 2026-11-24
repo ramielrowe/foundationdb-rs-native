@@ -15,14 +15,22 @@ default = ["tokio"]
 # `Database::open` and friends on tokio (`TokioRuntime`), and `TokioRuntime` as the default
 # runtime type parameter. Without it the client works over any `Runtime` (`Database::open_with`).
 tokio = ["fdb-native-transport/tokio"]
+# `SmolRuntime` (async-io sockets and timers, async-executor tasks) as an adapter to open a
+# `Database` over (`Database::open_with(SmolRuntime::new(), ..)`). Independent of `tokio`.
+smol = ["fdb-native-transport/smol"]
 # TLS: clusters whose coordinators are `:tls` (and `DatabaseOptions::tls`), through the
 # transport's rustls layer.
 tls = ["fdb-native-transport/tls"]
+# `bench_support`, a hidden facade over the read-your-writes data structures for
+# `benches/ryw.rs` (`cargo bench -p fdb-native-client --features bench-internals`). Not part of
+# the public API.
+bench-internals = []
 
 [dependencies]
 fdb-native-schema.workspace = true
 fdb-native-transport.workspace = true
 fdb-native-wire.workspace = true
+rpds.workspace = true
 futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-core = "0.3.34"
 futures-io = "0.3.34"
@@ -33,6 +41,48 @@ fdb-native-testkit = { path = "../fdb-native-testkit" }
 fdb-native-tuple = { path = "../fdb-native-tuple" }
 fdb-native-transport = { workspace = true, features = ["tokio"] }
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util", "sync", "time"] }
+divan = "0.1.21"
+futures-lite = "2.6.1"
 proptest = "1.11.0"
 regex = { version = "1.11", default-features = false, features = ["std", "perf"] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "ryw"
+harness = false
+required-features = ["bench-internals"]
+
+# The examples run on tokio (the default `tokio` feature); `tests/docker_examples.rs` runs
+# them against a testkit container.
+[[example]]
+name = "basic"
+required-features = ["tokio"]
+
+[[example]]
+name = "range_scan"
+required-features = ["tokio"]
+
+[[example]]
+name = "watch"
+required-features = ["tokio"]
+
+[[example]]
+name = "versionstamp"
+required-features = ["tokio"]
+
+[[example]]
+name = "counter"
+required-features = ["tokio"]
+
+[[example]]
+name = "options"
+required-features = ["tokio"]
+
+# On smol instead: `--no-default-features --features smol`.
+[[example]]
+name = "smol"
+required-features = ["smol"]
+
+[[example]]
+name = "tls"
+required-features = ["tokio", "tls"]

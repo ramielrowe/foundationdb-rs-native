@@ -13,10 +13,12 @@ use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::KeyValue;
 use futures_core::Stream;
 
-use super::{Snapshot, Transaction};
+use super::{ReadFuture, ReadGuard, ReadStart, RywView, Snapshot, Transaction, TxSource};
 use crate::error::Error;
 use crate::error::codes::*;
+use crate::read::Limits;
 use crate::read::{RangeOptions, read_conflict_range, remove_or_equal};
+use crate::ryw;
 
 /// What [`Transaction::get_range`] returns: one batch of rows, in the order read (descending
 /// for a reverse read), and whether the range may have more.
@@ -37,50 +39,70 @@ impl RangeResult {
     }
 }
 
+/// A checked range read, for [`Transaction::range_read`].
+struct NativeRangeRead {
+    begin: KeySelector,
+    end: KeySelector,
+    options: RangeOptions,
+    max_read_key: &'static [u8],
+    use_provisional_proxies: bool,
+    epoch: u64,
+}
+
 impl<R: Runtime> Transaction<R> {
     /// `getRange(begin, end, limit, target_bytes, mode, iteration, snapshot = false,
     /// reverse)`: one batch of the rows from the key `begin` resolves to (included) up to the
-    /// key `end` resolves to (excluded), at the transaction's read version, as
-    /// `fdb_transaction_get_range` returns them with read-your-writes disabled. **Does not
-    /// see the transaction's own writes yet** (read-your-writes is M5; see the [module
-    /// documentation](super)). [`get_ranges`](Self::get_ranges) and
-    /// [`range_stream`](Self::range_stream) read the whole range.
+    /// key `end` resolves to (excluded), as the transaction sees them: the database at the
+    /// read version with the transaction's writes before this call applied (a key it set is
+    /// there, a key it cleared is not; the selectors resolve through them too), as
+    /// `fdb_transaction_get_range` returns them. The read starts when `get_range` is called
+    /// (see [`get`](Self::get)). [`get_ranges`](Self::get_ranges) and
+    /// [`get_ranges_keyvalues`](Self::get_ranges_keyvalues) read the whole range.
     ///
     /// * **Limits** ([`RangeOptions`]): `fdb_c`'s. At most `limit` rows (0: no limit); about
     ///   `target_bytes` bytes, lowered to the streaming mode's batch size (each row counted
     ///   as its key and value plus 8 bytes; at least one row comes back if there is one).
-    ///   With a byte target the batch ends with the first shard that returned rows.
-    ///   [`more`](RangeResult::more) says whether the range may go on.
+    ///   [`more`](RangeResult::more) says whether the range may go on. The storage reads
+    ///   behind a batch follow C++'s read-your-writes layer (`getRangeValue`): only the parts
+    ///   of the range the transaction's cache and writes do not answer are read, with limits
+    ///   grown to cover the rows the transaction's clears will drop.
     /// * **Errors**, in `fdb_c`'s order: `exact_mode_without_limits` (2210) for
     ///   [`StreamingMode::Exact`](crate::read::StreamingMode::Exact) without a limit,
     ///   `client_invalid_operation` (2000) for the iterator mode at iteration 0; then the
     ///   deferred error, `transaction_cancelled`/`transaction_timed_out`,
     ///   `used_during_commit`; `key_outside_legal_range` (2004) for a selector key after
-    ///   `\xff` (`\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option); then
-    ///   the read's errors (`transaction_too_old`, `future_version`, ...). A selector key
-    ///   longer than any key is shortened first (`KeySelectorRef::setKey`).
-    /// * **Bounds** (`readThrough` of `ReadYourWrites.actor.cpp` 7.4:186-213, 8.0:195-222):
-    ///   `orEqual` selectors become `(keyAfter(key), false, offset)`; an inverted range
-    ///   (begin's offset at least end's and its key at least end's) is empty. A reverse read
-    ///   whose end offset is above 1 resolves the end first (a `get_key`, with its read
-    ///   conflict range), clamped to the readable keys. A forward read never returns keys
-    ///   from `\xff` on (`\xff\xff` with the system key options): the rows from there are
-    ///   dropped and `more` is then `false`.
-    /// * **Read conflict range** (non-snapshot): `getRangeFinished`'s (NativeAPI
-    ///   7.4:4849-4895, 8.0:2650-2702), what the result depends on: from the begin
-    ///   selector's key (the first row read when a limit cut a reverse read, `""` if the
-    ///   read went to the beginning of the database) to the end selector's key (after the
-    ///   last row read when a limit cut a forward read, `\xff\xff` if the read went through
-    ///   the end of the database); not added if empty or if the read fails. It is added when
-    ///   the read ends, and a commit started meanwhile waits for it. As C++'s
-    ///   `extraConflictRanges`, it does not count toward the transaction's size.
-    pub async fn get_range(
+    ///   `\xff` (`\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option);
+    ///   `accessed_unreadable` (1036) if the range meets keys a versionstamped operation of
+    ///   the transaction made unreadable; then the read's errors (`transaction_too_old`,
+    ///   `future_version`, ...). A selector key longer than any key is shortened first
+    ///   (`KeySelectorRef::setKey`).
+    /// * **Bounds**: `orEqual` selectors become `(keyAfter(key), false, offset)`; an inverted
+    ///   range (begin's offset at least end's and its key at least end's) is empty. The rows
+    ///   never go past the keys the transaction may read (`\xff`, or `\xff\xff` with the
+    ///   system key options).
+    /// * **Read conflict range** (non-snapshot; `RYWImpl::addConflictRange(GetRangeReq)`):
+    ///   what the result depends on, from the begin selector's key (the last row read, if
+    ///   lower; `""` if the read went to the beginning of the database) to the end
+    ///   selector's key (after the last row when a limit cut a forward read, or the first
+    ///   row of a reverse read that the begin selector's offset of 1 or less cut short;
+    ///   `getMaxReadKey()` if the read went through the end), less the keys the transaction
+    ///   had set or cleared; added when the read ends, and a commit started meanwhile waits
+    ///   for it.
+    /// * **With [`ReadYourWritesDisable`](crate::TransactionOption::ReadYourWritesDisable)**
+    ///   (`readThrough` of `ReadYourWrites.actor.cpp` 7.4:186-213, 8.0:195-222): one
+    ///   NativeAPI read. A reverse read whose end offset is above 1 resolves the end first
+    ///   (a `get_key`, with its read conflict range), clamped to the readable keys; a forward
+    ///   read drops the rows from `\xff` on (`\xff\xff` with the system key options), and
+    ///   `more` is then `false`. Its read conflict range is `getRangeFinished`'s (NativeAPI
+    ///   7.4:4849-4895, 8.0:2650-2702); as C++'s `extraConflictRanges`, it does not count
+    ///   toward the transaction's size.
+    pub fn get_range(
         &self,
         begin: &KeySelector,
         end: &KeySelector,
         options: &RangeOptions,
-    ) -> Result<RangeResult, Error> {
-        self.get_range_with(begin, end, options, false).await
+    ) -> impl Future<Output = Result<RangeResult, Error>> + Send + use<R> {
+        self.get_range_with(begin, end, options, false)
     }
 
     /// The batches of the rows between `begin` and `end` ([`RangeStream`]): what the
@@ -109,7 +131,7 @@ impl<R: Runtime> Transaction<R> {
     /// use futures_core::Stream;
     ///
     /// let tx = db.create_transaction();
-    /// let mut rows = tx.range_stream(
+    /// let mut rows = tx.get_ranges_keyvalues(
     ///     KeySelector::first_greater_or_equal(b"a".to_vec()),
     ///     KeySelector::first_greater_or_equal(b"b".to_vec()),
     ///     RangeOptions::default(),
@@ -121,7 +143,7 @@ impl<R: Runtime> Transaction<R> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn range_stream(
+    pub fn get_ranges_keyvalues(
         &self,
         begin: KeySelector,
         end: KeySelector,
@@ -130,52 +152,132 @@ impl<R: Runtime> Transaction<R> {
         KeyValueStream::new(self.get_ranges(begin, end, options))
     }
 
-    pub(super) async fn get_range_with(
+    pub(super) fn get_range_with(
         &self,
         begin: &KeySelector,
         end: &KeySelector,
         options: &RangeOptions,
         snapshot: bool,
-    ) -> Result<RangeResult, Error> {
+    ) -> ReadFuture<RangeResult> {
         // `validate_and_update_parameters` comes before anything else.
-        options.validate()?;
-        let (begin, end, max_read_key, use_provisional_proxies, epoch, guard) = {
+        if let Err(e) = options.validate() {
+            return ReadFuture::ready(Err(e));
+        }
+        let (start, begin, end, view, guard) = {
             let mut state = self.state();
-            self.check_handle(&state)?;
-            if let Some(e) = state.deferred.clone() {
-                return Err(e);
-            }
-            state.check_alive(self.rt().now())?;
-            state.check_not_committing()?;
-            let max_read_key = state.flags.max_read_key();
+            let start = match self.begin_read(&mut state) {
+                Ok(start) => start,
+                Err(e) => return ReadFuture::ready(Err(e)),
+            };
+            let max_read_key = start.max_read_key;
             let begin = self.set_key(&state, begin);
             let end = self.set_key(&state, end);
             if begin.key.as_slice() > max_read_key || end.key.as_slice() > max_read_key {
-                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
+                return ReadFuture::ready(Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE)));
             }
             // `limits.isReached()` and `!limits.isValid()` cannot happen: `fdb_c`'s limits
             // are never 0 rows nor negative.
             let begin = remove_or_equal(&begin);
             let end = remove_or_equal(&end);
             if begin.offset >= end.offset && begin.key >= end.key {
-                return Ok(RangeResult::default());
+                return ReadFuture::ready(Ok(RangeResult::default()));
             }
-            (
-                begin,
-                end,
-                max_read_key,
-                state.flags.use_provisional_proxies,
-                state.epoch,
-                (!snapshot).then(|| self.start_read(&mut state)),
-            )
+            let view = Self::ryw_view(&state, snapshot);
+            (start, begin, end, view, self.start_read(&mut state))
         };
+        let tx = self.clone();
+        let options = *options;
+        ReadFuture::Task(self.spawn_read(async move {
+            let result = match view {
+                None => {
+                    let read = NativeRangeRead {
+                        begin,
+                        end,
+                        options,
+                        max_read_key: start.max_read_key,
+                        use_provisional_proxies: start.use_provisional_proxies,
+                        epoch: start.epoch,
+                    };
+                    tx.range_read(read, (!snapshot).then_some(&guard)).await
+                }
+                Some(view) => {
+                    let conflict = (!snapshot).then_some(&guard);
+                    tx.ryw_range_read(view, &start, begin, end, options, conflict)
+                        .await
+                }
+            };
+            drop(guard);
+            result
+        }))
+    }
+
+    /// `readWithConflictRangeRYW` / `readWithConflictRangeSnapshot` of a `GetRangeReq`: the
+    /// read-your-writes range read, and its read conflict range if `conflict` (a
+    /// serializable read).
+    async fn ryw_range_read(
+        &self,
+        view: RywView,
+        start: &ReadStart,
+        begin: KeySelector,
+        end: KeySelector,
+        options: RangeOptions,
+        conflict: Option<&ReadGuard<R>>,
+    ) -> Result<RangeResult, Error> {
+        let reader = &self.inner.db.inner.reader;
+        let limits = self
+            .guarded(start.epoch, async {
+                options.limits(reader.schema().await?)
+            })
+            .await??;
+        let source = TxSource::new(self, start);
+        let read = view.read(&source, start.max_read_key);
+        let limits = Limits::new(limits);
+        let out = if options.reverse {
+            ryw::read::get_range_value_back(&read, begin.clone(), end.clone(), limits).await?
+        } else {
+            ryw::read::get_range_value(&read, begin.clone(), end.clone(), limits).await?
+        };
+        if let Some(guard) = conflict {
+            self.add_ryw_conflict(guard, |c| {
+                ryw::read::add_range_read_conflict(
+                    c,
+                    &begin,
+                    &end,
+                    options.reverse,
+                    &out,
+                    start.max_read_key,
+                    &read.writes,
+                )
+            })?;
+        }
+        Ok(RangeResult {
+            kvs: out.rows,
+            more: out.more,
+        })
+    }
+
+    /// `readThrough` of a `GetRangeReq`: the range read with read-your-writes disabled (and
+    /// its read conflict range, for a non-snapshot read: `guard`).
+    async fn range_read(
+        &self,
+        read: NativeRangeRead,
+        guard: Option<&ReadGuard<R>>,
+    ) -> Result<RangeResult, Error> {
+        let NativeRangeRead {
+            begin,
+            end,
+            options,
+            max_read_key,
+            use_provisional_proxies,
+            epoch,
+        } = read;
+        let options = &options;
         let mut end = end;
         if options.reverse && end.offset > 1 {
             // `readThrough`: resolve the end first, so that a reverse read does not start in
             // keys the transaction may not read.
             let key =
-                Box::pin(self.native_get_key(&end, guard.as_ref(), epoch, use_provisional_proxies))
-                    .await?;
+                Box::pin(self.native_get_key(&end, guard, epoch, use_provisional_proxies)).await?;
             let key = if key.as_slice() > max_read_key {
                 max_read_key.to_vec()
             } else {
@@ -204,7 +306,7 @@ impl<R: Runtime> Transaction<R> {
                     .await
             })
             .await??;
-        if let Some(guard) = &guard {
+        if let Some(guard) = guard {
             if let Some(range) = read_conflict_range(&begin, &end, options.reverse, &read) {
                 self.add_read_conflict(guard, range)?;
             }
@@ -231,14 +333,16 @@ impl<R: Runtime> Transaction<R> {
 }
 
 impl<R: Runtime> Snapshot<'_, R> {
-    /// [`Transaction::get_range`] without a read conflict range.
-    pub async fn get_range(
+    /// [`Transaction::get_range`] without a read conflict range (and without the
+    /// transaction's writes if snapshot reads do not see them:
+    /// [`SnapshotRywDisable`](crate::TransactionOption::SnapshotRywDisable)).
+    pub fn get_range(
         &self,
         begin: &KeySelector,
         end: &KeySelector,
         options: &RangeOptions,
-    ) -> Result<RangeResult, Error> {
-        self.tx.get_range_with(begin, end, options, true).await
+    ) -> impl Future<Output = Result<RangeResult, Error>> + Send + use<R> {
+        self.tx.get_range_with(begin, end, options, true)
     }
 
     /// [`Transaction::get_ranges`] without read conflict ranges.
@@ -251,8 +355,8 @@ impl<R: Runtime> Snapshot<'_, R> {
         RangeStream::new(self.tx.clone(), begin, end, options, true)
     }
 
-    /// [`Transaction::range_stream`] without read conflict ranges.
-    pub fn range_stream(
+    /// [`Transaction::get_ranges_keyvalues`] without read conflict ranges.
+    pub fn get_ranges_keyvalues(
         &self,
         begin: KeySelector,
         end: KeySelector,
@@ -271,6 +375,9 @@ type BatchFuture = Pin<Box<dyn Future<Output = Result<RangeResult, Error>> + Sen
 /// after its last row (forward: `firstGreaterThan(last)`; reverse: the end becomes
 /// `firstGreaterOrEqual(last)`). The stream ends after a batch without `more`, when the row
 /// limit is reached, or after an error (which it yields). Empty batches are not yielded.
+///
+/// `Send` (not `Sync`); it holds a handle to the transaction.
+#[must_use = "streams do nothing unless polled"]
 pub struct RangeStream<R: Runtime> {
     tx: Transaction<R>,
     snapshot: bool,
@@ -361,7 +468,7 @@ impl<R: Runtime> Stream for RangeStream<R> {
                     this.options,
                     this.snapshot,
                 );
-                Box::pin(async move { tx.get_range_with(&begin, &end, &options, snapshot).await })
+                Box::pin(tx.get_range_with(&begin, &end, &options, snapshot))
             });
             let result = match pending.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -384,8 +491,28 @@ impl<R: Runtime> Stream for RangeStream<R> {
     }
 }
 
-/// The rows of a range, one at a time ([`Transaction::range_stream`]): the batches of a
+/// The rows of a range, one at a time ([`Transaction::get_ranges_keyvalues`]): the batches of a
 /// [`RangeStream`], flattened.
+///
+/// ```no_run
+/// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+/// use fdb_native_client::{KeySelector, RangeOptions};
+/// use futures_lite::StreamExt;
+///
+/// let tx = db.create_transaction();
+/// let mut rows = tx.get_ranges_keyvalues(
+///     KeySelector::first_greater_or_equal(b"users/".to_vec()),
+///     KeySelector::first_greater_or_equal(b"users0".to_vec()),
+///     RangeOptions::default(),
+/// );
+/// while let Some(row) = rows.next().await {
+///     let row = row?;
+///     println!("{:?} = {:?}", row.key, row.value);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "streams do nothing unless polled"]
 pub struct KeyValueStream<R: Runtime> {
     batches: RangeStream<R>,
     rows: VecDeque<KeyValue>,

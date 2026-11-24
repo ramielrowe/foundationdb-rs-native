@@ -210,7 +210,7 @@ async fn docker_get_range_matches_fdbcli() {
             }
         }
     }
-    let rows: Vec<KeyValue> = collect(tx.range_stream(
+    let rows: Vec<KeyValue> = collect(tx.get_ranges_keyvalues(
         fge(b"gr/"),
         fge(b"gr0"),
         RangeOptions::with_limit(123).reverse(true),

@@ -11,9 +11,10 @@
 //!   see [`Error::from_request`]);
 //! * the client's own **logic** decided on one (`all_alternatives_failed`,
 //!   `database_locked`, `client_invalid_operation`, ...);
-//! * the **commit path** ([`Committer`](crate::Committer), [`CommitBuffer`](crate::CommitBuffer)):
-//!   `not_committed` (with the conflicting ranges, [`Error::conflicting_ranges`]),
-//!   `commit_unknown_result`, `key_too_large`, `transaction_too_large`, ...;
+//! * the **commit path** ([`Committer`](crate::commit::Committer),
+//!   [`CommitBuffer`](crate::commit::CommitBuffer)): `not_committed` (with the conflicting
+//!   ranges, [`Error::conflicting_ranges`]), `commit_unknown_result`, `key_too_large`,
+//!   `transaction_too_large`, ...;
 //! * **opening a database** (`no_cluster_file_found`, `connection_string_invalid`,
 //!   `tls_error`, ...; the cause is the [`source`](std::error::Error::source)).
 //!
@@ -38,8 +39,7 @@
 //!   `transaction_throttled_hot_shard`, `batch_transaction_throttled`, `process_behind`,
 //!   `tag_throttled`, `transaction_rejected_range_locked`, and on 7.4 `proxy_tag_throttled`.
 //! * [`is_retryable`](Error::is_retryable) is `RETRYABLE`, the union of the two.
-//! * [`transaction_retry`](Error::transaction_retry) (and
-//!   [`on_error`](Error::on_error)) is what `Transaction::onError`
+//! * [`transaction_retry`](Error::transaction_retry) is what `Transaction::onError`
 //!   does with the error (NativeAPI 7.4:8112-8167, 8.0:5908-5958): reset the transaction and
 //!   retry after the transaction's exponential backoff ([`TransactionRetry::Backoff`]) for
 //!   the codes listed there, after `FUTURE_VERSION_RETRY_DELAY` (10 ms, capped by the
@@ -61,7 +61,7 @@
 //! A request that may have reached the server without a reply saying what became of it is
 //! `request_maybe_delivered` for a read ([`Error::from_request`]); for a commit, C++'s
 //! `tryCommit` turns it into `commit_unknown_result` (NativeAPI 7.4:7060-7061, 8.0:4755-4756):
-//! [`Error::from_commit_request`]. The [`Committer`](crate::Committer) reports every commit
+//! [`Error::from_commit_request`]. The [`Committer`](crate::commit::Committer) reports every commit
 //! failure that way.
 //!
 //! ## Where the predicates know more than the code
@@ -137,6 +137,11 @@ pub mod codes {
     /// `watch_cancelled` (1029): a storage server holds too many watches, so the client
     /// polls instead.
     pub const WATCH_CANCELLED: u16 = 1029;
+    /// `watches_disabled` (1034): a watch of a transaction with read-your-writes disabled.
+    pub const WATCHES_DISABLED: u16 = 1034;
+    /// `accessed_unreadable` (1036): a read of a key whose value the transaction's own
+    /// versionstamped operations make unknown until the commit (a watch of such a key).
+    pub const ACCESSED_UNREADABLE: u16 = 1036;
     /// `process_behind` (1037): the storage server lags too far behind.
     pub const PROCESS_BEHIND: u16 = 1037;
     /// `database_locked` (1038).
@@ -185,6 +190,8 @@ pub mod codes {
     pub const INVERTED_RANGE: u16 = 2005;
     /// `invalid_option_value` (2006).
     pub const INVALID_OPTION_VALUE: u16 = 2006;
+    /// `invalid_option` (2007).
+    pub const INVALID_OPTION: u16 = 2007;
     /// `read_version_already_set` (2010).
     pub const READ_VERSION_ALREADY_SET: u16 = 2010;
     /// `version_invalid` (2011).
@@ -344,7 +351,7 @@ impl Error {
     }
 
     /// The error a commit request gets when it fails the way `error` says (`tryCommit`'s
-    /// `catch`, as the [`Committer`](crate::Committer) classifies it):
+    /// `catch`, as the [`Committer`](crate::commit::Committer) classifies it):
     ///
     /// * a request that may have been delivered with no definite answer
     ///   ([`RequestError::maybe_delivered`]: a broken connection, a cancellation, an
@@ -488,7 +495,8 @@ impl Error {
 
     /// What `Transaction::onError` does with this error: `Some` if it resets the transaction
     /// and retries (and how long it waits first), `None` if it rethrows the error (or, for
-    /// `success`, fails with `client_invalid_operation`; see [`on_error`](Self::on_error)).
+    /// `success`, fails with `client_invalid_operation`, as
+    /// [`Transaction::on_error`](crate::Transaction::on_error) does).
     /// [`TransactionRetry::Backoff`] for `commit_unknown_result` means the transaction may
     /// already have committed. A commit that certainly was not delivered is retried with the
     /// backoff (C++ would have reported it as `commit_unknown_result`).
@@ -518,7 +526,7 @@ impl Error {
     /// `Transaction::onError(e)` as a result: `Ok` with how to wait before retrying the
     /// reset transaction, or `Err` with the error the transaction fails with: this one, or
     /// `client_invalid_operation` for `success` (C++: "onError(success)" is a misuse).
-    pub fn on_error(&self) -> Result<TransactionRetry, Error> {
+    pub(crate) fn on_error(&self) -> Result<TransactionRetry, Error> {
         if self.code == SUCCESS {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
@@ -796,6 +804,41 @@ mod tests {
             Error::from_commit_request(RequestError::Fdb(FdbError::new(NOT_COMMITTED))).code(),
             NOT_COMMITTED
         );
+    }
+
+    #[test]
+    fn a_tls_failure_cause_is_in_the_client_error() {
+        use fdb_native_transport::ConnectionError;
+        use std::error::Error as _;
+
+        let alert = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "received fatal alert: UnknownCA",
+        );
+        let io = ConnectionError::Io(alert.into());
+        for e in [
+            Error::from_request(RequestError::MaybeDelivered(Some(io.clone()))),
+            Error::from_commit_request(RequestError::NotSent(Some(io.clone()))),
+        ] {
+            // The text says why, not only that the connection failed...
+            let text = e.to_string();
+            assert!(text.contains("received fatal alert: UnknownCA"), "{text}");
+            // ...and so does the chain: client error, transport error, connection error.
+            let request = e.source().expect("the transport error");
+            assert!(request.to_string().contains("UnknownCA"));
+            let mut chain = Vec::new();
+            let mut next = request.source();
+            while let Some(error) = next {
+                chain.push(error.to_string());
+                next = error.source();
+            }
+            assert!(
+                chain
+                    .iter()
+                    .any(|m| m.contains("received fatal alert: UnknownCA")),
+                "{chain:?}"
+            );
+        }
     }
 
     #[test]

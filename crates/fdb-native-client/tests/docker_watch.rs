@@ -2,8 +2,10 @@
 //! `FDB_IMAGE`, default 7.4.10), changed with `fdbcli`: a watch fires when the value changes
 //! (a set, a clear), does not fire for a set of the same value or for the watching
 //! transaction's own commit, starts at the commit of a read-only transaction too, is
-//! cancelled by dropping it, and the cap refuses one more watch with `too_many_watches`. Run
-//! with `cargo nextest run -p fdb-native-client --run-ignored only`.
+//! cancelled by dropping it, and the cap refuses one more watch with `too_many_watches`;
+//! two transactions that increment a counter and watch it concurrently either conflict or
+//! fire each other's watches. Run with `cargo nextest run -p fdb-native-client --run-ignored
+//! only`.
 
 #![cfg(feature = "tokio")]
 
@@ -11,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fdb_native_client::error::codes;
-use fdb_native_client::{Database, DatabaseOptions, MutationType, Watch, WatchConfig};
+use fdb_native_client::watch::WatchConfig;
+use fdb_native_client::{Database, DatabaseOptions, MutationType, Watch};
 use fdb_native_testkit::FdbContainer;
 use fdb_native_transport::runtime::TokioRuntime;
 
@@ -102,6 +105,29 @@ async fn fires(what: &str, watch: &mut Watch) {
         .unwrap_or_else(|e| panic!("{what}: {e}"));
 }
 
+/// `\xff/metadataVersion` may be watched without the system key options (as C++ allows),
+/// and a transaction that bumps it (the versionstamped value `metadataVersionRequiredValue`)
+/// fires the watch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_watch_of_the_metadata_version_fires_when_it_is_bumped() {
+    const KEY: &[u8] = b"\xff/metadataVersion";
+    let c = Cluster::start().await;
+    let mut watch = c.watch(KEY).await;
+    stays_pending(&mut watch).await;
+    within(
+        "bump",
+        c.db.run(|tx, _| async move {
+            tx.atomic_op(KEY, &[0; 14], MutationType::SetVersionstampedValue);
+            Ok(())
+        }),
+    )
+    .await
+    .expect("bump");
+    fires("the metadata version bump", &mut watch).await;
+    c.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker"]
 async fn docker_watch_fires_when_fdbcli_changes_the_value() {
@@ -170,7 +196,7 @@ async fn docker_watch_fires_when_fdbcli_changes_the_value() {
     let mut watch = within(
         "atomic and watch",
         c.db.run(|tx, _| async move {
-            tx.atomic_op(b"watch/n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+            tx.atomic_op(b"watch/n", &1u64.to_le_bytes(), MutationType::Add);
             tx.watch(b"watch/n").await
         }),
     )
@@ -302,5 +328,95 @@ async fn docker_watch_cap() {
     drop((d, e));
     assert_eq!(c.db.outstanding_watches(), 1);
 
+    c.finish().await;
+}
+
+/// The counter's value.
+async fn counter(db: &Database, key: &'static [u8]) -> u64 {
+    let value = within(
+        "read the counter",
+        db.run(move |tx, _| async move { tx.get(key).await }),
+    )
+    .await
+    .unwrap()
+    .unwrap_or_default();
+    u64::from_le_bytes(value.try_into().expect("8 bytes"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_watch_concurrent_increments() {
+    // Two transactions each add 1 to a counter and watch it, and commit concurrently (in one
+    // commit batch, most likely). The watch reads the counter (a dependent write: with a
+    // read conflict range), so either one conflicts, or each watches its own view and fires
+    // once the other's increment is visible. Never does a committed watch miss the other's
+    // increment.
+    let c = Cluster::start().await;
+    let key: &'static [u8] = b"count/n";
+    let one = 1u64.to_le_bytes();
+    let mut expected = 0u64;
+    for round in 0..3 {
+        let (t1, t2) = (c.db.create_transaction(), c.db.create_transaction());
+        let mut watches = Vec::new();
+        for tx in [&t1, &t2] {
+            tx.atomic_op(key, &one, MutationType::Add);
+            watches.push(within("watch", tx.watch(key)).await.unwrap());
+        }
+        let (r1, r2) = within("the commits", async {
+            tokio::join!(t1.commit(), t2.commit())
+        })
+        .await;
+        println!(
+            "round {round}: {:?} / {:?}",
+            r1.as_ref()
+                .map(|r| r.committed_version())
+                .map_err(|e| e.code()),
+            r2.as_ref()
+                .map(|r| r.committed_version())
+                .map_err(|e| e.code())
+        );
+        let mut w2 = watches.pop().unwrap();
+        let mut w1 = watches.pop().unwrap();
+        match (r1, r2) {
+            (Ok(_), Ok(_)) => {
+                expected += 2;
+                fires("the first watch", &mut w1).await;
+                fires("the second watch", &mut w2).await;
+            }
+            (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
+                expected += 1;
+                assert_eq!(e.code(), codes::NOT_COMMITTED, "{e}");
+                let (winner, loser) = if t1.committed_version() > 0 {
+                    (&mut w1, &mut w2)
+                } else {
+                    (&mut w2, &mut w1)
+                };
+                // The loser's watch fails with its commit's error.
+                assert_eq!(
+                    within("the loser's watch", loser).await.unwrap_err().code(),
+                    codes::NOT_COMMITTED
+                );
+                // The winner watches its own result, which is the counter's value now.
+                assert_eq!(counter(&c.db, key).await, expected);
+                stays_pending(winner).await;
+                // The loser, retried, increments it: that fires the winner's watch, and the
+                // retry's own watch watches the new value.
+                let mut again = within(
+                    "the retry",
+                    c.db.run(move |tx, _| async move {
+                        tx.atomic_op(key, &one, MutationType::Add);
+                        tx.watch(key).await
+                    }),
+                )
+                .await
+                .unwrap();
+                expected += 1;
+                fires("the winner's watch", winner).await;
+                stays_pending(&mut again).await;
+            }
+            (Err(a), Err(b)) => panic!("both failed: {a} / {b}"),
+        }
+        assert_eq!(counter(&c.db, key).await, expected);
+    }
     c.finish().await;
 }

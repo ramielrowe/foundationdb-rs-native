@@ -23,21 +23,45 @@
 //! ## In the transaction (the read-your-writes layer)
 //!
 //! * **`watch(key)`** (`ReadYourWritesTransaction::watch`, RYW 7.4:2440-2459, 8.0:2356;
-//!   `RYWImpl::watch`, 7.4:1284-1340, 8.0:1278): checks the transaction (`used_during_commit`,
-//!   the key's range `key_outside_legal_range`, its size `key_too_large`), reads the key
-//!   **with a read conflict range** (the transaction's own write if it has one), and
-//!   registers a `Watch` object with the transaction (`Transaction::watch`, NativeAPI
+//!   `RYWImpl::watch`, 7.4:1284-1335, 8.0:1278): checks the transaction (`used_during_commit`,
+//!   `watches_disabled` (1034) with read-your-writes disabled, the key's range
+//!   `key_outside_legal_range`, its size `key_too_large`), reads the key
+//!   through the read-your-writes layer (`readWithConflictRange`, 7.4:379-395: the database's
+//!   value at the read version with the transaction's own writes applied, see below), counted
+//!   in the reads the commit waits for (`ryw->reading`), and registers a `Watch` object with the transaction (`Transaction::watch`, NativeAPI
 //!   7.4:6008-6017, 8.0:3752), which **counts it against the cap**: `increaseWatchCounter`
 //!   (NativeAPI 7.4:2407-2413, 8.0:339) throws `too_many_watches` (1032) when
 //!   `outstandingWatches >= maxOutstandingWatches` (`DEFAULT_MAX_OUTSTANDING_WATCHES`
 //!   10 000, ClientKnobs 7.4:127, 8.0:235; the `MAX_WATCHES` database option sets it, up to
 //!   `ABSOLUTE_MAX_WATCHES` 1 000 000). The count goes down again when the watch finishes
 //!   (fires, fails, or its future is dropped; `watch`, NativeAPI 7.4:5951-6003).
+//! * **The value read** (`RYWImpl::read(GetValueReq)`, RYW 7.4:94-136; `RYWIterator::kv`,
+//!   `RYWIterator.cpp` 7.4:44-90; `WriteMap::mutate`/`coalesce`, `WriteMap.cpp`
+//!   7.4:88-158, 357-494), from the transaction's writes to the key **as of the `watch`
+//!   call** (the read iterates over a snapshot of the write map): a set or clear last gives
+//!   the value without reading (and adds **no** read conflict range); atomic operations on
+//!   top of a set or clear are folded into it ([`crate::atomic`]); atomic operations alone
+//!   (a dependent write) apply, in order, to the database's value at the read version; no
+//!   write reads the database's value. The database's value comes through the
+//!   transaction's snapshot cache, as any read's: a key the transaction read already is not
+//!   read again. The last two add the key as a **read conflict range**
+//!   (`updateConflictMap`, 7.4:322-333: an unmodified key or a dependent write), so a watch
+//!   whose value depends on the database conflicts if the key changes before the commit,
+//!   and the value watched is the key's value as of the commit. A key a pending
+//!   `SetVersionstampedValue` wrote, or in the range a pending `SetVersionstampedKey` may
+//!   write (`getVersionstampKeyRange`, from the key stamped with the read version + 1 if the
+//!   transaction has one, to the key with ten `0xff` bytes there), is **unreadable** until a
+//!   clear covers it: the watch fails with `accessed_unreadable` (1036) (unless the
+//!   `BypassUnreadable` option is set, as for a read).
 //! * **Later writes to the key** (`triggerWatches`, RYW 7.4:1243-1282, called by `set`
-//!   2354, `clear` 2403 and 2437, `atomicOp` 2296): a watch whose value was read, or whose
-//!   key was written since, fires **at once** (before the commit) if the new value differs
-//!   from either; an atomic operation (`valueKnown = false`) always fires it. A write of the
-//!   same value changes nothing.
+//!   2354, `clear` 2403 and 2437, `atomicOp` 2296, each after the write's checks passed): a
+//!   watch whose value was read, or whose key was written since, fires **at once** (before
+//!   the commit) if the new value differs from either; an atomic operation
+//!   (`valueKnown = false`) always fires it. A write of the same value changes nothing. A
+//!   `SetVersionstampedKey` triggers the key `transformVersionstampKey` makes of its key
+//!   (the placeholder stamped with the read version + 1, or zeros, and the 4 offset bytes
+//!   kept), as an atomic operation. A write during the watch's read is compared with the
+//!   value read once it arrives; one that fires the watch ends it without the read.
 //! * **At commit** (`commitAndWatch`, NativeAPI 7.4:7248-7280, 8.0:4938; `setupWatches`,
 //!   7.4:6743-6762, 8.0:4478): after a successful commit each watch of the transaction is
 //!   started with `watchValueMap`, at version `getCommittedVersion() > 0 ? committed :
@@ -69,18 +93,21 @@
 //!   watchers fire; if it is older (the metadata was updated to a newer version meanwhile)
 //!   it goes around again (the "ABA" case); on `future_version` it goes around again, on
 //!   another error the watchers fail with it.
-//! * **`watchValue`** is [`Reader::watch_value`](crate::Reader::watch_value).
+//! * **`watchValue`** is [`Reader::watch_value`](crate::read::Reader::watch_value).
 //!
 //! ## Differences
 //!
-//! * **No read-your-writes layer yet.** `Transaction::get` does not see the transaction's own
-//!   writes, but `watch` does what `ReadYourWritesTransaction::watch` does: the watched value
-//!   is the transaction's own write to the key if there is one (found in the commit buffer:
-//!   a `set` gives the value, a `clear` or a covering `clear_range` none), else the
-//!   value in the database at the read version. A pending atomic operation on the key (whose
-//!   result only the cluster can compute) makes the watched value **the key's value at the
-//!   commit version**, read once the commit has succeeded. The later writes of the
-//!   transaction act as `triggerWatches` has them (above).
+//! * **A watch started after the commit started** fails with `used_during_commit` (maybe
+//!   committed once the commit may have been sent) **without failing the commit**; C++'s
+//!   `checkUsedDuringCommit` also makes the commit fail with it.
+//! * **The read runs as a task of its own** (as every non-snapshot read of the transaction
+//!   does): a `watch` future that is dropped or no longer polled does not hold the commit up;
+//!   the read still ends (and registers the watch, which is then dropped). **Dropping the
+//!   future does not cancel the read**: it still adds its read conflict range, so the commit
+//!   can fail with `not_committed` because of a watch nobody waits for. C++ cancels the read
+//!   (and adds no range) when the watch's future is destroyed.
+//! * **The cap's slot** is given back when the watch's result is sent, or when its future is
+//!   dropped, as C++'s `watch` actor ends (not when the result is polled).
 //! * **`getFutureReferenceCount() == 1`.** `watchStorageServerResp` treats a metadata with
 //!   one future left as one without any: it deletes it silently on an error, which leaves
 //!   its single watcher with `broken_promise`. Here the storage watch is abandoned only when
@@ -89,18 +116,17 @@
 //!   map with `operation_cancelled` (1101). Watches in transactions that are not committed
 //!   yet fail when the transaction does (its commit fails with `operation_cancelled`).
 //! * **Not ported:** switching the cluster file (`connectionFileChanged`, `restartWatch`),
-//!   tenants, watching `\xff/metadataVersion` (needs the metadata version key exception of
-//!   `get`), tags and debug ids.
+//!   tenants, tags and debug ids.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, poll_fn};
+use std::ops::Bound;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fdb_native_schema::domain::{Mutation, MutationType};
 use fdb_native_transport::runtime::{Runtime, TaskHandle};
 use futures_channel::oneshot;
 
@@ -163,24 +189,69 @@ impl Counter {
     }
 
     /// `increaseWatchCounter`.
-    pub(crate) fn acquire(self: &Arc<Self>) -> Result<Slot, Error> {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Result<Arc<Slot>, Error> {
         let max = self.max.load(Ordering::SeqCst);
         self.outstanding
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < max).then_some(n + 1)
             })
             .map_err(|_| Error::new(TOO_MANY_WATCHES))?;
-        Ok(Slot(self.clone()))
+        Ok(Arc::new(Slot {
+            counter: self.clone(),
+            released: AtomicBool::new(false),
+        }))
     }
 }
 
-/// One outstanding watch of the count; `decreaseWatchCounter` when dropped.
+/// One outstanding watch of the count. Both ends of the watch hold it ([`Held`]); the first
+/// to finish (the end that sends the result, or the [`Watch`] dropped first) gives it back
+/// (`decreaseWatchCounter`), once.
 #[derive(Debug)]
-pub(crate) struct Slot(Arc<Counter>);
+pub(crate) struct Slot {
+    counter: Arc<Counter>,
+    released: AtomicBool,
+}
 
-impl Drop for Slot {
+impl Slot {
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.counter.outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A [`Slot`] that is given back when this is dropped.
+#[derive(Debug)]
+struct Held(Arc<Slot>);
+
+impl Drop for Held {
     fn drop(&mut self) {
-        self.0.outstanding.fetch_sub(1, Ordering::SeqCst);
+        self.0.release();
+    }
+}
+
+/// The sending end of a watch: its result goes to the [`Watch`] through this, and sending it
+/// (or dropping this) gives the watch's slot back at once, whether or not the `Watch` is
+/// polled.
+#[derive(Debug)]
+pub(crate) struct Notifier {
+    tx: oneshot::Sender<Result<(), Error>>,
+    _slot: Held,
+}
+
+impl Notifier {
+    /// Sends the watch's result, and gives its slot back.
+    pub(crate) fn send(self, result: Result<(), Error>) {
+        let _ = self.tx.send(result);
+    }
+
+    /// Whether the [`Watch`] was dropped.
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.tx.is_canceled()
+    }
+
+    fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.tx.poll_canceled(cx)
     }
 }
 
@@ -200,8 +271,10 @@ impl Drop for Slot {
 ///   attempt), with `too_many_watches` (1032) from [`Transaction::watch`](crate::Transaction::watch) itself if the
 ///   database has too many outstanding watches, and with `operation_cancelled` (1101) if the
 ///   database is shut down.
+/// * **It counts against the cap until it is resolved** (when its result is sent, polled or
+///   not) **or dropped.**
 /// * **Dropping it cancels it:** the database stops watching the key if no other watch needs
-///   it, and the watch no longer counts against the cap.
+///   it.
 /// * **Several watches** of one key and value share one request to the storage server.
 ///
 /// `Ok(())` does not say that the value differs from the one watched when you read it: a
@@ -215,7 +288,7 @@ pub struct Watch {
 enum WatchState {
     Waiting {
         rx: oneshot::Receiver<Result<(), Error>>,
-        _slot: Slot,
+        _slot: Held,
     },
     Ready(Option<Result<(), Error>>),
 }
@@ -229,10 +302,22 @@ impl Watch {
         }
     }
 
-    fn waiting(rx: oneshot::Receiver<Result<(), Error>>, slot: Slot) -> Watch {
-        Watch {
-            state: WatchState::Waiting { rx, _slot: slot },
-        }
+    /// A watch and its sending end, holding `slot`.
+    fn channel(slot: Arc<Slot>) -> (Watch, Notifier) {
+        let (tx, rx) = oneshot::channel();
+        let watch = Watch {
+            state: WatchState::Waiting {
+                rx,
+                _slot: Held(slot.clone()),
+            },
+        };
+        (
+            watch,
+            Notifier {
+                tx,
+                _slot: Held(slot),
+            },
+        )
     }
 }
 
@@ -259,7 +344,6 @@ impl Future for Watch {
             WatchState::Waiting { rx, .. } => match Pin::new(rx).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(result)) => {
-                    // Finished: no longer outstanding (the slot goes with the state).
                     self.state = WatchState::Ready(None);
                     Poll::Ready(result)
                 }
@@ -275,67 +359,64 @@ impl Future for Watch {
 
 // ---- a transaction's watches ----------------------------------------------------------------
 
-/// What a watch watches.
-#[derive(Debug)]
-pub(crate) enum Baseline {
-    /// This value (`None`: the key not being set).
-    Value(Option<Vec<u8>>),
-    /// The key's value at the commit version, not known before.
-    AfterCommit,
-}
+/// Watch ids, unique in the process: an id is never reused, also across resets of a
+/// transaction (whose [`PendingWatches`] start over).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A watch of a transaction: its key and id ([`PendingWatches`]' key).
+pub(crate) type PendingId = (Vec<u8>, u64);
 
 #[derive(Debug)]
 enum Phase {
-    /// `watch` is reading the value.
-    Reading,
+    /// `watch` is reading the value; told (`onChangeTrigger`) if a write fires it meanwhile.
+    Reading(Option<oneshot::Sender<()>>),
     /// Waiting for the commit; resolves through this.
-    Registered(oneshot::Sender<Result<(), Error>>),
+    Registered(Notifier),
     /// Fired by a write of the transaction while it was `Reading`.
     Fired,
 }
 
 #[derive(Debug)]
 struct Pending {
-    id: u64,
-    key: Vec<u8>,
     /// `valuePresent`/`value`: the value read (`Some(None)`: the key is not set).
     value: Option<Option<Vec<u8>>>,
     /// `setPresent`/`setValue`: the last value a write gave the key since the watch started.
     set: Option<Option<Vec<u8>>>,
-    after_commit: bool,
     use_provisional: bool,
     phase: Phase,
 }
 
 /// What a write did to a key, for [`PendingWatches::trigger`].
+#[derive(Clone, Copy)]
 pub(crate) enum Written<'a> {
     /// The key is now this value (`None`: cleared).
     Value(Option<&'a [u8]>),
-    /// An atomic operation: its result is not known.
+    /// An atomic operation: its result is not known (`valueKnown = false`).
     Unknown,
 }
 
 /// A watch to start when the transaction commits.
 pub(crate) struct Armed {
-    pub(crate) key: Vec<u8>,
-    pub(crate) baseline: Baseline,
-    pub(crate) use_provisional: bool,
-    tx: oneshot::Sender<Result<(), Error>>,
+    key: Vec<u8>,
+    /// The value watched (`None`: the key not being set).
+    value: Option<Vec<u8>>,
+    use_provisional: bool,
+    tx: Notifier,
 }
 
 impl Armed {
     /// The watch fails with `error` without having started.
     pub(crate) fn fail(self, error: &Error) {
-        let _ = self.tx.send(Err(error.clone()));
+        self.tx.send(Err(error.clone()));
     }
 }
 
 /// The watches of a transaction that has not committed (`Transaction::watches` and
-/// `ReadYourWritesTransaction::watchMap`).
+/// `ReadYourWritesTransaction::watchMap`), by key: a write finds the watches it triggers, and
+/// a watch finds itself, in logarithmic time.
 #[derive(Debug, Default)]
 pub(crate) struct PendingWatches {
-    next_id: u64,
-    entries: Vec<Pending>,
+    entries: BTreeMap<PendingId, Pending>,
 }
 
 impl PendingWatches {
@@ -343,76 +424,83 @@ impl PendingWatches {
         self.entries.is_empty()
     }
 
-    /// Adds a watch of `key` whose value is being read.
-    pub(crate) fn register(&mut self, key: &[u8], use_provisional: bool) -> u64 {
-        self.next_id += 1;
-        self.entries.push(Pending {
-            id: self.next_id,
-            key: key.to_vec(),
-            value: None,
-            set: None,
-            after_commit: false,
-            use_provisional,
-            phase: Phase::Reading,
-        });
-        self.next_id
+    /// Adds a watch of `key` whose value is being read: its id, and what tells the read that
+    /// a write fired it.
+    pub(crate) fn register(
+        &mut self,
+        key: &[u8],
+        use_provisional: bool,
+    ) -> (PendingId, oneshot::Receiver<()>) {
+        let id = (key.to_vec(), NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        self.entries.insert(
+            id.clone(),
+            Pending {
+                value: None,
+                set: None,
+                use_provisional,
+                phase: Phase::Reading(Some(tx)),
+            },
+        );
+        (id, rx)
     }
 
-    /// Forgets watch `id` (its read failed).
-    pub(crate) fn remove(&mut self, id: u64) {
-        self.entries.retain(|p| p.id != id);
+    /// Forgets watch `id` (its read failed, or a write fired it).
+    pub(crate) fn remove(&mut self, id: &PendingId) {
+        self.entries.remove(id);
     }
 
     /// `RYWImpl::watch` after the read: `Watch` already resolved if a write of the
-    /// transaction fired it, else registered with the transaction (`Transaction::watch`),
-    /// which counts it against the cap.
+    /// transaction fired it (during the read, or because it wrote another value than the one
+    /// read), else registered with the transaction (`Transaction::watch`), which counts it
+    /// against the cap.
     pub(crate) fn finish_read(
         &mut self,
-        id: u64,
-        baseline: Baseline,
+        id: &PendingId,
+        value: Option<Vec<u8>>,
         counter: &Arc<Counter>,
     ) -> Result<Watch, Error> {
-        let Some(pos) = self.entries.iter().position(|p| p.id == id) else {
+        let Some(p) = self.entries.get_mut(id) else {
             // The transaction was reset meanwhile.
             return Err(Error::new(TRANSACTION_CANCELLED));
         };
-        let p = &mut self.entries[pos];
         if matches!(p.phase, Phase::Fired) {
-            self.entries.swap_remove(pos);
+            self.entries.remove(id);
             return Ok(Watch::ready(Ok(())));
         }
-        match baseline {
-            Baseline::Value(v) => p.value = Some(v),
-            Baseline::AfterCommit => p.after_commit = true,
-        }
-        if matches!((&p.set, &p.value), (Some(set), Some(value)) if set != value) {
-            self.entries.swap_remove(pos);
+        if p.set.as_ref().is_some_and(|set| *set != value) {
+            self.entries.remove(id);
             return Ok(Watch::ready(Ok(())));
         }
+        p.value = Some(value);
         let slot = match counter.acquire() {
             Ok(slot) => slot,
             Err(e) => {
-                self.entries.swap_remove(pos);
+                self.entries.remove(id);
                 return Err(e);
             }
         };
-        let (tx, rx) = oneshot::channel();
+        let (watch, tx) = Watch::channel(slot);
         p.phase = Phase::Registered(tx);
-        Ok(Watch::waiting(rx, slot))
+        Ok(watch)
     }
 
     /// `triggerWatches` for a write to `begin` (when `end` is `None`) or to `[begin, end)`.
     pub(crate) fn trigger(&mut self, begin: &[u8], end: Option<&[u8]>, written: Written<'_>) {
-        self.entries.retain_mut(|p| {
-            let hit = match end {
-                None => p.key == begin,
-                Some(end) => begin <= &p.key[..] && &p.key[..] < end,
-            };
-            if !hit {
-                return true;
+        let low = Bound::Included((begin.to_vec(), 0));
+        let high = match end {
+            None => Bound::Included((begin.to_vec(), u64::MAX)),
+            Some(end) if end <= begin => return,
+            Some(end) => Bound::Excluded((end.to_vec(), 0)),
+        };
+        let mut done = Vec::new();
+        for (id, p) in self.entries.range_mut((low, high)) {
+            if matches!(&p.phase, Phase::Fired) {
+                continue;
             }
             if matches!(&p.phase, Phase::Registered(tx) if tx.is_canceled()) {
-                return false;
+                done.push(id.clone());
+                continue;
             }
             let fire = match written {
                 Written::Unknown => true,
@@ -425,31 +513,35 @@ impl PendingWatches {
                 if let Written::Value(v) = written {
                     p.set = Some(v.map(<[u8]>::to_vec));
                 }
-                return true;
+                continue;
             }
             match std::mem::replace(&mut p.phase, Phase::Fired) {
                 Phase::Registered(tx) => {
-                    let _ = tx.send(Ok(()));
-                    false
+                    tx.send(Ok(()));
+                    done.push(id.clone());
                 }
-                // `watch` finds out when its read is over.
-                _ => true,
+                // `watch` finds out at once, and ends without its read.
+                Phase::Reading(tell) => {
+                    if let Some(tell) = tell {
+                        let _ = tell.send(());
+                    }
+                }
+                Phase::Fired => {}
             }
-        });
+        }
+        for id in done {
+            self.entries.remove(&id);
+        }
     }
 
     /// `setupWatches`: the registered watches, to start.
     pub(crate) fn take_registered(&mut self) -> Vec<Armed> {
         std::mem::take(&mut self.entries)
             .into_iter()
-            .filter_map(|p| match p.phase {
+            .filter_map(|((key, _), p)| match p.phase {
                 Phase::Registered(tx) => Some(Armed {
-                    key: p.key,
-                    baseline: if p.after_commit {
-                        Baseline::AfterCommit
-                    } else {
-                        Baseline::Value(p.value.flatten())
-                    },
+                    key,
+                    value: p.value.flatten(),
                     use_provisional: p.use_provisional,
                     tx,
                 }),
@@ -460,45 +552,12 @@ impl PendingWatches {
 
     /// `cancelWatches(e)`: every registered watch fails with `error`.
     pub(crate) fn cancel_all(&mut self, error: &Error) {
-        for p in std::mem::take(&mut self.entries) {
+        for p in std::mem::take(&mut self.entries).into_values() {
             if let Phase::Registered(tx) = p.phase {
-                let _ = tx.send(Err(error.clone()));
+                tx.send(Err(error.clone()));
             }
         }
     }
-}
-
-/// What a transaction's own writes say about a key.
-pub(crate) enum Own {
-    /// Nothing: read the database.
-    None,
-    /// The key's value after the writes (`None`: cleared).
-    Known(Option<Vec<u8>>),
-    /// An atomic operation is pending: only the cluster can say.
-    Unknown,
-}
-
-/// What the buffered `mutations` make of `key`, in order.
-pub(crate) fn own_value(mutations: &[Mutation], key: &[u8]) -> Own {
-    let mut own = Own::None;
-    for m in mutations {
-        match m.kind {
-            MutationType::SET_VALUE if m.param1 == key => {
-                own = Own::Known(Some(m.param2.clone()));
-            }
-            MutationType::CLEAR_RANGE => {
-                if &m.param1[..] <= key && key < &m.param2[..] {
-                    own = Own::Known(None);
-                }
-            }
-            // The key of a versionstamped key is not the one written.
-            MutationType::SET_VERSIONSTAMPED_KEY => {}
-            MutationType::SET_VALUE => {}
-            _ if m.param1 == key => own = Own::Unknown,
-            _ => {}
-        }
-    }
-    own
 }
 
 // ---- the database's watches -------------------------------------------------------------------
@@ -514,7 +573,7 @@ struct Entry<R: Runtime> {
     version: i64,
     use_provisional: bool,
     /// `watchPromise`'s futures.
-    waiters: Vec<Waiter>,
+    waiters: Waiters,
     /// `watchFutureSS`.
     task: Option<R::Task<()>>,
 }
@@ -601,8 +660,48 @@ impl<R: Runtime> Drop for RefGuard<R> {
     }
 }
 
-fn live(waiters: &mut Vec<Waiter>) {
-    waiters.retain(|w| !w.is_canceled());
+/// The watchers of a key's metadata. Those whose watch was dropped are pruned when the
+/// list has doubled since the last pruning, so that joining stays amortized constant time.
+struct Waiters {
+    list: Vec<Waiter>,
+    prune_at: usize,
+}
+
+impl Waiters {
+    const MIN_PRUNE: usize = 8;
+
+    fn one(waiter: Waiter) -> Waiters {
+        Waiters {
+            list: vec![waiter],
+            prune_at: Self::MIN_PRUNE,
+        }
+    }
+
+    fn push(&mut self, waiter: Waiter) {
+        if self.list.len() >= self.prune_at {
+            self.prune();
+            self.prune_at = (2 * self.list.len()).max(Self::MIN_PRUNE);
+        }
+        self.list.push(waiter);
+    }
+
+    /// Drops the watchers that are gone.
+    fn prune(&mut self) {
+        self.list.retain(|w| !w.is_canceled());
+    }
+
+    /// Whether no watcher is left (pruning first).
+    fn is_empty(&mut self) -> bool {
+        self.prune();
+        self.list.is_empty()
+    }
+
+    /// Sends `result` to every watcher.
+    fn send(&mut self, result: Result<i64, Error>) {
+        for waiter in self.list.drain(..) {
+            let _ = waiter.send(result.clone());
+        }
+    }
 }
 
 impl<R: Runtime> WatchContext<R> {
@@ -653,9 +752,7 @@ impl<R: Runtime> WatchContext<R> {
             st.map.drain().map(|(_, e)| e).collect()
         };
         for mut entry in entries {
-            for waiter in entry.waiters.drain(..) {
-                let _ = waiter.send(Err(Error::new(OPERATION_CANCELLED)));
-            }
+            entry.waiters.send(Err(Error::new(OPERATION_CANCELLED)));
             if let Some(task) = entry.task.take() {
                 task.abort();
             }
@@ -667,7 +764,7 @@ impl<R: Runtime> WatchContext<R> {
     pub(crate) fn start(self: &Arc<Self>, armed: Vec<Armed>, version: i64) {
         for Armed {
             key,
-            baseline,
+            value,
             use_provisional,
             tx,
         } in armed
@@ -679,7 +776,7 @@ impl<R: Runtime> WatchContext<R> {
             drop(
                 self.rt.spawn(self.clone().watch_value_map(
                     key,
-                    baseline,
+                    value,
                     version,
                     use_provisional,
                     tx,
@@ -693,43 +790,19 @@ impl<R: Runtime> WatchContext<R> {
     async fn watch_value_map(
         self: Arc<Self>,
         key: Vec<u8>,
-        baseline: Baseline,
+        value: Option<Vec<u8>>,
         version: i64,
         use_provisional: bool,
-        mut tx: oneshot::Sender<Result<(), Error>>,
+        mut tx: Notifier,
     ) {
         let _count = RefGuard::new(&self, &key, version);
-        let work = async {
-            let value = match baseline {
-                Baseline::Value(v) => v,
-                Baseline::AfterCommit => self.read_at(&key, version, use_provisional).await?,
-            };
-            self.watch_future(&key, value, version, use_provisional)
-                .await
-        };
+        let work = self.watch_future(&key, value, version, use_provisional);
         let outcome = {
             let dropped = poll_fn(|cx| tx.poll_canceled(cx));
             race(work, dropped).await
         };
         if let Either::Left(result) = outcome {
-            let _ = tx.send(result);
-        }
-    }
-
-    /// The value of `key` at `version`, once the storage servers have it.
-    async fn read_at(
-        &self,
-        key: &[u8],
-        version: i64,
-        use_provisional: bool,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        loop {
-            match self.reader.get_with(key, version, use_provisional).await {
-                Err(e) if matches!(e.code(), FUTURE_VERSION | PROCESS_BEHIND) => {
-                    self.rt.sleep(self.timings.future_version_retry_delay).await;
-                }
-                other => return other,
-            }
+            tx.send(result);
         }
     }
 
@@ -786,16 +859,13 @@ impl<R: Runtime> WatchContext<R> {
                         entry.version = version;
                         entry.use_provisional = use_provisional;
                     }
-                    live(&mut entry.waiters);
                     entry.waiters.push(tx);
                     Join::Wait(rx)
                 }
                 // Another value, a newer version: the old watchers fire, a new watch.
                 Some(entry) if version > entry.version => {
                     let mut old = st.map.remove(key).expect("the entry");
-                    for waiter in old.waiters.drain(..) {
-                        let _ = waiter.send(Ok(version));
-                    }
+                    old.waiters.send(Ok(version));
                     abort = old.task.take();
                     self.insert(&mut st, key, value, version, use_provisional, tx);
                     Join::Wait(rx)
@@ -837,7 +907,7 @@ impl<R: Runtime> WatchContext<R> {
                 value: value.clone(),
                 version,
                 use_provisional,
-                waiters: vec![waiter],
+                waiters: Waiters::one(waiter),
                 task: Some(task),
             },
         );
@@ -859,9 +929,7 @@ impl<R: Runtime> WatchContext<R> {
             // `val_3 != val_1`: the map's watch is stale.
             if st.map.get(key).is_some_and(|e| e.value != current) {
                 let mut old = st.map.remove(key).expect("the entry");
-                for waiter in old.waiters.drain(..) {
-                    let _ = waiter.send(Ok(version));
-                }
+                old.waiters.send(Ok(version));
                 abort = old.task.take();
             }
         }
@@ -918,24 +986,22 @@ impl<R: Runtime> WatchContext<R> {
             let Some(entry) = st.map.get_mut(&key).filter(|e| e.id == id) else {
                 return;
             };
-            live(&mut entry.waiters);
+            let alone = entry.waiters.is_empty();
             let finished = match result {
                 // Case 1: the server saw the change at or after the metadata's version.
                 Ok(seen) if seen >= entry.version => Some(Ok(seen)),
                 // ABA: the metadata moved on to a newer version while the server answered
                 // for the old one. Without watchers it is over; else watch again.
-                Ok(_) if entry.waiters.is_empty() => None,
+                Ok(_) if alone => None,
                 Ok(_) => continue,
-                Err(_) if entry.waiters.is_empty() => None,
+                Err(_) if alone => None,
                 Err(e) if e.code() == FUTURE_VERSION => continue,
                 Err(e) => Some(Err(e)),
             };
             let mut entry = st.map.remove(&key).expect("the entry");
             drop(st);
             if let Some(outcome) = finished {
-                for waiter in entry.waiters.drain(..) {
-                    let _ = waiter.send(outcome.clone());
-                }
+                entry.waiters.send(outcome);
             }
             return;
         }

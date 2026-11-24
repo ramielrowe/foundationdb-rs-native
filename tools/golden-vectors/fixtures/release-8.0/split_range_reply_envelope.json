@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "name": "split_range_reply_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "SplitRangeReply as sent (ErrorOr<EnsureTable<>> tag 2). Not a LoadBalancedReply.",
+  "cpp_type": "ErrorOr<EnsureTable<SplitRangeReply>>",
+  "file_identifier": 45367566,
+  "file_identifier_hex": "0x02b4410e",
+  "size": 88,
+  "bytes": "1c0000000e41b402080009000800040006000600040006000800040014000000080000000200000012000000040000000200000018000000040000000900000073706c69742f6d00ff0000000700000073706c69742f6600",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<SplitRangeReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<SplitRangeReply>>",
+          "value": {
+            "type": "table<SplitRangeReply>",
+            "value": [
+              {
+                "field": "splitPoints",
+                "slot": 0,
+                "type": "vector<bytes>",
+                "value": [
+                  {
+                    "type": "bytes",
+                    "value": "73706c69742f66"
+                  },
+                  {
+                    "type": "bytes",
+                    "value": "73706c69742f6d00ff"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

@@ -18,7 +18,8 @@
 //! and drains its outputs:
 //!
 //! * **bytes to write**, [`pending_output`](Connection::pending_output), acknowledged with
-//!   [`consume_output`](Connection::consume_output);
+//!   [`consume_output`](Connection::consume_output) (and, for a write that failed after the
+//!   transport may have taken part of it, [`write_failed`](Connection::write_failed));
 //! * **events**, [`poll_event`](Connection::poll_event) until it returns `None` after every
 //!   input: [`Event::Connected`] with the peer's ConnectPacket, [`Event::Frame`] for a
 //!   registered token (the payload borrows the receive buffer), [`Event::UnknownToken`],
@@ -37,6 +38,7 @@
 //!                          a command → conn.send(..) / register(..) / ...
 //!     2. drain     while let Some(event) = conn.poll_event(): handle it (Closed ends the loop)
 //!     3. write     conn.pending_output() to the socket; conn.consume_output(written)
+//!                  (a write error: conn.write_failed(offered, kind, now); see Written offsets)
 //!     4. wait      for: socket readable | conn.poll_timeout() | a command
 //! ```
 //!
@@ -224,6 +226,54 @@
 //! serializes only its token, and FDB resolves the reply endpoint to the address of the
 //! connection the request arrived on (`loadedEndpoint`, 7.4:2179-2181, 8.0:2318-2320), so
 //! requests whose reply endpoints are `ReplyPromise`s satisfy this.
+//!
+//! # Written offsets
+//!
+//! The output is one byte stream over the connection's life: our ConnectPacket from offset 0,
+//! then every frame in the order it is written. Frames sent before the handshake are held,
+//! but their place is already known: they are released right after the ConnectPacket, before
+//! anything else (nothing else is queued during the handshake). So
+//! [`output_offset`](Connection::output_offset), read just before a [`send`](Connection::send),
+//! is the offset of the frame's first byte, held or not.
+//!
+//! [`written`](Connection::written) is how far the driver has reported the stream written
+//! ([`consume_output`](Connection::consume_output)), and
+//! [`maybe_written`](Connection::maybe_written) how far the transport *may* have taken it:
+//! `written`, or further after a write that failed or was abandoned with an unknown outcome
+//! ([`write_failed`](Connection::write_failed),
+//! [`output_maybe_written`](Connection::output_maybe_written)). A frame that starts at or past
+//! `maybe_written` when the connection ends was never handed to the transport, not one byte
+//! of it, and never will be. Any other frame may have been delivered, even if only its first
+//! byte was taken.
+//!
+//! **This is opt-in.** The offsets are only as exact as the driver's reports, so the
+//! [`ReplyRegistry`](crate::rpc::ReplyRegistry) fails a request whose frame was never handed
+//! over as [`NotSent`](crate::rpc::RequestError::NotSent) only on a connection configured with
+//! [`unwritten_not_sent`](ConnectionConfig::unwritten_not_sent), by which the driver promises
+//! reports that cover every byte the transport **may** have taken. Without it (the default),
+//! every request put on an established connection is maybe delivered when it ends. The
+//! [peer manager](crate::peer) opts in. The reports it takes:
+//!
+//! * bytes a write accepted (`Ok(n)`) are written, whatever becomes of them: a TLS session's
+//!   buffer, the socket's send buffer and the network all count as delivered;
+//! * a write that returned an error (or `Ok(0)`) may still have taken part of its buffer,
+//!   unless the stream guarantees otherwise: a TLS stream (`futures-rustls`) returns the
+//!   socket's error after encrypting part of the buffer into its session. Report it with
+//!   [`write_failed`](Connection::write_failed) and the number of bytes offered. Only a
+//!   stream that takes nothing when it fails, as `write(2)` and [`std::io::Write::write`]'s
+//!   contract say, may be reported with plain [`io_error`](Connection::io_error);
+//! * a write that returned `Pending` took nothing only if the stream guarantees it (a socket
+//!   that would block wrote nothing; an OpenSSL session without
+//!   `SSL_MODE_ENABLE_PARTIAL_WRITE` can send a record and then say `WANT_WRITE`). Otherwise
+//!   report the bytes offered with [`output_maybe_written`](Connection::output_maybe_written);
+//! * a write whose outcome is unknown (a write future abandoned halfway, by a driver that
+//!   writes from a copy) is [`output_maybe_written`](Connection::output_maybe_written);
+//! * report before anything ends the connection: its end discards the output, and the
+//!   offsets are final from then on.
+//!
+//! Since a write the stream does not vouch for counts everything it was offered, offer such
+//! a stream bounded slices (the peer manager offers at most 64 KiB): the frames past the slice
+//! stay certainly unwritten.
 
 mod config;
 mod error;
@@ -239,7 +289,7 @@ use fdb_native_wire::{
 };
 
 pub use config::{ConnectionConfig, DEFAULT_MAX_PENDING_OUTPUT, MonitorConfig};
-pub use error::{ConnectionError, SendError};
+pub use error::{ConnectionError, IoError, SendError};
 pub use messages::{
     EndpointNotFound, PING_REPLY_OK, PingReply, PingRequest, TOKEN_STREAM_FLAG, well_known,
 };
@@ -393,8 +443,13 @@ struct Core {
     out_pos: usize,
     /// Frames sent before the handshake completed.
     held: Vec<u8>,
-    /// Bytes of `out` written so far, over the connection's life.
+    /// Bytes of `out` written so far, over the connection's life: the offset in the output
+    /// stream up to which bytes were reported written.
     written_total: u64,
+    /// The offset in the output stream up to which bytes may have been taken by the
+    /// transport without being reported written (a write that failed). See
+    /// [`Connection::maybe_written`].
+    maybe_taken: u64,
     /// FlowTransport frames this side queued in response to the peer (ping replies and
     /// endpoint-not-found notices) and not yet written: their end in the stream (counted like
     /// `written_total`) and length.
@@ -441,6 +496,7 @@ impl Connection {
             out_pos: 0,
             held: Vec::new(),
             written_total: 0,
+            maybe_taken: 0,
             internal: VecDeque::new(),
             internal_pending: 0,
             recv_room: 0,
@@ -612,10 +668,27 @@ impl Connection {
                 && (self.decoder.error().is_some() || front_frame_complete(&self.decoder)))
     }
 
-    /// The socket failed at `now`: the connection ends with [`ConnectionError::Io`].
-    pub fn io_error(&mut self, kind: std::io::ErrorKind, now: Instant) {
+    /// The socket failed at `now`: the connection ends with [`ConnectionError::Io`]. Pass
+    /// the [`io::Error`](std::io::Error) itself to keep its cause (a TLS alert, say) in the
+    /// error; an [`ErrorKind`](std::io::ErrorKind) alone keeps only the kind.
+    ///
+    /// For a failed **write** this says that the write took nothing: use it only for a stream
+    /// that guarantees so, and [`write_failed`](Self::write_failed) otherwise (see
+    /// [Written offsets](self#written-offsets)). A failed read takes no output.
+    pub fn io_error(&mut self, error: impl Into<IoError>, now: Instant) {
         self.core.advance(now);
-        self.core.fail(ConnectionError::Io(kind));
+        self.core.fail(ConnectionError::Io(error.into()));
+    }
+
+    /// A write of the first `offered` bytes of [`pending_output`](Self::pending_output) failed
+    /// with `error` at `now`, and the stream may have taken any part of them first (a TLS
+    /// stream can): they count as possibly written
+    /// ([`output_maybe_written`](Self::output_maybe_written)), then the connection ends with
+    /// [`ConnectionError::Io`], as for [`io_error`](Self::io_error). A frame that starts past
+    /// the `offered` bytes was not written.
+    pub fn write_failed(&mut self, offered: usize, error: impl Into<IoError>, now: Instant) {
+        self.output_maybe_written(offered);
+        self.io_error(error, now);
     }
 
     /// When [`handle_timeout`](Self::handle_timeout) must next be called, if at all. It may be
@@ -778,7 +851,9 @@ impl Connection {
     }
 
     /// Records that the first `n` bytes of [`pending_output`](Self::pending_output) were
-    /// written.
+    /// written: handed to the transport, which may deliver them. Report every byte a write
+    /// took before doing anything else to the connection (see
+    /// [Written offsets](self#written-offsets)).
     pub fn consume_output(&mut self, n: usize) {
         let core = &mut self.core;
         let n = n.min(core.out.len() - core.out_pos);
@@ -801,6 +876,48 @@ impl Connection {
             core.out.drain(..core.out_pos);
             core.out_pos = 0;
         }
+    }
+
+    /// Records that the transport may have taken the first `n` bytes of
+    /// [`pending_output`](Self::pending_output) although no write said so: a write that failed
+    /// on a stream that can take part of its buffer before failing (TLS), or a write abandoned
+    /// with an unknown outcome. The bytes stay pending (a driver that carries on writes them
+    /// again, and reports them with [`consume_output`](Self::consume_output) then), but
+    /// [`maybe_written`](Self::maybe_written) covers them, so the requests in them count as
+    /// possibly delivered. Call it before the connection ends: its end discards the output
+    /// (`n` is clamped to what is pending).
+    pub fn output_maybe_written(&mut self, n: usize) {
+        let core = &mut self.core;
+        let n = n.min(core.out.len() - core.out_pos);
+        let end = core.written_total + n as u64;
+        core.maybe_taken = core.maybe_taken.max(end);
+    }
+
+    /// The offset in the output stream up to which bytes were reported written
+    /// ([`consume_output`](Self::consume_output)) over the connection's life, our ConnectPacket
+    /// included. See [Written offsets](self#written-offsets).
+    pub fn written(&self) -> u64 {
+        self.core.written_total
+    }
+
+    /// The offset in the output stream up to which bytes may have been handed to the
+    /// transport: [`written`](Self::written), or further after a write that failed or was
+    /// abandoned ([`write_failed`](Self::write_failed),
+    /// [`output_maybe_written`](Self::output_maybe_written)). No byte at or past it was handed
+    /// to the transport; once the connection has ended, none ever will be. See
+    /// [Written offsets](self#written-offsets).
+    pub fn maybe_written(&self) -> u64 {
+        self.core.written_total.max(self.core.maybe_taken)
+    }
+
+    /// The offset in the output stream at which the next frame [sent](Self::send) will start.
+    /// A frame sent during the handshake is held, but its offset is already final: held
+    /// frames are released right after our ConnectPacket, before anything else. Once the
+    /// connection has ended, a frame that starts at or past
+    /// [`maybe_written`](Self::maybe_written) was never handed to the transport. See
+    /// [Written offsets](self#written-offsets).
+    pub fn output_offset(&self) -> u64 {
+        self.core.output_end()
     }
 
     /// The next event, if any. Call it until it returns `None` after every input: frames are
@@ -990,11 +1107,18 @@ impl Core {
         self.events.push_back(Queued::Closed(error));
     }
 
+    /// The offset in the output stream after everything queued, held frames included.
+    fn output_end(&self) -> u64 {
+        self.written_total + (self.out.len() - self.out_pos) as u64 + self.held.len() as u64
+    }
+
     /// The handshake succeeded.
     fn established(&mut self, packet: ConnectPacket) {
         self.state = ConnectionState::Established;
         self.was_established = true;
         self.events.push_back(Queued::Connected(packet));
+        // The held frames go right after what is in `out`, which is only (what is left of) our
+        // ConnectPacket, so the offsets `output_offset` gave them during the handshake hold.
         let held = std::mem::take(&mut self.held);
         self.out.extend_from_slice(&held);
         // connectionMonitor: "set this to not immediately close the connection as idle".
@@ -1076,6 +1200,9 @@ impl Core {
         file_identifier: u32,
         reply: bool,
     ) {
+        // Only once established: during the handshake nothing but our ConnectPacket may be in
+        // `out`, or the offsets of held frames would move (see Written offsets).
+        debug_assert_eq!(self.state, ConnectionState::Established);
         let config = self.frame_config;
         let before = self.out.len();
         let Core { out, writer, .. } = self;

@@ -750,13 +750,69 @@ fn the_peer_closing_after_frames_delivers_them_first() {
 }
 
 #[test]
+fn an_io_error_keeps_its_cause() {
+    use std::error::Error as _;
+
+    #[derive(Debug)]
+    struct Alert;
+    impl std::fmt::Display for Alert {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("received fatal alert: UnknownCA")
+        }
+    }
+    impl std::error::Error for Alert {}
+
+    let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
+    conn.io_error(
+        std::io::Error::new(std::io::ErrorKind::InvalidData, Alert),
+        t(20),
+    );
+    let got = events(&mut conn);
+    let [Ev::Closed(error)] = got.as_slice() else {
+        panic!("{got:?}");
+    };
+
+    // The kind is there, and so is the cause: in Display and as the source.
+    let ConnectionError::Io(io) = error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "i/o error: received fatal alert: UnknownCA"
+    );
+    let source = error.source().expect("the I/O error");
+    assert_eq!(source.to_string(), "received fatal alert: UnknownCA");
+    assert!(source.source().expect("the wrapped error").is::<Alert>());
+    assert!(io.cause().is_some_and(|c| c.is::<Alert>()));
+    assert!(io.io_error().is_some());
+
+    // Unchanged: still a failed connection, not a clean end, and clonable and comparable.
+    assert_eq!(error.fdb_error(), "connection_failed");
+    assert!(!error.is_clean());
+    assert_eq!(error.clone(), *error);
+    assert_ne!(
+        *error,
+        ConnectionError::Io(std::io::ErrorKind::InvalidData.into())
+    );
+
+    // A bare kind has no cause beyond itself.
+    let bare = ConnectionError::Io(std::io::ErrorKind::ConnectionReset.into());
+    assert_eq!(bare.to_string(), "i/o error: connection reset");
+    assert!(bare.source().unwrap().source().is_none());
+    // An OS error keeps its message.
+    let os = ConnectionError::Io(std::io::Error::from_raw_os_error(104).into());
+    assert!(os.to_string().contains("os error 104"), "{os}");
+}
+
+#[test]
 fn io_errors_end_the_connection() {
     let (mut conn, _) = connected(ProtocolVersion::V7_4, false);
     conn.io_error(std::io::ErrorKind::ConnectionReset, t(20));
     assert_eq!(
         events(&mut conn),
         vec![Ev::Closed(ConnectionError::Io(
-            std::io::ErrorKind::ConnectionReset
+            std::io::ErrorKind::ConnectionReset.into()
         ))]
     );
 }

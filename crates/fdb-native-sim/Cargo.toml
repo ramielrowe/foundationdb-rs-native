@@ -1,0 +1,22 @@
+[package]
+name = "fdb-native-sim"
+description = "Deterministic simulation of the native FoundationDB client: a seeded Runtime, a faulty in-memory network and a model cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The client without its default `tokio` feature: everything runs on the simulator's runtime.
+fdb-native-client = { path = "../fdb-native-client", default-features = false }
+fdb-native-schema.workspace = true
+fdb-native-transport.workspace = true
+fdb-native-wire.workspace = true
+futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-io = "0.3.34"
+futures-lite = "2.6.1"

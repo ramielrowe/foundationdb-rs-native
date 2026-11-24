@@ -68,6 +68,7 @@ impl ServerInfo {
     }
 
     /// Where to send a `GetValueRequest`: the address and the `getValue` (base) token.
+    #[cfg(test)]
     pub(crate) fn target(&self) -> (NetworkAddress, Uid) {
         let interface = self.interface();
         (interface.address, interface.server.base.token)
@@ -284,7 +285,7 @@ impl LocationCache {
 
     /// The targets of the servers that cached ranges (or reads in progress) still use, on
     /// every stream the read path sends to and records endpoint failures of (`getValue`,
-    /// `getKey`, `getKeyValues`, `watchValue`).
+    /// `getKey`, `getKeyValues`, `watchValue`, `waitMetrics`, `getRangeSplitPoints`).
     pub(crate) fn live_targets(&self) -> HashSet<(NetworkAddress, Uid)> {
         let streams = &fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
         let indices = [
@@ -292,6 +293,8 @@ impl LocationCache {
             streams.get_key,
             streams.get_key_values,
             streams.watch_value,
+            streams.wait_metrics,
+            streams.get_range_split_points,
         ];
         self.servers
             .values()
@@ -587,9 +590,9 @@ mod tests {
             let begin = i.to_be_bytes();
             let end = (i + 1).to_be_bytes();
             cache.insert(&range(&begin, &end), location, &mut rng);
-            // Four streams per live server.
+            // Six streams per live server.
             let live = cache.live_targets().len();
-            assert!(live <= 4 * 10, "{live}");
+            assert!(live <= 6 * 10, "{live}");
             assert!(
                 cache.server_entries() <= 2 * 10 + 64 + 1,
                 "{}",

@@ -11,6 +11,8 @@
 //! | [`GetKeyRequest`] | `tenantInfo` between `spanContext` and `options` |
 //! | [`GetKeyValuesRequest`] | `tenantInfo` between `spanContext` and `options`; no `taskID` |
 //! | [`WatchValueRequest`] | `tenantInfo` after `spanContext`, the last slot |
+//! | [`WaitMetricsRequest`] | `tenantInfo` and `minVersion` (8.0: `legacyVersion`) after `reply` |
+//! | [`SplitRangeRequest`] | `tenantInfo` after `reply` (8.0: `limit`) |
 //! | [`CommitTransactionRequest`] | `tenantInfo` between `spanContext` and `idempotencyId` |
 //! | [`GetKeyServerLocationsRequest`] | `tenant` and `minTenantVersion` (8.0: `legacyVersion`) |
 //! | [`GetReadVersionRequest`] | no `maxGrvQueueDelayMS` |
@@ -37,7 +39,8 @@ pub use crate::common::{
     CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyServerLocationsReply,
     GetKeyValuesReply, GetValueReply, GrvProxyInterface, Hostname, KeyRangeRef, KeySelectorRef,
     KeyServerLocation, LocalityData, MutationRef, OpenDatabaseCoordRequest, Pair, SpanContext,
-    StorageServerInterface, TraceFlags, VersionHistory, WatchValueReply,
+    SplitRangeReply, StorageMetrics, StorageServerInterface, TraceFlags, VersionHistory,
+    WatchValueReply,
 };
 use crate::streams::CommitProxyStreams;
 use crate::{SchemaVersion, domain};
@@ -770,6 +773,104 @@ impl From<WatchValueRequest<'_>> for domain::WatchValue {
             tags: r.tags.map(TagSetRef::into_owned),
             debug_id: r.debug_id,
             span_context: r.span_context,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Storage metrics.
+
+/// `WaitMetricsRequest` on 7.4 (`serializer(ar, keys, min, max, reply, tenantInfo,
+/// minVersion, arena)`).
+///
+/// Absent: `WaitMetricsRequest() {}`: zero except `tenantInfo`, a `TenantInfo()`.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 1795961)]
+pub struct WaitMetricsRequest<'a> {
+    /// `keys`.
+    pub keys: KeyRangeRef<'a>,
+    /// `min`.
+    pub min: StorageMetrics,
+    /// `max`.
+    pub max: StorageMetrics,
+    /// `reply`.
+    pub reply: ReplyPromise<domain::StorageMetrics>,
+    /// `tenantInfo`.
+    pub tenant_info: TenantInfo<'a>,
+    /// `minVersion` (8.0's `legacyVersion`).
+    pub min_version: i64,
+    /// `arena`.
+    #[fdb(arena)]
+    pub arena: (),
+}
+
+impl<'a> WaitMetricsRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`.
+    pub fn from_domain(r: &'a domain::WaitMetrics, reply: Uid) -> Self {
+        WaitMetricsRequest {
+            keys: (&r.keys).into(),
+            min: (&r.min).into(),
+            max: (&r.max).into(),
+            reply: ReplyPromise::new(reply),
+            tenant_info: TenantInfo::NONE,
+            min_version: r.version,
+            arena: (),
+        }
+    }
+}
+
+impl From<WaitMetricsRequest<'_>> for domain::WaitMetrics {
+    fn from(r: WaitMetricsRequest<'_>) -> Self {
+        domain::WaitMetrics {
+            keys: r.keys.into(),
+            min: r.min.into(),
+            max: r.max.into(),
+            version: r.min_version,
+        }
+    }
+}
+
+/// `SplitRangeRequest` on 7.4 (`serializer(ar, keys, chunkSize, reply, tenantInfo, arena)`).
+///
+/// Absent: `SplitRangeRequest() {}`: zero except `tenantInfo`, a `TenantInfo()`. C++ leaves
+/// `chunkSize` uninitialised; zero here.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 10725174)]
+pub struct SplitRangeRequest<'a> {
+    /// `keys`.
+    pub keys: KeyRangeRef<'a>,
+    /// `chunkSize`.
+    pub chunk_size: i64,
+    /// `reply`.
+    pub reply: ReplyPromise<domain::SplitRangeReply>,
+    /// `tenantInfo`.
+    pub tenant_info: TenantInfo<'a>,
+    /// `arena`.
+    #[fdb(arena)]
+    pub arena: (),
+}
+
+impl<'a> SplitRangeRequest<'a> {
+    /// The request for `r`, whose reply goes to the endpoint with token `reply`. 7.4 has no
+    /// `limit`: `r.limit` is not sent.
+    pub fn from_domain(r: &'a domain::SplitRange, reply: Uid) -> Self {
+        SplitRangeRequest {
+            keys: (&r.keys).into(),
+            chunk_size: r.chunk_size,
+            reply: ReplyPromise::new(reply),
+            tenant_info: TenantInfo::NONE,
+            arena: (),
+        }
+    }
+}
+
+impl From<SplitRangeRequest<'_>> for domain::SplitRange {
+    /// `limit` is -1 (none), the only behaviour of a 7.4 server.
+    fn from(r: SplitRangeRequest<'_>) -> Self {
+        domain::SplitRange {
+            keys: r.keys.into(),
+            chunk_size: r.chunk_size,
+            limit: -1,
         }
     }
 }

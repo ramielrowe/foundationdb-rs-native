@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fdb_native_client::atomic;
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::KEY_SPACE_END;
-use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, Error, MutationType, Watch, WatchConfig,
-};
+use fdb_native_client::watch::WatchConfig;
+use fdb_native_client::{Database, DatabaseOptions, Error, MutationType, Watch};
 use fdb_native_schema::domain::{
     Commit, CommitId, GetKeyServerLocations, GetReadVersion, GetValue, GetValueReply, KeyRange,
     KeyServerLocations, Mutation, MutationType as Mt, ReadVersion, StorageServer, WatchValue,
@@ -303,7 +304,17 @@ async fn env(schema: SchemaVersion, servers: usize, watch: WatchConfig) -> Env {
                                     data.insert(param1.clone(), param2.clone());
                                 }
                                 Mt::CLEAR_RANGE => data.retain(|k, _| !(param1 <= k && k < param2)),
-                                _ => {}
+                                Mt::SET_VERSIONSTAMPED_KEY | Mt::SET_VERSIONSTAMPED_VALUE => {}
+                                // The storage server's `convertAtomicOp`.
+                                op => {
+                                    let old = data.get(param1).map(Vec::as_slice);
+                                    match atomic::apply(op, old, param2, atomic::VALUE_SIZE_LIMIT)
+                                        .unwrap()
+                                    {
+                                        Some(v) => data.insert(param1.clone(), v),
+                                        None => data.remove(param1),
+                                    };
+                                }
                             }
                         }
                     }
@@ -435,6 +446,21 @@ async fn a_watch_starts_at_commit_and_fires_when_the_value_changes() {
     }
 }
 
+/// `watch` starts when it is called (C++'s watch future): a watch whose future is awaited
+/// only after the commit was registered by that commit.
+#[tokio::test(start_paused = true)]
+async fn a_watch_starts_when_called_and_may_be_awaited_after_the_commit() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let watch = tx.watch(b"k");
+    tx.commit().await.unwrap();
+    let mut watch = within("the watch", watch).await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    assert!(pending(&mut watch).await);
+    env.set_value(b"k", Some(b"v"));
+    resolved("the watch", &mut watch).await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_watch_of_a_retry_loop_returns_pending_and_fires() {
     let env = standard(SchemaVersion::V8_0).await;
@@ -488,25 +514,148 @@ async fn a_watch_of_a_written_key_watches_the_written_value_at_the_commit_versio
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_pending_atomic_operation_makes_the_value_the_one_at_the_commit() {
-    let env = standard(SchemaVersion::V7_4).await;
-    env.set_value(b"n", Some(b"abc"));
+async fn a_pending_atomic_operation_applies_to_the_value_at_the_read_version() {
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        env.set_value(b"n", Some(&5u64.to_le_bytes()));
+        let tx = env.db.create_transaction();
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+        let mut watch = tx.watch(b"n").await.unwrap();
+        // The key was read at the read version (a dependent write: RYW reads the database).
+        let read_version = tx.get_read_version().await.unwrap();
+        assert_eq!(env.reads.lock().unwrap().clone(), vec![read_version]);
+        let result = tx.commit().await.unwrap();
+        // With a read conflict range on the key (`updateConflictMap`).
+        let commit = env.commits.lock().unwrap().last().unwrap().clone();
+        assert!(
+            commit
+                .read_conflict_ranges
+                .contains(&KeyRange::single_key(b"n")),
+            "{:?}",
+            commit.read_conflict_ranges
+        );
+        until("the watch request", || env.request_count() == 1).await;
+        let (request, _, _) = env.requests().remove(0);
+        // The value at the read version with the transaction's own addition applied.
+        assert_eq!(request.value, Some(6u64.to_le_bytes().to_vec()));
+        assert_eq!(request.version, result.committed_version());
+        assert_eq!(
+            env.reads.lock().unwrap().len(),
+            1,
+            "nothing read after the commit"
+        );
+        // The commit's own addition does not fire it, another change does.
+        assert!(pending(&mut watch).await);
+        env.set_value(b"n", Some(&7u64.to_le_bytes()));
+        resolved("the watch", &mut watch).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn atomic_operations_fold_into_the_value_the_transaction_wrote() {
+    let env = standard(SchemaVersion::V8_0).await;
+    env.set_value(b"a", Some(b"db"));
     let tx = env.db.create_transaction();
-    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
-    let mut watch = tx.watch(b"n").await.unwrap();
-    let result = tx.commit().await.unwrap();
-    until("the watch request", || env.request_count() == 1).await;
-    let (request, _, _) = env.requests().remove(0);
-    // The key's value at the commit version was read, and that is what is watched.
-    assert_eq!(request.value.as_deref(), Some(&b"abc"[..]));
-    assert_eq!(request.version, result.committed_version());
+    // A set, then atomic operations: known without a read.
+    tx.set(b"a", &5u16.to_le_bytes());
+    tx.atomic_op(b"a", &3u16.to_le_bytes(), MutationType::Add);
+    tx.atomic_op(b"a", &4u16.to_le_bytes(), MutationType::Max);
+    // A clear, then an operation: from no value (`MinV2` of nothing is the operand).
+    tx.clear(b"b");
+    tx.atomic_op(b"b", b"\x09", MutationType::Min);
+    // A clear, then a compare-and-clear of nothing: still nothing.
+    tx.clear(b"c");
+    tx.atomic_op(b"c", b"x", MutationType::CompareAndClear);
+    // Dependent operations, in order, on the database's value.
+    env.set_value(b"d", Some(b"\x01\x02"));
+    tx.atomic_op(b"d", b"\xff\x00", MutationType::Add);
+    tx.atomic_op(b"d", b"q", MutationType::AppendIfFits);
+    let mut watches = Vec::new();
+    for key in [b"a", b"b", b"c", b"d"] {
+        watches.push(tx.watch(key).await.unwrap());
+    }
+    let read_version = tx.get_read_version().await.unwrap();
     assert_eq!(
         env.reads.lock().unwrap().clone(),
-        vec![result.committed_version()]
+        vec![read_version],
+        "only `d` depends on the database"
     );
-    assert!(pending(&mut watch).await);
-    env.set_value(b"n", None);
-    resolved("the watch", &mut watch).await.unwrap();
+    tx.commit().await.unwrap();
+    until("the watch requests", || env.request_count() == 4).await;
+    let mut requests: Vec<_> = env
+        .requests()
+        .into_iter()
+        .map(|(r, _, _)| (r.key, r.value))
+        .collect();
+    requests.sort();
+    assert_eq!(
+        requests,
+        vec![
+            (b"a".to_vec(), Some(8u16.to_le_bytes().to_vec())),
+            (b"b".to_vec(), Some(b"\x09".to_vec())),
+            (b"c".to_vec(), None),
+            (b"d".to_vec(), Some(b"\x00\x03q".to_vec())),
+        ]
+    );
+    // Those values are what the commit wrote (the fake proxy applies `Atomic.h` too): no
+    // watch fired.
+    for watch in &mut watches {
+        assert!(pending(watch).await);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_write_fires_a_watch_of_a_key_with_a_pending_atomic_operation() {
+    let env = standard(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+    tx.atomic_op(b"m", &1u64.to_le_bytes(), MutationType::Add);
+    let mut by_set = tx.watch(b"n").await.unwrap();
+    let mut by_clear = tx.watch(b"m").await.unwrap();
+    // The value the operation gives (the key is not set: 1): nothing changes.
+    tx.set(b"n", &1u64.to_le_bytes());
+    assert!(ready(&mut by_set).await.is_none());
+    // Another value, a clear: they fire at once.
+    tx.set(b"n", &2u64.to_le_bytes());
+    tx.clear(b"m");
+    assert!(ready(&mut by_set).await.unwrap().is_ok());
+    assert!(ready(&mut by_clear).await.unwrap().is_ok());
+    assert_eq!(env.db.outstanding_watches(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_increments_fire_each_others_watches() {
+    // Two transactions increment a counter and watch it, and both commit (the fake proxy
+    // resolves no conflicts, as if both were in one batch without the read conflict range):
+    // the first to commit sees the other's increment as a change. Its watch value is its own
+    // view (read version + its addition), not the value at its commit version, which already
+    // has both increments.
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        let (t1, t2) = (env.db.create_transaction(), env.db.create_transaction());
+        for tx in [&t1, &t2] {
+            tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+        }
+        let mut w1 = t1.watch(b"n").await.unwrap();
+        let mut w2 = t2.watch(b"n").await.unwrap();
+        t2.commit().await.unwrap();
+        t1.commit().await.unwrap();
+        assert_eq!(
+            env.data.lock().unwrap().get(&b"n"[..]),
+            Some(&2u64.to_le_bytes().to_vec())
+        );
+        // Both watched 1; the key is 2 by the time either watch reaches the server.
+        resolved("the first watch", &mut w1).await.unwrap();
+        resolved("the second watch", &mut w2).await.unwrap();
+        // Both commits carried the key as a read conflict range: a real resolver fails one.
+        for commit in env.commits.lock().unwrap().iter() {
+            assert!(
+                commit
+                    .read_conflict_ranges
+                    .contains(&KeyRange::single_key(b"n"))
+            );
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -526,7 +675,7 @@ async fn writes_after_the_watch_that_change_the_value_fire_it_at_once() {
     tx.set(b"a", b"2");
     tx.set(b"b", b"1"); // the value it has: nothing changed
     tx.clear_range(b"c", b"d"); // clearing what is not there changes nothing
-    tx.atomic_op(b"d", &[1], MutationType::ADD_VALUE); // its result is not known
+    tx.atomic_op(b"d", &[1], MutationType::Add); // its result is not known
     assert!(ready(&mut by_set).await.unwrap().is_ok());
     assert!(ready(&mut by_atomic).await.unwrap().is_ok());
     assert!(ready(&mut same).await.is_none());
@@ -967,6 +1116,27 @@ async fn watch_checks_its_key_and_the_transaction() {
     );
     assert_eq!(env.db.outstanding_watches(), 0);
 
+    // `\xff/metadataVersion` may be watched without the system key options, as C++ allows
+    // (`ReadYourWritesTransaction::watch`, 7.4:2451); a key next to it may not.
+    let tx = env.db.create_transaction();
+    assert_eq!(
+        tx.watch(b"\xff/metadataVersion\x00")
+            .await
+            .unwrap_err()
+            .code(),
+        codes::KEY_OUTSIDE_LEGAL_RANGE
+    );
+    let mut watch = tx.watch(b"\xff/metadataVersion").await.unwrap();
+    tx.commit().await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    let (request, _, _) = env.requests().remove(0);
+    assert_eq!(request.key, b"\xff/metadataVersion");
+    assert!(pending(&mut watch).await);
+    env.set_value(b"\xff/metadataVersion", Some(&[1; 10]));
+    resolved("the metadata version watch", &mut watch)
+        .await
+        .unwrap();
+
     // After the commit started, a watch is `used_during_commit`.
     let tx = env.db.create_transaction();
     tx.commit().await.unwrap();
@@ -977,24 +1147,298 @@ async fn watch_checks_its_key_and_the_transaction() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn versionstamped_operations_trigger_watches_as_atomic_operations_do() {
+async fn versionstamped_operations_trigger_watches_and_make_keys_unreadable() {
     let env = standard(SchemaVersion::V8_0).await;
     let tx = env.db.create_transaction();
+    let read_version = tx.get_read_version().await.unwrap();
     let mut by_value = tx.watch(b"v").await.unwrap();
     let mut by_key = tx.watch(b"k").await.unwrap();
-    // The key a versionstamped key writes is not known before the commit: no watch is
-    // triggered (C++ triggers on the key with the placeholder, which nobody watches).
+    // `k` + placeholder + offset 1.
     let mut key = b"k".to_vec();
     key.extend_from_slice(&[0xff; 10]);
     key.extend_from_slice(&1i32.to_le_bytes());
+    // C++ triggers the key `transformVersionstampKey` makes: the placeholder stamped with
+    // the read version + 1, the offset kept.
+    let stamped = atomic::transform_versionstamp_key(&key, read_version + 1, 0).unwrap();
+    let mut by_stamped = tx.watch(&stamped).await.unwrap();
     tx.set_versionstamped_key(&key, b"x");
     assert!(ready(&mut by_key).await.is_none());
-    // A versionstamped value's result is not known: the watch fires at once.
+    assert!(ready(&mut by_stamped).await.unwrap().is_ok());
+
+    // The keys the versionstamped key may write are unreadable until the commit.
+    let range = atomic::versionstamp_key_range(&key, Some(read_version), b"\xff").unwrap();
+    let mut inside = b"k".to_vec();
+    inside.extend_from_slice(&(read_version + 5).to_be_bytes());
+    inside.extend_from_slice(&[0, 0]);
+    assert!(range.begin <= inside && inside < range.end);
+    for unreadable in [&range.begin, &inside, &stamped] {
+        assert_eq!(
+            tx.watch(unreadable).await.unwrap_err().code(),
+            codes::ACCESSED_UNREADABLE
+        );
+    }
+    // Outside the range, a watch reads as usual.
+    let mut before = b"k".to_vec();
+    before.extend_from_slice(&read_version.to_be_bytes());
+    let before_watch = tx.watch(&before).await.unwrap();
+    let end = range.end.clone();
+    let end_watch = tx.watch(&end).await.unwrap();
+    // A set keeps a key unreadable; a clear makes it readable (the value: none).
+    tx.set(&inside, b"mine");
+    assert_eq!(
+        tx.watch(&inside).await.unwrap_err().code(),
+        codes::ACCESSED_UNREADABLE
+    );
+    tx.clear(&inside);
+    let inside_watch = tx.watch(&inside).await.unwrap();
+
+    // A versionstamped value's result is not known: the watch fires at once, and the key is
+    // unreadable, also after a set, until a clear.
     let mut value = vec![0xff; 10];
     value.extend_from_slice(&0i32.to_le_bytes());
     tx.set_versionstamped_value(b"v", &value);
     assert!(ready(&mut by_value).await.unwrap().is_ok());
+    assert_eq!(
+        tx.watch(b"v").await.unwrap_err().code(),
+        codes::ACCESSED_UNREADABLE
+    );
+    tx.set(b"v", b"plain");
+    assert_eq!(
+        tx.watch(b"v").await.unwrap_err().code(),
+        codes::ACCESSED_UNREADABLE
+    );
+    tx.clear_range(b"v", b"w");
+    let v_watch = tx.watch(b"v").await.unwrap();
+    assert_eq!(env.db.outstanding_watches(), 5);
+
+    tx.commit().await.unwrap();
+    until("the watch requests", || env.request_count() == 5).await;
+    let mut keys: Vec<_> = env.requests().into_iter().map(|(r, _, _)| r.key).collect();
+    keys.sort();
+    let mut expected = vec![b"k".to_vec(), b"v".to_vec(), before, end, inside];
+    expected.sort();
+    assert_eq!(keys, expected);
+    drop((before_watch, end_watch, inside_watch, v_watch));
+
+    // Without a read version, the range starts at the zero stamp.
+    let tx = env.db.create_transaction();
+    tx.set_versionstamped_key(&key, b"x");
+    let mut zero = b"k".to_vec();
+    zero.extend_from_slice(&[0; 10]);
+    assert_eq!(
+        tx.watch(&zero).await.unwrap_err().code(),
+        codes::ACCESSED_UNREADABLE
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_fails_its_checks_triggers_no_watch() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let mut watch = tx.watch(b"k").await.unwrap();
+    tx.set(b"k", &vec![b'v'; 100_001]); // value_too_large
+    tx.atomic_op(&[b'k'; 10_001], b"x", MutationType::Add); // key_too_large
+    let mut stamp = b"k".to_vec();
+    stamp.extend_from_slice(&5i32.to_le_bytes());
+    tx.set_versionstamped_value(b"k", &stamp); // client_invalid_operation
+    tx.clear_range(b"k", b"a"); // inverted_range
+    assert!(ready(&mut watch).await.is_none());
+    // The first error is the transaction's.
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VALUE_TOO_LARGE
+    );
+    assert!(ready(&mut watch).await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_commit_started_while_a_watch_reads_waits_for_it() {
+    // (9q8.3 review) The watch's read is in progress (polled once) when the commit starts:
+    // as C++'s `reading`, the commit waits for it, and the watch is registered and started.
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        let tx = env.db.create_transaction();
+        tx.set(b"w", b"1");
+        let watch = tx.watch(b"k");
+        let mut watch = std::pin::pin!(watch);
+        let reading =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(reading);
+        let commit = within("the commit", tx.commit()).await;
+        assert!(commit.is_ok(), "{schema}: {commit:?}");
+        assert_eq!(
+            env.data.lock().unwrap().get(&b"w"[..]),
+            Some(&b"1".to_vec())
+        );
+        let mut watch = within("the watch", watch).await.unwrap();
+        until("the watch request", || env.request_count() == 1).await;
+        assert!(pending(&mut watch).await);
+        env.set_value(b"k", Some(b"v"));
+        resolved("the watch", &mut watch).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watch_future_no_longer_polled_does_not_hold_the_commit() {
+    let env = standard(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    tx.set(b"w", b"1");
+    let watch = tx.watch(b"k");
+    let mut watch = std::pin::pin!(watch);
+    let pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(pending);
+    // The watch future is kept but not polled: its read ends on its own.
+    within("the commit", tx.commit()).await.unwrap();
+    let mut watch = within("the watch", watch).await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    env.set_value(b"k", Some(b"v"));
+    resolved("the watch", &mut watch).await.unwrap();
+
+    // Dropped before its read ended: the commit goes on; nothing is left counted.
+    let tx = env.db.create_transaction();
+    tx.set(b"w", b"2");
+    {
+        let watch = tx.watch(b"j");
+        let mut watch = std::pin::pin!(watch);
+        let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx))).await;
+    }
+    within("the commit", tx.commit()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(env.db.outstanding_watches(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watch_after_the_commit_started_does_not_fail_the_commit() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    tx.set(b"w", b"1");
+    let commit = tx.commit();
+    let mut commit = std::pin::pin!(commit);
+    let started =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(commit.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(started);
+    let e = tx.watch(b"k").await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(!e.is_maybe_committed(), "the request was not sent yet");
+    within("the commit", commit).await.unwrap();
+    // After the commit: maybe committed (it did commit).
+    let e = tx.watch(b"k").await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed());
+    assert_eq!(env.db.outstanding_watches(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fired_watch_frees_its_slot_without_being_polled() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let _watch = tx.watch(b"k").await.unwrap();
     tx.commit().await.unwrap();
     until("the watch request", || env.request_count() == 1).await;
-    assert_eq!(env.requests()[0].0.key, b"k");
+    assert_eq!(env.db.outstanding_watches(), 1);
+    env.set_value(b"k", Some(b"v"));
+    until("the slot to free", || env.db.outstanding_watches() == 0).await;
+
+    // So does a watch fired by the transaction's own write.
+    let tx = env.db.create_transaction();
+    let _watch = tx.watch(b"k").await.unwrap();
+    assert_eq!(env.db.outstanding_watches(), 1);
+    tx.set(b"k", b"other");
+    assert_eq!(env.db.outstanding_watches(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_during_a_watch_read_cancels_it_and_not_a_later_watch() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let first = tx.watch(b"k");
+    let mut first = std::pin::pin!(first);
+    let reading =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(reading);
+    tx.reset();
+    // A watch of the same key after the reset (the watch ids of the new state must not
+    // meet the old one's).
+    let mut second = tx.watch(b"k").await.unwrap();
+    assert_eq!(
+        within("the first watch", first).await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    assert_eq!(env.db.outstanding_watches(), 1);
+    tx.commit().await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    assert!(pending(&mut second).await);
+    env.set_value(b"k", Some(b"v"));
+    resolved("the second watch", &mut second).await.unwrap();
+}
+
+/// `ReadYourWritesTransaction::watch` with read-your-writes disabled: `watches_disabled`
+/// (7.4:2447-2448, 8.0:2364-2365).
+#[tokio::test(start_paused = true)]
+async fn watches_are_disabled_without_read_your_writes() {
+    let env = standard(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    tx.set_option(fdb_native_client::TransactionOption::ReadYourWritesDisable)
+        .unwrap();
+    assert_eq!(
+        tx.watch(b"k").await.unwrap_err().code(),
+        codes::WATCHES_DISABLED
+    );
+    assert_eq!(env.db.outstanding_watches(), 0);
+    assert!(env.reads.lock().unwrap().is_empty(), "nothing read");
+    // The transaction goes on.
+    tx.set(b"k", b"v");
+    tx.commit().await.unwrap();
+}
+
+/// The watch's value is a read-your-writes `get` (`readWithConflictRange(GetValueReq)`):
+/// what the transaction read already comes from its cache, with the read conflict range
+/// once.
+#[tokio::test(start_paused = true)]
+async fn a_watch_reads_through_the_transactions_cache() {
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        env.set_value(b"k", Some(b"db"));
+        env.set_value(b"n", Some(&5u64.to_le_bytes()));
+        let tx = env.db.create_transaction();
+        assert_eq!(tx.get(b"k").await.unwrap(), Some(b"db".to_vec()));
+        assert_eq!(env.reads.lock().unwrap().len(), 1);
+        let mut watch = tx.watch(b"k").await.unwrap();
+        assert_eq!(env.reads.lock().unwrap().len(), 1, "the cache answers");
+        // A dependent write over a cached value: no read either.
+        assert!(tx.get(b"n").await.unwrap().is_some());
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+        let mut by_n = tx.watch(b"n").await.unwrap();
+        assert_eq!(env.reads.lock().unwrap().len(), 2);
+        tx.set(b"other", b"x");
+        let result = tx.commit().await.unwrap();
+        let commit = env.commits.lock().unwrap().last().unwrap().clone();
+        let mut reads = commit.read_conflict_ranges.clone();
+        reads.retain(|r| !r.begin.starts_with(b"\xff/SC/"));
+        reads.sort_by(|a, b| a.begin.cmp(&b.begin));
+        assert_eq!(
+            reads,
+            vec![KeyRange::single_key(b"k"), KeyRange::single_key(b"n")]
+        );
+        until("the watch requests", || env.request_count() == 2).await;
+        let mut requests: Vec<_> = env.requests().into_iter().map(|(r, _, _)| r).collect();
+        requests.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(requests[0].value.as_deref(), Some(&b"db"[..]));
+        assert_eq!(requests[1].value, Some(6u64.to_le_bytes().to_vec()));
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.version == result.committed_version())
+        );
+        env.set_value(b"k", Some(b"theirs"));
+        resolved("the watch of k", &mut watch).await.unwrap();
+        assert!(pending(&mut by_n).await);
+        env.set_value(b"n", None);
+        resolved("the watch of n", &mut by_n).await.unwrap();
+    }
 }

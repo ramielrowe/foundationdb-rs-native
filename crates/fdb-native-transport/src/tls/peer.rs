@@ -35,8 +35,12 @@
 //!   (the future is dropped on expiry, which abandons the handshake; the error is then
 //!   [`PeerError::TlsTimeout`](crate::peer::PeerError::TlsTimeout)). A handshake failure,
 //!   including a certificate that `verify_peers` rejects, is
-//!   [`PeerError::Tls`](crate::peer::PeerError::Tls) with kind `InvalidData`; the manager
-//!   never falls back to a plaintext connection.
+//!   [`PeerError::Tls`](crate::peer::PeerError::Tls) with kind `InvalidData` and the I/O
+//!   error (a [`rustls::Error`]) as its `source`; the manager
+//!   never falls back to a plaintext connection. A server that refuses *our* certificate is
+//!   heard from after the handshake, as a connection error: see [why a handshake or a TLS
+//!   connection failed](super#why-a-handshake-or-a-tls-connection-failed), which also covers
+//!   fdbserver's throttling of repeated handshake failures.
 //! * Frames over the stream carry no checksum: the manager builds the connection with the
 //!   address's TLS flag ([`Checksum::for_tls`](crate::Checksum::for_tls)).
 //!
@@ -90,6 +94,11 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     type Stream = PeerTlsStream<S>;
+
+    /// `futures-rustls` 0.26 (without early data, which this crate does not enable) returns
+    /// `Pending` from `poll_write` only when its session took none of the buffer: once it took
+    /// some, it returns `Ok` with the count, whatever the socket did.
+    const PENDING_TAKES_NOTHING: bool = true;
 
     fn tls_enabled(&self) -> bool {
         true

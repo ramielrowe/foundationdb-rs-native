@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use fdb_native_client::cluster::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 use fdb_native_client::read::{ReadConfig, Reader};
-use fdb_native_client::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 use fdb_native_testkit::FdbContainer;
 use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
 use fdb_native_transport::runtime::TokioRuntime;
@@ -185,4 +185,71 @@ async fn docker_reads_values_written_by_fdbcli() {
     tokio::task::spawn_blocking(move || drop(fdb))
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_priorities_and_metadata_version() {
+    use fdb_native_client::read::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
+
+    let fdb = Arc::new(
+        tokio::task::spawn_blocking(FdbContainer::start)
+            .await
+            .unwrap()
+            .expect("container"),
+    );
+    println!("image {}, cluster {}", fdb.image(), fdb.cluster_string());
+    let out = fdbcli(&fdb, "writemode on; set k v").await;
+    assert!(out.contains("Committed"), "{out}");
+
+    let rt = TokioRuntime::new();
+    let peers = PeerManager::new(rt.clone(), PeerManagerConfig::default(), DiscardEvents);
+    let record = ConnectionRecord::open(fdb.cluster_file()).expect("cluster file");
+    let monitor = Arc::new(ClusterMonitor::start(
+        rt.clone(),
+        peers.clone(),
+        record,
+        ClusterMonitorConfig::default(),
+    ));
+    let reader = Reader::new(rt, peers.clone(), monitor.clone(), ReadConfig::default());
+
+    // Every priority gets a read version (concurrently, so that they are batched by priority).
+    let versions: Vec<_> = [Priority::Batch, Priority::Default, Priority::Immediate]
+        .into_iter()
+        .flat_map(|priority| (0..5).map(move |_| priority))
+        .map(|priority| {
+            let reader = reader.clone();
+            tokio::spawn(async move {
+                let mut options = ReadVersionOptions::default();
+                options.priority = priority;
+                reader.get_read_version_with(options).await
+            })
+        })
+        .collect();
+    for v in versions {
+        assert!(within("GRV", v).await.unwrap().unwrap() > 0);
+    }
+
+    // The metadata version the GRV proxy reports is what a storage server has for the key.
+    let (version, from_proxy) = within(
+        "GRV",
+        reader.get_read_version_and_metadata(ReadVersionOptions::default()),
+    )
+    .await
+    .unwrap();
+    println!("metadataVersion at {version}: {from_proxy:?}");
+    assert_eq!(
+        reader.cached_metadata_version(version),
+        Some(from_proxy.clone())
+    );
+    let from_storage = within("get", reader.get(METADATA_VERSION_KEY, version))
+        .await
+        .unwrap();
+    assert_eq!(from_proxy, from_storage);
+    assert_eq!(
+        within("metadata", reader.metadata_version(version))
+            .await
+            .unwrap(),
+        from_storage
+    );
 }

@@ -1,6 +1,6 @@
 //! Read versions: `getConsistentReadVersion` and `readVersionBatcher`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,10 +14,11 @@ use fdb_native_wire::Endpoint;
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 
-use super::Shared;
+use super::balance::ProxyBalance;
 use super::util::{Either, never, now_secs, race, secs};
+use super::{Shared, lock};
 use crate::error::Error;
-use crate::error::codes::{INTERNAL_ERROR, OPERATION_CANCELLED};
+use crate::error::codes::{INTERNAL_ERROR, INVALID_OPTION_VALUE, OPERATION_CANCELLED};
 
 /// A read version as the batcher hands it to every transaction of a batch.
 pub(crate) type GrvResult = Result<Arc<ReadVersion>, Error>;
@@ -54,6 +55,10 @@ pub struct ReadVersionOptions {
     /// `LOCK_AWARE` / `READ_LOCK_AWARE`: a read version from a locked database is accepted
     /// instead of failing with `database_locked`.
     pub lock_aware: bool,
+    /// `MAX_GRV_QUEUE_DELAY` (milliseconds, 8.0 only; ignored on a 7.4 cluster, which has no
+    /// such option): how long the GRV proxy may queue the request. It is part of the batcher's
+    /// key (NativeAPI 8.0:5741), so requests with different delays are sent separately.
+    pub max_grv_queue_delay_ms: Option<i64>,
 }
 
 impl ReadVersionOptions {
@@ -73,6 +78,82 @@ impl ReadVersionOptions {
         }
         flags
     }
+
+    /// `invalid_option_value` (2006) if `max_grv_queue_delay_ms` is outside `[0, i32::MAX]`
+    /// (`extractIntOption(value, 0, std::numeric_limits<int32_t>::max())`, NativeAPI
+    /// 8.0:5096-5098), whichever release the cluster runs.
+    pub fn validate(&self) -> Result<(), Error> {
+        match self.max_grv_queue_delay_ms {
+            Some(ms) if !(0..=i64::from(i32::MAX)).contains(&ms) => Err(Error::with_message(
+                INVALID_OPTION_VALUE,
+                "max_grv_queue_delay_ms must be in [0, 2147483647]",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The batcher these options go through: one per distinct request.
+    pub(crate) fn batcher_key(&self) -> BatcherKey {
+        (self.flags(), self.max_grv_queue_delay_ms)
+    }
+}
+
+/// `metadataVersionKey` (`\xff/metadataVersion`): the system key whose value changes
+/// whenever a transaction tells the cluster that cached metadata must be refreshed. The GRV
+/// proxies report it with every read version.
+pub const METADATA_VERSION_KEY: &[u8] = b"\xff/metadataVersion";
+
+/// `DatabaseContext::metadataVersionCache` (`METADATA_VERSION_CACHE_SIZE` entries): the
+/// `\xff/metadataVersion` at the latest read versions the database saw, from GRV replies
+/// (`extractReadVersion`, NativeAPI 7.4:7830-7837, 8.0:5557-5562) and commit replies
+/// (`tryCommit`, 7.4:6990-6996). A version is added only if it is newer than the newest
+/// (C++ keeps a ring buffer sorted by version and looks versions up by binary search; this
+/// is the same set, oldest dropped first).
+#[derive(Debug)]
+pub(crate) struct MetadataVersionCache {
+    entries: VecDeque<(i64, Option<Vec<u8>>)>,
+    capacity: usize,
+}
+
+impl MetadataVersionCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        MetadataVersionCache {
+            entries: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Remembers the value at `version`, if it is newer than all remembered.
+    pub(crate) fn insert(&mut self, version: i64, value: Option<Vec<u8>>) {
+        if self
+            .entries
+            .back()
+            .is_some_and(|(newest, _)| version <= *newest)
+        {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((version, value));
+    }
+
+    /// The value at exactly `version`, if remembered.
+    pub(crate) fn get(&self, version: i64) -> Option<Option<Vec<u8>>> {
+        let (a, b) = self.entries.as_slices();
+        // Sorted by version across both slices: search whichever may hold it.
+        let found = match b.first() {
+            Some((first_of_b, _)) if version >= *first_of_b => b
+                .binary_search_by_key(&version, |e| e.0)
+                .ok()
+                .map(|i| &b[i]),
+            _ => a
+                .binary_search_by_key(&version, |e| e.0)
+                .ok()
+                .map(|i| &a[i]),
+        };
+        found.map(|(_, value)| value.clone())
+    }
 }
 
 impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
@@ -84,6 +165,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         count: u32,
         flags: u32,
+        max_grv_queue_delay_ms: Option<i64>,
     ) -> Result<ReadVersion, Error> {
         let use_provisional = flags & GetReadVersion::FLAG_USE_PROVISIONAL_PROXIES != 0;
         loop {
@@ -111,12 +193,23 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 span_context: Default::default(),
                 // `ssVersionVectorCache.getMaxVersion()`: version vectors are not used.
                 max_version: INVALID_VERSION,
-                max_grv_queue_delay_ms: None,
+                max_grv_queue_delay_ms,
+            };
+            // `GrvProxyInfo`: weighted by the proxies' `processBusyTime`, for the proxies of
+            // this info (a new info starts again from uniform probabilities).
+            let model = {
+                let key = (info.id(), info.grv_proxy_ids());
+                let now = now_secs(self.rt.now());
+                lock(&self.grv_model).get(key, now)
             };
             let reply = self.basic_load_balance(
                 &alternatives,
                 move |schema, reply, out| request.encode_request_into(schema, reply, out),
                 GetReadVersion::decode_reply,
+                Some(ProxyBalance {
+                    model: &model,
+                    busy_time: |reply: &ReadVersion| reply.process_busy_time,
+                }),
             );
             let changed = async {
                 match self.monitor.proxies_changed(&info).await {
@@ -136,8 +229,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     }
 }
 
+/// What a `readVersionBatcher` is for (`cx->versionBatcher[...]`: the flags on 7.4, the flags
+/// and `maxGrvQueueDelayMS` on 8.0 as `VersionBatcherKey`). The flags include the priority, so
+/// batch, default and immediate requests are never sent together.
+pub(crate) type BatcherKey = (u32, Option<i64>);
+
 /// One `readVersionBatcher` (NativeAPI 7.4:7671-7761, 8.0:5383-5482): collects the read
-/// version requests of one set of flags and sends them as batches.
+/// version requests of one [`BatcherKey`] and sends them as batches.
 pub(crate) struct Batcher<R: Runtime> {
     pub(crate) sender: mpsc::UnboundedSender<Waiter>,
     pub(crate) task: R::Task<()>,
@@ -146,11 +244,11 @@ pub(crate) struct Batcher<R: Runtime> {
 impl<R: Runtime> Batcher<R> {
     pub(crate) fn start<W: StreamWrapper<R::Stream>>(
         shared: Arc<Shared<R, W>>,
-        flags: u32,
+        key: BatcherKey,
     ) -> Batcher<R> {
         let (sender, receiver) = mpsc::unbounded();
         let rt = shared.rt.clone();
-        let task = rt.spawn(run_batcher(shared, flags, receiver));
+        let task = rt.spawn(run_batcher(shared, key, receiver));
         Batcher { sender, task }
     }
 }
@@ -163,7 +261,7 @@ type InFlight = Pin<Box<dyn Future<Output = f64> + Send>>;
 /// are driven by this task, so they end with it.
 async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
     shared: Arc<Shared<R, W>>,
-    flags: u32,
+    key: BatcherKey,
     mut receiver: mpsc::UnboundedReceiver<Waiter>,
 ) {
     let max_batch = shared.config.max_batch_size.max(1);
@@ -213,7 +311,7 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
                 progress = true;
                 timer = None;
                 let waiters = std::mem::take(&mut pending);
-                in_flight.push(Box::pin(send_batch(shared.clone(), flags, waiters)));
+                in_flight.push(Box::pin(send_batch(shared.clone(), key, waiters)));
             } else if send {
                 timer = None;
             }
@@ -243,13 +341,13 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
 /// Resolves with the time it took (`timeReply`), whatever the outcome.
 async fn send_batch<R: Runtime, W: StreamWrapper<R::Stream>>(
     shared: Arc<Shared<R, W>>,
-    flags: u32,
+    (flags, max_grv_queue_delay_ms): BatcherKey,
     waiters: Vec<Waiter>,
 ) -> f64 {
     let start = now_secs(shared.rt.now());
     let count = u32::try_from(waiters.len()).unwrap_or(u32::MAX);
     let result = shared
-        .get_consistent_read_version(count, flags)
+        .get_consistent_read_version(count, flags, max_grv_queue_delay_ms)
         .await
         .map(Arc::new);
     for waiter in waiters {
@@ -264,6 +362,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_version_cache_keeps_the_newest() {
+        let mut cache = MetadataVersionCache::new(3);
+        assert_eq!(cache.get(10), None);
+        cache.insert(10, None);
+        cache.insert(20, Some(b"a".to_vec()));
+        // Not newer than the newest: ignored.
+        cache.insert(20, Some(b"b".to_vec()));
+        cache.insert(15, Some(b"c".to_vec()));
+        assert_eq!(cache.get(10), Some(None));
+        assert_eq!(cache.get(20), Some(Some(b"a".to_vec())));
+        assert_eq!(cache.get(15), None);
+        cache.insert(30, Some(b"d".to_vec()));
+        // At capacity: the oldest goes.
+        cache.insert(40, None);
+        assert_eq!(cache.get(10), None);
+        assert_eq!(cache.get(20), Some(Some(b"a".to_vec())));
+        assert_eq!(cache.get(30), Some(Some(b"d".to_vec())));
+        assert_eq!(cache.get(40), Some(None));
+        assert_eq!(cache.get(35), None);
+    }
+
+    #[test]
+    fn metadata_version_cache_lookup_across_the_ring() {
+        let mut cache = MetadataVersionCache::new(5);
+        for v in 1..=23i64 {
+            cache.insert(v * 10, Some(v.to_be_bytes().to_vec()));
+        }
+        for v in 1..=23i64 {
+            let expected = (v > 18).then(|| Some(v.to_be_bytes().to_vec()));
+            assert_eq!(cache.get(v * 10), expected, "{v}");
+        }
+    }
+
+    #[test]
     fn flags_like_cpp() {
         let default = ReadVersionOptions::default();
         assert_eq!(default.flags(), GetReadVersion::PRIORITY_DEFAULT);
@@ -272,6 +404,7 @@ mod tests {
             causal_read_risky: true,
             use_provisional_proxies: true,
             lock_aware: false,
+            max_grv_queue_delay_ms: None,
         };
         assert_eq!(
             options.flags(),

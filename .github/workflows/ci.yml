@@ -28,11 +28,20 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --features fdb-native-transport/tls -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features fdb-native-transport/tls,fdb-native-client/tls -- -D warnings
+      # The examples (clippy's --all-targets checks them; this builds them, TLS one included).
+      - run: cargo build --workspace --examples --features fdb-native-client/tls
+      - run: cargo clippy --workspace --all-targets --features fdb-native-transport/smol,fdb-native-client/smol -- -D warnings
+      # Without tokio (the examples need it, but the library and the smol example do not).
+      - run: cargo build -p fdb-native-client --no-default-features --features smol --example smol
+      - run: cargo clippy -p fdb-native-transport -p fdb-native-client --no-default-features --features fdb-native-transport/smol,fdb-native-client/smol -- -D warnings
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo doc --workspace --no-deps --features fdb-native-transport/tls
+      - run: cargo doc --workspace --no-deps --features fdb-native-transport/tls,fdb-native-client/tls
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --workspace --no-deps --features fdb-native-transport/smol,fdb-native-client/smol
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -45,7 +54,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
-      - run: cargo check --workspace --all-targets --features fdb-native-transport/tls
+      - run: cargo check --workspace --all-targets --features fdb-native-transport/tls,fdb-native-client/tls
+      - run: cargo check --workspace --all-targets --features fdb-native-transport/smol,fdb-native-client/smol
       - run: cargo check -p fdb-native-wire --no-default-features --all-targets
 
   test:
@@ -74,8 +84,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --features fdb-native-transport/tls
-      - run: cargo test --doc --workspace --features fdb-native-transport/tls
+      - run: cargo nextest run --workspace --features fdb-native-transport/tls,fdb-native-client/tls
+      - run: cargo test --doc --workspace --features fdb-native-transport/tls,fdb-native-client/tls
+
+  # The smol runtime adapter (`SmolRuntime`, the `smol` features) is off by default. This runs the
+  # adapter's tests and the transport and client on smol: the peer manager against a loopback fake
+  # server, the client against a fake cluster, TLS over the smol stream. Its docker tests run in
+  # `docker-integration` below.
+  test-smol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --features fdb-native-transport/smol,fdb-native-client/smol --profile ci
+      # With TLS too (the TLS-over-smol loopback tests need both features).
+      - run: cargo nextest run -p fdb-native-transport --features smol,tls --profile ci -E 'binary(smol_tls)'
+      - run: cargo test --doc --workspace --features fdb-native-transport/smol,fdb-native-client/smol
 
   docker-integration:
     runs-on: ubuntu-latest
@@ -94,6 +120,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # cpp_crosscheck (the binary, and the cpp_crosscheck_* tests in other binaries) is ignored because it
       # needs the dev-only golden-vectors tool, not Docker.
-      # The tls feature is on so that the TLS docker tests (peer_tls_docker, tls_peer_wrapper) run too;
-      # the plain tests are unaffected by it.
-      - run: cargo nextest run --workspace --features fdb-native-transport/tls --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
+      # The tls features are on so that the TLS docker tests (peer_tls_docker, tls_peer_wrapper, and the
+      # client's docker_database and docker_examples TLS tests) run too, and the smol features so that
+      # the docker tests on the smol adapter (smol_docker, docker_smol) do;
+      # the plain tests are unaffected by them.
+      - run: cargo nextest run --workspace --features fdb-native-transport/tls,fdb-native-client/tls,fdb-native-transport/smol,fdb-native-client/smol --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'

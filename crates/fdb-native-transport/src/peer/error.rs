@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fdb_native_wire::{EncodeError, ProtocolVersion, Uid};
 
-use crate::{ConnectionError, FrameError};
+use crate::{ConnectionError, FrameError, IoError};
 
 /// Why a connection attempt, or a connection, to a peer failed or ended.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -31,13 +31,20 @@ pub enum PeerError {
         /// The timeout.
         after: Duration,
     },
-    /// The [stream wrapper](super::StreamWrapper) failed.
+    /// The [stream wrapper](super::StreamWrapper) failed: the TLS handshake did, for
+    /// example because the server's certificate was refused. (A server's refusal of *our*
+    /// certificate usually shows up later, as [`ConnectionError::Io`] on the first read:
+    /// with TLS 1.3 the client's handshake is done before the server has checked it.)
     #[error("TLS setup failed: {message} ({kind})")]
     Tls {
         /// The kind of the I/O error.
         kind: io::ErrorKind,
         /// Its message.
         message: String,
+        /// The I/O error itself, for the cause (with the `tls` feature, a `rustls::Error`:
+        /// see [`IoError::cause`]).
+        #[source]
+        source: IoError,
     },
     /// The connection ended: see [`ConnectionError`], which also says whether it was clean.
     #[error(transparent)]
@@ -102,10 +109,13 @@ pub enum SendError {
 }
 
 impl PeerError {
-    /// The error of a request that was not sent because of this (connect) failure.
+    /// The error of a request that was not sent because of this (connect) failure. A failed
+    /// TLS handshake is reported as the I/O error it was, so its cause (an untrusted server
+    /// certificate, ...) reaches the request's error.
     pub(crate) fn not_sent(&self) -> crate::rpc::RequestError {
         crate::rpc::RequestError::NotSent(match self {
             PeerError::Connection(e) => Some(e.clone()),
+            PeerError::Tls { source, .. } => Some(ConnectionError::Io(source.clone())),
             _ => None,
         })
     }

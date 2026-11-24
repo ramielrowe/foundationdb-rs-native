@@ -237,7 +237,7 @@ fn record_from_a_loaded_cluster_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fdb.cluster");
     std::fs::write(&path, "a:b@10.0.0.1:4500\n").unwrap();
-    let file = crate::ClusterFile::open_or_default(Some(&path)).unwrap();
+    let file = crate::cluster_file::ClusterFile::open_or_default(Some(&path)).unwrap();
     let record = ConnectionRecord::from(file);
     assert_eq!(record.path(), Some(path.as_path()));
     assert_eq!(record.check_file(), None);

@@ -1,0 +1,145 @@
+{
+  "format_version": 1,
+  "name": "wait_metrics_request",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageServerInterface::waitMetrics request (adjusted endpoint 4). min and max are StorageMetrics tables (bytes, bytesWrittenPerKSecond, iosPerKSecond, bytesReadPerKSecond, opsReadPerKSecond: all i64), every field distinct. 7.4: (keys, min, max, reply, tenantInfo, minVersion, arena); 8.0: (keys, min, max, reply, legacyVersion, arena): tenantInfo removed and minVersion renamed, so legacyVersion (i64) is slot 4 where 7.4 has tenantInfo.",
+  "cpp_type": "WaitMetricsRequest",
+  "file_identifier": 1795961,
+  "file_identifier_hex": "0x001b6779",
+  "size": 264,
+  "bytes": "3c00000079671b00000000000600080004000600140004000e002c0004000c0014001c0024000e001c000c00100014001800040008000c000400080030000000040000001e0000000090cd792f0800008c00000058000000240000000800000000000000520000000c00000000009d5e0c00000000009d7e0000000064000000ffffffffffffffff00bca0650100000007000000000000000800000000000000000000000000001000000000940000000100000000000000020000000000000003000000000000000400000000000000050000000000000000000000a80000001800000004000000090000006d6574726963732f7a000000090000006d6574726963732f61000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<WaitMetricsRequest>",
+        "value": [
+          {
+            "field": "keys",
+            "slot": 0,
+            "type": "table<KeyRangeRef>",
+            "value": [
+              {
+                "field": "begin",
+                "slot": 0,
+                "type": "bytes",
+                "value": "6d6574726963732f61"
+              },
+              {
+                "field": "end",
+                "slot": 1,
+                "type": "bytes",
+                "value": "6d6574726963732f7a"
+              }
+            ]
+          },
+          {
+            "field": "min",
+            "slot": 1,
+            "type": "table<StorageMetrics>",
+            "value": [
+              {
+                "field": "bytes",
+                "slot": 0,
+                "type": "i64",
+                "value": 1
+              },
+              {
+                "field": "bytesWrittenPerKSecond",
+                "slot": 1,
+                "type": "i64",
+                "value": 2
+              },
+              {
+                "field": "iosPerKSecond",
+                "slot": 2,
+                "type": "i64",
+                "value": 3
+              },
+              {
+                "field": "bytesReadPerKSecond",
+                "slot": 3,
+                "type": "i64",
+                "value": 4
+              },
+              {
+                "field": "opsReadPerKSecond",
+                "slot": 4,
+                "type": "i64",
+                "value": 5
+              }
+            ]
+          },
+          {
+            "field": "max",
+            "slot": 2,
+            "type": "table<StorageMetrics>",
+            "value": [
+              {
+                "field": "bytes",
+                "slot": 0,
+                "type": "i64",
+                "value": -1
+              },
+              {
+                "field": "bytesWrittenPerKSecond",
+                "slot": 1,
+                "type": "i64",
+                "value": 6000000000
+              },
+              {
+                "field": "iosPerKSecond",
+                "slot": 2,
+                "type": "i64",
+                "value": 7
+              },
+              {
+                "field": "bytesReadPerKSecond",
+                "slot": 3,
+                "type": "i64",
+                "value": 8
+              },
+              {
+                "field": "opsReadPerKSecond",
+                "slot": 4,
+                "type": "i64",
+                "value": 1152921504606846976
+              }
+            ]
+          },
+          {
+            "field": "reply",
+            "slot": 3,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798988,
+                  "second": 9123448420122492940
+                }
+              }
+            ]
+          },
+          {
+            "field": "legacyVersion",
+            "slot": 4,
+            "type": "i64",
+            "value": 9000000000000
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

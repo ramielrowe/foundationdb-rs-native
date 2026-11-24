@@ -19,16 +19,16 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::{KEY_SPACE_END, RangeLimits, RangeOptions, RangeRead, StreamingMode};
 use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, KeySelector, KeyValue, Transaction,
-    TransactionOption,
+    Database, DatabaseOptions, KeySelector, KeyValue, Transaction, TransactionOption,
 };
 use fdb_native_schema::domain::{
     ClientDbInfo, Commit, CommitId, CommitProxy, GetKey, GetKeyReply, GetKeyServerLocations,
@@ -755,8 +755,13 @@ impl Env {
         .unwrap_or_else(|e| panic!("{begin:?}..{end:?}: {e}"))
     }
 
+    /// A transaction at the fake cluster's read version, **with read-your-writes disabled**:
+    /// these tests check the reads C++'s `readThrough` passes to NativeAPI (their requests and
+    /// NativeAPI's read conflict ranges); `ryw.rs` tests the read-your-writes reads.
     fn transaction(&self) -> Transaction<MemRuntime> {
         let tx = self.db.create_transaction();
+        tx.set_option(TransactionOption::ReadYourWritesDisable)
+            .expect("before any read or write");
         tx.set_read_version(READ_VERSION);
         tx
     }
@@ -1128,7 +1133,7 @@ async fn streams_continue_after_more_in_both_directions() {
             let o = RangeOptions::default()
                 .mode(StreamingMode::Small)
                 .reverse(reverse);
-            let rows: Vec<KeyValue> = collect(tx.range_stream(fge(b""), fge(b"\xff"), o))
+            let rows: Vec<KeyValue> = collect(tx.get_ranges_keyvalues(fge(b""), fge(b"\xff"), o))
                 .await
                 .into_iter()
                 .map(Result::unwrap)
@@ -1152,7 +1157,7 @@ async fn streams_continue_after_more_in_both_directions() {
             assert!(batches.len() > 3, "{}", batches.len());
         }
         // Snapshot streams add no conflict range.
-        let rows = collect(tx.snapshot().range_stream(
+        let rows = collect(tx.snapshot().get_ranges_keyvalues(
             fge(b"c"),
             fge(b"d"),
             RangeOptions::default(),
@@ -1521,6 +1526,8 @@ async fn transaction_checks_and_system_keys() {
         );
         // Without a read version, the first read asks for one.
         let tx = env.db.create_transaction();
+        tx.set_option(TransactionOption::ReadYourWritesDisable)
+            .unwrap();
         let r = tx.get_range(&fge(b"a"), &fge(b"g"), &o).await.unwrap();
         assert_eq!(keys(&r.kvs), ks(&[b"a", b"f"]));
     }
@@ -1636,7 +1643,7 @@ async fn random_ranges_match_a_btreemap_over_random_shard_maps() {
                 // The whole range through a stream (the iterator mode, a row limit).
                 let o = RangeOptions::with_limit(rows.unwrap_or(0)).reverse(reverse);
                 let streamed: Vec<KeyValue> =
-                    collect(tx.snapshot().range_stream(b.clone(), e.clone(), o))
+                    collect(tx.snapshot().get_ranges_keyvalues(b.clone(), e.clone(), o))
                         .await
                         .into_iter()
                         .map(|r| r.unwrap_or_else(|e| panic!("{what}: {e}")))
@@ -1760,15 +1767,21 @@ async fn a_failed_read_does_not_block_the_commit() {
             vec![],
             "{schema}: no range of a failed read"
         );
-        // A read abandoned (its future dropped) does not block it either.
+        // A read abandoned (its future dropped) still ends, as a C++ read actor does: the
+        // commit waits for it, and carries its range.
         env.fail_with(None);
-        env.delay(Duration::from_secs(1000));
+        env.delay(Duration::from_secs(5));
         let tx = env.transaction();
         tx.set(b"w", b"1");
         let abandoned =
             tokio::time::timeout(Duration::from_millis(10), tx.get_range(&sel_b, &sel_z, &o)).await;
         assert!(abandoned.is_err());
         within("commit", tx.commit()).await.unwrap();
+        assert_eq!(
+            env.sent_read_conflicts(1),
+            vec![range(b"b", b"k\x00")],
+            "{schema}: the abandoned read's range"
+        );
     }
 }
 
@@ -1829,4 +1842,89 @@ async fn read_conflict_ranges_of_reads_do_not_count_toward_the_size() {
     tx.set_option(TransactionOption::SizeLimit(1000)).unwrap();
     within("commit", tx.commit()).await.unwrap();
     assert_eq!(env.sent_read_conflicts(0).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forward_read_through_the_end_of_the_key_space_conflicts_up_to_it() {
+    // (9q8.3 review) The begin selector resolves at `\xff\xff` (the last shard's rows are
+    // read, the end is two keys past the end of the database): the read went through the end,
+    // so its conflict range ends at `\xff\xff`, not after its last row.
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 2).await;
+        env.set(&[b"a", b"\xff/a", b"\xff/b"]);
+        env.layout(&[(b"", b"\xff", 0), (b"\xff", KEY_SPACE_END, 1)]);
+        let tx = env.transaction();
+        tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        let exact = RangeOptions::with_limit(100).mode(StreamingMode::Exact);
+        let r = within(
+            "get_range",
+            tx.get_range(&fge(b"\xff/"), &plus(fge(KEY_SPACE_END), 1), &exact),
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys(&r.kvs), vec![b"\xff/a".to_vec(), b"\xff/b".to_vec()]);
+        assert!(!r.more);
+        tx.set(b"w", b"1");
+        within("commit", tx.commit()).await.unwrap();
+        assert_eq!(
+            env.sent_read_conflicts(0),
+            vec![range(b"\xff/", KEY_SPACE_END)],
+            "{schema}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_future_no_longer_polled_does_not_hold_the_commit() {
+    // (9q8.3 review) Non-snapshot reads polled once, then kept but never polled again (the
+    // losers of a `select`): they run on as tasks of their own, so the commit, which waits
+    // for them, goes on once they end, with their ranges.
+    let env = Env::new(SchemaVersion::V8_0, 2).await;
+    env.set(&KEYS);
+    env.layout(&TWO_SHARDS);
+    env.delay(Duration::from_millis(50));
+    let tx = env.transaction();
+    let (b, e, o) = (fge(b"a"), fge(b"z"), RangeOptions::default());
+    let read = tx.get_range(&b, &e, &o);
+    let mut read = std::pin::pin!(read);
+    let selector = fge(b"g");
+    let key = tx.get_key(&selector);
+    let mut key = std::pin::pin!(key);
+    let polled = poll_fn(|cx| {
+        let read = read.as_mut().poll(cx).is_pending();
+        let key = key.as_mut().poll(cx).is_pending();
+        std::task::Poll::Ready(read && key)
+    })
+    .await;
+    assert!(polled, "the reads should be pending");
+    tx.set(b"w", b"1");
+    within("commit", tx.commit()).await.unwrap();
+    assert_eq!(
+        env.sent_read_conflicts(0),
+        vec![range(b"a", b"k\x00"), range(b"g", b"k\x00")]
+    );
+    // The futures still give their results (the first shard's rows: a shard boundary).
+    assert_eq!(
+        keys(&read.await.unwrap().kvs),
+        keys_list(&[b"a", b"f", b"k"])
+    );
+    assert_eq!(key.await.unwrap(), b"k");
+
+    // A range stream inside a `select` with a timer that wins.
+    let tx = env.transaction();
+    let mut rows = tx.get_ranges_keyvalues(fge(b"a"), fge(b"z"), RangeOptions::default());
+    let next = poll_fn(|cx| Pin::new(&mut rows).poll_next(cx));
+    let timer = tokio::time::sleep(Duration::from_millis(1));
+    tokio::select! {
+        biased;
+        _ = timer => {}
+        _ = next => panic!("the read should be slower than the timer"),
+    }
+    tx.set(b"w", b"1");
+    within("commit after a select", tx.commit()).await.unwrap();
+    assert_eq!(env.sent_read_conflicts(1), vec![range(b"a", b"k\x00")]);
+}
+
+fn keys_list(keys: &[&[u8]]) -> Vec<Vec<u8>> {
+    keys.iter().map(|k| k.to_vec()).collect()
 }

@@ -1,0 +1,37 @@
+{
+  "format_version": 1,
+  "name": "split_range_reply_empty",
+  "group": "storage",
+  "kind": "positive",
+  "description": "SplitRangeReply with no split points (a range smaller than the chunk size).",
+  "cpp_type": "ErrorOr<EnsureTable<SplitRangeReply>>",
+  "file_identifier": 45367566,
+  "file_identifier_hex": "0x02b4410e",
+  "size": 56,
+  "bytes": "200000000e41b402000000000800090008000400060006000400060008000400140000000800000002000000120000000400000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<SplitRangeReply>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<SplitRangeReply>>",
+          "value": {
+            "type": "table<SplitRangeReply>",
+            "value": [
+              {
+                "field": "splitPoints",
+                "slot": 0,
+                "type": "vector<bytes>",
+                "value": []
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

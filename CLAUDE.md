@@ -65,9 +65,33 @@ cargo fmt --all --check                                        # formatting
 cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings are errors in CI)
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
+cargo nextest run --workspace --features fdb-native-transport/smol,fdb-native-client/smol  # unit tests incl. the smol adapter and tests
 cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'  # Docker-backed integration tests
 cargo test --doc --workspace                                   # doc tests (nextest skips them)
+cargo build --workspace --examples                             # examples (also checked by --all-targets)
 ```
+
+The TLS code is behind features of two crates: `fdb-native-transport/tls` and
+`fdb-native-client/tls` (the client's `cfg(feature = "tls")` code, the `tls` example and the
+client's TLS docker tests need the client's own feature). CI runs clippy, docs, MSRV checks,
+tests and the docker job with `--features fdb-native-transport/tls,fdb-native-client/tls` too.
+
+The second runtime adapter, smol (`SmolRuntime`: async-io, async-executor, `blocking`), is behind
+`fdb-native-transport/smol` and `fdb-native-client/smol` (a feature of both: the client's `smol`
+example and its smol tests need the client's own). The smol tests (`tests/smol_*.rs`, `smol_fake`,
+`docker_smol`, `smol_docker`) are `cfg(feature = "smol")`, so they run only with
+`--features fdb-native-transport/smol,fdb-native-client/smol` (CI's `test-smol` job; the docker job has
+them on too). The client under test runs on smol there; the fake servers of `smol_fake` and
+`smol_tls` stay on tokio (they share only streams and channels with it), and `MemRuntime<R>` in
+`crates/fdb-native-client/tests/support` takes its time and tasks from `R`. A smol build without
+tokio: `cargo build -p fdb-native-client --no-default-features --features smol --example smol`.
+Its `Runtime` safety constants (`WRITE_ERRORS_TAKE_NOTHING`, `PENDING_TAKES_NOTHING`) are
+justified against async-io's source in `runtime/smol_rt.rs`; a change of async-io's `poll_write`
+needs that re-checked.
+
+`fdb-native-client/examples/` are runnable examples (`cargo run -p fdb-native-client --example
+basic -- CLUSTER_FILE`); `tests/docker_examples.rs` includes each example's `run` with
+`#[path]` and calls it against a testkit container, so an example change is a test change.
 
 `fdb-native-wire`'s encoder is also checked against FDB's C++ readers by an ignored test binary,
 `cpp_crosscheck` (`#[ignore = "requires golden-vectors tool"]`, excluded from the Docker CI job).
@@ -114,8 +138,54 @@ charges unchanged (`tools/golden-vectors/strict.h` mirrors them); `tests/bulk_ve
 bulk vector paths to the element-wise ones, and `tests/writer_reuse.rs` pins a reused `Writer` to a new one and
 the bytes of seeded messages (digests recorded from the pre-vvh.8 encoder).
 
+**Deterministic simulation** (`crates/fdb-native-sim`, dev-only, `publish = false`): the real
+client runs on `SimRuntime` (a seeded single-threaded executor with virtual time) against a model
+cluster on a fault-injecting in-memory network, all from one seed. `tests/sweep.rs` runs a seed
+sweep in the normal `cargo nextest run --workspace` (200 seeds, ~1 s on a laptop in debug; every
+tenth seed runs twice and must give the same trace hash) and asserts the invariants: at-most-once
+commits checked against the cluster's commit log, the bank workload's serializability, reads
+checked against the history, `on_error` backoff bounds, failure-monitor and load-balancing
+convergence, liveness after the faults heal, and no client task left after `Database::shutdown`.
+A failing seed prints its replay command:
+
+```bash
+FDB_SIM_SEEDS=2000 FDB_SIM_SEED_START=0 cargo nextest run -p fdb-native-sim --no-capture -E 'test(seed_sweep)'  # a bigger sweep (--release for 10^4+ seeds)
+FDB_SIM_SEED=1234 FDB_SIM_TRACE=1 cargo nextest run -p fdb-native-sim --no-capture -E 'test(replay_seed)'     # replay one seed with its trace (2: every poll and segment)
+```
+
+The seed decides the cluster's shape, the network's fault rates, the chaos schedule, the client's
+seeds and the stream's write promises (`seed % 4`: both `Runtime` safety constants true, both
+false, or one of each); `tests/faults.rs` turns write-time resets up under both settings. A client
+change that makes a seed nondeterministic (iterating a `HashMap` with effects, a `RandomState` RNG
+without a seed option) shows up as `NONDETERMINISTIC` in the sweep. The harness tolerates one known
+gap: the GRV batcher tasks outlive `Database::shutdown` until the database is dropped
+(`foundationdb-rs-native-x4q`).
+
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.
+
+## Bindingtester conformance
+
+`tools/bindingtester/run.sh` runs the upstream bindingtester (Python binding + `libfdb_c`, in Docker,
+pinned to FDB 7.4.10 and 8.0.1) comparing the Python stack machine against `fdb-native-stacktester`
+on the `api`, `scripted` and `tuple` suites; the stacktester is registered as `rust` through a
+wrapper (`overlay/run_bindingtester.py`: min API 520, all types, 2040-bit ints, no tenants, no
+directory layer). Dev-only, manual (`.github/workflows/bindingtester.yml` is `workflow_dispatch`).
+
+```bash
+tools/bindingtester/run.sh -V 7.4                      # builds the tester, 3 seeds of api+scripted+tuple (~100 s)
+tools/bindingtester/run.sh -V 8.0 -s api --seeds 20 -n 500
+tools/bindingtester/run.sh --self-test -V 8.0          # python vs python: checks the harness only
+```
+
+Needs docker, git, curl (optionally `FDB_SRC=/path/to/foundationdb`, read only). It starts its own
+disposable FDB container and removes it by ID on exit; the bindingtester wipes the whole database,
+so never aim it at a shared cluster. Logs and `summary.tsv` per seed go to
+`tools/bindingtester/results/` (gitignored). Known expected difference: Python packs
+`+-(2^64-1)` with `1d`/`0b` where we use `1c`/`0c`; by default the harness rewrites those two
+values in the `tuple` test (`--int-edge keep` shows the 2 resulting differences). On 7.4 the
+cluster is configured with `tenant_mode=optional_experimental` (the 7.4 bindingtester clears the
+tenant map). Details: `tools/bindingtester/README.md`.
 
 ## Architecture Overview
 
@@ -129,6 +199,7 @@ targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crate
 - `fdb-native-tuple`: tuple and subspace layers; independent of the other crates.
 - `fdb-native-testkit`: Docker test harness (`publish = false`).
 - `fdb-native-stacktester`: binary for the bindingtester stack machine (`publish = false`).
+- `fdb-native-sim`: deterministic simulation (a seeded `Runtime`, a faulty network, a model cluster, workloads and invariants; `publish = false`); depends on `client`, `schema`, `transport`, `wire`.
 
 Outside the workspace, `tools/golden-vectors/` is a dev-only C++ tool that compiles FDB's
 flatbuffers headers and writes golden vectors to `tools/golden-vectors/fixtures/`. The fixtures
@@ -145,6 +216,10 @@ The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/bin
 - Shared package metadata comes from `[workspace.package]`; every crate sets `lints.workspace = true`.
   Workspace lints: `unsafe_code = "forbid"`, `missing_debug_implementations`, `unreachable_pub`, clippy `all`.
 - Edition 2024, MSRV 1.85. No unstable rustfmt options.
+- **Client API**: `fdb-native-client`'s crate root re-exports the application API (`Database`,
+  `Transaction`, options, `Error`, ...); the lower layers (`read`, `commit`, `cluster`,
+  `cluster_file`, `watch`, `atomic`) are public modules for tools and tests and are not
+  re-exported. Its crate docs have the API design notes; record API changes in `CHANGELOG.md`.
 - **Docker-backed tests**: tests that need a live FDB container are marked
   `#[ignore = "requires docker"]` and run with `cargo nextest run --run-ignored only`
   (excluding the `cpp_crosscheck` binary, which needs the golden-vectors tool instead).

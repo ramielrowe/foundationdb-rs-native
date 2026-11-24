@@ -1,0 +1,39 @@
+{
+  "format_version": 1,
+  "name": "split_range_reply",
+  "group": "storage",
+  "kind": "positive",
+  "description": "SplitRangeReply as a bare table: splitPoints, a vector of strings.",
+  "cpp_type": "SplitRangeReply",
+  "file_identifier": 11813134,
+  "file_identifier_hex": "0x00b4410e",
+  "size": 72,
+  "bytes": "100000000e41b400000006000800040006000000040000000e000000040000000200000018000000040000000900000073706c69742f6d00ff0000000700000073706c69742f6600",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SplitRangeReply>",
+        "value": [
+          {
+            "field": "splitPoints",
+            "slot": 0,
+            "type": "vector<bytes>",
+            "value": [
+              {
+                "type": "bytes",
+                "value": "73706c69742f66"
+              },
+              {
+                "type": "bytes",
+                "value": "73706c69742f6d00ff"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, Error, MaybeCommitted, MutationType, Transaction,
-    TransactionOption,
+    Database, DatabaseOptions, Error, MaybeCommitted, MutationType, Transaction, TransactionOption,
 };
 use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{CommitId, GetReadVersion, MutationType as Mt};
@@ -88,7 +88,7 @@ async fn a_write_only_commit_reads_a_causal_read_risky_version_and_commits() {
         let tx = env.db.create_transaction();
         tx.set(b"k", b"v");
         tx.clear_range(b"a", b"b");
-        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
         let handle = spawn({
             let tx = tx.clone();
             async move { tx.commit().await }
@@ -101,7 +101,9 @@ async fn a_write_only_commit_reads_a_causal_read_risky_version_and_commits() {
         let (commit, _) = call.commit();
         assert_eq!(commit.read_snapshot, 100);
         let kinds: Vec<_> = commit.mutations.iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, vec![Mt::SET_VALUE, Mt::CLEAR_RANGE, Mt::ADD_VALUE]);
+        // From the write map, as C++'s `writeRangeToNativeTransaction` sends them: the
+        // cleared ranges first, then each key's operations in key order.
+        assert_eq!(kinds, vec![Mt::CLEAR_RANGE, Mt::SET_VALUE, Mt::ADD_VALUE]);
         // A blind write: the self-conflicting key is a read and a write conflict range.
         assert_eq!(commit.read_conflict_ranges.len(), 1);
         assert_eq!(commit.flags, 0);
@@ -144,7 +146,7 @@ async fn options_reach_the_requests_and_a_set_read_version_is_used() {
     tx.set_option(TransactionOption::CausalWriteRisky).unwrap();
     tx.set_option(TransactionOption::ReportConflictingKeys)
         .unwrap();
-    tx.add_read_conflict_range(b"r", b"s");
+    tx.add_read_conflict_range(b"r", b"s").unwrap();
     tx.set(b"k", b"v");
     let handle = spawn({
         let tx = tx.clone();
@@ -275,6 +277,72 @@ async fn write_errors_are_deferred_to_the_commit() {
             codes::INVALID_OPTION_VALUE
         );
     }
+}
+
+/// `fdb_transaction_add_conflict_range`: an inverted range is `inverted_range` at once (the
+/// `KeyRangeRef` that `fdb_c` builds first), before the legal range is looked at, and leaves
+/// the transaction as it was; a range out of the legal keys is a deferred error.
+#[tokio::test(start_paused = true)]
+async fn conflict_ranges_return_inverted_range_at_once_and_defer_the_rest() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    for read in [true, false] {
+        let add = |tx: &Transaction<MemRuntime>, b: &[u8], e: &[u8]| {
+            if read {
+                tx.add_read_conflict_range(b, e)
+            } else {
+                tx.add_write_conflict_range(b, e)
+            }
+        };
+        let tx = env.db.create_transaction();
+        for (b, e) in [(&b"b"[..], &b"a"[..]), (b"\xff\xff\x01", b"\xff\xff\x00")] {
+            assert_eq!(
+                add(&tx, b, e).unwrap_err().code(),
+                codes::INVERTED_RANGE,
+                "{read} {b:?}"
+            );
+        }
+        // Not deferred: the transaction commits (nothing to write).
+        assert_eq!(tx.commit().await.unwrap().committed_version(), -1);
+
+        let tx = env.db.create_transaction();
+        add(&tx, b"a", b"\xff\xff\x00").unwrap();
+        assert_eq!(
+            tx.commit().await.unwrap_err().code(),
+            codes::KEY_OUTSIDE_LEGAL_RANGE,
+            "{read}"
+        );
+    }
+    assert!(env.commit.try_next().is_none(), "nothing was sent");
+
+    // The single-key forms are `[key, key\x00)`.
+    let tx = env.db.create_transaction();
+    tx.add_read_conflict_key(b"r").unwrap();
+    tx.add_write_conflict_key(b"w").unwrap();
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    env.grv.next().await.reply_grv(10);
+    let call = env.commit.next().await;
+    let (commit, _) = call.commit();
+    assert!(
+        commit
+            .read_conflict_ranges
+            .iter()
+            .any(|r| r.begin == b"r" && r.end == b"r\x00"),
+        "{:?}",
+        commit.read_conflict_ranges
+    );
+    assert!(
+        commit
+            .write_conflict_ranges
+            .iter()
+            .any(|r| r.begin == b"w" && r.end == b"w\x00"),
+        "{:?}",
+        commit.write_conflict_ranges
+    );
+    call.reply_commit(committed(11, 0));
+    done(handle).await.unwrap();
 }
 
 /// Runs `on_error(code)` and returns how long it waited.
@@ -976,7 +1044,7 @@ async fn the_system_key_boundaries() {
     read.abort();
     let tx = env.db.create_transaction();
     tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
-    tx.add_read_conflict_range(b"a", b"\xff\xff");
+    tx.add_read_conflict_range(b"a", b"\xff\xff").unwrap();
     tx.set_read_version(1);
     tx.set(b"k", b"v");
     let committing = spawn(legality(&tx));
@@ -985,7 +1053,7 @@ async fn the_system_key_boundaries() {
     for write in [
         |tx: &Transaction<MemRuntime>| tx.set(b"\xff", b""),
         |tx: &Transaction<MemRuntime>| tx.clear_range(b"a", b"\xff\x00"),
-        |tx: &Transaction<MemRuntime>| tx.add_write_conflict_range(b"a", b"\xff\x00"),
+        |tx: &Transaction<MemRuntime>| tx.add_write_conflict_range(b"a", b"\xff\x00").unwrap(),
     ] {
         let tx = env.db.create_transaction();
         tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
@@ -1012,7 +1080,10 @@ async fn the_system_key_boundaries() {
             false,
         ),
         (
-            |tx: &Transaction<MemRuntime>| tx.add_read_conflict_range(b"\xff", b"\xff\xff\x00"),
+            |tx: &Transaction<MemRuntime>| {
+                tx.add_read_conflict_range(b"\xff", b"\xff\xff\x00")
+                    .unwrap()
+            },
             false,
         ),
     ] {
