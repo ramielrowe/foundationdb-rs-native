@@ -99,3 +99,39 @@ These changed the API that earlier development builds had:
 * New: `strinc` (the end of a prefix's range, as the bindings' `strinc`) and
   `DatabaseOption::TransactionLoggingMaxFieldLength` (405, the default of the transaction
   option).
+
+These aligned behaviour with C++'s read-your-writes layer:
+
+* **`used_during_commit` before the cancellation or timeout.** A read, `watch`, `commit`,
+  the storage metrics and `get_versionstamp` of a transaction that is committing give
+  `used_during_commit` (2017) even if the transaction was cancelled or timed out meanwhile
+  (they gave `transaction_cancelled` / `transaction_timed_out`), as C++ checks
+  `checkUsedDuringCommit()` before `resetPromise` (`ReadYourWrites.actor.cpp` 7.4:1675-1680,
+  2441-2446, 2502-2513, 2515-2521). The deferred error of a write still comes first.
+* **`get_read_version` during a commit** gives the read version and leaves the commit alone
+  (it was `used_during_commit`, which also failed the commit): C++'s `getReadVersion`
+  (7.4:1581-1587) has no `checkUsedDuringCommit`.
+* **Dropping the last handle of a transaction cancels it**, as `~ReadYourWritesTransaction`
+  does (7.4:2774-2776): its reads, watches' reads, range batches and read version request in
+  progress end at once with `transaction_cancelled` (1025), also for a future the user still
+  holds; nothing of the transaction outlives it (its tasks held it, and the database, until
+  their reads ended).
+* **`get_versionstamp` after a sent commit was cut short is maybe committed.** When the
+  transaction is killed (`cancel`, the timeout, the drop of the last handle) after its commit
+  request may have reached a proxy, the future fails with that error marked
+  `is_maybe_committed()` (C++: a bare `transaction_cancelled`), as the commit's own result
+  already is; the stamp of a commit that may have succeeded is lost. Before the request was
+  sent the error is as before.
+* **Dropping a `watch` future before its read ends cancels the watch**: no read conflict
+  range, no registration (the read went on and added its range), as C++'s `watch` actor is
+  cancelled with its future.
+* **The bound of the readable keys** (`ReadSystemKeys`, `AccessSystemKeys`) is looked at
+  again after each wait of a read, as C++ calls `getMaxReadKey()` there (it was taken when
+  the read was called).
+* **`set(\xff/metadataVersion)`** is refused before anything else (C++ 7.4:2299-2302): during
+  a commit it is a deferred `client_invalid_operation` that does not poison the commit, and it
+  does not use up `NextWriteNoWriteConflictRange`.
+* **`Database::shutdown` stops the read version batchers** even while handles of the
+  database or of its transactions are held (they ran until the last one was dropped): the
+  waiting requests and every later one fail with `operation_cancelled` (1101). New:
+  `read::Reader::shutdown`.

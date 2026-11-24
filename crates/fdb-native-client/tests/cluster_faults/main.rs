@@ -42,8 +42,8 @@
 //! * Progress resumes within [`RECOVERY`] of each fault (or of its healing, for the faults
 //!   that stop the database).
 //! * No panic anywhere (a panic hook counts them, also in the client's own tasks), no task
-//!   left once the database is shut down, no watch left, and at most one connection per
-//!   server process.
+//!   left once the database is shut down (while it is still held, and after), no watch left,
+//!   and at most one connection per server process.
 
 #![cfg(feature = "tokio")]
 
@@ -186,18 +186,23 @@ impl Harness {
         }
         db.shutdown().await;
         assert!(db.is_shut_down());
-        drop(db);
-        // Every task of the database ends.
+        // Every task of the database ends, while the database (and whatever the scenario
+        // still holds of it, a transaction, ...) is held, then once it is dropped.
         let metrics = tokio::runtime::Handle::current().metrics();
-        let t = Instant::now();
-        while metrics.num_alive_tasks() > tasks_before {
-            assert!(
-                t.elapsed() < Duration::from_secs(10),
-                "[{name}] {} tasks alive after the shutdown, {tasks_before} before the database",
-                metrics.num_alive_tasks()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut db = Some(db);
+        for when in ["after the shutdown", "once the database was dropped"] {
+            let t = Instant::now();
+            while metrics.num_alive_tasks() > tasks_before {
+                assert!(
+                    t.elapsed() < Duration::from_secs(10),
+                    "[{name}] {} tasks alive {when}, {tasks_before} before the database",
+                    metrics.num_alive_tasks()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            db = None;
         }
+        drop(db);
         assert_eq!(
             PANICS.load(Ordering::SeqCst),
             0,
@@ -464,8 +469,8 @@ async fn fault_database_lock() {
     let e = tx.get_read_version().await.expect_err("locked");
     assert_eq!(e.code(), codes::DATABASE_LOCKED, "{e}");
     assert!(e.is_retryable_not_committed() && !e.is_maybe_committed());
-    // (A transaction holds the database: the check for tasks left needs it gone.)
-    drop(tx);
+    // (The transaction is held to the end: `Database::shutdown` must stop the read
+    // version batchers while it holds the database.)
     // A write in `run` whose retries run out: `database_locked`, certainly not committed.
     let e =
         h.db.run(|tx, _| async move {
@@ -532,6 +537,7 @@ async fn fault_database_lock() {
         "the raw workers saw database_locked"
     );
     h.finish(wl).await;
+    drop(tx);
 }
 
 #[tokio::test(flavor = "multi_thread")]

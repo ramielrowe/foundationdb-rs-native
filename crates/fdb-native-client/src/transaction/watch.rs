@@ -12,7 +12,8 @@ use fdb_native_transport::runtime::Runtime;
 use futures_channel::oneshot;
 
 use super::{
-    CommitStage, ReadFuture, ReadGuard, ReadStart, RywView, SYSTEM_KEYS_END, Transaction, TxSource,
+    CommitStage, ReadFuture, ReadGuard, ReadStart, ReadTask, RywView, SYSTEM_KEYS_END, Transaction,
+    TxSource,
 };
 use crate::error::Error;
 use crate::error::codes::*;
@@ -74,11 +75,12 @@ impl<R: Runtime> Transaction<R> {
     /// # }
     /// ```
     ///
-    /// **Dropping the future before its read ends does not cancel the read**: it still ends and
-    /// adds its read conflict range, so the commit can fail with `not_committed` (1020) if
-    /// another transaction changed the key, even though nobody waits for the watch. C++
-    /// cancels the read when the watch's future is destroyed (see the differences in
-    /// [`crate::watch`]).
+    /// **Dropping the future before its read ends cancels the watch**, as C++'s `watch` actor
+    /// is cancelled with its future (`RYWImpl::watch`, 7.4:1284-1335, 8.0:1278-1327): the
+    /// read stops, adds no read conflict range, and the watch is neither registered nor
+    /// counted; a commit waiting for the read goes on. (A future kept but not polled is not
+    /// dropped: its read goes on, and the commit waits for it.) Once the read ended, the
+    /// watch is the future's answer: dropping the future then drops the [`Watch`].
     ///
     /// # Errors
     ///
@@ -99,12 +101,31 @@ impl<R: Runtime> Transaction<R> {
     pub fn watch(&self, key: &[u8]) -> impl Future<Output = Result<Watch, Error>> + Send + use<R> {
         match self.begin_watch(key) {
             Ok((read, guard)) => {
-                let tx = self.clone();
-                ReadFuture::Task(self.spawn_read(async move {
-                    let result = tx.watch_read(read, &guard).await;
-                    drop(guard);
-                    result
-                }))
+                let tx = self.task_handle();
+                let (mut answer, rx) = oneshot::channel();
+                // Detached, as every read's task; but the future's drop cancels the read
+                // (C++'s `watch` actor is cancelled with its future, and its read with it:
+                // `readWithConflictRange` adds the range only when the read ends).
+                drop(self.rt().spawn(async move {
+                    let id = read.id.clone();
+                    let read = race(tx.watch_read(read, &guard), answer.cancellation()).await;
+                    match read {
+                        Either::Left(result) => {
+                            drop(guard);
+                            let _ = answer.send(result);
+                        }
+                        // Dropped before its read ended: no range, no registration.
+                        Either::Right(()) => {
+                            let mut state = tx.state();
+                            if state.epoch == guard.epoch {
+                                state.watches.remove(&id);
+                            }
+                            drop(state);
+                            drop(guard);
+                        }
+                    }
+                }));
+                ReadFuture::Task(ReadTask(rx))
             }
             Err(e) => ReadFuture::ready(Err(e)),
         }
@@ -118,10 +139,13 @@ impl<R: Runtime> Transaction<R> {
         if let Some(e) = state.deferred.clone() {
             return Err(e);
         }
-        state.check_alive(self.rt().now())?;
+        // `checkUsedDuringCommit()` before `resetPromise.isSet()` (7.4:2441-2446,
+        // 8.0:2357-2362), but without killing the transaction (see the differences in
+        // `crate::watch`).
         if let Some(e) = state.used_during_commit() {
             return Err(e);
         }
+        state.check_alive(self.rt().now())?;
         let start = ReadStart {
             epoch: state.epoch,
             use_provisional_proxies: state.flags.use_provisional_proxies,

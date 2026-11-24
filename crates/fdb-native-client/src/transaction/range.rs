@@ -185,7 +185,7 @@ impl<R: Runtime> Transaction<R> {
             let view = Self::ryw_view(&state, snapshot);
             (start, begin, end, view, self.start_read(&mut state))
         };
-        let tx = self.clone();
+        let tx = self.task_handle();
         let options = *options;
         ReadFuture::Task(self.spawn_read(async move {
             let result = match view {
@@ -271,12 +271,20 @@ impl<R: Runtime> Transaction<R> {
             params,
             epoch,
         } = read;
+        // C++ reads `getMaxReadKey()` after each wait (`readThrough`, 7.4:187-215, 8.0:196-223).
+        let start = ReadStart {
+            epoch,
+            use_provisional_proxies: params.use_provisional_proxies,
+            read_options: params.read_options,
+            max_read_key,
+        };
         let options = &options;
         let mut end = end;
         if options.reverse && end.offset > 1 {
             // `readThrough`: resolve the end first, so that a reverse read does not start in
             // keys the transaction may not read.
             let key = Box::pin(self.native_get_key(&end, guard, epoch, params)).await?;
+            let max_read_key = self.max_read_key_now(&start);
             let key = if key.as_slice() > max_read_key {
                 max_read_key.to_vec()
             } else {
@@ -305,6 +313,7 @@ impl<R: Runtime> Transaction<R> {
         }
         let more = read.more();
         let mut kvs = read.into_key_values();
+        let max_read_key = self.max_read_key_now(&start);
         if !options.reverse
             && kvs
                 .last()

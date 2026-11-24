@@ -61,7 +61,13 @@
 //!   `SetVersionstampedKey` triggers the key `transformVersionstampKey` makes of its key
 //!   (the placeholder stamped with the read version + 1, or zeros, and the 4 offset bytes
 //!   kept), as an atomic operation. A write during the watch's read is compared with the
-//!   value read once it arrives; one that fires the watch ends it without the read.
+//!   value read once it arrives; one that fires the watch ends it without the read. The
+//!   value read is the one of the writes **as of the `watch` call** also when they are
+//!   dependent: C++'s `it->skip(k)` after the read of a key with atomic operations (RYW
+//!   7.4:128, 8.0:137) looks the key up again in the iterator's write map, which is a
+//!   snapshot later writes do not change (`WriteMap::iterator`, `WriteMap.h` 7.4:158-160,
+//!   8.0:186-188), not in the current one. So a set of another value during such a read
+//!   fires the watch when the read ends, as in C++.
 //! * **At commit** (`commitAndWatch`, NativeAPI 7.4:7248-7280, 8.0:4938; `setupWatches`,
 //!   7.4:6743-6762, 8.0:4478): after a successful commit each watch of the transaction is
 //!   started with `watchValueMap`, at version `getCommittedVersion() > 0 ? committed :
@@ -100,12 +106,11 @@
 //! * **A watch started after the commit started** fails with `used_during_commit` (maybe
 //!   committed once the commit may have been sent) **without failing the commit**; C++'s
 //!   `checkUsedDuringCommit` also makes the commit fail with it.
-//! * **The read runs as a task of its own** (as every non-snapshot read of the transaction
-//!   does): a `watch` future that is dropped or no longer polled does not hold the commit up;
-//!   the read still ends (and registers the watch, which is then dropped). **Dropping the
-//!   future does not cancel the read**: it still adds its read conflict range, so the commit
-//!   can fail with `not_committed` because of a watch nobody waits for. C++ cancels the read
-//!   (and adds no range) when the watch's future is destroyed.
+//! * **The read runs as a task of its own** (as every read of the transaction does): a
+//!   `watch` future that is no longer polled does not hold the commit up, the read still
+//!   ends and registers the watch. **Dropping the future before the read ends cancels it**,
+//!   as C++ cancels the `watch` actor with its future: no read conflict range, no
+//!   registration.
 //! * **The cap's slot** is given back when the watch's result is sent, or when its future is
 //!   dropped, as C++'s `watch` actor ends (not when the result is polled).
 //! * **`getFutureReferenceCount() == 1`.** `watchStorageServerResp` treats a metadata with

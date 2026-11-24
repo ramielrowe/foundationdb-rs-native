@@ -72,6 +72,13 @@ pub(crate) trait RywSource: Send + Sync {
         limits: Limits,
         reverse: bool,
     ) -> BoxFuture<'_, Result<RangeRead, Error>>;
+
+    /// `getMaxReadKey()` now, which C++ reads again after each wait of a read (the
+    /// `ReadSystemKeys` and `AccessSystemKeys` options may have changed meanwhile); `None`:
+    /// the one of [`RywRead::max_read_key`] holds.
+    fn max_read_key(&self) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 /// A read: where it reads from, and the transaction's view when it was called.
@@ -81,10 +88,20 @@ pub(crate) struct RywRead<'s, S> {
     /// The write map snapshot (an iterator over an empty write map for a snapshot read that
     /// does not see the transaction's writes: C++ reads the cache alone then).
     pub(crate) writes: WriteMapIter,
-    /// `getMaxReadKey()`.
+    /// `getMaxReadKey()` when the read was called (what its synchronous start uses, as
+    /// C++'s actor before its first wait); after a wait, [`RywSource::max_read_key`] tells
+    /// the current one ([`current_max_read_key`](Self::current_max_read_key)).
     pub(crate) max_read_key: &'static [u8],
-    /// `options.bypassUnreadable` (`get` only, as C++).
+    /// `options.bypassUnreadable` (`get` only, as C++, which looks at it when the read is
+    /// called: `RYWImpl::read(GetValueReq)` 7.4:98-100 runs before the first wait).
     pub(crate) bypass_unreadable: bool,
+}
+
+impl<S: RywSource> RywRead<'_, S> {
+    /// `ryw->getMaxReadKey()` after a wait: the transaction's current one.
+    fn current_max_read_key(&self) -> &'static [u8] {
+        self.source.max_read_key().unwrap_or(self.max_read_key)
+    }
 }
 
 /// What a range read returns (`RangeResult` with its flags).
@@ -429,21 +446,21 @@ pub(crate) fn get_key<'a, S: RywSource>(
     mut key: KeySelector,
 ) -> BoxFuture<'a, Result<Vec<u8>, Error>> {
     Box::pin(async move {
-        let max = read.max_read_key;
         if key.offset > 0 {
+            let max = read.max_read_key;
             let result = get_range_value(read, key, fge(max.to_vec()), row_limit(1)).await?;
             if result.read_to_begin {
                 return Ok(Vec::new());
             }
             if result.read_through_end || result.rows.is_empty() {
-                return Ok(max.to_vec());
+                return Ok(read.current_max_read_key().to_vec());
             }
             Ok(result.rows[0].key.clone())
         } else {
             key.offset += 1;
             let result = get_range_value_back(read, fge(Vec::new()), key, row_limit(1)).await?;
             if result.read_through_end {
-                return Ok(max.to_vec());
+                return Ok(read.current_max_read_key().to_vec());
             }
             if result.read_to_begin || result.rows.is_empty() {
                 return Ok(Vec::new());
@@ -1028,7 +1045,9 @@ async fn range_value<S: RywSource>(
     limits: Limits,
     reverse: bool,
 ) -> Result<RangeOut, Error> {
-    let max = read.max_read_key;
+    // The first step is the read's synchronous start; the later ones come after a wait,
+    // and C++ reads `getMaxReadKey()` again for each.
+    let mut max = read.max_read_key;
     let mut state = RangeState::new(begin, end, limits);
     let mut phase = Phase::Start;
     #[cfg(test)]
@@ -1038,6 +1057,9 @@ async fn range_value<S: RywSource>(
         {
             steps += 1;
             assert!(steps < 10_000, "a range read does not progress");
+        }
+        if !matches!(phase, Phase::Start) {
+            max = read.current_max_read_key();
         }
         let step = read.source.with_cache(|cache| {
             if reverse {
@@ -1068,7 +1090,7 @@ async fn range_value<S: RywSource>(
                 if resolved.is_empty() {
                     state.read_to_begin = true;
                 }
-                if resolved == max {
+                if resolved == read.current_max_read_key() {
                     state.read_through_end = true;
                 }
                 if reverse {

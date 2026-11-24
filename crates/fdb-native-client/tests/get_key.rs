@@ -972,3 +972,41 @@ async fn transaction_get_key_follows_the_transaction_rules() {
     assert_eq!(tx.get_key(&fgt(b"a")).await.unwrap(), b"f");
     assert_eq!(tx.get_read_version().await.unwrap(), READ_VERSION);
 }
+
+/// C++'s `getMaxReadKey()` is looked at again after the wait of a read (`readThrough`,
+/// 7.4:180-186), so `ReadSystemKeys` set while a read is in progress lets that read return a
+/// system key, not `\xff`. A key past the bound of the call is still refused at the call.
+/// (`ryw.rs` has the same with read-your-writes.)
+#[tokio::test(start_paused = true)]
+async fn the_max_read_key_is_read_again_after_the_wait() {
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 1).await;
+        env.set(&KEYS);
+        env.set(&[b"\xff/sys"]);
+        // Without the option the result is clamped to `\xff`.
+        let tx = env.transaction();
+        assert_eq!(
+            within("clamped", tx.get_key(&fgt(b"x"))).await.unwrap(),
+            b"\xff",
+            "{schema}"
+        );
+        // The option set after the call, before the read's wait ends.
+        let tx = env.transaction();
+        let reading = tx.get_key(&fgt(b"x"));
+        tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        assert_eq!(
+            within("get_key", reading).await.unwrap(),
+            b"\xff/sys",
+            "{schema}: the bound is read again after the wait"
+        );
+        // A key past the bound is refused at the call, whatever is set later.
+        let tx = env.transaction();
+        let refused = tx.get_key(&fge(b"\xff\x00"));
+        tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        assert_eq!(
+            within("refused", refused).await.unwrap_err().code(),
+            codes::KEY_OUTSIDE_LEGAL_RANGE,
+            "{schema}"
+        );
+    }
+}

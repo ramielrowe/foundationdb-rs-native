@@ -475,6 +475,17 @@ impl<R: Runtime> Database<R> {
     /// `used_during_commit` (reported as [maybe committed](Error::is_maybe_committed), since
     /// the first one may have committed).
     ///
+    /// **A handle kept past the attempt keeps that attempt alive.** The transaction is
+    /// cancelled when the last handle of the user is dropped
+    /// ([Dropping a transaction](crate::transaction#dropping-a-transaction)), and a clone of
+    /// the handle `f` got, or a [`RangeStream`](crate::RangeStream) it started, is such a
+    /// handle. If `f` lets one escape (a spawned task holding a clone, a returned stream),
+    /// the attempt's reads, watches and `get_versionstamp` futures are not cancelled when
+    /// `run` returns: they go on until that handle is dropped. When the loop retries, the
+    /// reset ends them with `transaction_cancelled` and the handle is stale (see
+    /// [Handles of a retry loop](crate::transaction#handles-of-a-retry-loop)); after the
+    /// attempt that `run` returns, nothing resets it. `run` does not wait for such handles.
+    ///
     /// # Idempotency
     ///
     /// **A transaction that ends in `commit_unknown_result` may have committed, and `run`
@@ -562,10 +573,17 @@ impl<R: Runtime> Database<R> {
     /// Stops the cluster monitor and closes every connection, and waits for both. Every
     /// handle of the database (and its transactions) then fails with `operation_cancelled`
     /// (1101). Idempotent.
+    ///
+    /// None of the database's tasks outlives the call, also while handles of it (or of its
+    /// transactions) are still held: the read version batchers and the watches stop at once
+    /// ([`Reader::shutdown`](crate::read::Reader::shutdown)), and a read version request after
+    /// it fails at once with `operation_cancelled` instead of starting one.
     pub async fn shutdown(&self) {
         // The watches fail with `operation_cancelled` (the cluster monitor and the
-        // connections would only end them eventually).
+        // connections would only end them eventually), and so do the read version requests
+        // (the batchers would otherwise live as long as a handle of the database).
         self.inner.watches.shutdown();
+        self.inner.reader.shutdown();
         self.inner.monitor.shutdown().await;
         self.inner.peers.shutdown().await;
     }

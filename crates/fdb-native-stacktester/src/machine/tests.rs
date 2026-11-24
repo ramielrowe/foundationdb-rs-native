@@ -481,7 +481,8 @@ async fn tenant_instructions_without_tenants() {
 async fn a_commit_has_started_when_the_next_instruction_runs() {
     // A commit that has to wait for the cluster (it has a write, and no read version) has
     // started before the next instruction runs, as `fdb_c`'s does: a read after it is
-    // `used_during_commit`, which also ends the commit.
+    // `used_during_commit`, which also ends the commit. (Not `GET_READ_VERSION`, which C++
+    // answers during a commit: `getReadVersion` has no `checkUsedDuringCommit`.)
     let db = db();
     let mut m = machine(&db);
     run(
@@ -491,12 +492,13 @@ async fn a_commit_has_started_when_the_next_instruction_runs() {
             push(b(b"v")),
             push(b(b"k")),
             op("SET"),
-            op("COMMIT"),           // 4
-            op("GET_READ_VERSION"), // 5
+            op("COMMIT"), // 4
+            push(b(b"k")),
+            op("GET"), // 6
         ],
     )
     .await
     .unwrap();
     assert!(matches!(m.stack().items()[0].entry, Entry::Pending(_)));
-    assert_eq!(stack(&m).await, vec![(4, error(2017)), (5, error(2017))]);
+    assert_eq!(stack(&m).await, vec![(4, error(2017)), (6, error(2017))]);
 }
