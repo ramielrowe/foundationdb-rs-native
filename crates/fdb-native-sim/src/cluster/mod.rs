@@ -24,6 +24,14 @@
 //!   requests get `broken_promise`, later ones `ENDPOINT_NOT_FOUND`), optionally publish an
 //!   info without proxies first, and may make the version clock jump. Killing a process that
 //!   hosts a current proxy triggers one after a detection delay.
+//! * **Data distribution** (opt-in, [`ClusterConfig::data_distribution`]): a storage server
+//!   that stays down for a few seconds is taken out of its teams, as FDB's data distributor
+//!   does once the server is failed: each shard it held that another live replica still
+//!   holds moves to a team without it (a live server not in the team takes its place, and
+//!   serves the shard from the version it was copied at; reads at older versions get
+//!   `wrong_shard_server`), so location lookups stop naming it. A server that comes back
+//!   rejoins after a delay, taking shards back (rebalancing). The client's location cache
+//!   learns of all this as it does in FDB: by errors and by lookups after an invalidation.
 //! * **Restarts**: a restarted storage server comes back with new endpoint tokens, as an FDB
 //!   storage role does (cached locations then hit `ENDPOINT_NOT_FOUND`).
 //!
@@ -104,6 +112,11 @@ pub struct ClusterConfig {
     pub grv_proxies: usize,
     /// Commit proxies per generation.
     pub commit_proxies: usize,
+    /// Whether a model of FDB's data distribution runs: a storage server that stays down is
+    /// taken out of its teams (see the [module documentation](self)). Off by default: the
+    /// shard map then changes only by [`SimCluster::move_shard`], [`SimCluster::split_shard`]
+    /// and [`SimCluster::remove_storage`].
+    pub data_distribution: bool,
 }
 
 impl Default for ClusterConfig {
@@ -117,6 +130,7 @@ impl Default for ClusterConfig {
             replication: 2,
             grv_proxies: 1,
             commit_proxies: 2,
+            data_distribution: false,
         }
     }
 }
@@ -135,6 +149,7 @@ impl ClusterConfig {
             replication: rng.range(1, storage.min(3) as u64) as usize,
             grv_proxies: rng.range(1, stateless.min(2) as u64) as usize,
             commit_proxies: rng.range(1, stateless.min(3) as u64) as usize,
+            data_distribution: false,
         }
     }
 }
@@ -217,12 +232,18 @@ struct Shard {
     begin: Vec<u8>,
     end: Vec<u8>,
     team: Vec<usize>,
+    /// The version from which a member that data distribution added serves the shard (the
+    /// version its copy was made at): reads at older versions are `wrong_shard_server`. A
+    /// member that is not here has had the shard since the start.
+    joined: BTreeMap<usize, i64>,
 }
 
 struct StorageState {
     process: usize,
     iface: StorageServer,
     restarts: u64,
+    /// How many times its process was killed.
+    deaths: u64,
     lag: Duration,
     behind_until: Instant,
 }
@@ -249,6 +270,9 @@ impl Role {
     }
 }
 
+/// Key ranges, `[begin, end)`.
+type KeyRanges = Vec<(Vec<u8>, Vec<u8>)>;
+
 struct State {
     model: Model,
     generation: u64,
@@ -268,6 +292,9 @@ struct State {
     /// Storage servers removed for good ([`SimCluster::remove_storage`]): in no team, never
     /// restarted.
     removed: BTreeSet<usize>,
+    /// Storage servers data distribution took out of teams, with the key ranges they held
+    /// then (for their rejoin).
+    dd_evicted: BTreeMap<usize, KeyRanges>,
 }
 
 struct Inner {
@@ -406,6 +433,7 @@ impl SimCluster {
                     accepting_requests: true,
                 },
                 restarts: 0,
+                deaths: 0,
                 lag: Duration::ZERO,
                 behind_until: Instant::ZERO,
             })
@@ -434,6 +462,7 @@ impl SimCluster {
                 begin: std::mem::replace(&mut begin, end.clone()),
                 end,
                 team,
+                joined: BTreeMap::new(),
             });
         }
         let state = State {
@@ -452,6 +481,7 @@ impl SimCluster {
             rng,
             recovery_pending: false,
             removed: BTreeSet::new(),
+            dd_evicted: BTreeMap::new(),
         };
         let cluster = SimCluster {
             inner: Arc::new(Inner {
@@ -631,6 +661,9 @@ impl SimCluster {
             return;
         }
         process.kill(mode);
+        if let ProcessClass::Storage(ss) = self.inner.classes[index] {
+            self.on_storage_death(ss);
+        }
         let hosts_proxy = {
             let state = lock(&self.inner.state);
             state
@@ -662,6 +695,172 @@ impl SimCluster {
         }
         self.start_process(index);
         self.trace("restart", &[index as u64], || process.name());
+        if let ProcessClass::Storage(ss) = self.inner.classes[index] {
+            self.on_storage_restart(ss);
+        }
+    }
+
+    // ---- data distribution ----------------------------------------------------------------
+
+    /// How long a storage server stays down before data distribution takes it out of its
+    /// teams (FDB: the failure monitor's detection plus the team tracker's reaction).
+    const DD_EVICT_DELAY: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(8));
+
+    /// How long after a restart a storage server that was taken out of its teams gets shards
+    /// again (rebalancing).
+    const DD_REJOIN_DELAY: (Duration, Duration) = (Duration::from_secs(3), Duration::from_secs(10));
+
+    /// Storage server `ss` just died: with data distribution, it is taken out of its teams
+    /// if it is still down after a delay (and has not died again meanwhile, which restarts
+    /// the delay).
+    fn on_storage_death(&self, ss: usize) {
+        if !self.inner.config.data_distribution {
+            return;
+        }
+        let (delay, deaths) = {
+            let mut state = lock(&self.inner.state);
+            state.storage[ss].deaths += 1;
+            let (lo, hi) = Self::DD_EVICT_DELAY;
+            (state.rng.duration(lo, hi), state.storage[ss].deaths)
+        };
+        let me = self.clone();
+        let sim = self.inner.sim.clone();
+        self.inner.sim.spawn_on(self.inner.controller, async move {
+            sim.sleep(delay).await;
+            let down = {
+                let state = lock(&me.inner.state);
+                state.storage[ss].deaths == deaths
+                    && !me.inner.processes[state.storage[ss].process].is_alive()
+            };
+            if down {
+                me.dd_evict(ss);
+            }
+        });
+    }
+
+    /// Storage server `ss` restarted: if data distribution had taken it out of its teams, it
+    /// rejoins after a delay.
+    fn on_storage_restart(&self, ss: usize) {
+        let (delay, deaths) = {
+            let mut state = lock(&self.inner.state);
+            if !state.dd_evicted.contains_key(&ss) {
+                return;
+            }
+            let (lo, hi) = Self::DD_REJOIN_DELAY;
+            (state.rng.duration(lo, hi), state.storage[ss].deaths)
+        };
+        let me = self.clone();
+        let sim = self.inner.sim.clone();
+        self.inner.sim.spawn_on(self.inner.controller, async move {
+            sim.sleep(delay).await;
+            let up = {
+                let state = lock(&me.inner.state);
+                state.storage[ss].deaths == deaths
+                    && me.inner.processes[state.storage[ss].process].is_alive()
+            };
+            if up {
+                me.dd_rejoin(ss);
+            }
+        });
+    }
+
+    /// Takes `ss` out of the teams that hold a shard another live server holds too: each such
+    /// shard moves to the team without it, plus a live server that was not in the team, if
+    /// there is one (its copy is made at the current version). A shard no other live server
+    /// holds stays (nothing to copy from). Returns whether any shard moved.
+    fn dd_evict(&self, ss: usize) -> bool {
+        let moved = {
+            let mut state = lock(&self.inner.state);
+            let alive: Vec<bool> = state
+                .storage
+                .iter()
+                .map(|s| self.inner.processes[s.process].is_alive())
+                .collect();
+            let version = state.model.max_version();
+            let State {
+                shards,
+                rng,
+                removed,
+                ..
+            } = &mut *state;
+            let mut moved = Vec::new();
+            for shard in shards.iter_mut() {
+                if !shard.team.contains(&ss) {
+                    continue;
+                }
+                if !shard.team.iter().any(|s| *s != ss && alive[*s]) {
+                    continue;
+                }
+                shard.team.retain(|s| *s != ss);
+                shard.joined.remove(&ss);
+                let spare: Vec<usize> = (0..alive.len())
+                    .filter(|c| alive[*c] && !removed.contains(c) && !shard.team.contains(c))
+                    .collect();
+                if !spare.is_empty() {
+                    let c = *rng.pick(&spare);
+                    shard.team.push(c);
+                    shard.team.sort_unstable();
+                    shard.joined.insert(c, version);
+                }
+                moved.push((shard.begin.clone(), shard.end.clone()));
+            }
+            let count = moved.len();
+            if count > 0 {
+                state.dd_evicted.insert(ss, moved);
+            }
+            count
+        };
+        self.trace("dd-evict", &[ss as u64, moved as u64], || {
+            format!("storage {ss}: {moved} shards moved off it")
+        });
+        moved > 0
+    }
+
+    /// Storage server `ss` is back: it takes back the shards it was taken out of (replacing a
+    /// random member of the team), and joins teams that have fewer members than the
+    /// replication. Its copy is made at the current version.
+    fn dd_rejoin(&self, ss: usize) {
+        let moved = {
+            let mut state = lock(&self.inner.state);
+            let Some(ranges) = state.dd_evicted.remove(&ss) else {
+                return;
+            };
+            let version = state.model.max_version();
+            let replication = self.inner.config.replication;
+            let State { shards, rng, .. } = &mut *state;
+            let mut moved = 0;
+            for shard in shards.iter_mut() {
+                if shard.team.contains(&ss) {
+                    continue;
+                }
+                let held = ranges
+                    .iter()
+                    .any(|(b, e)| shard.begin < *e && *b < shard.end);
+                if shard.team.len() < replication {
+                    shard.team.push(ss);
+                } else if held {
+                    let i = rng.index(shard.team.len());
+                    let out = shard.team[i];
+                    shard.team[i] = ss;
+                    shard.joined.remove(&out);
+                } else {
+                    continue;
+                }
+                shard.team.sort_unstable();
+                shard.joined.insert(ss, version);
+                moved += 1;
+            }
+            moved
+        };
+        self.trace("dd-rejoin", &[ss as u64, moved as u64], || {
+            format!("storage {ss}: {moved} shards moved to it")
+        });
+    }
+
+    /// Whether data distribution took storage server `ss` out of its teams and it has not
+    /// rejoined yet.
+    pub fn dd_evicted(&self, ss: usize) -> bool {
+        lock(&self.inner.state).dd_evicted.contains_key(&ss)
     }
 
     fn schedule_recovery(&self) {
@@ -1026,6 +1225,7 @@ impl SimCluster {
                         begin: key.clone(),
                         end: shard.end,
                         team,
+                        joined: shard.joined,
                     },
                 );
                 Some(key)
@@ -1438,6 +1638,19 @@ impl SimCluster {
             state.stats.wrong_shard += 1;
             return ReadStep::Error(codes::WRONG_SHARD_SERVER);
         };
+        // A member data distribution added has the shard from the version it was copied at
+        // on. Before that it answers `wrong_shard_server` (the client looks the shard up
+        // again, and asks a member that has it), unless the version is out of the MVCC window,
+        // which the server checks first (`waitForVersion`): without that a transaction whose
+        // read version is older than the copy would never learn that it is too old.
+        if shard.joined.get(&ss).is_some_and(|from| version < *from) {
+            if version < state.model.oldest(now) {
+                state.stats.too_old += 1;
+                return ReadStep::Error(codes::TRANSACTION_TOO_OLD);
+            }
+            state.stats.wrong_shard += 1;
+            return ReadStep::Error(codes::WRONG_SHARD_SERVER);
+        }
         if state.storage[ss].behind_until > now && state.rng.chance(0.5) {
             state.stats.process_behind += 1;
             return ReadStep::Error(codes::PROCESS_BEHIND);
