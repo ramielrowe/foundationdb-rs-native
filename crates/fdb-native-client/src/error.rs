@@ -500,6 +500,12 @@ impl Error {
     /// [`TransactionRetry::Backoff`] for `commit_unknown_result` means the transaction may
     /// already have committed. A commit that certainly was not delivered is retried with the
     /// backoff (C++ would have reported it as `commit_unknown_result`).
+    ///
+    /// This is 7.4's list, which has every code 8.0's has: 8.0 removed
+    /// `blob_granule_request_failed` (1079) and `proxy_tag_throttled` (1223), which an 8.0
+    /// cluster never sends, and [`Transaction::on_error`](crate::Transaction::on_error) on an
+    /// 8.0 cluster does not retry them, as 8.0's `onError`. Likewise the predicates count
+    /// `proxy_tag_throttled` as retryable, as 7.4's `fdb_error_predicate` does.
     pub fn transaction_retry(&self) -> Option<TransactionRetry> {
         if self.commit_state() == CommitState::NotDelivered {
             return Some(TransactionRetry::Backoff);
@@ -531,6 +537,23 @@ impl Error {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
         self.transaction_retry().ok_or_else(|| self.clone())
+    }
+
+    /// [`on_error`](Self::on_error) as the `Transaction::onError` of the release of the
+    /// cluster (`None`: not known yet, both releases' lists): 8.0 removed
+    /// `blob_granule_request_failed` (1079) and `proxy_tag_throttled` (1223) and does not
+    /// retry them (NativeAPI 8.0's `onError`), where 7.4 does.
+    pub(crate) fn on_error_for(
+        &self,
+        release: Option<SchemaVersion>,
+    ) -> Result<TransactionRetry, Error> {
+        if release == Some(SchemaVersion::V8_0)
+            && self.commit_state() != CommitState::NotDelivered
+            && matches!(self.code, BLOB_GRANULE_REQUEST_FAILED | PROXY_TAG_THROTTLED)
+        {
+            return Err(self.clone());
+        }
+        self.on_error()
     }
 
     /// Whether `getBackoff` grows the backoff after this error up to
@@ -759,6 +782,26 @@ mod tests {
         );
         assert_eq!(Error::new(1021).on_error().unwrap(), Backoff);
         assert_eq!(Error::new(2102).on_error().unwrap_err().code(), 2102);
+
+        // 8.0 removed 1079 and 1223 and does not retry them; 7.4 does.
+        for code in [1079, 1223] {
+            for release in [None, Some(SchemaVersion::V7_4)] {
+                assert_eq!(Error::new(code).on_error_for(release).unwrap(), Backoff);
+            }
+            let e = Error::new(code).on_error_for(Some(SchemaVersion::V8_0));
+            assert_eq!(e.unwrap_err().code(), code);
+        }
+        for release in [None, Some(SchemaVersion::V7_4), Some(SchemaVersion::V8_0)] {
+            assert_eq!(Error::new(1020).on_error_for(release).unwrap(), Backoff);
+            assert_eq!(
+                Error::new(1009).on_error_for(release).unwrap(),
+                FutureVersion
+            );
+            assert_eq!(
+                Error::new(2102).on_error_for(release).unwrap_err().code(),
+                2102
+            );
+        }
     }
 
     #[test]

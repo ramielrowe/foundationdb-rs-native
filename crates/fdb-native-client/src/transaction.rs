@@ -1747,7 +1747,7 @@ impl<R: Runtime> Transaction<R> {
             let retry = if limit_hit {
                 Err(error.clone())
             } else {
-                error.on_error()
+                error.on_error_for(self.inner.db.inner.monitor.schema_version())
             };
             let knobs = &self.inner.db.inner.knobs;
             let delay = match retry {

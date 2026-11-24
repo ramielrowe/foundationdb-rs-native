@@ -402,6 +402,29 @@ async fn on_error_backs_off_as_cpp_does() {
     );
 }
 
+/// `on_error` retries what the cluster's release retries: 7.4 retries
+/// `blob_granule_request_failed` (1079) and `proxy_tag_throttled` (1223), 8.0 removed them
+/// (the bindingtester's `api` test, seed 1114 at 2000 operations on 8.0: ON_ERROR with
+/// 1079).
+#[tokio::test(start_paused = true)]
+async fn on_error_retries_what_the_release_of_the_cluster_retries() {
+    for schema in SCHEMAS {
+        let env = env(schema).await;
+        for code in [
+            codes::BLOB_GRANULE_REQUEST_FAILED,
+            codes::PROXY_TAG_THROTTLED,
+        ] {
+            let tx = env.db.create_transaction();
+            let result = tx.on_error(Error::new(code)).await;
+            if schema == SchemaVersion::V8_0 {
+                assert_eq!(result.unwrap_err().code(), code);
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_retry_limit_and_errors_that_are_not_retried_cancel_the_transaction() {
     let env = env(SchemaVersion::V7_4).await;
