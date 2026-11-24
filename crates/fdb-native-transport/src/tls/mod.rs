@@ -331,6 +331,53 @@
 //! chain to a configured anchor and pass every other check, so a configured CA must have
 //! issued it.
 //!
+//! # Why a handshake or a TLS connection failed
+//!
+//! The cause is kept, in the error's `Display` and in its
+//! [`source`](std::error::Error::source) chain, up to the client's `Error`:
+//!
+//! * **We refuse the server** (an untrusted or expired certificate, a `verify_peers` rule that
+//!   does not match): the handshake fails in the stream wrapper, as
+//!   [`PeerError::Tls`](crate::peer::PeerError::Tls) with the [`rustls::Error`] as the source
+//!   ([`rustls_error`] reads it, e.g. `InvalidCertificate(UnknownIssuer)`). A request refused
+//!   because of it is `NotSent` with the same I/O error.
+//! * **The server refuses us** (our client certificate is from an unknown CA, or is not
+//!   accepted by the server's `verify_peers`): with TLS 1.3 our handshake is finished before
+//!   the server has checked our certificate, so the connection is established as far as we can
+//!   tell, and the server's alert arrives on the first read. It surfaces as
+//!   [`ConnectionError::Io`](crate::ConnectionError::Io) (kind `InvalidData`), whose
+//!   [`IoError`](crate::IoError) says `received fatal alert: UnknownCA` and gives the
+//!   [`rustls::Error::AlertReceived`] as its source; [`alert_received`] returns the
+//!   alert. fdbserver (OpenSSL) sends `UnknownCA` for a client certificate from another CA and
+//!   `InternalError` for one that its `verify_peers` rules refuse. A server that closes
+//!   without any alert is a peer close ([`ConnectionError::PeerClosed`](crate::ConnectionError::PeerClosed)),
+//!   with no cause to report.
+//!
+//! # fdbserver throttles repeated handshake failures
+//!
+//! fdbserver (7.4 and 8.0 alike) remembers handshake failures per peer address and then stops
+//! shaking hands with that peer for a while, in both directions (`flow/Net2.actor.cpp` 7.4,
+//! `flow/Net2.cpp` 8.0, `SSLConnection::acceptHandshakeWrapper` / `connect`; the knobs are in
+//! `flow/Knobs.cpp`):
+//!
+//! * When a handshake it accepts fails or times out, the server records the failure against
+//!   the peer's **IP address**. The first failure starts a window of
+//!   `TLS_SERVER_CONNECTION_THROTTLE_TIMEOUT` seconds (default 9); every further failure in the
+//!   window counts. Once the count reaches `TLS_SERVER_CONNECTION_THROTTLE_ATTEMPTS`
+//!   (default 1, which the *second* failure in the window does), later connections from that
+//!   IP are not handshaken at all until the window ends: the server waits
+//!   `CONNECTION_MONITOR_TIMEOUT` and closes the socket (`connection_failed`).
+//! * When fdbserver acts as a client, `TLS_CLIENT_CONNECTION_THROTTLE_TIMEOUT` (default 11) and
+//!   `TLS_CLIENT_CONNECTION_THROTTLE_ATTEMPTS` (default 1) do the same per remote `ip:port`.
+//!
+//! What a client sees: **after a few rejected attempts in quick succession** (a bad client
+//! certificate and a retry loop, say) **the server stops answering TLS handshakes from the
+//! address for up to nine seconds**, however good the certificate has become in between. The
+//! attempts then fail with a closed connection or a handshake timeout instead of the
+//! original alert, so look at the *first* failure for the cause, and do not retry a
+//! rejected certificate in a tight loop. Several clients behind one NAT address share a
+//! server-side count.
+//!
 //! # Closing, truncation and flushing
 //!
 //! FoundationDB never sends a TLS `close_notify`: `SSLConnection::closeSocket`
@@ -367,7 +414,7 @@ pub use config::{
 };
 pub use error::TlsError;
 pub use provider::crypto_provider;
-pub use stream::{TlsConnector, TlsStream, rustls_error};
+pub use stream::{TlsConnector, TlsStream, alert_received, rustls_error};
 
 /// The rustls this module is built on, re-exported so a custom
 /// [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier) uses

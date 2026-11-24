@@ -709,7 +709,7 @@ fn a_connection_lost_after_sending_may_have_delivered() {
     assert_eq!(server.requests(&mut conn).len(), 3);
 
     conn.io_error(std::io::ErrorKind::ConnectionReset, t(20));
-    let error = ConnectionError::Io(std::io::ErrorKind::ConnectionReset);
+    let error = ConnectionError::Io(std::io::ErrorKind::ConnectionReset.into());
     let events = drain(&mut registry, &mut conn);
     let done = completions(&events);
     assert_eq!(
@@ -1355,7 +1355,9 @@ fn a_connection_dropped_undrained_fails_its_requests_as_maybe_delivered() {
                 endpoint: EP_A,
                 result: Err(RequestError::MaybeDelivered(None)),
             }),
-            RpcEvent::Closed(ConnectionError::Io(std::io::ErrorKind::ConnectionRefused)),
+            RpcEvent::Closed(ConnectionError::Io(
+                std::io::ErrorKind::ConnectionRefused.into()
+            )),
         ]
     );
     let err = RequestError::MaybeDelivered(None);
@@ -1395,7 +1397,7 @@ fn a_close_consumed_elsewhere_still_completes_the_requests() {
     conn.io_error(std::io::ErrorKind::ConnectionReset, t(20));
     // Someone polls the connection directly and takes its Closed.
     while conn.poll_event().is_some() {}
-    let error = ConnectionError::Io(std::io::ErrorKind::ConnectionReset);
+    let error = ConnectionError::Io(std::io::ErrorKind::ConnectionReset.into());
     assert_eq!(
         drain(&mut reg, &mut conn),
         vec![RpcEvent::Completion(Completion {

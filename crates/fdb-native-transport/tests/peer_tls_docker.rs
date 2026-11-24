@@ -21,7 +21,8 @@ use fdb_native_transport::peer::{
 use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::TokioRuntime;
 use fdb_native_transport::tls::peer::TlsStreamWrapper;
-use fdb_native_transport::tls::{TlsConfig, TlsConnector};
+use fdb_native_transport::tls::rustls::{AlertDescription, CertificateError, Error as RustlsError};
+use fdb_native_transport::tls::{self, TlsConfig, TlsConnector};
 use fdb_native_wire::{EncodeError, NetworkAddress, ProtocolVersion, ReplyPromise};
 
 const IMAGES: [(&str, ProtocolVersion); 2] = [
@@ -333,7 +334,7 @@ async fn assert_rules_reject_server(rules: &'static str) {
         assert!(
             matches!(
                 &error,
-                PeerError::Tls { kind: std::io::ErrorKind::InvalidData, message }
+                PeerError::Tls { kind: std::io::ErrorKind::InvalidData, message, .. }
                     if message.contains("certificate")
             ),
             "{image}: {rules}: {error:?}"
@@ -420,9 +421,33 @@ async fn docker_tls_wrong_ca_is_rejected() {
         assert!(
             matches!(
                 &error,
-                PeerError::Tls { kind: std::io::ErrorKind::InvalidData, message }
+                PeerError::Tls { kind: std::io::ErrorKind::InvalidData, message, .. }
                     if message.to_lowercase().contains("unknownissuer")
             ),
+            "{image}: {error:?}"
+        );
+        // Our refusal of the server's certificate keeps its cause too: Display, source chain
+        // and the rustls error.
+        let PeerError::Tls { source, .. } = &error else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                tls::rustls_error(source.io_error().unwrap()),
+                Some(RustlsError::InvalidCertificate(
+                    CertificateError::UnknownIssuer
+                ))
+            ),
+            "{image}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("UnknownIssuer"),
+            "{image}: {error}"
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|e| e.source())
+                .is_some_and(|c| c.is::<RustlsError>()),
             "{image}: {error:?}"
         );
         assert_failed_before_connecting(&peer, &mut events, image).await;
@@ -490,6 +515,7 @@ async fn docker_tls_server_rejects_unlisted_client_certificate() {
         let peer = mgr.peer(&address);
         let error = connect_error(&peer, image).await;
         assert_not_connected(&peer, &mut events, &error, image);
+        assert_refused_with_alert(&error, AlertDescription::InternalError, image);
         mgr.shutdown().await;
         stop(fdb).await;
     }
@@ -511,9 +537,42 @@ async fn docker_tls_server_rejects_client_certificate_from_another_ca() {
         let peer = mgr.peer(&address);
         let error = connect_error(&peer, image).await;
         assert_not_connected(&peer, &mut events, &error, image);
+        assert_refused_with_alert(&error, AlertDescription::UnknownCA, image);
         mgr.shutdown().await;
         stop(fdb).await;
     }
+}
+
+/// The server's refusal of our certificate arrived as a TLS alert on the first read, and the
+/// error says which: in its `Display`, in its `source` chain, and as the rustls alert.
+fn assert_refused_with_alert(error: &PeerError, alert: AlertDescription, what: &str) {
+    use std::error::Error as _;
+
+    let PeerError::Connection(ConnectionError::Io(io)) = error else {
+        panic!("{what}: expected an I/O error from the first read: {error:?}");
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::InvalidData, "{what}");
+    assert_eq!(
+        tls::alert_received(io.io_error().expect("the I/O error")),
+        Some(alert),
+        "{what}: {error:?}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("received fatal alert: {alert:?}")),
+        "{what}: {text}"
+    );
+    let cause = error
+        .source()
+        .and_then(|e| e.source())
+        .unwrap_or_else(|| panic!("{what}: no cause in the source chain of {error:?}"));
+    assert!(
+        matches!(
+            cause.downcast_ref::<RustlsError>(),
+            Some(RustlsError::AlertReceived(a)) if *a == alert
+        ),
+        "{what}: {cause:?}"
+    );
 }
 
 /// The attempt failed without ever being established.

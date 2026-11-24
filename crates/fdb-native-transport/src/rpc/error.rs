@@ -77,7 +77,7 @@ pub enum RequestError {
         Some(e) => format!(": {e}"),
         None => String::new(),
     })]
-    MaybeDelivered(Option<ConnectionError>),
+    MaybeDelivered(#[source] Option<ConnectionError>),
     /// The request was never written: the connection ended before its handshake completed
     /// (requests sent then are held, see the [connection documentation](crate::connection#sending)),
     /// or it had already ended (`None` when only the peer's side has closed). Safe to resend.
@@ -85,7 +85,7 @@ pub enum RequestError {
         Some(e) => format!("ended: {e}"),
         None => "is closing".to_owned(),
     })]
-    NotSent(Option<ConnectionError>),
+    NotSent(#[source] Option<ConnectionError>),
     /// The peer does not have the endpoint (`IFailureMonitor::endpointNotFound`). If
     /// `maybe_delivered`, the request was pending when the endpoint was reported missing (or
     /// when another request to it got `broken_promise`); the report does not say which request
