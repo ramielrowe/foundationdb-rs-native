@@ -921,9 +921,15 @@ async fn a_stuck_or_failing_tls_handshake_is_reported() {
     };
     let mgr = PeerManager::with_stream_wrapper(MemRuntime::new(&net), config(), failing, sink);
     match mgr.peer(&server.address).connect().await {
-        Err(PeerError::Tls { kind, message }) => {
+        Err(PeerError::Tls {
+            kind,
+            message,
+            source,
+        }) => {
             assert_eq!(kind, io::ErrorKind::InvalidData);
             assert!(message.contains("bad certificate"));
+            assert_eq!(source.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(source.to_string(), message);
         }
         other => panic!("{other:?}"),
     }

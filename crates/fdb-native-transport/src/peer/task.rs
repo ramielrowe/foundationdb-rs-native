@@ -146,6 +146,7 @@ async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
             Err(e) => Err(PeerError::Tls {
                 kind: e.kind(),
                 message: e.to_string(),
+                source: e.into(),
             }),
         }
     };
@@ -908,7 +909,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 match Pin::new(&mut run.stream).poll_read(cx, buf) {
                     Poll::Ready(Ok(0)) => run.conn.recv_eof(run.rt.now()),
                     Poll::Ready(Ok(n)) => run.conn.recv_commit(n, run.rt.now()),
-                    Poll::Ready(Err(e)) => run.conn.io_error(e.kind(), run.rt.now()),
+                    Poll::Ready(Err(e)) => run.conn.io_error(e, run.rt.now()),
                     Poll::Pending => break,
                 }
                 progress = true;
@@ -1111,7 +1112,7 @@ fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
                 progress = true;
             }
             Poll::Ready(Err(e)) => {
-                run.conn.io_error(e.kind(), run.rt.now());
+                run.conn.io_error(e, run.rt.now());
                 return true;
             }
             Poll::Pending => return progress,
@@ -1121,7 +1122,7 @@ fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
         match Pin::new(&mut run.stream).poll_flush(cx) {
             Poll::Ready(Ok(())) => run.needs_flush = false,
             Poll::Ready(Err(e)) => {
-                run.conn.io_error(e.kind(), run.rt.now());
+                run.conn.io_error(e, run.rt.now());
                 return true;
             }
             Poll::Pending => {}

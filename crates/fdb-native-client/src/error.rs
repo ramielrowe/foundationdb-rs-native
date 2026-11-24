@@ -804,6 +804,41 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_failure_cause_is_in_the_client_error() {
+        use fdb_native_transport::ConnectionError;
+        use std::error::Error as _;
+
+        let alert = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "received fatal alert: UnknownCA",
+        );
+        let io = ConnectionError::Io(alert.into());
+        for e in [
+            Error::from_request(RequestError::MaybeDelivered(Some(io.clone()))),
+            Error::from_commit_request(RequestError::NotSent(Some(io.clone()))),
+        ] {
+            // The text says why, not only that the connection failed...
+            let text = e.to_string();
+            assert!(text.contains("received fatal alert: UnknownCA"), "{text}");
+            // ...and so does the chain: client error, transport error, connection error.
+            let request = e.source().expect("the transport error");
+            assert!(request.to_string().contains("UnknownCA"));
+            let mut chain = Vec::new();
+            let mut next = request.source();
+            while let Some(error) = next {
+                chain.push(error.to_string());
+                next = error.source();
+            }
+            assert!(
+                chain
+                    .iter()
+                    .any(|m| m.contains("received fatal alert: UnknownCA")),
+                "{chain:?}"
+            );
+        }
+    }
+
+    #[test]
     fn from_request_keeps_the_source() {
         let e = Error::from_request(RequestError::MaybeDelivered(None));
         assert_eq!(e.code(), REQUEST_MAYBE_DELIVERED);

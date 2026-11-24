@@ -148,6 +148,22 @@ pub fn rustls_error(error: &io::Error) -> Option<&rustls::Error> {
     error.get_ref()?.downcast_ref::<rustls::Error>()
 }
 
+/// The alert the peer sent that ended the session, if `error` is one: a server that refuses
+/// our client certificate sends `bad_certificate`, `unknown_ca`, `certificate_unknown`,
+/// `certificate_required` or `handshake_failure`, depending on what it objected to and its
+/// TLS library.
+///
+/// Reads [`rustls_error`]'s [`rustls::Error::AlertReceived`]. To get it from a failed
+/// connection, use [`ConnectionError::Io`](crate::ConnectionError::Io)'s
+/// [`IoError::io_error`](crate::IoError::io_error) (or
+/// [`PeerError::Tls`](crate::peer::PeerError::Tls)'s `source`).
+pub fn alert_received(error: &io::Error) -> Option<rustls::AlertDescription> {
+    match rustls_error(error)? {
+        rustls::Error::AlertReceived(alert) => Some(*alert),
+        _ => None,
+    }
+}
+
 /// An established TLS client session over `S`.
 ///
 /// Implements the `futures-io` [`AsyncRead`] and [`AsyncWrite`] traits, so

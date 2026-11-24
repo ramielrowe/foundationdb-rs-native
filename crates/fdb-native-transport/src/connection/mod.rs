@@ -239,7 +239,7 @@ use fdb_native_wire::{
 };
 
 pub use config::{ConnectionConfig, DEFAULT_MAX_PENDING_OUTPUT, MonitorConfig};
-pub use error::{ConnectionError, SendError};
+pub use error::{ConnectionError, IoError, SendError};
 pub use messages::{
     EndpointNotFound, PING_REPLY_OK, PingReply, PingRequest, TOKEN_STREAM_FLAG, well_known,
 };
@@ -612,10 +612,12 @@ impl Connection {
                 && (self.decoder.error().is_some() || front_frame_complete(&self.decoder)))
     }
 
-    /// The socket failed at `now`: the connection ends with [`ConnectionError::Io`].
-    pub fn io_error(&mut self, kind: std::io::ErrorKind, now: Instant) {
+    /// The socket failed at `now`: the connection ends with [`ConnectionError::Io`]. Pass
+    /// the [`io::Error`](std::io::Error) itself to keep its cause (a TLS alert, say) in the
+    /// error; an [`ErrorKind`](std::io::ErrorKind) alone keeps only the kind.
+    pub fn io_error(&mut self, error: impl Into<IoError>, now: Instant) {
         self.core.advance(now);
-        self.core.fail(ConnectionError::Io(kind));
+        self.core.fail(ConnectionError::Io(error.into()));
     }
 
     /// When [`handle_timeout`](Self::handle_timeout) must next be called, if at all. It may be

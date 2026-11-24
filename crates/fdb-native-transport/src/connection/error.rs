@@ -1,5 +1,8 @@
 //! Why a connection ended, and why a send was refused.
 
+use std::fmt;
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fdb_native_wire::{ProtocolVersion, Uid, binary};
@@ -55,9 +58,12 @@ pub enum ConnectionError {
         /// Whether it happened before the peer's ConnectPacket was read.
         during_handshake: bool,
     },
-    /// The socket failed ([`Connection::io_error`](super::Connection::io_error)).
+    /// The socket failed ([`Connection::io_error`](super::Connection::io_error)). The
+    /// [`IoError`] keeps the underlying [`io::Error`], so a cause such as a TLS alert from the
+    /// peer (`received fatal alert: UnknownCA`) is in the message and the
+    /// [`source`](std::error::Error::source) chain, and not only its kind.
     #[error("i/o error: {0}")]
-    Io(std::io::ErrorKind),
+    Io(#[source] IoError),
     /// Nothing at all arrived from the peer within the monitor's timeout after a ping
     /// (`connection_failed`, logged as `ConnectionTimeout`).
     #[error("no bytes from the peer within {0:?} of a ping")]
@@ -128,6 +134,98 @@ impl ConnectionError {
             | ConnectionError::OutputOverflow(_)
             | ConnectionError::PingTimeout(_) => "connection_failed",
         }
+    }
+}
+
+/// An I/O failure of the socket (or of the TLS layer over it), with its cause.
+///
+/// An [`ErrorKind`](io::ErrorKind) alone says little: a rustls error that surfaces from a
+/// read is an [`io::Error`] of kind `InvalidData` whatever the alert was. This keeps the whole
+/// error behind an [`Arc`], so it is cheap to clone and stays an [`Error`](std::error::Error)
+/// with a [`source`](std::error::Error::source).
+///
+/// * `Display` is the error's message, e.g. `received fatal alert: UnknownCA` for a server
+///   that refused our client certificate, or `Connection reset by peer (os error 104)`.
+/// * [`source`](std::error::Error::source) is the error that [`io::Error::new`] wrapped, if
+///   there was one: a `rustls::Error` for a TLS failure (with the `tls` feature,
+///   `fdb_native_transport::tls::rustls_error` and `tls::alert_received` read it).
+/// * Equality compares the kind and the message.
+#[derive(Clone)]
+pub struct IoError {
+    kind: io::ErrorKind,
+    error: Option<Arc<io::Error>>,
+}
+
+impl IoError {
+    /// Wraps `error`, keeping it for [`io_error`](Self::io_error) and the source chain.
+    pub fn new(error: io::Error) -> Self {
+        IoError {
+            kind: error.kind(),
+            error: Some(Arc::new(error)),
+        }
+    }
+
+    /// The error's kind.
+    pub fn kind(&self) -> io::ErrorKind {
+        self.kind
+    }
+
+    /// The [`io::Error`] this was made from; `None` if only a kind is known.
+    pub fn io_error(&self) -> Option<&io::Error> {
+        self.error.as_deref()
+    }
+
+    /// The error that [`io::Error::new`] wrapped (the TLS library's error, for a TLS
+    /// failure), if the I/O error had one.
+    pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.error.as_deref()?.get_ref()
+    }
+}
+
+impl From<io::ErrorKind> for IoError {
+    fn from(kind: io::ErrorKind) -> Self {
+        IoError { kind, error: None }
+    }
+}
+
+impl From<io::Error> for IoError {
+    fn from(error: io::Error) -> Self {
+        IoError::new(error)
+    }
+}
+
+impl fmt::Display for IoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.error {
+            Some(error) => fmt::Display::fmt(error, f),
+            None => fmt::Display::fmt(&self.kind, f),
+        }
+    }
+}
+
+impl fmt::Debug for IoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("IoError");
+        s.field("kind", &self.kind);
+        if let Some(error) = &self.error {
+            s.field("message", &error.to_string());
+        }
+        s.finish()
+    }
+}
+
+impl PartialEq for IoError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.to_string() == other.to_string()
+    }
+}
+
+impl Eq for IoError {}
+
+impl std::error::Error for IoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause()
+            .map(|e| e as &(dyn std::error::Error + 'static))
     }
 }
 
