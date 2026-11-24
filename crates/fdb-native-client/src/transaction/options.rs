@@ -21,7 +21,7 @@
 //! | [`IncludePortInAddress`](TransactionOption::IncludePortInAddress) | 23 | no | no-op (no `getAddressesForKey` yet; the port is always included) |
 //! | [`NextWriteNoWriteConflictRange`](TransactionOption::NextWriteNoWriteConflictRange) | 30 | no | supported |
 //! | [`CommitOnFirstProxy`](TransactionOption::CommitOnFirstProxy) | 40 | no | supported (hidden test option) |
-//! | [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable) | 51 | no | validated; no-op until M5 (reads never see own writes today) |
+//! | [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable) | 51 | no | supported (only before any read or write) |
 //! | [`ReadServerSideCacheEnable`](TransactionOption::ReadServerSideCacheEnable) / [`Disable`](TransactionOption::ReadServerSideCacheDisable) | 507 / 508 | no | accepted; hint, not sent to storage servers yet |
 //! | [`ReadPriorityNormal`](TransactionOption::ReadPriorityNormal) / [`Low`](TransactionOption::ReadPriorityLow) / [`High`](TransactionOption::ReadPriorityHigh) | 509 / 510 / 511 | no | accepted; hint, not sent to storage servers yet |
 //! | [`PrioritySystemImmediate`](TransactionOption::PrioritySystemImmediate) | 200 | no | supported (read version priority) |
@@ -36,7 +36,7 @@
 //! | [`LogTransaction`](TransactionOption::LogTransaction) | 404 | no | validated as C++ does (needs the identifier); no trace log, no-op |
 //! | [`TransactionLoggingMaxFieldLength`](TransactionOption::TransactionLoggingMaxFieldLength) | 405 | no | validated; no-op |
 //! | [`ServerRequestTracing`](TransactionOption::ServerRequestTracing) | 406 | no | accepted; no server-side debug id is sent, no-op |
-//! | [`SnapshotRywEnable`](TransactionOption::SnapshotRywEnable) / [`Disable`](TransactionOption::SnapshotRywDisable) | 600 / 601 | no | no-op until M5 |
+//! | [`SnapshotRywEnable`](TransactionOption::SnapshotRywEnable) / [`Disable`](TransactionOption::SnapshotRywDisable) | 600 / 601 | no | supported |
 //! | [`LockAware`](TransactionOption::LockAware) | 700 | no | supported |
 //! | [`UsedDuringCommitProtectionDisable`](TransactionOption::UsedDuringCommitProtectionDisable) | 701 | no | supported |
 //! | [`ReadLockAware`](TransactionOption::ReadLockAware) | 702 | no | supported |
@@ -46,7 +46,7 @@
 //! | [`Tag`](TransactionOption::Tag) / [`AutoThrottleTag`](TransactionOption::AutoThrottleTag) | 800 / 801 | no | **unsupported**: `invalid_option` (2007) |
 //! | [`SpanParent`](TransactionOption::SpanParent) | 900 | no | validated (33 bytes); not propagated, no-op |
 //! | [`ExpensiveClearCostEstimationEnable`](TransactionOption::ExpensiveClearCostEstimationEnable) | 1000 | no | no-op (it only refines tag throttling costs) |
-//! | [`BypassUnreadable`](TransactionOption::BypassUnreadable) | 1100 | no | no-op until M5 |
+//! | [`BypassUnreadable`](TransactionOption::BypassUnreadable) | 1100 | no | supported (`get`, as C++) |
 //! | [`UseGrvCache`](TransactionOption::UseGrvCache) | 1101 | no | no-op (there is no GRV cache: the read version is always fresh) |
 //! | [`MaxGrvQueueDelay`](TransactionOption::MaxGrvQueueDelay) | 1103 | no | supported on 8.0 clusters; ignored by 7.4 ones |
 //!
@@ -155,10 +155,10 @@ pub enum TransactionOption {
     /// instead of being load balanced.
     CommitOnFirstProxy,
     /// `READ_YOUR_WRITES_DISABLE` (51): reads see the database at the read version, not the
-    /// transaction's own writes. `client_invalid_operation` (2000) if the transaction has
-    /// read or written already. **Every transaction behaves like this today** (no
-    /// read-your-writes yet), so there is nothing more to do: the option is validated and
-    /// that is all. Once read-your-writes exists it will be the way to turn it off.
+    /// transaction's own writes, and add the read conflict ranges C++'s `Transaction` adds
+    /// (`readThrough`); see [`Transaction`](crate::Transaction). `client_invalid_operation`
+    /// (2000) if the transaction has a read in progress, has cached a read, or has written
+    /// (C++: `reading.getFutureCount() > 0 || !cache.empty() || !writes.empty()`).
     ReadYourWritesDisable,
     /// `READ_SERVER_SIDE_CACHE_ENABLE` (507): a hint to the storage servers (the default).
     /// Accepted; not sent yet.
@@ -214,10 +214,14 @@ pub enum TransactionOption {
     /// no debug id is sent, so it does nothing.
     ServerRequestTracing,
     /// `SNAPSHOT_RYW_ENABLE` (600): snapshot reads see the transaction's writes (the
-    /// default). No-op until read-your-writes exists.
+    /// default). A count, as C++'s `snapshotRywEnabled`: it starts at the database's
+    /// ([`DatabaseOption::SnapshotRywEnable`](crate::DatabaseOption::SnapshotRywEnable), 1 by
+    /// default) and this option adds one; snapshot reads see the writes while it is above 0.
     SnapshotRywEnable,
-    /// `SNAPSHOT_RYW_DISABLE` (601): snapshot reads do not see the transaction's writes. No-op
-    /// until read-your-writes exists.
+    /// `SNAPSHOT_RYW_DISABLE` (601): takes one from the count of
+    /// [`SnapshotRywEnable`](Self::SnapshotRywEnable): once it is 0 or less, snapshot reads
+    /// do not see the transaction's writes (they read the database at the read version, and
+    /// what earlier reads cached of it).
     SnapshotRywDisable,
     /// `LOCK_AWARE` (700): the transaction may read and commit while the database is locked
     /// (it is responsible for having taken the lock). Cancels
@@ -253,8 +257,12 @@ pub enum TransactionOption {
     /// `EXPENSIVE_CLEAR_COST_ESTIMATION_ENABLE` (1000): ask the storage servers how big a
     /// cleared range is, for the tag throttling costs. No-op (there are no tags).
     ExpensiveClearCostEstimationEnable,
-    /// `BYPASS_UNREADABLE` (1100): reads may see the unreadable parts of the key space
-    /// (versionstamped writes). No-op until read-your-writes exists.
+    /// `BYPASS_UNREADABLE` (1100): a [`get`](crate::Transaction::get) of a key the
+    /// transaction's versionstamped operations made unreadable does not fail with
+    /// `accessed_unreadable` (1036): it returns what the transaction knows (a
+    /// `SetVersionstampedValue`'s operand as given, or the database's value of a key a
+    /// `SetVersionstampedKey` may write). As in C++, only `get` bypasses: range reads and
+    /// `get_key` still fail.
     BypassUnreadable,
     /// `USE_GRV_CACHE` (1101): allow a cached (stale) read version. No-op: there is no
     /// cache, the read version is always requested.
@@ -263,7 +271,8 @@ pub enum TransactionOption {
     /// `transaction_grv_queue_rejected` (1251) if the GRV proxy estimates that ratekeeper
     /// throttling will keep it queued longer than this (at most `i32::MAX` milliseconds).
     /// Ignored by 7.4 clusters, whose GRV proxies have no such option (a 7.4 C++ client
-    /// would not know the option either).
+    /// would not know the option either). The delay is sent in whole milliseconds, a
+    /// fraction of a millisecond rounded up (as the other durations here).
     MaxGrvQueueDelay(Duration),
 }
 
@@ -405,10 +414,16 @@ pub(super) struct Flags {
     pub(super) used_during_commit_protection_disable: bool,
     /// `DEBUG_TRANSACTION_IDENTIFIER`.
     pub(super) debug_identifier: Option<String>,
+    /// `READ_YOUR_WRITES_DISABLE` (`options.readYourWritesDisabled`).
+    pub(super) read_your_writes_disabled: bool,
+    /// `options.snapshotRywEnabled`: snapshot reads see the writes while it is above 0.
+    pub(super) snapshot_ryw: i32,
+    /// `BYPASS_UNREADABLE`.
+    pub(super) bypass_unreadable: bool,
 }
 
 impl Flags {
-    pub(super) fn new(size_limit: u64) -> Flags {
+    pub(super) fn new(size_limit: u64, snapshot_ryw: i32) -> Flags {
         Flags {
             causal_write_risky: false,
             causal_read_risky: false,
@@ -427,6 +442,9 @@ impl Flags {
             next_write_no_write_conflict_range: false,
             used_during_commit_protection_disable: false,
             debug_identifier: None,
+            read_your_writes_disabled: false,
+            snapshot_ryw,
+            bypass_unreadable: false,
         }
     }
 
@@ -470,13 +488,19 @@ impl State {
             NextWriteNoWriteConflictRange => self.flags.next_write_no_write_conflict_range = true,
             CommitOnFirstProxy => self.flags.commit_on_first_proxy = true,
             ReadYourWritesDisable => {
-                // `reading.getFutureCount() > 0 || !cache.empty() || !writes.empty()`.
-                if self.reading.count > 0 || self.read_issued || !self.buffer.is_empty() {
+                // `reading.getFutureCount() > 0 || !cache.empty() || !writes.empty()` (with
+                // read-your-writes disabled, the writes are in the buffer only).
+                if self.reading.count > 0
+                    || !self.ryw.cache.is_empty()
+                    || !self.ryw.writes.is_empty()
+                    || !self.buffer.is_empty()
+                {
                     return Err(Error::with_message(
                         CLIENT_INVALID_OPERATION,
                         "read-your-writes cannot be disabled after a read or a write",
                     ));
                 }
+                self.flags.read_your_writes_disabled = true;
             }
             PrioritySystemImmediate => self.flags.priority = Priority::Immediate,
             PriorityBatch => self.flags.priority = Priority::Batch,
@@ -537,12 +561,16 @@ impl State {
             | DebugRetryLogging(_)
             | TransactionLoggingMaxFieldLength(_)
             | ServerRequestTracing
-            | SnapshotRywEnable
-            | SnapshotRywDisable
             | SpanParent(_)
             | ExpensiveClearCostEstimationEnable
-            | BypassUnreadable
             | UseGrvCache => {}
+            SnapshotRywEnable => {
+                self.flags.snapshot_ryw = self.flags.snapshot_ryw.saturating_add(1)
+            }
+            SnapshotRywDisable => {
+                self.flags.snapshot_ryw = self.flags.snapshot_ryw.saturating_sub(1)
+            }
+            BypassUnreadable => self.flags.bypass_unreadable = true,
             // `validate` refuses them.
             Tag(_) | AutoThrottleTag(_) => unreachable!("refused by validate"),
         }

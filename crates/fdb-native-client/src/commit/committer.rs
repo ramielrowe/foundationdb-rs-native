@@ -218,10 +218,45 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
         options: &CommitOptions,
         sent: &AtomicBool,
     ) -> Result<CommitOutcome, Error> {
+        let Some(commit) = self.prepare_parts(
+            mutations,
+            read_conflicts,
+            write_conflicts,
+            extra_read_conflicts,
+            options,
+        )?
+        else {
+            return Ok(CommitOutcome::NothingToCommit);
+        };
+        self.commit_prepared_tracked(commit, read_version, options, sent)
+            .await
+    }
+
+    /// `commitMutations`' checks and additions (see [`prepare`](super)) without the read
+    /// version, which C++ only fetches after them (NativeAPI 7.4:7129-7180, 8.0:4820-4875):
+    /// a write in a read-only (`READ_LOCK_AWARE`) transaction or an oversized transaction
+    /// fails before any read version request. `None`: nothing to commit.
+    pub(crate) fn prepare_buffer(
+        &self,
+        buffer: CommitBuffer,
+        options: &CommitOptions,
+    ) -> Result<Option<Commit>, Error> {
+        let (mutations, reads, writes, extra) = buffer.into_parts_with_extra();
+        self.prepare_parts(mutations, reads, writes, extra, options)
+    }
+
+    fn prepare_parts(
+        &self,
+        mutations: Vec<Mutation>,
+        read_conflicts: Vec<KeyRange>,
+        write_conflicts: Vec<KeyRange>,
+        extra_read_conflicts: Vec<KeyRange>,
+        options: &CommitOptions,
+    ) -> Result<Option<Commit>, Error> {
         let limits = self.limits();
         let uid = self.rng(|r| Uid::new(r.next_u64(), r.next_u64()));
-        let Some(commit) = prepare(
-            read_version,
+        prepare(
+            INVALID_VERSION,
             mutations,
             read_conflicts,
             write_conflicts,
@@ -229,10 +264,20 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Committer<R, W> {
             options,
             &limits,
             || uid,
-        )?
-        else {
-            return Ok(CommitOutcome::NothingToCommit);
-        };
+        )
+    }
+
+    /// `tryCommit` of a commit from [`prepare_buffer`](Self::prepare_buffer), at
+    /// `read_version`; `sent` is set once the request may reach a proxy.
+    pub(crate) async fn commit_prepared_tracked(
+        &self,
+        mut commit: Commit,
+        read_version: i64,
+        options: &CommitOptions,
+        sent: &AtomicBool,
+    ) -> Result<CommitOutcome, Error> {
+        let limits = self.limits();
+        commit.read_snapshot = read_version;
         let request = Arc::new(commit);
         match self.send_commit(&request, options, sent).await {
             Ok(id) => Ok(CommitOutcome::Committed(id)),

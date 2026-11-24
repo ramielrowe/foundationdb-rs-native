@@ -547,6 +547,7 @@ impl<'a> SnapshotCacheIter<'a> {
 
     /// C++ `++it`: moves to the next (non-degenerate) segment. Returns `false`, without
     /// moving, if this is the last segment.
+    #[must_use]
     pub(crate) fn advance(&mut self) -> bool {
         let original_end = self.end_key();
         let saved = self.clone();
@@ -563,6 +564,7 @@ impl<'a> SnapshotCacheIter<'a> {
 
     /// C++ `--it`: moves to the previous (non-degenerate) segment. Returns `false`, without
     /// moving, if this is the first segment.
+    #[must_use]
     pub(crate) fn retreat(&mut self) -> bool {
         let original_begin = self.begin_key();
         let saved = self.clone();

@@ -31,6 +31,7 @@ use fdb_native_transport::tls::TlsConfig;
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig, StreamWrapper};
@@ -210,6 +211,11 @@ pub(crate) struct DbInner<R: Runtime> {
     /// `DatabaseContext::transactionDefaults`: the transaction options new transactions start
     /// with ([`Database::set_option`]).
     transaction_defaults: Mutex<Arc<Vec<TransactionOption>>>,
+    /// `DatabaseContext::snapshotRywEnabled`: 1 (`apiVersionAtLeast(300)`), counted up and
+    /// down by the `SNAPSHOT_RYW_ENABLE` / `DISABLE` database options; a transaction's
+    /// snapshot reads see its writes while its own count (which starts from this one) is
+    /// above 0.
+    pub(crate) snapshot_ryw: AtomicI32,
     tls: bool,
     rng: Mutex<Rng>,
 }
@@ -388,6 +394,7 @@ impl<R: Runtime> Database<R> {
                 watches,
                 knobs,
                 transaction_defaults: Mutex::new(Arc::new(Vec::new())),
+                snapshot_ryw: AtomicI32::new(1),
                 tls: uses_tls,
                 rng: Mutex::new(rng),
             }),
@@ -506,8 +513,10 @@ impl<R: Runtime> Database<R> {
 
     /// `setOption(option)` of the database (`fdb_database_set_option`): see
     /// [`DatabaseOption`] for the options and the
-    /// transaction defaults. `invalid_option_value` (2006) for a value out of range, `invalid_option`
-    /// (2007) for a default this client does not support: the options are unchanged then.
+    /// transaction defaults. `invalid_option_value` (2006) for a value out of range (the
+    /// options are unchanged then). Every option [`DatabaseOption`] offers is supported, so
+    /// this never fails with `invalid_option` (2007): the options this client does not
+    /// support have no variant.
     ///
     /// ```no_run
     /// # fn example(db: &fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
@@ -521,8 +530,17 @@ impl<R: Runtime> Database<R> {
     /// # }
     /// ```
     pub fn set_option(&self, option: DatabaseOption) -> Result<(), Error> {
-        if let DatabaseOption::MaxWatches(max) = option {
-            return self.set_max_watches(max);
+        match option {
+            DatabaseOption::MaxWatches(max) => return self.set_max_watches(max),
+            DatabaseOption::SnapshotRywEnable => {
+                self.inner.snapshot_ryw.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            DatabaseOption::SnapshotRywDisable => {
+                self.inner.snapshot_ryw.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            _ => {}
         }
         let Some(default) = option.default_for() else {
             return Ok(());

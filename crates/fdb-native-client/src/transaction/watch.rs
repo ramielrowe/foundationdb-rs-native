@@ -52,8 +52,7 @@ impl<R: Runtime> Transaction<R> {
     /// * **Later writes** of the transaction to the key that give it another value than the
     ///   one watched resolve the watch at once; an atomic operation on the key always does.
     ///
-    /// This is the behaviour of C++'s read-your-writes layer, whose watch semantics the
-    /// transaction has even though its reads do not see its writes yet (see the [module
+    /// This is the behaviour of C++'s read-your-writes layer (see the [module
     /// documentation](super)).
     ///
     /// # Errors
@@ -184,11 +183,16 @@ impl<R: Runtime> Transaction<R> {
                 .used_during_commit()
                 .unwrap_or(Error::new(USED_DURING_COMMIT)));
         }
-        // `updateConflictMap`: the key was unmodified or had dependent writes.
+        // `updateConflictMap`: the key was unmodified or had dependent writes. With
+        // read-your-writes, the range joins the reads' (`readConflicts`).
         let end = key_after(&key);
-        if let Err(e) = state.buffer.add_read_conflict_range(&key, &end) {
-            state.watches.remove(&id);
-            return Err(e);
+        if state.flags.read_your_writes_disabled {
+            if let Err(e) = state.buffer.add_read_conflict_range(&key, &end) {
+                state.watches.remove(&id);
+                return Err(e);
+            }
+        } else {
+            state.ryw.read_conflicts.insert(&key, &end);
         }
         let value = fold(&ops, value, value_size_limit);
         let counter = &self.inner.db.inner.watches.counter;

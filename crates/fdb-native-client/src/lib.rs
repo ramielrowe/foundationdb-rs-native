@@ -92,7 +92,7 @@ pub mod read;
 #[allow(
     dead_code,
     unused_imports,
-    reason = "the RYW layer is built up piece by piece; the read path (ygr.3) consumes these"
+    reason = "the RYW layer is built up piece by piece; the commit path (ygr.4) consumes the rest"
 )]
 mod ryw;
 pub mod transaction;

@@ -1061,10 +1061,10 @@ proptest! {
                     }
                     for forward in moves {
                         if forward {
-                            it.advance();
+                            let _ = it.advance();
                             it.skip_contiguous(ExtKey::from(&limit));
                         } else {
-                            it.retreat();
+                            let _ = it.retreat();
                             it.skip_contiguous_back(ExtKey::from(&limit));
                         }
                         let _ = (it.begin_key(), it.end_key(), it.kv());

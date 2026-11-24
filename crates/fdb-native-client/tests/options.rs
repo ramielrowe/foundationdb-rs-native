@@ -1110,3 +1110,146 @@ async fn a_sub_millisecond_timeout_is_not_zero() {
     tx.set_read_version(1);
     assert_eq!(tx.get_read_version().await.unwrap(), 1);
 }
+
+/// A read future that is kept but never polled again does not hold up the commit: the read
+/// runs as a task of its own, started when it is called (review of 9q8.7: the `get` held its
+/// `reading` guard inside the future).
+#[tokio::test(start_paused = true)]
+async fn an_unpolled_get_future_does_not_hold_up_the_commit() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let fut = tx.get(METADATA_VERSION);
+    let mut fut = std::pin::pin!(fut);
+    // Polled once, then left alone.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut fut)
+            .await
+            .is_err()
+    );
+    env.grv.next().await.reply_grv_with(10, false, Some(b"mv"));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tx.set(b"k", b"v");
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let call = env.commit.next().await;
+    let (commit, _) = call.commit();
+    // The read's conflict range is in the commit.
+    assert!(
+        commit
+            .read_conflict_ranges
+            .contains(&KeyRange::single_key(METADATA_VERSION)),
+        "{:?}",
+        commit.read_conflict_ranges
+    );
+    call.reply_commit(committed(20, 0));
+    assert_eq!(done(handle).await.unwrap().committed_version(), 20);
+    // The future still has its answer.
+    assert_eq!(fut.await.unwrap(), Some(b"mv".to_vec()));
+
+    // Never polled at all: the same, though they wait for the read version.
+    let tx = env.db.create_transaction();
+    let _kept = tx.get(METADATA_VERSION);
+    let _kept_key = tx.get_key(&fdb_native_client::KeySelector::first_greater_or_equal(
+        METADATA_VERSION.to_vec(),
+    ));
+    env.grv.next().await.reply_grv_with(30, false, Some(b"mv"));
+    tx.set(b"k", b"v");
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let finished = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if let Some(call) = env.commit.try_next() {
+                call.reply_commit(committed(40, 0));
+            }
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(finished.is_ok(), "the commit waited for reads nobody polls");
+}
+
+/// `commitMutations` refuses a write in a read-only (`READ_LOCK_AWARE`) transaction, or an
+/// oversized one, before it asks for a read version (NativeAPI 7.4:7129-7180).
+#[tokio::test(start_paused = true)]
+async fn commit_checks_come_before_the_read_version_request() {
+    for schema in SCHEMAS {
+        let mut env = env(schema).await;
+        let tx = env.db.create_transaction();
+        opt(&tx, TransactionOption::ReadLockAware);
+        tx.set(b"k", b"v");
+        assert_eq!(
+            tx.commit().await.unwrap_err().code(),
+            codes::TRANSACTION_READ_ONLY
+        );
+        assert!(env.grv.try_next().is_none());
+
+        let tx = env.db.create_transaction();
+        opt(&tx, TransactionOption::SizeLimit(32));
+        tx.set(b"k", &[0; 100]);
+        assert_eq!(
+            tx.commit().await.unwrap_err().code(),
+            codes::TRANSACTION_TOO_LARGE
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(env.grv.try_next().is_none());
+    }
+}
+
+/// `\xff/metadataVersion` is written only as the read-your-writes layer allows: a
+/// `SetVersionstampedValue` of the 14-byte required value, without any system key option;
+/// a `set` or any other atomic operation is `client_invalid_operation` (RYW 7.4:2226-2230,
+/// 2300). Written, the key is unreadable in the transaction.
+#[tokio::test(start_paused = true)]
+async fn metadata_version_writes() {
+    for schema in SCHEMAS {
+        let mut env = env(schema).await;
+        let tx = env.db.create_transaction();
+        tx.set(METADATA_VERSION, b"x");
+        assert_eq!(
+            tx.commit().await.unwrap_err().code(),
+            codes::CLIENT_INVALID_OPERATION
+        );
+        let tx = env.db.create_transaction();
+        tx.atomic_op(METADATA_VERSION, &[0; 14], MutationType::ADD_VALUE);
+        assert_eq!(
+            tx.get_read_version().await.unwrap_err().code(),
+            codes::CLIENT_INVALID_OPERATION
+        );
+        let tx = env.db.create_transaction();
+        tx.atomic_op(
+            METADATA_VERSION,
+            &[0; 13],
+            MutationType::SET_VERSIONSTAMPED_VALUE,
+        );
+        assert_eq!(
+            tx.get_read_version().await.unwrap_err().code(),
+            codes::CLIENT_INVALID_OPERATION
+        );
+
+        let tx = env.db.create_transaction();
+        tx.set_read_version(10);
+        tx.atomic_op(
+            METADATA_VERSION,
+            &[0; 14],
+            MutationType::SET_VERSIONSTAMPED_VALUE,
+        );
+        assert_eq!(
+            tx.get(METADATA_VERSION).await.unwrap_err().code(),
+            codes::ACCESSED_UNREADABLE
+        );
+        let commit = commit_request(&mut env, &tx).await;
+        assert_eq!(commit.mutations.len(), 1);
+        assert_eq!(
+            commit.mutations[0].kind,
+            MutationType::SET_VERSIONSTAMPED_VALUE
+        );
+        assert_eq!(commit.mutations[0].param1, METADATA_VERSION);
+    }
+}
