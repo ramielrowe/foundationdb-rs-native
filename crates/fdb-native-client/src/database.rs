@@ -46,8 +46,12 @@ use crate::error::Error;
 use crate::error::codes::TLS_ERROR;
 use crate::read::util::Rng;
 use crate::read::{ReadConfig, Reader};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionOption};
 use crate::watch::{ABSOLUTE_MAX_WATCHES, WatchConfig, WatchContext};
+
+pub mod options;
+
+pub use options::DatabaseOption;
 
 /// How a [`Database`] is built. [`DatabaseOptions::default`] has C++'s knobs everywhere.
 #[derive(Clone, Debug, Default)]
@@ -203,11 +207,22 @@ pub(crate) struct DbInner<R: Runtime> {
     pub(crate) committer: Committer<R, ClientTls>,
     pub(crate) watches: Arc<WatchContext<R>>,
     pub(crate) knobs: TransactionKnobs,
+    /// `DatabaseContext::transactionDefaults`: the transaction options new transactions start
+    /// with ([`Database::set_option`]).
+    transaction_defaults: Mutex<Arc<Vec<TransactionOption>>>,
     tls: bool,
     rng: Mutex<Rng>,
 }
 
 impl<R: Runtime> DbInner<R> {
+    /// The defaults a transaction created now starts with.
+    pub(crate) fn transaction_defaults(&self) -> Arc<Vec<TransactionOption>> {
+        self.transaction_defaults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// `random01()`, for the backoff jitter.
     pub(crate) fn random01(&self) -> f64 {
         self.rng
@@ -372,6 +387,7 @@ impl<R: Runtime> Database<R> {
                 committer,
                 watches,
                 knobs,
+                transaction_defaults: Mutex::new(Arc::new(Vec::new())),
                 tls: uses_tls,
                 rng: Mutex::new(rng),
             }),
@@ -412,7 +428,8 @@ impl<R: Runtime> Database<R> {
     ///
     /// Options set in `f` apply to that attempt only, except those that C++ keeps across
     /// retries (`timeout`, `retry_limit`, `max_retry_delay`); setting them on every attempt
-    /// is fine.
+    /// is fine. The transaction starts with the [database's defaults](Database::set_option),
+    /// which also stay across the retries.
     ///
     /// ```no_run
     /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
@@ -487,10 +504,51 @@ impl<R: Runtime> Database<R> {
         self.inner.peers.shutdown().await;
     }
 
+    /// `setOption(option)` of the database (`fdb_database_set_option`): see
+    /// [`DatabaseOption`] for the options and the
+    /// transaction defaults. `invalid_option_value` (2006) for a value out of range, `invalid_option`
+    /// (2007) for a default this client does not support: the options are unchanged then.
+    ///
+    /// ```no_run
+    /// # fn example(db: &fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+    /// use std::time::Duration;
+    /// use fdb_native_client::DatabaseOption;
+    ///
+    /// // Every transaction from now on times out after 5 s, and retries 10 times at most.
+    /// db.set_option(DatabaseOption::TransactionTimeout(Duration::from_secs(5)))?;
+    /// db.set_option(DatabaseOption::TransactionRetryLimit(10))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_option(&self, option: DatabaseOption) -> Result<(), Error> {
+        if let DatabaseOption::MaxWatches(max) = option {
+            return self.set_max_watches(max);
+        }
+        let Some(default) = option.default_for() else {
+            return Ok(());
+        };
+        default.validate(self.inner.committer.limits().transaction_size_limit)?;
+        let mut defaults = self
+            .inner
+            .transaction_defaults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The same option again replaces the earlier default.
+        let kind = std::mem::discriminant(&default);
+        let mut next: Vec<TransactionOption> = defaults
+            .iter()
+            .filter(|o| std::mem::discriminant(*o) != kind)
+            .cloned()
+            .collect();
+        next.push(default);
+        *defaults = Arc::new(next);
+        Ok(())
+    }
+
     /// `MAX_WATCHES` (the database option): the most watches that may be outstanding at once
     /// (default 10 000; [`WatchConfig::max_outstanding_watches`]). Watches already
     /// outstanding stay, whatever the new cap. `invalid_option_value` (2006) above
-    /// [`ABSOLUTE_MAX_WATCHES`] (1 000 000).
+    /// [`ABSOLUTE_MAX_WATCHES`] (1 000 000). Also [`DatabaseOption::MaxWatches`].
     pub fn set_max_watches(&self, max: usize) -> Result<(), Error> {
         if max > ABSOLUTE_MAX_WATCHES {
             return Err(Error::with_message(

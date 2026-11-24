@@ -163,6 +163,7 @@ impl<R: Runtime> Transaction<R> {
             if begin.key.as_slice() > max_read_key || end.key.as_slice() > max_read_key {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
+            state.read_issued = true;
             // `limits.isReached()` and `!limits.isValid()` cannot happen: `fdb_c`'s limits
             // are never 0 rows nor negative.
             let begin = remove_or_equal(&begin);
