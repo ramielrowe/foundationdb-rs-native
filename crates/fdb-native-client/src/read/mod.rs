@@ -148,7 +148,8 @@
 //!   failed one is probed until it comes back.
 //! * **Bound.** Before an insert, while the cache holds `LOCATION_CACHE_EVICTION_SIZE`
 //!   ranges ([`ReadConfig::location_cache_size`], 600 000; ClientKnobs 7.4:99,
-//!   8.0:209), a random range is evicted (at most 100 per insert, as C++). C++'s cache is a
+//!   8.0:209; the `LOCATION_CACHE_SIZE` database option changes it,
+//!   [`Reader::set_location_cache_size`]), a random range is evicted (at most 100 per insert, as C++). C++'s cache is a
 //!   `CoalescedKeyRangeMap` (`DatabaseContext.h` 7.4:546), so an eviction or a range
 //!   invalidation (both `insert` an empty value) merges the range with unknown neighbours,
 //!   as here; only `invalidateCache(key)`, which assigns the value in place, keeps the
@@ -458,7 +459,8 @@ pub struct ReadConfig {
     /// `GRV_BATCH_TIMEOUT` (5 ms): the longest a read version request waits for others to
     /// batch with.
     pub grv_batch_timeout: Duration,
-    /// `LOCATION_CACHE_EVICTION_SIZE` (600 000): the most shards whose location is cached.
+    /// `LOCATION_CACHE_EVICTION_SIZE` (600 000): the most shards whose location is cached
+    /// ([`Reader::set_location_cache_size`] changes it).
     pub location_cache_size: usize,
     /// `WRONG_SHARD_SERVER_DELAY` (10 ms): the wait before locating a key again after
     /// `wrong_shard_server` or `all_alternatives_failed`.
@@ -466,8 +468,9 @@ pub struct ReadConfig {
     /// `METADATA_VERSION_CACHE_SIZE` (1000): how many read versions' `\xff/metadataVersion`
     /// the reader remembers (see [`Reader::metadata_version`]).
     pub metadata_version_cache_size: usize,
-    /// The client's data center id (C++'s client locality `dcid`, the `datacenter_id`
-    /// network option): replicas in it are preferred. `None` (the default) prefers none.
+    /// The client's data center id (C++'s client locality `dcid`, the `DATACENTER_ID`
+    /// database option): replicas in it are preferred. `None` (the default) prefers none.
+    /// [`Reader::set_client_dc_id`] changes it.
     pub client_dc_id: Option<Vec<u8>>,
     /// Seed of the random choices (replica order, eviction, jitter). `None` draws one.
     pub seed: Option<u64>,
@@ -601,7 +604,14 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             peers,
             monitor,
             rng: Mutex::new(Rng::new(config.seed)),
-            locations: Mutex::new(LocationCache::new(config.location_cache_size)),
+            locations: Mutex::new({
+                let mut cache = LocationCache::new(config.location_cache_size);
+                cache.set_locality(location::ClientLocality {
+                    dc_id: config.client_dc_id.clone(),
+                    zone_id: None,
+                });
+                cache
+            }),
             model: Mutex::new(balance::QueueModel::default()),
             state: Mutex::new(State {
                 alternatives: AlternativesFailures {
@@ -864,6 +874,59 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// How many shard locations are cached.
     pub fn cached_locations(&self) -> usize {
         lock(&self.inner.shared.locations).len()
+    }
+
+    /// The bound of the location cache: [`ReadConfig::location_cache_size`] until
+    /// [`set_location_cache_size`](Self::set_location_cache_size) changes it.
+    pub fn location_cache_size(&self) -> usize {
+        lock(&self.inner.shared.locations).capacity()
+    }
+
+    /// `LOCATION_CACHE_SIZE` (`DatabaseContext::setOption`): a new bound of the location
+    /// cache, applied when the next locations are cached (nothing is evicted at once, as in
+    /// C++). 0 is taken as 1.
+    pub fn set_location_cache_size(&self, size: usize) {
+        lock(&self.inner.shared.locations).set_capacity(size);
+    }
+
+    /// The client's data center id: [`ReadConfig::client_dc_id`] until
+    /// [`set_client_dc_id`](Self::set_client_dc_id) changes it.
+    pub fn client_dc_id(&self) -> Option<Vec<u8>> {
+        lock(&self.inner.shared.locations).locality().dc_id.clone()
+    }
+
+    /// `DATACENTER_ID` (`DatabaseContext::setOption`): the client's data center id
+    /// (`None`: none), whose replicas are preferred from now on. As in C++, the location
+    /// cache and its server entries are forgotten, so that every replica's distance is
+    /// computed again.
+    pub fn set_client_dc_id(&self, dc_id: Option<Vec<u8>>) {
+        let mut cache = lock(&self.inner.shared.locations);
+        let locality = location::ClientLocality {
+            dc_id,
+            ..cache.locality().clone()
+        };
+        cache.set_locality(locality);
+    }
+
+    /// `MACHINE_ID` (`DatabaseContext::setOption`): the client's zone id. C++ uses it to
+    /// find replicas on the same machine only when `LOAD_BALANCE_ZONE_ID_LOCALITY_ENABLED`
+    /// is set (off by default), which this client does not offer, so it is only stored; as
+    /// in C++, the location cache and its server entries are forgotten.
+    pub fn set_client_zone_id(&self, zone_id: Option<Vec<u8>>) {
+        let mut cache = lock(&self.inner.shared.locations);
+        let locality = location::ClientLocality {
+            zone_id,
+            ..cache.locality().clone()
+        };
+        cache.set_locality(locality);
+    }
+
+    /// The client's zone id ([`set_client_zone_id`](Self::set_client_zone_id)).
+    pub fn client_zone_id(&self) -> Option<Vec<u8>> {
+        lock(&self.inner.shared.locations)
+            .locality()
+            .zone_id
+            .clone()
     }
 
     /// What the load balancer's queue model and lagging requests hold. For tests.
@@ -1130,12 +1193,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
 
     /// `setCachedLocation`.
     fn cache_location(&self, range: &KeyRange, servers: &[StorageServer]) -> Arc<Location> {
-        let client_dc = self.config.client_dc_id.as_deref();
         let mut cache = lock(&self.locations);
+        let client_dc = cache.locality().dc_id.clone();
         let infos = servers
             .iter()
             .map(|s| {
-                cache.server_info(s, client_dc, |endpoint| {
+                cache.server_info(s, client_dc.as_deref(), |endpoint| {
                     let address = self.peers.primary_address(&endpoint.addresses);
                     (address, self.peers.peer(&address).reference())
                 })

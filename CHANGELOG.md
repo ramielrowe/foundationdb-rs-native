@@ -13,7 +13,8 @@ link `libfdb_c`.
 * **Databases**: `Database::open` (cluster files, with FDB's default lookup and updates when
   the coordinators change), `Database::from_connection_string`, `Database::open_with` over any
   runtime with `DatabaseOptions`; `DatabaseOption` (`MaxWatches`, `SnapshotRywEnable` /
-  `Disable`, the `Transaction*` defaults); `Database::run`, the retry loop, with
+  `Disable`, `LocationCacheSize`, `DatacenterId` (replica preference) and `MachineId`
+  (stored), the `Transaction*` defaults); `Database::run`, the retry loop, with
   `MaybeCommitted`; `shutdown`.
 * **Transactions**, with C++'s read-your-writes semantics (`ReadYourWritesTransaction`: the
   write map, the snapshot cache, read and write conflict ranges as C++ forms them, unreadable
@@ -30,7 +31,8 @@ link `libfdb_c`.
   * storage metrics: `get_estimated_range_size_bytes` and `get_range_split_points`
     (`fdb_c`'s, through the storage servers' `waitMetrics` and `getRangeSplitPoints`);
   * `on_error` with C++'s backoff, retry limit and retry predicates, `reset`, `cancel`,
-    timeouts, used-during-commit protection;
+    timeouts (a deadline that passed kills the transaction even if nothing ran then, as
+    C++'s timer does), used-during-commit protection;
   * `TransactionOption`: the options of `fdb.options` that apply to this client (timeouts,
     retry and size limits, priorities, system keys, lock awareness, read-your-writes and
     snapshot read-your-writes, causal options, conflict reporting, ...).
