@@ -128,7 +128,11 @@
 //! [`certainly_not_delivered`](RequestError::certainly_not_delivered) /
 //! [`should_retry`](RequestError::should_retry) say what a caller may do. A connect failure
 //! before the request was applied is [`RequestError::NotSent`]; the cause is in
-//! [`PeerStatus::last_error`] and the [`PeerEvent::ConnectFailed`] event.
+//! [`PeerStatus::last_error`] and the [`PeerEvent::ConnectFailed`] event. So is a request
+//! whose connection ended before the socket took one byte of it (see
+//! [Written offsets](crate::connection#written-offsets); a TLS session's buffer counts as
+//! taken, and so does whatever was offered to a failed write unless the runtime's sockets
+//! promise [`WRITE_ERRORS_TAKE_NOTHING`](crate::runtime::Runtime::WRITE_ERRORS_TAKE_NOTHING)).
 //!
 //! **Encoders.** The closure runs on the peer's task, with a vector **of its own** (the
 //! manager copies what it wrote into the frame afterwards), so whatever it does to the vector

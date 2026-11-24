@@ -126,6 +126,20 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// this type.
     type Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static;
 
+    /// Whether a `poll_write` on [`Stream`](Runtime::Stream) that returns an error took none
+    /// of the buffer it was given, as `write(2)` does and [`std::io::Write::write`]'s contract
+    /// says ("if an error is returned then no bytes in the buffer were written").
+    ///
+    /// The peer manager relies on it when a write fails: with `true`, a request none of whose
+    /// bytes were accepted by an earlier write is reported
+    /// [not sent](crate::rpc::RequestError::NotSent), safe to retry; with `false` (the
+    /// default, always safe), every byte offered to the failed write counts as possibly
+    /// delivered (see [Written offsets](crate::connection#written-offsets)). A stream that
+    /// buffers inside `poll_write` and can fail after taking part of the buffer must leave it
+    /// `false`. (TLS streams, made by a [`StreamWrapper`](crate::peer::StreamWrapper), are
+    /// always treated as `false`.)
+    const WRITE_ERRORS_TAKE_NOTHING: bool = false;
+
     /// Handle to a task started by [`spawn`](Runtime::spawn), yielding `T`.
     type Task<T: Send + 'static>: TaskHandle<T>;
 

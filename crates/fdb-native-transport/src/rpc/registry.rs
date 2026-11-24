@@ -64,8 +64,10 @@ pub enum RequestState {
     /// If the connection ends before [`Event::Connected`], the request was not sent
     /// ([`RequestError::NotSent`]).
     Queued,
-    /// Put on an established connection: it may have been delivered. If the connection ends
-    /// before the reply, the request fails with [`RequestError::MaybeDelivered`].
+    /// Put on an established connection's output. If the connection ends before the reply,
+    /// the request fails with [`RequestError::NotSent`] if not one byte of its frame was
+    /// handed to the transport ([`Connection::maybe_written`]), and with
+    /// [`RequestError::MaybeDelivered`] otherwise.
     Sent,
 }
 
@@ -153,6 +155,9 @@ struct Pending<K> {
     state: RequestState,
     /// Order of sending, to complete requests that fail together in that order.
     seq: u64,
+    /// The offset of its frame's first byte in the connection's output stream
+    /// ([`Connection::output_offset`]).
+    offset: u64,
 }
 
 /// A connection event without the borrow.
@@ -273,6 +278,14 @@ impl<K> ReplyRegistry<K> {
         self.pending.get(&reply_token).map(|p| p.endpoint)
     }
 
+    /// The offset of the pending request's frame in its connection's output stream
+    /// ([`Connection::output_offset`] when it was sent). Once the connection has ended, the
+    /// request was never handed to the transport if this is at or past
+    /// [`Connection::maybe_written`].
+    pub fn frame_offset(&self, reply_token: Uid) -> Option<u64> {
+        self.pending.get(&reply_token).map(|p| p.offset)
+    }
+
     /// How many requests to the remote endpoint `endpoint` are pending.
     pub fn pending_to(&self, endpoint: Uid) -> usize {
         self.by_endpoint.get(&endpoint).map_or(0, HashSet::len)
@@ -352,8 +365,9 @@ impl<K> ReplyRegistry<K> {
         F: FnOnce(Uid, &mut Vec<u8>) -> Result<(), EncodeError>,
     {
         let token = self.prepare(conn, endpoint)?;
+        let offset = conn.output_offset();
         let sent = conn.send_with(endpoint, |out| write(token, out));
-        self.finish_send(conn, endpoint, key, token, sent)
+        self.finish_send(conn, endpoint, key, (token, offset), sent)
     }
 
     /// Sends the request `build(reply_token)` (a message whose `ReplyPromise` field is
@@ -371,8 +385,10 @@ impl<K> ReplyRegistry<K> {
         F: FnOnce(Uid) -> R,
     {
         let token = self.prepare(conn, endpoint)?;
-        let sent = conn.send_message(endpoint, &build(token));
-        self.finish_send(conn, endpoint, key, token, sent)
+        let message = build(token);
+        let offset = conn.output_offset();
+        let sent = conn.send_message(endpoint, &message);
+        self.finish_send(conn, endpoint, key, (token, offset), sent)
     }
 
     /// Binds the registry to `conn` (see [Binding](Self#binding-to-a-connection)), and marks
@@ -447,7 +463,7 @@ impl<K> ReplyRegistry<K> {
         conn: &mut Connection,
         endpoint: Uid,
         key: K,
-        token: Uid,
+        (token, offset): (Uid, u64),
         sent: Result<(), SendError<EncodeError>>,
     ) -> Result<Uid, RequestError> {
         if let Err(e) = sent {
@@ -475,6 +491,7 @@ impl<K> ReplyRegistry<K> {
                 endpoint,
                 state,
                 seq,
+                offset,
             },
         );
         self.by_endpoint.entry(endpoint).or_default().insert(token);
@@ -526,8 +543,9 @@ impl<K> ReplyRegistry<K> {
     ///   C++ ignores it. [`Event::UnauthorizedEndpoint`]: the same, with
     ///   [`RequestError::Unauthorized`]. Each gives [`RpcEvent::EndpointFailed`] the first time.
     /// * [`Event::Closed`]: every pending request fails, [`NotSent`](RequestError::NotSent) if
-    ///   the connection's handshake never completed
-    ///   ([`Connection::was_established`]) and [`MaybeDelivered`](RequestError::MaybeDelivered)
+    ///   not one byte of its frame was handed to the transport (the handshake never completed,
+    ///   [`Connection::was_established`], or its frame starts at or past
+    ///   [`Connection::maybe_written`]) and [`MaybeDelivered`](RequestError::MaybeDelivered)
     ///   otherwise; then [`RpcEvent::Closed`].
     /// * Other frames and unknown tokens are passed on.
     ///
@@ -641,25 +659,33 @@ impl<K> ReplyRegistry<K> {
     }
 
     /// The connection ended: every pending request fails, then `Closed` is given (if
-    /// `give_closed`). A request was sent if the handshake ever completed: frames held before
-    /// it were then released to the output.
+    /// `give_closed`). A request was not sent if not one byte of its frame was handed to the
+    /// transport: its frame starts at or past [`Connection::maybe_written`], which is final
+    /// now that the connection has ended (its output is discarded). That covers the frames
+    /// held during a handshake that never completed, which the connection discarded; they are
+    /// also told apart by the handshake, as a second, independent reason. Every other request
+    /// may have been delivered, if only its first byte was written.
     fn close_all(
         &mut self,
         conn: &mut Connection,
         error: Option<ConnectionError>,
         give_closed: bool,
     ) {
+        debug_assert_eq!(conn.state(), ConnectionState::Closed);
         let established = conn.was_established();
+        let reached = conn.maybe_written();
         let mut all: Vec<(Uid, Pending<K>)> = self.pending.drain().collect();
         self.by_endpoint.clear();
         self.queued = 0;
         all.sort_by_key(|(_, p)| p.seq);
         for (token, pending) in all {
             conn.unregister(token);
-            let result = Err(if established || pending.state == RequestState::Sent {
-                RequestError::MaybeDelivered(error.clone())
-            } else {
+            let held_and_discarded = !established && pending.state == RequestState::Queued;
+            let unwritten = pending.offset >= reached;
+            let result = Err(if held_and_discarded || unwritten {
                 RequestError::NotSent(error.clone())
+            } else {
+                RequestError::MaybeDelivered(error.clone())
             });
             self.queue.push_back(RpcEvent::Completion(Completion {
                 key: pending.key,

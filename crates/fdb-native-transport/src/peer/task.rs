@@ -37,6 +37,12 @@ type BoxedSleep<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// How much is read from the socket at once.
 const READ_SIZE: usize = 16 * 1024;
 
+/// The most offered to one write on a stream that may take part of its buffer before failing
+/// (see [`Run::write_errors_take_nothing`]): if the write fails, these bytes count as possibly
+/// delivered, and what lies past them was certainly not written. (rustls buffers at most 64 KiB
+/// of plaintext by default, so a TLS stream takes no more than this at once anyway.)
+const UNSURE_WRITE_MAX: usize = 64 * 1024;
+
 /// The capacity above which the vector encoders write into is dropped after use instead of kept.
 const SCRATCH_KEEP: usize = 1 << 20;
 
@@ -195,6 +201,35 @@ struct Run<'a, R: Runtime, S> {
     established: bool,
     needs_flush: bool,
     sleep: Option<(Instant, BoxedSleep<'a>)>,
+    /// Whether a failed write on `stream` took nothing ([`Runtime::WRITE_ERRORS_TAKE_NOTHING`]
+    /// for a plain socket; never for a TLS stream). Otherwise the bytes offered to a failed
+    /// write count as possibly delivered.
+    write_errors_take_nothing: bool,
+}
+
+impl<R: Runtime, S: AsyncWrite + Unpin> Run<'_, R, S> {
+    /// The bytes to offer to the next write: everything pending, or a bounded prefix of it
+    /// on a stream whose failed writes may have taken part of their buffer.
+    fn offer_len(&self) -> usize {
+        let pending = self.conn.pending_output().len();
+        if self.write_errors_take_nothing {
+            pending
+        } else {
+            pending.min(UNSURE_WRITE_MAX)
+        }
+    }
+
+    /// A write of the first `offered` bytes failed with `error`: the connection ends, with
+    /// the offered bytes counted as possibly delivered unless the stream guarantees that a
+    /// failed write takes nothing.
+    fn write_error(&mut self, offered: usize, error: std::io::Error) {
+        let now = self.rt.now();
+        if self.write_errors_take_nothing {
+            self.conn.io_error(error, now);
+        } else {
+            self.conn.write_failed(offered, error, now);
+        }
+    }
 }
 
 /// The task of one peer. See the [module documentation](super).
@@ -545,7 +580,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     return true;
                 }
             };
-            let error = match self.run_connection(stream, announce).await {
+            // Only the runtime's own socket can promise that a failed write took nothing: a
+            // TLS session may have encrypted part of the buffer before the socket failed.
+            let exact = R::WRITE_ERRORS_TAKE_NOTHING && matches!(stream, MaybeTls::Plain(_));
+            let error = match self.run_connection(stream, announce, exact).await {
                 RunEnd::Shutdown => return false,
                 RunEnd::Closed(error) => error,
             };
@@ -995,8 +1033,14 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         Poll::Pending
     }
 
-    /// Runs one connection over `stream` until it ends.
-    async fn run_connection<S>(&mut self, stream: S, announce: ProtocolVersion) -> RunEnd
+    /// Runs one connection over `stream` until it ends. `write_errors_take_nothing`: see
+    /// [`Run::write_errors_take_nothing`].
+    async fn run_connection<S>(
+        &mut self,
+        stream: S,
+        announce: ProtocolVersion,
+        write_errors_take_nothing: bool,
+    ) -> RunEnd
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1036,6 +1080,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             established: false,
             needs_flush: false,
             sleep: None,
+            write_errors_take_nothing,
         };
 
         let end = poll_fn(|cx| self.poll_run(&mut run, cx)).await;
@@ -1065,19 +1110,29 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let rt = self.rt();
-        let Run { conn, stream, .. } = run;
+        // A write is polled to completion inside one poll of `work`, and its count reported
+        // at once: the timeout can only drop `work` while a write is pending, which took
+        // nothing.
         let work = async {
-            while !conn.pending_output().is_empty() {
-                let written =
-                    poll_fn(|cx| Pin::new(&mut *stream).poll_write(cx, conn.pending_output()))
-                        .await;
+            while !run.conn.pending_output().is_empty() {
+                let offered = run.offer_len();
+                let written = poll_fn(|cx| {
+                    Pin::new(&mut run.stream).poll_write(cx, &run.conn.pending_output()[..offered])
+                })
+                .await;
                 match written {
-                    Ok(n) if n > 0 => conn.consume_output(n),
-                    _ => return,
+                    Ok(n) if n > 0 => run.conn.consume_output(n),
+                    Ok(_) => return,
+                    Err(e) => {
+                        // What it may have taken counts, though the requests have completed
+                        // (as cancelled) already.
+                        run.write_error(offered, e);
+                        return;
+                    }
                 }
             }
-            let _ = poll_fn(|cx| Pin::new(&mut *stream).poll_flush(cx)).await;
-            let _ = poll_fn(|cx| Pin::new(&mut *stream).poll_close(cx)).await;
+            let _ = poll_fn(|cx| Pin::new(&mut run.stream).poll_flush(cx)).await;
+            let _ = poll_fn(|cx| Pin::new(&mut run.stream).poll_close(cx)).await;
         };
         let _ = timeout(&rt, self.shared.config.shutdown_timeout, work).await;
     }
@@ -1094,13 +1149,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Drop for PeerTask<R, W> {
 
 /// Writes the connection's output until the socket would block, then flushes. Returns whether
 /// anything was written (or the socket failed).
+///
+/// Every byte a write may have taken is reported to the connection before anything else
+/// happens to it (see [Written offsets](crate::connection#written-offsets)): `Ok(n)` is
+/// consumed at once (bytes a TLS session took count, flushed or not), `Pending` took nothing,
+/// `Ok(0)` took nothing, and an error took nothing only on a stream that promises so;
+/// otherwise the bytes offered to it count as possibly delivered.
 fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
     run: &mut Run<'_, R, S>,
     cx: &mut Context<'_>,
 ) -> bool {
     let mut progress = false;
     while !run.conn.pending_output().is_empty() {
-        match Pin::new(&mut run.stream).poll_write(cx, run.conn.pending_output()) {
+        let offered = run.offer_len();
+        let buf = &run.conn.pending_output()[..offered];
+        match Pin::new(&mut run.stream).poll_write(cx, buf) {
             Poll::Ready(Ok(0)) => {
                 run.conn
                     .io_error(std::io::ErrorKind::WriteZero, run.rt.now());
@@ -1112,7 +1175,7 @@ fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
                 progress = true;
             }
             Poll::Ready(Err(e)) => {
-                run.conn.io_error(e, run.rt.now());
+                run.write_error(offered, e);
                 return true;
             }
             Poll::Pending => return progress,
