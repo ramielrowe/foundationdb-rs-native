@@ -255,6 +255,19 @@ impl<R: Runtime> Batcher<R> {
 
 type InFlight = Pin<Box<dyn Future<Output = f64> + Send>>;
 
+/// How many batches in a row of a single request make the batcher stop waiting for company
+/// while no read version request is in flight. A transaction that asks for its read version
+/// only after the previous one's reply (a serial client, concurrency 1) leaves nothing to join
+/// the batch, and waiting out `batchTime` below the timer resolution means polling the clock
+/// (about 25 us of CPU per transaction on tokio, measured). The first request of the next
+/// batch is then sent after the usual yield, which still lets the other tasks of that moment
+/// add theirs. Any other state waits as C++ does: a batch that gathered more than one request,
+/// or a request that arrives while another batch is in flight (another transaction is running
+/// concurrently), restores the wait, and with it the batch sizes the wait produces (about 6 at
+/// 16 concurrent transactions, 60 at 256). C++ always waits `batchTime`, but sleeps in its
+/// reactor instead of polling. Bead `foundationdb-rs-native-yw5`.
+const LONE_BATCHES_BEFORE_NO_WAIT: u32 = 2;
+
 /// How many polls in a row may read the same [`Runtime::now`] before a [`BatchDelay`] stops
 /// yielding and sleeps instead: a clock that stands still while tasks run is virtual (tokio's
 /// paused clock moves only when every task waits on a timer), and yielding would never reach
@@ -274,6 +287,8 @@ const FROZEN_CLOCK_POLLS: u32 = 64;
 /// join the batch, as in C++ (sending after a single yield instead made batches 3 to 5 times
 /// smaller under load; see `docs/benchmarks.md`). The cost is the polling, for less than one
 /// resolution per batch. A longer wait, or any wait on a precise timer, sleeps.
+///
+/// The polling is pure cost when nothing can join: see [`LONE_BATCHES_BEFORE_NO_WAIT`].
 enum BatchDelay<'a, R: Runtime> {
     /// On the runtime's timer.
     Sleep(Pin<Box<dyn Future<Output = ()> + Send + 'a>>),
@@ -350,6 +365,8 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
     let mut pending: Vec<Waiter> = Vec::new();
     let mut timer: Option<BatchDelay<'_, R>> = None;
     let mut in_flight: Vec<InFlight> = Vec::new();
+    // Batches in a row that held one request.
+    let mut lone_batches = 0_u32;
     let mut closed = false;
 
     poll_fn(|cx| {
@@ -366,7 +383,12 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
                         if pending.len() >= max_batch {
                             send = true;
                         } else if timer.is_none() {
-                            timer = Some(BatchDelay::new(&shared.rt, batch_time));
+                            let alone =
+                                in_flight.is_empty() && lone_batches >= LONE_BATCHES_BEFORE_NO_WAIT;
+                            timer = Some(BatchDelay::new(
+                                &shared.rt,
+                                if alone { 0.0 } else { batch_time },
+                            ));
                             new_timer = true;
                         }
                     }
@@ -391,6 +413,11 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
                 progress = true;
                 timer = None;
                 let waiters = std::mem::take(&mut pending);
+                lone_batches = if waiters.len() == 1 {
+                    lone_batches.saturating_add(1)
+                } else {
+                    0
+                };
                 in_flight.push(Box::pin(send_batch(shared.clone(), key, waiters)));
             } else if send {
                 timer = None;
