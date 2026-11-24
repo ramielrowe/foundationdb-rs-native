@@ -3,8 +3,12 @@
 //! [`Runtime`] bundles the four things the transport needs from an async
 //! executor: TCP connect, timers (with a monotonic clock), task spawning, and
 //! DNS resolution. No executor-specific type appears in it, so the transport
-//! can run on any executor that has an adapter. The tokio adapter,
-//! `TokioRuntime`, is behind the default-on `tokio` cargo feature.
+//! can run on any executor that has an adapter. There are two, each behind a cargo feature:
+//! `TokioRuntime` (the default-on `tokio` feature) and `SmolRuntime` (the `smol` feature:
+//! async-io, async-executor and `blocking`, for smol or any executor that can run an
+//! `async_executor::Executor`). Pick one by the type you give the peer manager, or write
+//! another adapter against this contract. Both pass the same adapter tests and run the
+//! transport's and the client's end-to-end tests.
 //!
 //! # Design
 //!
@@ -109,9 +113,13 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 mod time;
 
+#[cfg(feature = "smol")]
+mod smol_rt;
 #[cfg(feature = "tokio")]
 mod tokio_rt;
 
+#[cfg(feature = "smol")]
+pub use smol_rt::{SmolRuntime, SmolStream, SmolTask};
 pub use time::{Instant, ManualClock};
 #[cfg(feature = "tokio")]
 pub use tokio_rt::{TokioRuntime, TokioStream, TokioTask};

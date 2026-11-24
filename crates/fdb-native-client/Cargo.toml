@@ -15,6 +15,9 @@ default = ["tokio"]
 # `Database::open` and friends on tokio (`TokioRuntime`), and `TokioRuntime` as the default
 # runtime type parameter. Without it the client works over any `Runtime` (`Database::open_with`).
 tokio = ["fdb-native-transport/tokio"]
+# `SmolRuntime` (async-io sockets and timers, async-executor tasks) as an adapter to open a
+# `Database` over (`Database::open_with(SmolRuntime::new(), ..)`). Independent of `tokio`.
+smol = ["fdb-native-transport/smol"]
 # TLS: clusters whose coordinators are `:tls` (and `DatabaseOptions::tls`), through the
 # transport's rustls layer.
 tls = ["fdb-native-transport/tls"]
@@ -74,6 +77,11 @@ required-features = ["tokio"]
 [[example]]
 name = "options"
 required-features = ["tokio"]
+
+# On smol instead: `--no-default-features --features smol`.
+[[example]]
+name = "smol"
+required-features = ["smol"]
 
 [[example]]
 name = "tls"
