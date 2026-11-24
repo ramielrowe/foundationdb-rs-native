@@ -1,0 +1,20 @@
+{
+  "what": "foundationdb-rs-native-rrx and -51w: the native client with both (93dd0a6: main at 03c5e9b merged); before and libfdb_c are in ../single-4t-rrx-51w",
+  "cluster": "single (fdb-bench serve: one fdbserver, single memory, testkit container)",
+  "image": "foundationdb/foundationdb:7.4.10",
+  "backends": [
+    "native"
+  ],
+  "threads": [
+    "4"
+  ],
+  "workloads": [
+    "get",
+    "scan",
+    "mixed"
+  ],
+  "reps": 3,
+  "duration_s": 8.0,
+  "warmup_s": 2.0,
+  "method": "`fdb-bench worker` cells of two frame-pointer builds (before, after) run against one `fdb-bench serve` cluster; per repetition and workload the order of native-before, native-after and libfdb_c rotates; load1 is the host's 1-minute load average when the cell started (3.0 to 5.3, median 4.0); `build` names the build (c, base, new)"
+}
