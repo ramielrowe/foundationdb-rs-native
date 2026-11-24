@@ -18,7 +18,8 @@ use fdb_native_transport::ConnectionError;
 use fdb_native_transport::connection::well_known;
 use fdb_native_transport::peer::{
     EndpointFailure, EndpointStatus, EventReceiver, FailureMonitor, Generation, NoTls, PeerError,
-    PeerEvent, PeerManager, PeerManagerConfig, PeerPhase, SendError, event_channel,
+    PeerEvent, PeerEventRecord, PeerManager, PeerManagerConfig, PeerPhase, SendError,
+    event_channel,
 };
 use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::TokioRuntime;
@@ -580,6 +581,87 @@ async fn an_unreferenced_failed_peer_is_not_probed() {
     let before = net.connects(sock(4501));
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(net.connects(sock(4501)), before);
+}
+
+/// A peer marked failed stops probing while nothing references it; referenced again (a
+/// recovery put the proxies back on a host the client had given up on) it is probed again,
+/// as C++ does (`connectionKeeper`'s `retryConnect` outlives the references, and a `Peer`
+/// made anew resets the address to available). Otherwise the address stays failed for good
+/// and everything waiting for it hangs. Found by the deterministic simulation
+/// (`fdb-native-sim`, seed 294: GRV and commits waited forever for proxies on a restarted
+/// process).
+#[tokio::test(start_paused = true)]
+async fn a_failed_peer_referenced_again_is_probed() {
+    let net = Net::new(); // nothing listens yet
+    let address = na(sock(4500), false);
+    let (mgr, _events) = manager(&net, config());
+    let fm: FailureMonitor = mgr.failure_monitor().clone();
+    let peer = mgr.peer(&address);
+    let reference = peer.reference();
+    while !fm.is_failed(&address) {
+        let _ = peer.connect().await;
+    }
+    // Released: the probes stop.
+    drop(reference);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = net.connects(sock(4500));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(net.connects(sock(4500)), before);
+
+    // The server is back, and the peer is referenced again: it is probed and recovers.
+    let server = listen_one(&net, sock(4500), Script::new(V74));
+    let _again = peer.reference();
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        fm.wait_address_failed(&address, false),
+    )
+    .await
+    .expect("the re-referenced peer is probed within 5 s");
+    assert!(!recovered.failed);
+    assert_eq!(server.connections(), 1);
+}
+
+/// A peer made anew for an address marked failed (its old peer was removed: nothing used it)
+/// makes the address available again, as C++'s `Peer::Peer` does
+/// (`setStatus(destination, FailureStatus(false))`, FlowTransport 7.4:1104-1113). Otherwise
+/// a caller that references the peer only while it looks for a live alternative (the
+/// committer's read version for its dummy transaction) skips it, drops it, and the peer is
+/// removed again before it could probe: the address stays failed for good. Found by the
+/// deterministic simulation (`fdb-native-sim`, seed 294).
+#[tokio::test(start_paused = true)]
+async fn a_new_peer_makes_its_failed_address_available() {
+    let net = Net::new(); // nothing listens yet
+    let address = na(sock(4500), false);
+    let (mgr, mut events) = manager(&net, config());
+    let fm: FailureMonitor = mgr.failure_monitor().clone();
+    {
+        let peer = mgr.peer(&address);
+        let _reference = peer.reference();
+        while !fm.is_failed(&address) {
+            let _ = peer.connect().await;
+        }
+    }
+    // Unreferenced, unused: the peer is removed; the address stays marked failed.
+    loop {
+        if let PeerEventRecord {
+            event: PeerEvent::Removed,
+            ..
+        } = events.next().await.expect("events")
+        {
+            break;
+        }
+    }
+    assert!(fm.is_failed(&address));
+
+    // The server is back. A new peer for the address: available, and requests go out.
+    let _server = listen_one(&net, sock(4500), Script::echo(V74));
+    let peer = mgr.peer(&address);
+    assert!(!fm.is_failed(&address), "a new peer resets its address");
+    let reply = peer
+        .request_as::<EchoReply, _>(token(7), echo_encode(7))
+        .await
+        .unwrap();
+    assert_eq!(reply.value, 7 + ECHO_ADDS);
 }
 
 #[tokio::test(start_paused = true)]
