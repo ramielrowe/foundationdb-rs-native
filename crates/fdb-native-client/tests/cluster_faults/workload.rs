@@ -5,7 +5,7 @@
 //! * **bank** workers: random transfers between accounts in `Database::run`, each writing a
 //!   transfer record (its idempotency marker) in the same transaction. A retry after a maybe
 //!   committed attempt reads the record first and stops if it is there.
-//! * **counter** workers: `ADD_VALUE 1` on one counter, with a marker key in the same
+//! * **counter** workers: `Add 1` on one counter, with a marker key in the same
 //!   transaction, through `Database::run` (unlimited retries) or with `RETRY_LIMIT` 3 (the
 //!   *limited* workers, whose errors come back to the caller during long faults).
 //! * **raw** workers: the same increment, committed once with `Transaction::commit` and no
@@ -615,7 +615,7 @@ async fn counter_worker(s: Arc<Shared>, kind: Kind, w: usize) {
                     if maybe_committed.0 && s.recheck(&tx, &marker).await? {
                         return Ok(());
                     }
-                    tx.atomic_op(COUNTER_KEY, &1i64.to_le_bytes(), MutationType::ADD_VALUE);
+                    tx.atomic_op(COUNTER_KEY, &1i64.to_le_bytes(), MutationType::Add);
                     tx.set(&marker, b"");
                     Ok(())
                 }
@@ -635,7 +635,7 @@ async fn raw_worker(s: Arc<Shared>, w: usize) {
         let tx = s.db.create_transaction();
         let result = async {
             tx.set_option(TransactionOption::Timeout(Duration::from_secs(10)))?;
-            tx.atomic_op(COUNTER_KEY, &1i64.to_le_bytes(), MutationType::ADD_VALUE);
+            tx.atomic_op(COUNTER_KEY, &1i64.to_le_bytes(), MutationType::Add);
             tx.set(&marker, b"");
             tx.commit().await
         }
@@ -710,7 +710,8 @@ async fn range_reader(s: Arc<Shared>, w: usize, seed: u64) {
             tx.set_option(TransactionOption::Timeout(OP_TIMEOUT))?;
             let version = tx.get_read_version().await?;
             let options = RangeOptions::default().mode(mode).reverse(reverse);
-            let rows = collect_stream(tx.range_stream(fge(&begin), fge(&end), options)).await?;
+            let rows =
+                collect_stream(tx.get_ranges_keyvalues(fge(&begin), fge(&end), options)).await?;
             // The same snapshot, by the reader in one unlimited read.
             let whole =
                 s.db.reader()
@@ -968,7 +969,7 @@ async fn read_prefix(
 ) -> Result<Vec<KeyValue>, Error> {
     let mut end = prefix.to_vec();
     *end.last_mut().unwrap() += 1;
-    collect_stream(tx.range_stream(
+    collect_stream(tx.get_ranges_keyvalues(
         KeySelector::first_greater_or_equal(prefix.to_vec()),
         KeySelector::first_greater_or_equal(end),
         RangeOptions::default().mode(StreamingMode::WantAll),
