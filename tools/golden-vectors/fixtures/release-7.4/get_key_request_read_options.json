@@ -1,0 +1,190 @@
+{
+  "format_version": 1,
+  "name": "get_key_request_read_options",
+  "group": "storage",
+  "kind": "positive",
+  "description": "GetKeyRequest as fdb-native-client sends it with READ_PRIORITY_HIGH and LOCK_AWARE: options type HIGH, cacheResult true, lockAware true (debugID and consistencyCheckStartVersion absent), tags absent, an empty VersionVector.",
+  "cpp_type": "GetKeyRequest",
+  "file_identifier": 10457870,
+  "file_identifier_hex": "0x009f930e",
+  "size": 296,
+  "bytes": "5c0000000e939f0006000800040018002a000c00040028001000140018001c002900200024000600140004000a001d00040014001c000a001100040010000c0012001400040010001100080012000c0013000a000d0004000c00080054000000040000005600000002409452a303000098000000000000007c000000580000003c000000240000000c0000000001000000000000100000000000000000000000ffffffffffffffff680000000400000000000000000000000100000186000000ffffffffffffffff000000000000000000000000a800000000000000000000000000000000000000000000000000000000000000ce0000000c00000000009d5e0c00000000009d7eb60000000c0000000100000000000000090000007072696f2f68696768000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<GetKeyRequest>",
+        "value": [
+          {
+            "field": "sel",
+            "slot": 0,
+            "type": "table<KeySelectorRef>",
+            "value": [
+              {
+                "field": "key",
+                "slot": 0,
+                "type": "bytes",
+                "value": "7072696f2f68696768"
+              },
+              {
+                "field": "orEqual",
+                "slot": 1,
+                "type": "bool",
+                "value": false
+              },
+              {
+                "field": "offset",
+                "slot": 2,
+                "type": "i32",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "field": "version",
+            "slot": 1,
+            "type": "i64",
+            "value": 4000000000002
+          },
+          {
+            "field": "tags",
+            "slot": 2,
+            "type": "optional<tag_set>",
+            "tag": 0,
+            "value": null
+          },
+          {
+            "field": "reply",
+            "slot": 4,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798988,
+                  "second": 9123448420122492940
+                }
+              }
+            ]
+          },
+          {
+            "field": "spanContext",
+            "slot": 5,
+            "type": "table<SpanContext>",
+            "value": [
+              {
+                "field": "traceID",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 0,
+                  "second": 0
+                }
+              },
+              {
+                "field": "spanID",
+                "slot": 1,
+                "type": "u64",
+                "value": 0
+              },
+              {
+                "field": "m_Flags",
+                "slot": 2,
+                "type": "u8",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "field": "tenantInfo",
+            "slot": 6,
+            "type": "table<TenantInfo>",
+            "value": [
+              {
+                "field": "tenantId",
+                "slot": 0,
+                "type": "i64",
+                "value": -1
+              },
+              {
+                "field": "token",
+                "slot": 1,
+                "type": "optional<table<WipedString>>",
+                "tag": 0,
+                "value": null
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          },
+          {
+            "field": "options",
+            "slot": 7,
+            "type": "optional<table<ReadOptions>>",
+            "tag": 1,
+            "value": {
+              "type": "table<ReadOptions>",
+              "value": [
+                {
+                  "field": "type",
+                  "slot": 0,
+                  "type": "i32",
+                  "value": 4
+                },
+                {
+                  "field": "cacheResult",
+                  "slot": 1,
+                  "type": "bool",
+                  "value": true
+                },
+                {
+                  "field": "debugID",
+                  "slot": 2,
+                  "type": "optional<uid>",
+                  "tag": 0,
+                  "value": null
+                },
+                {
+                  "field": "consistencyCheckStartVersion",
+                  "slot": 4,
+                  "type": "optional<i64>",
+                  "tag": 0,
+                  "value": null
+                },
+                {
+                  "field": "lockAware",
+                  "slot": 6,
+                  "type": "bool",
+                  "value": true
+                }
+              ]
+            }
+          },
+          {
+            "field": "ssLatestCommitVersions",
+            "slot": 9,
+            "type": "version_vector",
+            "value": {
+              "versions": [],
+              "maxVersion": -1
+            }
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

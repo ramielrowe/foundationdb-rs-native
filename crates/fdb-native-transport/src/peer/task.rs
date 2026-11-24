@@ -646,6 +646,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     self.emit(PeerEvent::ConnectFailed {
                         error: error.clone(),
                     });
+                    self.shared.failures.connect_failed(
+                        &self.peer.address,
+                        rt.now(),
+                        self.shared.config.connect_failed_count_ttl,
+                    );
                     self.notify_disconnect();
                     self.record_failure(error);
                     return true;

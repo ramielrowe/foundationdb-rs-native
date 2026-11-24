@@ -11,8 +11,8 @@
 mod support;
 
 use fdb_native_schema::domain::{
-    Commit, GetKey, GetKeyServerLocations, GetKeyValues, GetReadVersion, GetValue,
-    OpenDatabaseCoord, SplitRange, WaitMetrics, WatchValue,
+    Commit, GetKey, GetKeyServerLocations, GetKeyValues, GetReadVersion, GetValue, KeySelector,
+    OpenDatabaseCoord, ReadOptions, SplitRange, WaitMetrics, WatchValue,
 };
 use fdb_native_schema::{Request, SchemaVersion, v7_4, v8_0};
 use fdb_native_wire::{DecodeError, EnsureTable, ErrorOr, FileIdentified, decode, encode};
@@ -258,6 +258,14 @@ fn release_7_4() -> Vec<Outcome> {
             "get_value_request_minimal",
             "GetValueRequest"
         ),
+        check_request!(
+            GetValueRequest,
+            GetValue,
+            V,
+            "release-7.4",
+            "get_value_request_read_options",
+            "GetValueRequest"
+        ),
         check!(
             GetValueReply,
             "release-7.4",
@@ -296,6 +304,14 @@ fn release_7_4() -> Vec<Outcome> {
             "get_key_request",
             "GetKeyRequest"
         ),
+        check_request!(
+            GetKeyRequest,
+            GetKey,
+            V,
+            "release-7.4",
+            "get_key_request_read_options",
+            "GetKeyRequest"
+        ),
         check!(GetKeyReply, "release-7.4", "get_key_reply", "GetKeyReply"),
         check_reply!(
             GetKeyReply,
@@ -311,6 +327,14 @@ fn release_7_4() -> Vec<Outcome> {
             V,
             "release-7.4",
             "get_key_values_request",
+            "GetKeyValuesRequest"
+        ),
+        check_request!(
+            GetKeyValuesRequest,
+            GetKeyValues,
+            V,
+            "release-7.4",
+            "get_key_values_request_read_options",
             "GetKeyValuesRequest"
         ),
         check!(
@@ -547,6 +571,14 @@ fn release_8_0() -> Vec<Outcome> {
             "get_value_request_minimal",
             "GetValueRequest"
         ),
+        check_request!(
+            GetValueRequest,
+            GetValue,
+            V,
+            "release-8.0",
+            "get_value_request_read_options",
+            "GetValueRequest"
+        ),
         check!(
             GetValueReply,
             "release-8.0",
@@ -585,6 +617,14 @@ fn release_8_0() -> Vec<Outcome> {
             "get_key_request",
             "GetKeyRequest"
         ),
+        check_request!(
+            GetKeyRequest,
+            GetKey,
+            V,
+            "release-8.0",
+            "get_key_request_read_options",
+            "GetKeyRequest"
+        ),
         check!(GetKeyReply, "release-8.0", "get_key_reply", "GetKeyReply"),
         check_reply!(
             GetKeyReply,
@@ -600,6 +640,14 @@ fn release_8_0() -> Vec<Outcome> {
             V,
             "release-8.0",
             "get_key_values_request",
+            "GetKeyValuesRequest"
+        ),
+        check_request!(
+            GetKeyValuesRequest,
+            GetKeyValues,
+            V,
+            "release-8.0",
+            "get_key_values_request_read_options",
             "GetKeyValuesRequest"
         ),
         check!(
@@ -871,6 +919,140 @@ fn cpp_crosscheck_release_readers_decode_rust_messages() {
         }
     }
     println!("{checked} Rust-encoded messages read identically by the release readers");
+}
+
+/// Every `ReadOptions` a transaction of `fdb-native-client` can send: `ReadOptions()` with
+/// the type of `READ_PRIORITY_*`, the `cacheResult` of `READ_SERVER_SIDE_CACHE_*` and the
+/// `lockAware` of `LOCK_AWARE` / `READ_LOCK_AWARE` (no debug id, no consistency check).
+fn client_read_options() -> Vec<ReadOptions> {
+    let mut out = Vec::new();
+    for read_type in [ReadOptions::LOW, ReadOptions::NORMAL, ReadOptions::HIGH] {
+        for cache_result in [true, false] {
+            for lock_aware in [false, true] {
+                out.push(ReadOptions {
+                    read_type,
+                    cache_result,
+                    lock_aware,
+                    ..ReadOptions::default()
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The storage read requests `fdb-native-client` sends with read options, for `version`:
+/// `(cpp_type, bytes, the dump of the bytes as the Rust wire type reads them)`. Each is
+/// shaped as the read path builds it (no tags, a default span, an empty version vector; a
+/// `GetKeyValuesRequest` with `taskID` `DefaultEndpoint` from `getRange` and without from
+/// `getExactRange`), with every [`client_read_options`].
+fn client_read_requests(version: SchemaVersion) -> Vec<(&'static str, Vec<u8>, Value)> {
+    // The dump of `bytes` as the wire type `$ty` of `version` reads it.
+    macro_rules! dump {
+        ($ty:ident, $version:expr, $bytes:expr) => {
+            match $version {
+                SchemaVersion::V7_4 => root1(&decode::<v7_4::$ty>($bytes).expect("7.4 decode")),
+                SchemaVersion::V8_0 => root1(&decode::<v8_0::$ty>($bytes).expect("8.0 decode")),
+            }
+        };
+    }
+    let token = fdb_native_wire::Uid::new(0x5e9d, 0x7e9d);
+    let mut out = Vec::new();
+    for options in client_read_options() {
+        let value = GetValue {
+            key: b"prio/key".to_vec(),
+            version: 4_000_000_000_000,
+            tags: None,
+            span_context: Default::default(),
+            options: Some(options),
+            ss_latest_commit_versions: Default::default(),
+        };
+        let bytes = value.encode_request(version, token).expect("encode");
+        assert_eq!(
+            GetValue::decode_request(version, &bytes),
+            Ok((value, token))
+        );
+        let d = dump!(GetValueRequest, version, &bytes);
+        out.push(("GetValueRequest", bytes, d));
+
+        let key = GetKey {
+            sel: KeySelector::new(b"prio/key".to_vec(), false, 1),
+            version: 4_000_000_000_000,
+            tags: None,
+            span_context: Default::default(),
+            options: Some(options),
+            ss_latest_commit_versions: Default::default(),
+        };
+        let bytes = key.encode_request(version, token).expect("encode");
+        assert_eq!(GetKey::decode_request(version, &bytes), Ok((key, token)));
+        let d = dump!(GetKeyRequest, version, &bytes);
+        out.push(("GetKeyRequest", bytes, d));
+
+        let task_ids: &[Option<i32>] = match version {
+            SchemaVersion::V7_4 => &[None],
+            SchemaVersion::V8_0 => &[Some(5000), None],
+        };
+        for task_id in task_ids {
+            let range = GetKeyValues {
+                begin: KeySelector::new(b"scan/a".to_vec(), false, 1),
+                end: KeySelector::new(b"scan/z".to_vec(), false, 1),
+                version: 4_000_000_000_000,
+                limit: 80_000,
+                limit_bytes: 80_000,
+                tags: None,
+                span_context: Default::default(),
+                options: Some(options),
+                ss_latest_commit_versions: Default::default(),
+                task_id: *task_id,
+            };
+            let bytes = range.encode_request(version, token).expect("encode");
+            assert_eq!(
+                GetKeyValues::decode_request(version, &bytes),
+                Ok((range, token))
+            );
+            let d = dump!(GetKeyValuesRequest, version, &bytes);
+            out.push(("GetKeyValuesRequest", bytes, d));
+        }
+    }
+    out
+}
+
+/// The client's read option requests round-trip through both schema sets, and their
+/// `options` read back as sent.
+#[test]
+fn client_read_option_requests_round_trip() {
+    for version in SchemaVersion::ALL {
+        let requests = client_read_requests(version);
+        let per_options = match version {
+            SchemaVersion::V7_4 => 3,
+            SchemaVersion::V8_0 => 4,
+        };
+        assert_eq!(requests.len(), client_read_options().len() * per_options);
+    }
+}
+
+/// The ignored C++ cross-check of the read options as this client sends them: every
+/// request of [`client_read_requests`] is decoded by each release's own reader, whose dump
+/// must be the Rust one (the same decoders as
+/// [`cpp_crosscheck_release_readers_decode_rust_messages`]).
+#[test]
+#[ignore = "requires the message golden-vectors decoders"]
+fn cpp_crosscheck_release_readers_decode_client_read_options() {
+    let mut checked = 0;
+    for (version, var) in [
+        (SchemaVersion::V7_4, "FDB_GOLDEN_MESSAGES_BIN_7_4"),
+        (SchemaVersion::V8_0, "FDB_GOLDEN_MESSAGES_BIN_8_0"),
+    ] {
+        let bin =
+            std::env::var_os(var).unwrap_or_else(|| panic!("set {var} (see this test's docs)"));
+        for (i, (cpp_type, bytes, rust_dump)) in client_read_requests(version).iter().enumerate() {
+            let what = format!("{version:?} client request {i} ({cpp_type})");
+            let dump = cpp_decode(&bin, cpp_type, bytes, &what);
+            assert_json_eq(&format!("{what}: C++ reading it"), rust_dump, &dump);
+            checked += 1;
+        }
+    }
+    println!("{checked} client read option requests read identically by the release readers");
 }
 
 /// The `root` the release's decoder prints for `bytes` as `cpp_type`.

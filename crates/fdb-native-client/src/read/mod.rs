@@ -145,7 +145,8 @@
 //!   the whole range containing the key; `invalidateCache(range)` every range intersecting
 //!   it. Each replica is interned by server id (`StorageServerInfo::getInterface`) and holds a
 //!   reference to its peer, so connections to the servers of cached shards stay up and a
-//!   failed one is probed until it comes back.
+//!   failed one is probed until it comes back (or [the peer evictor](#the-peer-evictor)
+//!   forgets the ranges that name it).
 //! * **Bound.** Before an insert, while the cache holds `LOCATION_CACHE_EVICTION_SIZE`
 //!   ranges ([`ReadConfig::location_cache_size`], 600 000; ClientKnobs 7.4:99,
 //!   8.0:209; the `LOCATION_CACHE_SIZE` database option changes it,
@@ -160,14 +161,54 @@
 //!   Server entries no range uses any more, their queue model data and their endpoint
 //!   failure records are pruned once they could outnumber the live ones.
 //! * **Not ported:** the TSS mapping (`resultsTssMapping` is ignored: testing storage
-//!   servers only shadow reads for comparison), the tag mapping (version vectors), the
-//!   periodic peer evictor (`LOCATION_CACHE_PEER_EVICTOR_*`, off on 7.4), and tenants.
+//!   servers only shadow reads for comparison), the tag mapping (version vectors), and
+//!   tenants.
+//!
+//! ## The peer evictor
+//!
+//! A cached range keeps its servers' peers referenced, and a referenced peer that failed is
+//! probed every `SERVER_REQUEST_INTERVAL` (1 s) until it comes back. So a storage server that
+//! is gone for good (excluded and removed, its machine dead) would be dialed every second
+//! for as long as a cached range names it: until a read of that range fails over and
+//! invalidates it, which an idle client or one reading other keys never does.
+//!
+//! * **C++.** 8.0 runs `locationCachePeerEvictorActor` (`DatabaseContext.cpp` 8.0:1260-1336,
+//!   started at 1414-1416) when `LOCATION_CACHE_PEER_EVICTOR_ENABLED` (true on 8.0,
+//!   ClientKnobs 8.0:213; 7.4 has the same code, NativeAPI 7.4:1169-1362 and 1826-1828,
+//!   with the knob false, ClientKnobs 7.4:103). Every `LOCATION_CACHE_PEER_EVICTOR_DELAY`
+//!   (60 s) it reads FlowTransport's per-address count of failed connects
+//!   (`getPersistentConnectFailedCounts`: every failed TCP connect or TLS handshake,
+//!   `FlowTransport.actor.cpp` 7.4:886-923, `FlowTransport.cpp` 8.0:980-1016; an address is
+//!   forgotten once it has not failed for `PERSISTENT_CONNECT_FAILED_COUNT_TTL`, 600 s, FlowKnobs
+//!   7.4:56, 8.0:61), takes the addresses whose count grew by more than
+//!   `LOCATION_CACHE_PEER_EVICTOR_FAILED_THRESHOLD` (0) since the last sweep (counting from
+//!   zero if it went down), and `invalidateCacheByAddresses` forgets every cached range with
+//!   a replica at one of them (8.0:1144-1259), which drops the peer references and so the
+//!   probes. The next read of such a range asks a commit proxy, which no longer lists a
+//!   removed server.
+//! * **Here.** The same, with the transport's
+//!   [`FailureMonitor::connect_failures`](fdb_native_transport::peer::FailureMonitor::connect_failures)
+//!   and [`ReadConfig::location_cache_peer_evictor`],
+//!   [`location_cache_peer_evictor_delay`](ReadConfig::location_cache_peer_evictor_delay) and
+//!   [`location_cache_peer_evictor_failed_threshold`](ReadConfig::location_cache_peer_evictor_failed_threshold).
+//!   The task starts with the first cached location and ends with the reader, its
+//!   [`shutdown`](Reader::shutdown), its peer manager's shutdown or its cluster monitor's. The scan is one step:
+//!   `LOCATION_CACHE_PEER_EVICTOR_SCAN_CHUNK` (1 000 000) is above the cache's bound, so C++
+//!   does not yield in it either. A server still in use by a read in progress keeps its peer
+//!   until that read ends.
+//! * **Both releases.** The evictor is on by default whichever release the cluster runs, a
+//!   choice: it only changes what the client caches, so it is the client's behaviour (a C++
+//!   client's is that of the library it loaded, 8.0's for an 8.0 cluster), and on a 7.4
+//!   cluster it spares the cluster the same dials of dead servers for the cost of one
+//!   location lookup per evicted range on its next read, which a C++ 7.4 client pays anyway
+//!   once its read fails over. A server that is only flapping loses its ranges too, as in
+//!   8.0; set `location_cache_peer_evictor` to `false` for 7.4's behaviour.
 //!
 //! ## Values
 //!
 //! * **`getValue`** (7.4:3891-4035, 8.0:1687-1820): locate the key, then `loadBalance` a
-//!   `GetValueRequest(key, version)` (no tags, no read options, no version vector) over its
-//!   replicas. `wrong_shard_server` (1001) and `all_alternatives_failed` (1006) invalidate the
+//!   `GetValueRequest(key, version)` (no tags, no version vector; the transaction's
+//!   [read options](#read-options)) over its replicas. `wrong_shard_server` (1001) and `all_alternatives_failed` (1006) invalidate the
 //!   key's cached location, wait `WRONG_SHARD_SERVER_DELAY` (10 ms;
 //!   [`ReadConfig::wrong_shard_server_delay`]) and start again; any other error is returned:
 //!   `future_version` (1009) and `transaction_too_old` (1007) go to the transaction, which
@@ -257,7 +298,7 @@
 //!   backward). A server's shards span `["", \xff\xff)`, so walking off the database's end
 //!   reaches `\xff\xff` (and the start `""`), which the loop above turns into the answer: an
 //!   offset beyond the database is clamped, as C++ returns `allKeys.end` / `allKeys.begin`.
-//! * **Not ported:** the trace events, tags, read options, the version vector and
+//! * **Not ported:** the trace events, tags, the version vector and
 //!   `connectionFileChanged`, as for values. The endpoint-failure refresh of a reverse
 //!   lookup invalidates the cached range containing the key (not the one before it), as C++
 //!   does (`getKeyLocation`, 7.4:3381, 8.0:1365).
@@ -312,7 +353,7 @@
 //! * **Read conflict ranges** (`getRangeFinished`, 7.4:4849-4895, 8.0:2650-2702) are the
 //!   transaction's ([`Transaction::get_range`](crate::Transaction::get_range)).
 //! * **Not ported:** mapped ranges (`getMappedRange`), `getRangeStream`, the tenant prefix,
-//!   the version vector, tags, read options, BUGGIFY's random truncation, and trace events.
+//!   the version vector, tags, BUGGIFY's random truncation, and trace events.
 //!   Not in C++: a forward read whose begin resolves at the end of the key space returns
 //!   what it has (C++ would look up the shard of `\xff\xff`), and a reverse one whose end
 //!   does reads up to `\xff\xff`. A reply with `more` but no rows, or with more rows than
@@ -370,6 +411,50 @@
 //!   goes beyond it), and a `chunk_size` below 1 is `client_invalid_operation` (a storage
 //!   server's walk of its byte sample may never end for a negative one). The parts' sum saturates.
 //!
+//! ## Read options
+//!
+//! A storage read request has an `Optional<ReadOptions> options` (`StorageServerInterface.h`:
+//! `GetValueRequest`, `GetKeyRequest`, `GetKeyValuesRequest`, and `GetMappedKeyValuesRequest`,
+//! which this client does not send; `WatchValueRequest` has none): `type` (`ReadType`),
+//! `cacheResult`, `debugID`, `consistencyCheckStartVersion` and `lockAware` (`FDBTypes.h`
+//! 7.4:1730-1759, 8.0:1652-1681; `type` is an `int32_t` enum on 7.4 and a `uint32_t` one on
+//! 8.0, with the same values).
+//!
+//! * **When it is sent.** C++ keeps it in `trState->readOptions`, absent until a transaction
+//!   option makes it present: `READ_PRIORITY_LOW/NORMAL/HIGH` set `type`
+//!   (`ReadType::LOW`/`NORMAL`/`HIGH`), `READ_SERVER_SIDE_CACHE_ENABLE/DISABLE` set
+//!   `cacheResult`, each on `readOptions.withDefault(ReadOptions())` (NativeAPI 7.4:7561-7579,
+//!   8.0:5254-5272), and `LOCK_AWARE` / `READ_LOCK_AWARE` set `lockAware` (7.4:7420-7438,
+//!   8.0:5124-5142). So a transaction that set any of them sends `ReadOptions()` with those
+//!   changes, even when they are the defaults (`READ_PRIORITY_NORMAL` alone sends
+//!   `{NORMAL, cacheResult true}`), and a transaction that set none sends none. A reset (and
+//!   `on_error`) forgets them: they live in the `TransactionState` that `resetImpl` replaces
+//!   (7.4:6491-6499, 8.0:4235-4243), and the options are not persistent. The database's
+//!   `LOCK_AWARE` default does not set them (`TransactionOptions::reset` copies only
+//!   `lockAware`).
+//! * **Where.** `getValue` (7.4:3915-3959, 8.0:1706-1755), `getKey` (7.4:4041-4088,
+//!   8.0:1832-1887), `getExactRange` (7.4:4603, 8.0:2407) and `getRange` (7.4:4959,
+//!   8.0:2764) copy it into every request, and so do the reads of `getRangeFallback`
+//!   (`getKey` and `getExactRange`). Here: [`ReadParams::read_options`], which
+//!   [`Reader::get_with`], [`Reader::get_key_with`] and [`Reader::get_range_with_limits`]
+//!   take, and the transaction fills from its options when a read is called.
+//! * **`debugID`** is never sent: C++ sets it only for a transaction being traced
+//!   (`SERVER_REQUEST_TRACING`, `debugTransaction`), which this client accepts without
+//!   effect. `consistencyCheckStartVersion` is for the consistency checker.
+//! * **What a storage server does with it** (`fdbserver/storageserver.actor.cpp` 7.4,
+//!   `fdbserver/storageserver/storageserver.cpp` 8.0): it takes its read lock
+//!   (`getReadLock`, 7.4:1660-1664, 8.0:1415-1419) at the rank of the type
+//!   (`STORAGESERVER_READTYPE_PRIORITY_MAP` into `STORAGESERVER_READ_PRIORITIES`, a
+//!   `PriorityMultiLock` whose higher ranks get more of the concurrent reads; a type outside
+//!   the ranks is clamped), so a low priority scan yields to normal reads; `cacheResult`
+//!   false asks the storage engine not to keep the pages it read; `lockAware` matters only
+//!   for tenant locks.
+//!
+//! The messages, as this client builds them, are checked against each release's C++ reader
+//! (`tools/golden-vectors` fixtures `get_value_request_read_options`,
+//! `get_key_request_read_options` and `get_key_values_request_read_options`, and the
+//! `cpp_crosscheck` test of `fdb-native-schema`).
+//!
 //! ## Deliberate differences
 //!
 //! * **Lagging requests** are tasks on the runtime ([`Runtime::spawn`]), one per request, where
@@ -416,6 +501,7 @@ use crate::error::Error;
 use crate::error::codes::*;
 
 mod balance;
+mod evictor;
 mod grv;
 mod key;
 mod location;
@@ -426,6 +512,7 @@ mod watch_lb;
 
 #[doc(hidden)]
 pub use balance::{EndpointStats, LoadBalanceStats};
+pub use fdb_native_schema::domain::ReadOptions;
 pub use grv::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
 pub(crate) use range::{
@@ -476,6 +563,18 @@ pub struct ReadConfig {
     /// database option): replicas in it are preferred. `None` (the default) prefers none.
     /// [`Reader::set_client_dc_id`] changes it.
     pub client_dc_id: Option<Vec<u8>>,
+    /// `LOCATION_CACHE_PEER_EVICTOR_ENABLED`: whether cached locations whose storage
+    /// servers keep failing to connect are forgotten periodically (see [the peer
+    /// evictor](self#the-peer-evictor)). **Default `true`**, as 8.0 (ClientKnobs 8.0:213; 7.4
+    /// has the same evictor off, 7.4:103), whichever release the cluster runs.
+    pub location_cache_peer_evictor: bool,
+    /// `LOCATION_CACHE_PEER_EVICTOR_DELAY` (60 s; ClientKnobs 7.4:104, 8.0:214): the time
+    /// between two sweeps of the peer evictor.
+    pub location_cache_peer_evictor_delay: Duration,
+    /// `LOCATION_CACHE_PEER_EVICTOR_FAILED_THRESHOLD` (0; 7.4:105, 8.0:215): an address
+    /// whose failed connects grew by more than this since the last sweep loses its cached
+    /// locations.
+    pub location_cache_peer_evictor_failed_threshold: u64,
     /// Seed of the random choices (replica order, eviction, jitter). `None` draws one.
     pub seed: Option<u64>,
 }
@@ -489,8 +588,56 @@ impl Default for ReadConfig {
             wrong_shard_server_delay: Duration::from_millis(10),
             metadata_version_cache_size: 1000,
             client_dc_id: None,
+            location_cache_peer_evictor: true,
+            location_cache_peer_evictor_delay: Duration::from_secs(60),
+            location_cache_peer_evictor_failed_threshold: 0,
             seed: None,
         }
+    }
+}
+
+/// What a storage read carries from its transaction besides the read version: whether keys
+/// are located with provisional commit proxies too (`trState->useProvisionalProxies`, the
+/// transaction option `USE_PROVISIONAL_PROXIES`), and the `ReadOptions` the storage servers
+/// get (`trState->readOptions`, see the [module documentation](self#read-options)).
+///
+/// The default is neither. A `bool` converts to the first alone, so
+/// `reader.get_with(key, version, true)` still reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadParams {
+    /// Locate keys with provisional commit proxies too.
+    pub use_provisional_proxies: bool,
+    /// The `options` of every `GetValueRequest`, `GetKeyRequest` and `GetKeyValuesRequest`;
+    /// `None` sends none (a storage server then reads as for `ReadOptions()`).
+    pub read_options: Option<ReadOptions>,
+}
+
+impl ReadParams {
+    /// Neither provisional proxies nor read options.
+    pub fn new() -> ReadParams {
+        ReadParams::default()
+    }
+
+    /// The same, with `use_provisional_proxies`.
+    #[must_use]
+    pub fn use_provisional_proxies(mut self, on: bool) -> ReadParams {
+        self.use_provisional_proxies = on;
+        self
+    }
+
+    /// The same, with `read_options`.
+    #[must_use]
+    pub fn read_options(mut self, read_options: Option<ReadOptions>) -> ReadParams {
+        self.read_options = read_options;
+        self
+    }
+}
+
+impl From<bool> for ReadParams {
+    /// `use_provisional_proxies` alone.
+    fn from(use_provisional_proxies: bool) -> ReadParams {
+        ReadParams::new().use_provisional_proxies(use_provisional_proxies)
     }
 }
 
@@ -529,6 +676,8 @@ struct State {
     /// References to the peers of the proxies of the info last used, so that they are
     /// connected and probed while the client uses them.
     proxy_references: Option<(u64, Vec<PeerRef>)>,
+    /// Cached ranges the peer evictor forgot.
+    peer_evictions: u64,
 }
 
 /// What the reader's handles and its batcher tasks share.
@@ -549,6 +698,15 @@ pub(crate) struct Shared<R: Runtime, W> {
     grv_model: Mutex<balance::GrvModel>,
     /// `DatabaseContext::metadataVersionCache`.
     metadata_versions: Mutex<MetadataVersionCache>,
+    /// The peer evictor's task, started with the first cached location.
+    evictor: Mutex<Evictor<R>>,
+}
+
+/// The peer evictor's task, and whether the reader was [shut down](Reader::shutdown) (it is
+/// then never started again).
+struct Evictor<R: Runtime> {
+    task: Option<R::Task<()>>,
+    stopped: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -568,8 +726,8 @@ struct Batchers<R: Runtime> {
 }
 
 impl<R: Runtime, W> Inner<R, W> {
-    /// Stops the batchers (their waiting requests fail with `operation_cancelled`) and the
-    /// lagging requests; with `shut_down`, for good.
+    /// Stops the batchers (their waiting requests fail with `operation_cancelled`), the
+    /// lagging requests and the peer evictor; with `shut_down`, for good.
     fn stop(&self, shut_down: bool) {
         let running = {
             let mut batchers = lock(&self.batchers);
@@ -580,6 +738,14 @@ impl<R: Runtime, W> Inner<R, W> {
             batcher.task.abort();
         }
         self.shared.abort_lagging();
+        let evictor = {
+            let mut evictor = lock(&self.shared.evictor);
+            evictor.stopped |= shut_down;
+            evictor.task.take()
+        };
+        if let Some(task) = evictor {
+            task.abort();
+        }
     }
 }
 
@@ -647,6 +813,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                 location_backoff: 0.0,
                 failed_endpoints: HashMap::new(),
                 proxy_references: None,
+                peer_evictions: 0,
             }),
             this: this.clone(),
             lagging: Mutex::new(balance::Lagging::default()),
@@ -654,6 +821,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             metadata_versions: Mutex::new(MetadataVersionCache::new(
                 config.metadata_version_cache_size,
             )),
+            evictor: Mutex::new(Evictor {
+                task: None,
+                stopped: false,
+            }),
             config,
         });
         Reader {
@@ -674,7 +845,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 
     /// Stops the reader's tasks for good, while clones of it may still be held: the read
     /// version batchers (the requests waiting for a read version fail with
-    /// `operation_cancelled`, 1101) and the lagging requests of the load balancer. Every
+    /// `operation_cancelled`, 1101), the lagging requests of the load balancer and the
+    /// [peer evictor](self#the-peer-evictor). Every
     /// later read version request fails with `operation_cancelled` at once. The other reads
     /// fail with it once the peer manager is shut down or the cluster monitor closed (see the
     /// [module documentation](self)). [`Database::shutdown`](crate::Database::shutdown)
@@ -764,18 +936,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         self.metadata_version_with(version, false).await
     }
 
-    /// [`metadata_version`](Self::metadata_version), locating the key with provisional
-    /// commit proxies too if `use_provisional_proxies` when it has to be read.
+    /// [`metadata_version`](Self::metadata_version), read with `params` when it has to be
+    /// read ([`get_with`](Self::get_with)).
     pub async fn metadata_version_with(
         &self,
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<Option<Vec<u8>>, Error> {
         if let Some(cached) = self.cached_metadata_version(version) {
             return Ok(cached);
         }
-        self.get_with(METADATA_VERSION_KEY, version, use_provisional_proxies)
-            .await
+        self.get_with(METADATA_VERSION_KEY, version, params).await
     }
 
     /// The value of `\xff/metadataVersion` at `version` if the reader knows it without asking:
@@ -809,7 +980,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         Ok(ReadSnapshot {
             reader: self.clone(),
             version,
-            use_provisional_proxies: options.use_provisional_proxies,
+            params: ReadParams::from(options.use_provisional_proxies),
         })
     }
 
@@ -818,7 +989,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         ReadSnapshot {
             reader: self.clone(),
             version,
-            use_provisional_proxies: false,
+            params: ReadParams::new(),
         }
     }
 
@@ -832,14 +1003,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         self.get_with(key, version, false).await
     }
 
-    /// [`get`](Self::get), locating the key with provisional commit proxies too if
-    /// `use_provisional_proxies` (the transaction option `USE_PROVISIONAL_PROXIES`).
+    /// [`get`](Self::get) with `params`: the key is located with provisional commit proxies
+    /// too if [`use_provisional_proxies`](ReadParams::use_provisional_proxies) (the
+    /// transaction option `USE_PROVISIONAL_PROXIES`), and the request carries
+    /// [`read_options`](ReadParams::read_options). A `bool` is `use_provisional_proxies`.
     pub async fn get_with(
         &self,
         key: &[u8],
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<Option<Vec<u8>>, Error> {
+        let params = params.into();
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
@@ -853,7 +1027,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         let mut _previous: Option<Arc<Location>> = None;
         loop {
             let (_, location) = shared
-                .key_location(key, version, use_provisional_proxies)
+                .key_location(key, version, params.use_provisional_proxies)
                 .await?;
             _previous = Some(location.clone());
             let request = GetValue {
@@ -861,7 +1035,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                 version,
                 tags: None,
                 span_context: Default::default(),
-                options: None,
+                options: params.read_options,
                 ss_latest_commit_versions: VersionVector::default(),
             };
             match shared.load_balance_get_value(&location, request).await {
@@ -977,13 +1151,19 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     pub fn load_balance_stats(&self) -> LoadBalanceStats {
         self.inner.shared.load_balance_stats()
     }
+
+    /// How many cached ranges the peer evictor forgot. For tests.
+    #[doc(hidden)]
+    pub fn peer_evictions(&self) -> u64 {
+        lock(&self.inner.shared.state).peer_evictions
+    }
 }
 
 /// A read version and the reader to read at it: what a read-only transaction needs.
 pub struct ReadSnapshot<R: Runtime, W = NoTls> {
     reader: Reader<R, W>,
     version: i64,
-    use_provisional_proxies: bool,
+    params: ReadParams,
 }
 
 impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
@@ -991,7 +1171,7 @@ impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
         ReadSnapshot {
             reader: self.reader.clone(),
             version: self.version,
-            use_provisional_proxies: self.use_provisional_proxies,
+            params: self.params,
         }
     }
 }
@@ -1015,11 +1195,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
         &self.reader
     }
 
+    /// What the snapshot's reads carry ([`ReadParams`]).
+    pub fn params(&self) -> ReadParams {
+        self.params
+    }
+
+    /// The same snapshot, whose reads send `read_options` to the storage servers.
+    #[must_use]
+    pub fn with_read_options(mut self, read_options: Option<ReadOptions>) -> Self {
+        self.params.read_options = read_options;
+        self
+    }
+
     /// The value of `key` at the snapshot's version ([`Reader::get_with`]).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.reader
-            .get_with(key, self.version, self.use_provisional_proxies)
-            .await
+        self.reader.get_with(key, self.version, self.params).await
     }
 }
 
@@ -1253,7 +1443,27 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         drop(rng);
         drop(cache);
         self.prune();
+        self.start_peer_evictor();
         location
+    }
+
+    /// Starts the peer evictor, once, if it is enabled (C++ starts it with the
+    /// `DatabaseContext`; here it waits for something to evict).
+    fn start_peer_evictor(&self) {
+        if !self.config.location_cache_peer_evictor {
+            return;
+        }
+        let mut slot = lock(&self.evictor);
+        if slot.task.is_some() || slot.stopped {
+            return;
+        }
+        slot.task = Some(self.rt.spawn(evictor::run(
+            self.rt.clone(),
+            self.monitor.clone(),
+            self.this.clone(),
+            self.config.location_cache_peer_evictor_delay,
+            self.config.location_cache_peer_evictor_failed_threshold,
+        )));
     }
 
     /// Drops the queue model data and endpoint failure records of servers no cached range

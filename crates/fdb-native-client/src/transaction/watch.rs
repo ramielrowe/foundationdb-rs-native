@@ -149,6 +149,7 @@ impl<R: Runtime> Transaction<R> {
         let start = ReadStart {
             epoch: state.epoch,
             use_provisional_proxies: state.flags.use_provisional_proxies,
+            read_options: state.flags.read_options,
             max_read_key: state.flags.max_read_key(),
         };
         // `ReadYourWritesTransaction::watch` (7.4:2440-2459, 8.0:2356-2375).

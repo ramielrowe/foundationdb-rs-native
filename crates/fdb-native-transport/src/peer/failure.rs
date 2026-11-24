@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use fdb_native_wire::{NetworkAddress, Uid};
 
@@ -57,6 +58,18 @@ struct State {
     /// The waits on each address (its status, its disconnects, its endpoints). A change to one
     /// address wakes only that address's waiters.
     topics: HashMap<PeerKey, Waiters>,
+    /// FlowTransport's `persistentConnectFailedCount`: failed connects per address.
+    connect_failures: HashMap<PeerKey, ConnectFailures>,
+    /// `persistentConnectFailedLastPrune`; `None` before the first failure.
+    connect_failures_pruned: Option<Instant>,
+}
+
+/// `ConnectFailedInfo`: an address's failed connects, and when the last one was.
+#[derive(Debug)]
+struct ConnectFailures {
+    address: NetworkAddress,
+    count: u64,
+    last_failed: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -253,6 +266,52 @@ impl FailureMonitor {
         })
     }
 
+    /// A connect to `address` failed at `now`: the TCP connect or the TLS handshake, what
+    /// `connectionKeeper` counts in `persistentConnectFailedCount` (`FlowTransport.actor.cpp`
+    /// 7.4:886-923, `FlowTransport.cpp` 8.0:980-1016). On a failure, once `ttl`
+    /// (`PERSISTENT_CONNECT_FAILED_COUNT_TTL`) has passed since the last pruning, the
+    /// addresses whose last failure is `ttl` old or more are forgotten; a zero `ttl` never
+    /// prunes. Waiters are not woken: this is a counter for periodic readers
+    /// ([`connect_failures`](Self::connect_failures)).
+    pub(crate) fn connect_failed(&self, address: &NetworkAddress, now: Instant, ttl: Duration) {
+        let key = PeerKey::new(address);
+        let mut state = self.lock();
+        let entry = state
+            .connect_failures
+            .entry(key)
+            .or_insert(ConnectFailures {
+                address: *address,
+                count: 0,
+                last_failed: now,
+            });
+        entry.count += 1;
+        entry.last_failed = now;
+        let due = state
+            .connect_failures_pruned
+            .is_none_or(|at| now.saturating_duration_since(at) >= ttl);
+        if !ttl.is_zero() && due {
+            state.connect_failures_pruned = Some(now);
+            state
+                .connect_failures
+                .retain(|_, e| now.saturating_duration_since(e.last_failed) < ttl);
+        }
+    }
+
+    /// The failed connects counted per address
+    /// (`FlowTransport::getPersistentConnectFailedCounts`): every address that failed to
+    /// connect and was not forgotten since (see
+    /// [`PeerManagerConfig::connect_failed_count_ttl`](super::PeerManagerConfig::connect_failed_count_ttl)),
+    /// with its count of failures. A count only grows, except for an address that was
+    /// forgotten and fails again: it starts over from 1. The location cache's peer evictor
+    /// reads it.
+    pub fn connect_failures(&self) -> Vec<(NetworkAddress, u64)> {
+        self.lock()
+            .connect_failures
+            .values()
+            .map(|e| (e.address, e.count))
+            .collect()
+    }
+
     /// A connection to `address` ended (`notifyDisconnect`).
     pub(crate) fn notify_disconnect(&self, address: &NetworkAddress) {
         let key = PeerKey::new(address);
@@ -395,7 +454,6 @@ impl<F> Drop for Wait<'_, F> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
-    use std::time::Duration;
 
     use fdb_native_wire::IpAddress;
     use futures_lite::future::{block_on, poll_once};
@@ -408,6 +466,45 @@ mod tests {
 
     fn t(ms: u64) -> Instant {
         Instant::from_origin(Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn connect_failures_are_counted_and_pruned_after_the_ttl() {
+        let fm = FailureMonitor::new();
+        let ttl = Duration::from_secs(600);
+        let count = |fm: &FailureMonitor, a: &NetworkAddress| {
+            fm.connect_failures()
+                .into_iter()
+                .find(|(x, _)| x == a)
+                .map(|(_, n)| n)
+        };
+        assert!(fm.connect_failures().is_empty());
+        fm.connect_failed(&addr(1), t(0), ttl);
+        fm.connect_failed(&addr(1), t(1000), ttl);
+        fm.connect_failed(&addr(2), t(2000), ttl);
+        assert_eq!(count(&fm, &addr(1)), Some(2));
+        assert_eq!(count(&fm, &addr(2)), Some(1));
+        // A counter only: the status of the addresses is unchanged.
+        assert!(!fm.is_failed(&addr(1)));
+        assert_eq!(fm.address_status(&addr(1)).disconnects, 0);
+        // The pruning runs on a failure once `ttl` has passed since the last one (at 0):
+        // address 1 last failed 599 s before and stays; at 601 s it is forgotten.
+        fm.connect_failed(&addr(3), t(600_000), ttl);
+        assert_eq!(count(&fm, &addr(1)), Some(2));
+        fm.connect_failed(&addr(3), t(1_100_000), ttl);
+        assert_eq!(count(&fm, &addr(1)), Some(2), "not due before 1200 s");
+        fm.connect_failed(&addr(3), t(1_200_000), ttl);
+        assert_eq!(count(&fm, &addr(1)), None);
+        assert_eq!(count(&fm, &addr(2)), None);
+        assert_eq!(count(&fm, &addr(3)), Some(3));
+        // A forgotten address that fails again starts over.
+        fm.connect_failed(&addr(1), t(1_200_001), ttl);
+        assert_eq!(count(&fm, &addr(1)), Some(1));
+        // A zero ttl never prunes.
+        let fm = FailureMonitor::new();
+        fm.connect_failed(&addr(1), t(0), Duration::ZERO);
+        fm.connect_failed(&addr(2), t(10_000_000), Duration::ZERO);
+        assert_eq!(fm.connect_failures().len(), 2);
     }
 
     #[test]

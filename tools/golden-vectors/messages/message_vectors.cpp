@@ -104,6 +104,16 @@ ReadOptions readOptions() {
 	return o;
 }
 
+// ReadOptions as fdb-native-client builds them from the transaction options: NativeAPI's
+// setOption starts from ReadOptions() and READ_PRIORITY_* sets type, READ_SERVER_SIDE_CACHE_*
+// cacheResult, LOCK_AWARE / READ_LOCK_AWARE lockAware. debugID and consistencyCheckStartVersion
+// stay absent (the client sends no debug ids and runs no consistency checks).
+ReadOptions clientReadOptions(ReadType type, CacheResult cache, bool lockAware) {
+	ReadOptions o(type, cache);
+	o.lockAware = lockAware;
+	return o;
+}
+
 LocalityData locality(const std::string& process) {
 	LocalityData l;
 	l.set("processid"_sr, key(process));
@@ -247,6 +257,26 @@ void storageVectors() {
 		        r);
 	}
 	{
+		// What fdb-native-client sends for a transaction with READ_PRIORITY_NORMAL set: present
+		// options with ReadOptions()'s values.
+		GetValueRequest r;
+		r.key = key("prio/normal");
+		r.version = 4000000000000LL;
+		r.options = clientReadOptions(ReadType::NORMAL, CacheResult::True, false);
+		r.reply = replyTo<GetValueReply>(12);
+		message(g,
+		        "get_value_request_read_options",
+		        "GetValueRequest as fdb-native-client sends it with a transaction read option set: options "
+		        "present with ReadOptions()'s values (type NORMAL, cacheResult true, lockAware false; debugID and "
+		        "consistencyCheckStartVersion absent), tags absent, a default SpanContext" +
+#ifdef GV_V74
+		            std::string(" and TenantInfo") +
+#endif
+		            std::string(", an empty VersionVector."),
+		        "GetValueRequest",
+		        r);
+	}
+	{
 		GetValueReply r(Optional<Value>(key("the value")), true);
 		r.penalty = 1.5;
 		r.error = Optional<Error>();
@@ -304,6 +334,31 @@ void storageVectors() {
 		        r);
 	}
 	{
+		// READ_PRIORITY_LOW and READ_SERVER_SIDE_CACHE_DISABLE: a background scan.
+		GetKeyValuesRequest r;
+		r.begin = KeySelectorRef(sref("scan/a"), false, 1);
+		r.end = KeySelectorRef(sref("scan/z"), false, 1);
+		r.version = 4000000000001LL;
+		r.limit = 80000;
+		r.limitBytes = 80000;
+		r.options = clientReadOptions(ReadType::LOW, CacheResult::False, false);
+#if GV_FDB_MAJOR >= 8
+		r.taskID = TaskPriority::DefaultEndpoint;
+#endif
+		r.reply = replyTo<GetKeyValuesReply>(12);
+		message(g,
+		        "get_key_values_request_read_options",
+		        "GetKeyValuesRequest as fdb-native-client sends it with READ_PRIORITY_LOW and "
+		        "READ_SERVER_SIDE_CACHE_DISABLE: options type LOW, cacheResult false, lockAware false (debugID and "
+		        "consistencyCheckStartVersion absent), tags absent, an empty VersionVector"
+#if GV_FDB_MAJOR >= 8
+		        ", taskID DefaultEndpoint"
+#endif
+		        ".",
+		        "GetKeyValuesRequest",
+		        r);
+	}
+	{
 		GetKeyValuesReply r;
 		r.penalty = 2.0;
 		r.data.push_back_deep(r.arena, KeyValueRef("range/b"_sr, "value-b"_sr));
@@ -351,6 +406,21 @@ void storageVectors() {
 		        "StorageServerInterface::getKey request (adjusted endpoint 1). ssLatestCommitVersions is an empty "
 		        "VersionVector (only maxVersion)." +
 		            tenantNote,
+		        "GetKeyRequest",
+		        r);
+	}
+	{
+		// READ_PRIORITY_HIGH in a LOCK_AWARE transaction.
+		GetKeyRequest r;
+		r.sel = KeySelectorRef(sref("prio/high"), false, 1);
+		r.version = 4000000000002LL;
+		r.options = clientReadOptions(ReadType::HIGH, CacheResult::True, true);
+		r.reply = replyTo<GetKeyReply>(12);
+		message(g,
+		        "get_key_request_read_options",
+		        "GetKeyRequest as fdb-native-client sends it with READ_PRIORITY_HIGH and LOCK_AWARE: options type "
+		        "HIGH, cacheResult true, lockAware true (debugID and consistencyCheckStartVersion absent), tags "
+		        "absent, an empty VersionVector.",
 		        "GetKeyRequest",
 		        r);
 	}

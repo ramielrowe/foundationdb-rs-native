@@ -22,8 +22,8 @@
 //! | [`NextWriteNoWriteConflictRange`](TransactionOption::NextWriteNoWriteConflictRange) | 30 | no | supported |
 //! | [`CommitOnFirstProxy`](TransactionOption::CommitOnFirstProxy) | 40 | no | supported (hidden test option) |
 //! | [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable) | 51 | no | supported (only before any read or write) |
-//! | [`ReadServerSideCacheEnable`](TransactionOption::ReadServerSideCacheEnable) / [`Disable`](TransactionOption::ReadServerSideCacheDisable) | 507 / 508 | no | accepted; hint, not sent to storage servers yet |
-//! | [`ReadPriorityNormal`](TransactionOption::ReadPriorityNormal) / [`Low`](TransactionOption::ReadPriorityLow) / [`High`](TransactionOption::ReadPriorityHigh) | 509 / 510 / 511 | no | accepted; hint, not sent to storage servers yet |
+//! | [`ReadServerSideCacheEnable`](TransactionOption::ReadServerSideCacheEnable) / [`Disable`](TransactionOption::ReadServerSideCacheDisable) | 507 / 508 | no | supported: `ReadOptions::cacheResult` of every storage read ([Read options](crate::read#read-options)) |
+//! | [`ReadPriorityNormal`](TransactionOption::ReadPriorityNormal) / [`Low`](TransactionOption::ReadPriorityLow) / [`High`](TransactionOption::ReadPriorityHigh) | 509 / 510 / 511 | no | supported: `ReadOptions::type` of every storage read |
 //! | [`PrioritySystemImmediate`](TransactionOption::PrioritySystemImmediate) | 200 | no | supported (read version priority) |
 //! | [`PriorityBatch`](TransactionOption::PriorityBatch) | 201 | no | supported (read version priority) |
 //! | [`InitializeNewDatabase`](TransactionOption::InitializeNewDatabase) | 300 | no | supported |
@@ -82,7 +82,7 @@ use std::time::Duration;
 use super::{ReadVersion, SYSTEM_KEYS_BEGIN, SYSTEM_KEYS_END, State};
 use crate::error::Error;
 use crate::error::codes::*;
-use crate::read::Priority;
+use crate::read::{Priority, ReadOptions};
 
 /// `extractIntOption`'s upper bound for the millisecond options.
 const MAX_MILLIS: u128 = i32::MAX as u128;
@@ -176,18 +176,22 @@ pub enum TransactionOption {
     /// (2000) if the transaction has a read in progress, has cached a read, or has written
     /// (C++: `reading.getFutureCount() > 0 || !cache.empty() || !writes.empty()`).
     ReadYourWritesDisable,
-    /// `READ_SERVER_SIDE_CACHE_ENABLE` (507): a hint to the storage servers (the default).
-    /// Accepted; not sent yet.
+    /// `READ_SERVER_SIDE_CACHE_ENABLE` (507): the storage servers may cache the disk blocks
+    /// the transaction's reads touch (the default). Sent as `ReadOptions::cacheResult` true
+    /// (see [Read options](crate::read#read-options)).
     ReadServerSideCacheEnable,
-    /// `READ_SERVER_SIDE_CACHE_DISABLE` (508): a hint to the storage servers. Accepted; not
-    /// sent yet.
+    /// `READ_SERVER_SIDE_CACHE_DISABLE` (508): the storage servers should not cache the disk
+    /// blocks the transaction's reads touch (a scan that will not be repeated). Sent as
+    /// `ReadOptions::cacheResult` false.
     ReadServerSideCacheDisable,
-    /// `READ_PRIORITY_NORMAL` (509): a hint to the storage servers (the default). Accepted;
-    /// not sent yet.
+    /// `READ_PRIORITY_NORMAL` (509): the transaction's reads take the storage servers' read
+    /// lock at normal priority (the default). Sent as `ReadOptions::type` `NORMAL`.
     ReadPriorityNormal,
-    /// `READ_PRIORITY_LOW` (510): a hint to the storage servers. Accepted; not sent yet.
+    /// `READ_PRIORITY_LOW` (510): the transaction's reads take the storage servers' read
+    /// lock at low priority (a background scan). Sent as `ReadOptions::type` `LOW`.
     ReadPriorityLow,
-    /// `READ_PRIORITY_HIGH` (511): a hint to the storage servers. Accepted; not sent yet.
+    /// `READ_PRIORITY_HIGH` (511): the transaction's reads take the storage servers' read
+    /// lock at high priority. Sent as `ReadOptions::type` `HIGH`.
     ReadPriorityHigh,
     /// `PRIORITY_SYSTEM_IMMEDIATE` (200): the transaction's read versions are requested with
     /// the highest priority (never throttled; lower priority transactions wait behind it).
@@ -436,6 +440,9 @@ pub(super) struct Flags {
     pub(super) snapshot_ryw: i32,
     /// `BYPASS_UNREADABLE`.
     pub(super) bypass_unreadable: bool,
+    /// `trState->readOptions`: present once a read option, `LOCK_AWARE` or `READ_LOCK_AWARE`
+    /// was set, sent with every storage read.
+    pub(super) read_options: Option<ReadOptions>,
 }
 
 impl Flags {
@@ -461,7 +468,14 @@ impl Flags {
             read_your_writes_disabled: false,
             snapshot_ryw,
             bypass_unreadable: false,
+            read_options: None,
         }
+    }
+
+    /// `trState->readOptions.withDefault(ReadOptions())`: the read options, made present
+    /// (NativeAPI 7.4:7420-7440 and 7561-7579, 8.0:5124-5142 and 5254-5272).
+    fn read_options(&mut self) -> &mut ReadOptions {
+        self.read_options.get_or_insert_with(ReadOptions::default)
     }
 
     /// `getMaxReadKey()`.
@@ -549,10 +563,12 @@ impl State {
                 }
             }
             LockAware => {
+                self.flags.read_options().lock_aware = true;
                 self.flags.lock_aware = true;
                 self.flags.read_only = false;
             }
             ReadLockAware => {
+                self.flags.read_options().lock_aware = true;
                 if !self.flags.lock_aware {
                     self.flags.lock_aware = true;
                     self.flags.read_only = true;
@@ -565,14 +581,14 @@ impl State {
             UseProvisionalProxies => self.flags.use_provisional_proxies = true,
             ReportConflictingKeys => self.flags.report_conflicting_keys = true,
             MaxGrvQueueDelay(d) => self.flags.max_grv_queue_delay_ms = Some(millis(*d) as i64),
+            ReadServerSideCacheEnable => self.flags.read_options().cache_result = true,
+            ReadServerSideCacheDisable => self.flags.read_options().cache_result = false,
+            ReadPriorityNormal => self.flags.read_options().read_type = ReadOptions::NORMAL,
+            ReadPriorityLow => self.flags.read_options().read_type = ReadOptions::LOW,
+            ReadPriorityHigh => self.flags.read_options().read_type = ReadOptions::HIGH,
             // Validated, nothing to do.
             CausalReadDisable
             | IncludePortInAddress
-            | ReadServerSideCacheEnable
-            | ReadServerSideCacheDisable
-            | ReadPriorityNormal
-            | ReadPriorityLow
-            | ReadPriorityHigh
             | RawAccess
             | DebugRetryLogging(_)
             | TransactionLoggingMaxFieldLength(_)

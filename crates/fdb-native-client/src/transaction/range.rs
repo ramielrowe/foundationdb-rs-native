@@ -17,7 +17,7 @@ use super::{ReadFuture, ReadGuard, ReadStart, RywView, Snapshot, Transaction, Tx
 use crate::error::Error;
 use crate::error::codes::*;
 use crate::read::Limits;
-use crate::read::{RangeOptions, read_conflict_range, remove_or_equal};
+use crate::read::{RangeOptions, ReadParams, read_conflict_range, remove_or_equal};
 use crate::ryw;
 
 /// What [`Transaction::get_range`] returns: one batch of rows, in the order read (descending
@@ -45,7 +45,7 @@ struct NativeRangeRead {
     end: KeySelector,
     options: RangeOptions,
     max_read_key: &'static [u8],
-    use_provisional_proxies: bool,
+    params: ReadParams,
     epoch: u64,
 }
 
@@ -195,7 +195,7 @@ impl<R: Runtime> Transaction<R> {
                         end,
                         options,
                         max_read_key: start.max_read_key,
-                        use_provisional_proxies: start.use_provisional_proxies,
+                        params: start.params(),
                         epoch: start.epoch,
                     };
                     tx.range_read(read, (!snapshot).then_some(&guard)).await
@@ -268,13 +268,14 @@ impl<R: Runtime> Transaction<R> {
             end,
             options,
             max_read_key,
-            use_provisional_proxies,
+            params,
             epoch,
         } = read;
         // C++ reads `getMaxReadKey()` after each wait (`readThrough`, 7.4:187-215, 8.0:196-223).
         let start = ReadStart {
             epoch,
-            use_provisional_proxies,
+            use_provisional_proxies: params.use_provisional_proxies,
+            read_options: params.read_options,
             max_read_key,
         };
         let options = &options;
@@ -282,8 +283,7 @@ impl<R: Runtime> Transaction<R> {
         if options.reverse && end.offset > 1 {
             // `readThrough`: resolve the end first, so that a reverse read does not start in
             // keys the transaction may not read.
-            let key =
-                Box::pin(self.native_get_key(&end, guard, epoch, use_provisional_proxies)).await?;
+            let key = Box::pin(self.native_get_key(&end, guard, epoch, params)).await?;
             let max_read_key = self.max_read_key_now(&start);
             let key = if key.as_slice() > max_read_key {
                 max_read_key.to_vec()
@@ -302,14 +302,7 @@ impl<R: Runtime> Transaction<R> {
                 let version = self.read_version(false).await?;
                 let limits = options.limits(reader.schema().await?)?;
                 reader
-                    .get_range_with_limits(
-                        &begin,
-                        &end,
-                        limits,
-                        options.reverse,
-                        version,
-                        use_provisional_proxies,
-                    )
+                    .get_range_with_limits(&begin, &end, limits, options.reverse, version, params)
                     .await
             })
             .await??;

@@ -50,6 +50,11 @@ pub struct PeerManagerConfig {
     /// `SERVER_REQUEST_INTERVAL` (1 s; 7.4:62 and 8.0:67): how long a peer already marked
     /// failed waits between probes when there is nothing to send.
     pub failed_probe_interval: Duration,
+    /// `PERSISTENT_CONNECT_FAILED_COUNT_TTL` (600 s; 7.4:56 and 8.0:61): how long an address
+    /// that stopped failing to connect keeps its count in
+    /// [`FailureMonitor::connect_failures`](super::FailureMonitor::connect_failures) (the
+    /// forgetting happens on a later failure, as in C++). Zero keeps every count.
+    pub connect_failed_count_ttl: Duration,
     /// The connection monitor's timing (pings and idle rules).
     pub monitor: MonitorConfig,
     /// [`ConnectionConfig::max_pending_output`](crate::ConnectionConfig::max_pending_output):
@@ -99,6 +104,7 @@ impl Default for PeerManagerConfig {
             tls_throttle_attempts: 1,
             failure_detection_delay: Duration::from_secs(4),
             failed_probe_interval: Duration::from_secs(1),
+            connect_failed_count_ttl: Duration::from_secs(600),
             monitor: MonitorConfig::FDB_DEFAULT,
             max_pending_output: DEFAULT_MAX_PENDING_OUTPUT,
             max_packet_len: DEFAULT_PACKET_LIMIT,

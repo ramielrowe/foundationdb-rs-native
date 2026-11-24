@@ -229,6 +229,14 @@
 //! count. Every end of a connection or failed attempt is one `notifyDisconnect`
 //! (7.4:1073, 8.0:1165), which wakes the waiters of that address only.
 //!
+//! The monitor also counts each address's failed connects (a failed dial: the TCP connect,
+//! the TLS handshake or a [throttled](#tls-handshake-throttle) connect), as FlowTransport's
+//! `persistentConnectFailedCount` does (7.4:886-923, 8.0:980-1016), and forgets an address
+//! that has not failed for
+//! [`connect_failed_count_ttl`](PeerManagerConfig::connect_failed_count_ttl) (600 s). The
+//! counts ([`FailureMonitor::connect_failures`]) are what a client's location cache peer
+//! evictor reads.
+//!
 //! # References and removal
 //!
 //! C++ counts references to a peer (`peerReferences`, which starts at -1;
