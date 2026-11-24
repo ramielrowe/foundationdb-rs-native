@@ -1719,6 +1719,13 @@ impl<R: Runtime> Transaction<R> {
     pub async fn on_error(&self, error: Error) -> Result<(), Error> {
         let maybe_committed = error.is_maybe_committed();
         self.on_error_inner(error).await.map_err(|e| {
+            // `RYWImpl::onError` (7.4:1531, 8.0:1532): `if (e.code() ==
+            // error_code_broken_promise) throw transaction_cancelled();`.
+            let e = if e.code() == BROKEN_PROMISE {
+                Error::new(TRANSACTION_CANCELLED)
+            } else {
+                e
+            };
             if maybe_committed {
                 e.into_maybe_committed()
             } else {

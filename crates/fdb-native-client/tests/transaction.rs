@@ -441,6 +441,26 @@ async fn the_retry_limit_and_errors_that_are_not_retried_cancel_the_transaction(
         tx.commit().await.unwrap_err().code(),
         codes::TRANSACTION_CANCELLED
     );
+    // `broken_promise` is returned as `transaction_cancelled` (`RYWImpl::onError`; the
+    // bindingtester's `api` test, seed 1068 at 2000 operations, ON_ERROR with 1100), also
+    // when the retry limit is hit.
+    tx.reset();
+    assert_eq!(
+        tx.on_error(Error::new(codes::BROKEN_PROMISE))
+            .await
+            .unwrap_err()
+            .code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    tx.reset();
+    tx.set_option(TransactionOption::RetryLimit(0)).unwrap();
+    assert_eq!(
+        tx.on_error(Error::new(codes::BROKEN_PROMISE))
+            .await
+            .unwrap_err()
+            .code(),
+        codes::TRANSACTION_CANCELLED
+    );
     // A plain `connection_failed` is not retried; a commit that was not delivered is.
     tx.reset();
     assert!(
