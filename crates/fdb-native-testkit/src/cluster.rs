@@ -91,6 +91,7 @@
 //! | [`kill`](FdbCluster::kill) | `docker kill`: SIGKILL, connections reset |
 //! | [`stop`](FdbCluster::stop) | `docker stop -t 1`: SIGTERM, then SIGKILL |
 //! | [`start_process`](FdbCluster::start_process) | `docker start` after kill/stop, waits for the process to rejoin |
+//! | [`start_processes`](FdbCluster::start_processes) | the same for several at once (after the whole cluster was stopped) |
 //! | [`restart`](FdbCluster::restart) | `docker restart -t 1`, waits for the process to rejoin |
 //! | [`pause`](FdbCluster::pause) / [`unpause`](FdbCluster::unpause) | cgroup freezer: sockets stay open, nothing answers |
 //! | [`exclude`](FdbCluster::exclude) / [`include`](FdbCluster::include) | `fdbcli exclude`/`include`; exclude waits until the data has moved off |
@@ -1158,6 +1159,22 @@ impl FdbCluster {
         self.rejoined(index)
     }
 
+    /// Starts several processes stopped with [`kill`](Self::kill) or [`stop`](Self::stop)
+    /// (`docker start` each), then waits until all of them report in. Use it when the
+    /// processes cannot come up one at a time, for example after the whole cluster was
+    /// stopped: a lone process has no quorum of coordinators, and
+    /// [`start_process`](Self::start_process) would wait for it in vain.
+    pub fn start_processes(&self, indexes: &[usize]) -> Result<()> {
+        for &index in indexes {
+            let node = self.node_checked(index)?;
+            docker(&["start", node.id()], DOCKER_TIMEOUT)?;
+        }
+        for &index in indexes {
+            self.mark_up(index)?;
+        }
+        self.wait_processes(DEFAULT_WAIT_TIMEOUT)
+    }
+
     /// Restarts process `index` (`docker restart -t 1`) and waits until it reports in again.
     pub fn restart(&self, index: usize) -> Result<()> {
         let node = self.node_checked(index)?;
@@ -1166,6 +1183,12 @@ impl FdbCluster {
     }
 
     fn rejoined(&self, index: usize) -> Result<()> {
+        self.mark_up(index)?;
+        self.wait_processes(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    /// Checks that a started process kept its address, and counts it as up.
+    fn mark_up(&self, index: usize) -> Result<()> {
         let node = &self.nodes[index];
         let ip_out = docker(
             &[
@@ -1187,7 +1210,7 @@ impl FdbCluster {
             }
         }
         node.set_up(true);
-        self.wait_processes(DEFAULT_WAIT_TIMEOUT)
+        Ok(())
     }
 
     /// Freezes process `index` (`docker pause`, the cgroup freezer): its sockets stay open but
