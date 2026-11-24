@@ -862,7 +862,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             }
             // Decide when to send the request to the second best choice.
             if let Some(delay) = second_delay_secs(best_time, next_time, model.second_multiplier) {
-                second_delay = Some(Box::pin(self.rt.sleep_until(started + secs(delay))));
+                second_delay = Some(if delay > 0.0 {
+                    // At least `BASE_SECOND_REQUEST_TIME` (0.5 ms), so on a coarse timer it
+                    // fires up to a tick late: a hedge, not a wait on the reply path.
+                    Box::pin(self.rt.sleep_until(started + secs(delay)))
+                } else {
+                    // `delay(0)`: at once, not at the timer's next tick (tokio fires a
+                    // deadline just past about 1 ms later).
+                    Box::pin(std::future::ready(()))
+                });
             }
         }
 

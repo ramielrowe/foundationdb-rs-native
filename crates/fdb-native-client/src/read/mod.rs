@@ -102,8 +102,12 @@
 //!   sends a batch when it has `MAX_BATCH_SIZE` (1000) of them, or `batchTime` after the
 //!   first; `batchTime` starts at 0 (a batch is what arrives before the batcher runs again)
 //!   and follows half the reply latency, smoothed (`0.1 * target + 0.9 * batchTime`) and
-//!   capped at `GRV_BATCH_TIMEOUT` (5 ms; ClientKnobs 7.4:94-96, 8.0:204-206). Every
-//!   transaction of the batch gets the same reply.
+//!   capped at `GRV_BATCH_TIMEOUT` (5 ms; ClientKnobs 7.4:94-96, 8.0:204-206). A
+//!   `batchTime` below the runtime's
+//!   [`TIMER_RESOLUTION`](fdb_native_transport::runtime::Runtime::TIMER_RESOLUTION) (tokio's
+//!   1 ms tick) is waited out by re-reading the clock between yields rather than on the
+//!   timer, as flow's precise `delay` would wait it. Every transaction of the batch gets the
+//!   same reply.
 //! * **The reply.** `extractReadVersion` (7.4:7763-7863): `database_locked` if the database
 //!   is locked and the transaction is not lock aware; the version otherwise.
 //!
