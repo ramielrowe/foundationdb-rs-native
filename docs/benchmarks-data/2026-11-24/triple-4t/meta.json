@@ -1,0 +1,22 @@
+{
+  "backends": [
+    "native",
+    "c"
+  ],
+  "cluster": "triple",
+  "cluster_file": "docker:docker@172.19.0.10:4500,172.19.0.11:4500,172.19.0.12:4500",
+  "duration_s": 8.0,
+  "image": "foundationdb/foundationdb:7.4.10",
+  "reps": 3,
+  "status": "Using cluster file `/var/fdb/fdb.cluster'.\n\nConfiguration:\n  Redundancy mode        - double\n  Storage engine         - memory\n  Log engine             - ssd-2\n  Encryption at-rest     - disabled\n  Coordinators           - 3\n  Usable Regions         - 1\n\nCluster:\n  FoundationDB processes - 3\n  Zones                  - 3\n  Machines               - 3\n  Memory availability    - 8.0 GB per process on machine with least available\n  Fault Tolerance        - 1 machines\n  Server time            - 11/24/26 06:25:57\n\nData:\n  Replication health     - Healthy\n  Moving data            - 0.000 GB\n  Sum of key-value sizes - 0 MB\n  Disk space used        - 315 MB\n\nOperating space:\n  Storage server         - 1.0 GB free on most full server\n  Log server             - 210.8 GB free on most full server\n\nWorkload:\n  Read rate              - 47 Hz\n  Write rate             - 0 Hz\n  Transactions started   - 35 Hz\n  Transactions committed - 2 Hz\n  Conflict rate          - 0 Hz\n\nBackup and DR:\n  Running backups        - 0\n  Running DRs            - 0\n\nClient time: 11/24/26 06:25:57\n",
+  "threads": [
+    "4"
+  ],
+  "warmup_s": 2.0,
+  "workloads": [
+    "get",
+    "set",
+    "mixed",
+    "many_tx"
+  ]
+}
