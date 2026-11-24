@@ -94,8 +94,10 @@ impl<R: Runtime> Transaction<R> {
     /// versionstamped operation of the transaction makes unknown (unless
     /// [`BypassUnreadable`](super::TransactionOption::BypassUnreadable)), the errors of
     /// [`get`](Self::get), and `used_during_commit` (2017) after the commit started
-    /// ([maybe committed](Error::is_maybe_committed) once the commit may have been sent; the
-    /// commit itself goes on).
+    /// ([maybe committed](Error::is_maybe_committed) once the commit may have been sent). As
+    /// for every operation, that also fails the commit with it, unless
+    /// [`UsedDuringCommitProtectionDisable`](super::TransactionOption::UsedDuringCommitProtectionDisable)
+    /// is set.
     ///
     /// [`max_outstanding_watches`]: crate::watch::WatchConfig::max_outstanding_watches
     pub fn watch(&self, key: &[u8]) -> impl Future<Output = Result<Watch, Error>> + Send + use<R> {
@@ -140,11 +142,9 @@ impl<R: Runtime> Transaction<R> {
             return Err(e);
         }
         // `checkUsedDuringCommit()` before `resetPromise.isSet()` (7.4:2441-2446,
-        // 8.0:2357-2362), but without killing the transaction (see the differences in
-        // `crate::watch`).
-        if let Some(e) = state.used_during_commit() {
-            return Err(e);
-        }
+        // 8.0:2357-2362): as every operation, a watch after the commit started also fails
+        // the commit, unless `USED_DURING_COMMIT_PROTECTION_DISABLE` is set.
+        state.check_not_committing()?;
         state.check_alive(|| self.rt().now())?;
         let start = ReadStart {
             epoch: state.epoch,

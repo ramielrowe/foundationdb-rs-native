@@ -123,6 +123,11 @@ These aligned behaviour with C++'s read-your-writes layer:
   (they gave `transaction_cancelled` / `transaction_timed_out`), as C++ checks
   `checkUsedDuringCommit()` before `resetPromise` (`ReadYourWrites.actor.cpp` 7.4:1675-1680,
   2441-2446, 2502-2513, 2515-2521). The deferred error of a write still comes first.
+* **A `watch` after the commit started fails the commit too**, as every other operation
+  already did: C++'s `watch` calls `checkUsedDuringCommit()` (7.4:2441-2446, 8.0:2357-2362),
+  which fails the commit with `used_during_commit` (2017, maybe committed once the commit
+  may have been sent). Before, only the watch failed. `UsedDuringCommitProtectionDisable`
+  (701) restores that: only the offending operation fails.
 * **`get_read_version` during a commit** gives the read version and leaves the commit alone
   (it was `used_during_commit`, which also failed the commit): C++'s `getReadVersion`
   (7.4:1581-1587) has no `checkUsedDuringCommit`.

@@ -103,9 +103,6 @@
 //!
 //! ## Differences
 //!
-//! * **A watch started after the commit started** fails with `used_during_commit` (maybe
-//!   committed once the commit may have been sent) **without failing the commit**; C++'s
-//!   `checkUsedDuringCommit` also makes the commit fail with it.
 //! * **The read runs as a task of its own** (as every read of the transaction does): a
 //!   `watch` future that is no longer polled does not hold the commit up, the read still
 //!   ends and registers the watch. **Dropping the future before the read ends cancels it**,

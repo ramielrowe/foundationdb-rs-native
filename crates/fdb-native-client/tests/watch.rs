@@ -1364,8 +1364,11 @@ async fn a_set_during_a_dependent_watch_read_is_compared_with_the_value_read() {
     }
 }
 
+/// `ReadYourWritesTransaction::watch` calls `checkUsedDuringCommit` (7.4:2441-2446,
+/// 8.0:2357-2362), as every operation does: a watch after the commit started fails, and
+/// so does the commit, unless `USED_DURING_COMMIT_PROTECTION_DISABLE` is set.
 #[tokio::test(start_paused = true)]
-async fn a_watch_after_the_commit_started_does_not_fail_the_commit() {
+async fn a_watch_after_the_commit_started_fails_the_commit() {
     let env = standard(SchemaVersion::V8_0).await;
     let tx = env.db.create_transaction();
     tx.set(b"w", b"1");
@@ -1378,6 +1381,24 @@ async fn a_watch_after_the_commit_started_does_not_fail_the_commit() {
     let e = tx.watch(b"k").await.unwrap_err();
     assert_eq!(e.code(), codes::USED_DURING_COMMIT);
     assert!(!e.is_maybe_committed(), "the request was not sent yet");
+    let e = within("the commit", commit).await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(!e.is_maybe_committed(), "the request was not sent yet");
+    assert_eq!(env.db.outstanding_watches(), 0);
+
+    // With the option only the watch fails; the commit completes.
+    let tx = env.db.create_transaction();
+    tx.set_option(fdb_native_client::TransactionOption::UsedDuringCommitProtectionDisable)
+        .unwrap();
+    tx.set(b"w", b"1");
+    let commit = tx.commit();
+    let mut commit = std::pin::pin!(commit);
+    let started =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(commit.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(started);
+    let e = tx.watch(b"k").await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
     within("the commit", commit).await.unwrap();
     // After the commit: maybe committed (it did commit).
     let e = tx.watch(b"k").await.unwrap_err();
