@@ -68,6 +68,11 @@ anew starts with its address available, and a failed peer that is referenced aga
 (found by the deterministic simulation, `fdb-native-sim`, which is not published).
 Requests are encoded with a writer each thread keeps (new: `Writer::buffer_capacity`, to drop
 one that grew large), and the transport's reply and request maps use FxHash (bead `e82`).
+`PeerManager::peer` spawns a new peer's task after releasing the peers lock. A runtime that
+is shutting down drops the task inside `spawn`, and the task's drop takes that lock to remove
+its entry, so a multi-thread tokio runtime dropped while the coordinator monitor was opening a
+connection never finished dropping (a worker deadlocked on itself; found by `mes`, which ends its
+runtime at a deadline).
 
 ### API decisions made before the first release
 

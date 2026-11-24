@@ -1453,14 +1453,29 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
             .failures
             .set_address_failed(address, false, shared.rt.now());
         let task = PeerTask::new(shared.clone(), key, peer.clone(), ctrl_rx);
-        let task = shared.rt.spawn(task.run());
         peers.map.insert(
             key,
             Entry {
-                shared: peer,
-                task: Some(task),
+                shared: peer.clone(),
+                task: None,
             },
         );
+        // Spawn without the lock. An executor that is shutting down drops the task inside
+        // `spawn`, and `PeerTask`'s drop takes the lock (`Shared::forget`): with the lock held
+        // here that is a self-deadlock. Dropped in line, the task finds its entry (inserted
+        // above) and removes it.
+        drop(peers);
+        let task = shared.rt.spawn(task.run());
+        let mut peers = shared.lock_peers();
+        match peers.map.get_mut(&key) {
+            Some(entry) if Arc::ptr_eq(&entry.shared, &peer) => entry.task = Some(task),
+            // The task is gone already (dropped in line, or ended) and removed its entry, or
+            // the entry is another peer's. Nothing to wait for.
+            _ => {
+                drop(peers);
+                drop(task);
+            }
+        }
         handle
     }
 
