@@ -865,6 +865,55 @@ async fn a_timeout_set_during_an_operation_interrupts_it() {
     assert!(before.elapsed() < Duration::from_millis(2));
 }
 
+/// A deadline that passed while nothing ran has killed the transaction (C++'s `timebomb`
+/// fires on its own): unsetting or lengthening the timeout afterwards does not bring it
+/// back, and a `cancel` does not replace the error (the bindingtester's `test_timeouts`
+/// case 10).
+#[tokio::test(start_paused = true)]
+async fn a_timeout_that_fired_while_idle_cannot_be_unset() {
+    let env = env(SchemaVersion::V7_4).await;
+    for change in [
+        Some(Duration::ZERO),
+        Some(Duration::from_secs(1000)),
+        None, // cancel
+    ] {
+        let tx = env.db.create_transaction();
+        tx.set(b"foo", b"bar");
+        tx.set_option(TransactionOption::Timeout(Duration::from_millis(100)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        match change {
+            Some(timeout) => tx.set_option(TransactionOption::Timeout(timeout)).unwrap(),
+            None => tx.cancel(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The fake proxy never answers: a commit that is sent does not end.
+        let e = tokio::time::timeout(Duration::from_secs(10), tx.commit())
+            .await
+            .expect("the commit fails at once, without a request")
+            .unwrap_err();
+        assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT, "{change:?}");
+        assert!(!e.is_maybe_committed());
+        assert_eq!(
+            tx.get_read_version().await.unwrap_err().code(),
+            codes::TRANSACTION_TIMED_OUT
+        );
+        // A reset starts over.
+        tx.reset();
+        assert_eq!(tx.commit().await.unwrap().committed_version(), -1);
+    }
+
+    // Unset before the deadline, the timeout is gone (case 9).
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(100)))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.set_option(TransactionOption::Timeout(Duration::ZERO))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(tx.commit().await.unwrap().committed_version(), -1);
+}
+
 /// (f4) Shutting the database down ends the operations in progress; a commit that was
 /// sent may have committed.
 #[tokio::test(start_paused = true)]

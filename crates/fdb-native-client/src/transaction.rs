@@ -114,7 +114,10 @@
 //! [`reset`](Transaction::reset); not from [`on_error`](Transaction::on_error)): once it
 //! has passed, every operation, including one in progress and `on_error`, fails with
 //! `transaction_timed_out` (1031) until the transaction is reset. Setting the option applies
-//! to the operations in progress too (at once if the deadline has already passed).
+//! to the operations in progress too (at once if the deadline has already passed). As with
+//! C++'s timer, a deadline that has passed has killed the transaction even if nothing ran
+//! then: changing or removing the timeout afterwards does not bring it back, and a later
+//! [`cancel`](Transaction::cancel) leaves the error `transaction_timed_out`.
 //! [`cancel`](Transaction::cancel) does the same with `transaction_cancelled` (1025), and a
 //! [`reset`](Transaction::reset) (or `on_error`) makes the operations in progress fail with
 //! `transaction_cancelled`. The future of [`get_versionstamp`](Transaction::get_versionstamp)
@@ -476,15 +479,24 @@ impl State {
 
     /// Fails if the transaction is dead, or its timeout has passed (which kills it).
     fn check_alive(&mut self, now: Instant) -> Result<(), Error> {
-        if let Some(e) = &self.dead {
-            return Err(e.clone());
+        self.fire_timebomb(now);
+        match &self.dead {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
-        if self.deadline().is_some_and(|deadline| deadline <= now) {
-            let e = Error::new(TRANSACTION_TIMED_OUT);
-            self.kill(e.clone());
-            return Err(e);
+    }
+
+    /// `timebomb` (`ReadYourWrites.actor.cpp`): C++ arms a timer that sets `resetPromise`
+    /// to `transaction_timed_out` at the deadline, whatever the transaction is doing. Here
+    /// the deadline is looked at whenever the transaction is ([`Transaction::state`], and
+    /// every wait of an operation in progress): one that has passed kills the transaction
+    /// then, before anything else happens to it, as if the timer had fired at the deadline.
+    /// So a later change of the timeout (`set_option(Timeout(0))` included), a `cancel` or
+    /// a `used_during_commit` does not replace the timeout.
+    fn fire_timebomb(&mut self, now: Instant) {
+        if self.dead.is_none() && self.deadline().is_some_and(|deadline| deadline <= now) {
+            self.kill(Error::new(TRANSACTION_TIMED_OUT));
         }
-        Ok(())
     }
 
     /// Makes every operation fail with `error` (the first such error stays) until a full
@@ -597,7 +609,7 @@ impl<R: Runtime> Clone for Transaction<R> {
 
 impl<R: Runtime> fmt::Debug for Transaction<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state();
+        let state = lock(&self.inner.state);
         f.debug_struct("Transaction")
             .field("read_version", &state.read_version)
             .field("retries", &state.retries)
@@ -786,8 +798,12 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
+    /// The transaction's state, killed first if its deadline has passed
+    /// ([`State::fire_timebomb`]).
     fn state(&self) -> MutexGuard<'_, State> {
-        lock(&self.inner.state)
+        let mut state = lock(&self.inner.state);
+        state.fire_timebomb(self.rt().now());
+        state
     }
 
     fn rt(&self) -> &R {
@@ -1750,7 +1766,8 @@ impl<R: Runtime> Transaction<R> {
         state.apply_option(&option)?;
         if let TransactionOption::Timeout(_) = option {
             // `resetTimeout`: the operations in progress see the new deadline (and fail at
-            // once if it has passed).
+            // once if it has passed). A deadline that passed before this call has killed
+            // the transaction already (`state()`), and no new timeout brings it back.
             if state.check_alive(self.rt().now()).is_ok() {
                 state.interrupt(|| Interrupt::Deadline);
             }
