@@ -1366,10 +1366,11 @@ impl<R: Runtime> Transaction<R> {
     }
 
     /// A mutation (`set`, `clear`, `clear_range` or `atomic_op`): `f` on the state (its
-    /// buffer), unless the transaction is committing (`used_during_commit`) or dead, or the
-    /// handle is stale; its error is deferred. On success, the state (still locked) and what
-    /// `f` returned: the write's watches are triggered then (`triggerWatches` comes after the
-    /// write's checks).
+    /// buffer), unless the transaction is committing (`used_during_commit`) or the handle is
+    /// stale; its error is deferred. On success, the state (still locked) and what `f`
+    /// returned: the write's watches are triggered then (`triggerWatches` comes after the
+    /// write's checks), unless the transaction is dead (cancelled or timed out: the write
+    /// is made, as in C++, but its watches have failed already).
     ///
     /// The `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option is used up first thing, as the
     /// read-your-writes layer's `getAndResetWriteConflictDisabled` does (whatever the write
@@ -1396,9 +1397,6 @@ impl<R: Runtime> Transaction<R> {
             state.defer(Self::stale());
             return None;
         }
-        if state.dead.is_some() {
-            return None;
-        }
         if let Err(e) = state.check_not_committing() {
             state.defer(e);
             return None;
@@ -1407,6 +1405,12 @@ impl<R: Runtime> Transaction<R> {
         let result = f(&mut state, !skip_conflict);
         state.buffer.set_skip_write_conflict(false);
         match result {
+            // C++'s writes do not look at `resetPromise`: on a cancelled or timed-out
+            // transaction a write is still checked, its error deferred (which the next
+            // operation returns before the cancellation), and applied (only
+            // `approximate_size` sees it). It triggers no watch: the transaction's watches
+            // have failed with its error already.
+            Ok(_) if state.dead.is_some() => None,
             Ok(t) => Some((state, t)),
             Err(e) => {
                 state.defer(e);

@@ -1197,6 +1197,34 @@ async fn the_deferred_error_comes_before_the_cancellation() {
         tx.get_versionstamp().await.unwrap_err().code(),
         codes::VERSION_INVALID
     );
+    // A write after the cancellation is still checked (C++'s writes do not look at
+    // `resetPromise`), and its error is deferred: the bindingtester's `api` test, seed 1059
+    // at 2000 operations on 8.0 (CANCEL, SET of a value too large, GET).
+    let tx = env.db.create_transaction();
+    tx.cancel();
+    tx.set(b"k", &[0; 200_000]);
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::VALUE_TOO_LARGE
+    );
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VALUE_TOO_LARGE
+    );
+    // And applied: only the approximate size sees it.
+    let tx = env.db.create_transaction();
+    tx.cancel();
+    let before = tx.approximate_size().unwrap();
+    tx.set(b"k", b"v");
+    tx.clear_range(b"a", b"b");
+    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+    assert!(tx.approximate_size().unwrap() > before);
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    tx.reset();
+    assert_eq!(tx.approximate_size().unwrap(), 0);
     // A timeout that has passed does not hide it either.
     let tx = env.db.create_transaction();
     tx.set_option(TransactionOption::Timeout(Duration::from_millis(10)))
