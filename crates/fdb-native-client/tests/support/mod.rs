@@ -150,6 +150,8 @@ impl<R: Runtime> Runtime for MemRuntime<R> {
     type Stream = MemStream;
     type Task<T: Send + 'static> = R::Task<T>;
 
+    const TIMER_RESOLUTION: Duration = R::TIMER_RESOLUTION;
+
     /// The same runtime and the same in-memory network: databases on one share connections.
     fn same_runtime(&self, other: &Self) -> bool {
         self.inner.same_runtime(&other.inner) && Arc::ptr_eq(&self.net, &other.net)

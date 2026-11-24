@@ -1,0 +1,26 @@
+# Dev-only benchmark of fdb-native-client against libfdb_c (through the `foundationdb` crate).
+# Not a workspace member (the empty [workspace] table keeps it out of the root workspace, so
+# `cargo ... --workspace` never builds it and CI does not need libfdb_c or libclang).
+[package]
+name = "fdb-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Benchmarks of fdb-native-client vs libfdb_c on a disposable testkit cluster"
+
+[workspace]
+
+[dependencies]
+fdb-native-client = { path = "../../crates/fdb-native-client" }
+fdb-native-testkit = { path = "../../crates/fdb-native-testkit" }
+# libfdb_c through the Rust binding; links dynamically to the host's libfdb_c.so (7.4.10).
+foundationdb = { version = "0.11", default-features = false, features = ["embedded-fdb-include", "fdb-7_4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time", "sync", "signal"] }
+futures = "0.3"
+libc = "0.2"
+serde_json = "1"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4

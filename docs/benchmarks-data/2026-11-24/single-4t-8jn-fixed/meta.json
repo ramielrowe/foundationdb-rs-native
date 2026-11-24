@@ -1,0 +1,11 @@
+{
+  "what": "foundationdb-rs-native-8jn: the native client with the fix (BatchDelay in read/grv.rs), interleaved with ../single-4t-8jn on the same cluster",
+  "cluster": "single (fdb-bench serve: one fdbserver, single memory, testkit container)",
+  "image": "foundationdb/foundationdb:7.4.10",
+  "backends": ["native"],
+  "threads": ["4"],
+  "workloads": ["get", "set", "mixed", "watch"],
+  "reps": 3,
+  "duration_s": 8.0,
+  "warmup_s": 2.0
+}

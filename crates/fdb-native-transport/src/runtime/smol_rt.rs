@@ -168,6 +168,28 @@ impl Runtime for SmolRuntime {
     /// iteration is double counted either.
     const PENDING_TAKES_NOTHING: bool = true;
 
+    /// async-io's reactor waits until the earliest timer with the poller's own timeout, which
+    /// is precise to the microsecond where the OS allows it: a timerfd on Linux and Android
+    /// (polling 3.x `src/epoll.rs`), a `timespec` for kqueue (`sleep(20us)` takes about
+    /// 25 us, `sleep(900us)` 908 us; measured on Linux). Elsewhere (Windows, `poll(2)`) the
+    /// timeout is in milliseconds, so the default applies.
+    const TIMER_RESOLUTION: Duration = if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )) {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(1)
+    };
+
     /// The same executor (every [`SmolRuntime::new`] is the process-wide one).
     fn same_runtime(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.executor, &other.executor)

@@ -119,6 +119,8 @@ struct FakeGrv {
     busy: Arc<AtomicI32>,
     /// The `metadataVersion` of the replies.
     metadata: Arc<Mutex<Option<Vec<u8>>>>,
+    /// How long the proxy takes to reply (on tokio's timer).
+    reply_delay: Arc<Mutex<Duration>>,
 }
 
 struct FakeCommit {
@@ -269,12 +271,14 @@ impl Cluster {
         let answer = Arc::new(Mutex::new(Ok(false)));
         let busy = Arc::new(AtomicI32::new(0));
         let metadata = Arc::new(Mutex::new(None));
+        let reply_delay = Arc::new(Mutex::new(Duration::ZERO));
         {
             let requests = requests.clone();
             let answer = answer.clone();
             let version = self.version.clone();
             let busy = busy.clone();
             let metadata = metadata.clone();
+            let reply_delay = reply_delay.clone();
             let proxy_id = token;
             process.handle(token, move |incoming: Incoming| {
                 let (request, reply) =
@@ -290,7 +294,11 @@ impl Cluster {
                     Err(Some(code)) => Err(FdbError::new(code)),
                 };
                 let payload = GetReadVersion::encode_reply(incoming.schema, &reply_value).unwrap();
-                Action::reply(reply, payload)
+                Action::Reply {
+                    token: reply,
+                    payload,
+                    delay: *reply_delay.lock().unwrap(),
+                }
             });
         }
         FakeGrv {
@@ -300,6 +308,7 @@ impl Cluster {
             answer,
             busy,
             metadata,
+            reply_delay,
         }
     }
 
@@ -534,6 +543,83 @@ async fn grv_batches_concurrent_requests() {
             "{schema}"
         );
     }
+}
+
+/// On tokio's real clock (not paused): with `batchTime` tens of microseconds (this in-memory
+/// proxy answers that fast), a lone read version request goes out after `batchTime`, as
+/// `delay(batchTime)` does in C++, not on tokio's next timer tick (`sleep(20us)` takes
+/// 1.05 ms, which every transaction used to pay).
+#[tokio::test]
+async fn a_lone_grv_does_not_wait_for_a_timer_tick() {
+    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    let reader = cluster.reader();
+    // The connection, and a `batchTime` above zero from the replies' latency.
+    for _ in 0..20 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+    }
+    let mut fast = 0;
+    for _ in 0..20 {
+        let start = std::time::Instant::now();
+        within("GRV", reader.get_read_version()).await.unwrap();
+        if start.elapsed() < Duration::from_micros(900) {
+            fast += 1;
+        }
+    }
+    // Half, not all: a loaded test machine may deschedule the thread now and then.
+    assert!(
+        fast >= 10,
+        "only {fast} of 20 read versions took less than 0.9 ms"
+    );
+}
+
+/// On tokio's real clock, with `batchTime` below tokio's timer resolution: requests that
+/// arrive while a batch waits still join it, as in C++ (the batcher waits out `batchTime` on
+/// the clock rather than sending after one yield). 200 requests arrive one every 20 us over
+/// 4 ms; with a GRV latency of about 1 ms `batchTime` is about 0.5 ms, so a batch collects
+/// about 25 of them. Sent after a yield each, they would go out almost one by one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grv_requests_arriving_during_the_batch_time_join_the_batch() {
+    let (cluster, grv, _commit) = Cluster::ready(SchemaVersion::V8_0, 1).await;
+    // tokio's `sleep(100us)` is about 1.05 ms: the reply latency.
+    *grv.reply_delay.lock().unwrap() = Duration::from_micros(100);
+    let reader = cluster.reader();
+    // `batchTime` converges to half the latency (10% of the way per reply).
+    for _ in 0..40 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+    }
+    let before = grv.requests.lock().unwrap().len();
+    const N: usize = 200;
+    let handle = tokio::runtime::Handle::current();
+    let spawner = {
+        let reader = reader.clone();
+        tokio::task::spawn_blocking(move || {
+            (0..N)
+                .map(|_| {
+                    let reader = reader.clone();
+                    let read = handle.spawn(async move { reader.get_read_version().await });
+                    let next = std::time::Instant::now() + Duration::from_micros(20);
+                    while std::time::Instant::now() < next {
+                        std::hint::spin_loop();
+                    }
+                    read
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    for read in within("spawner", spawner).await.unwrap() {
+        within("GRV", read).await.unwrap().unwrap();
+    }
+    let requests = grv.requests.lock().unwrap();
+    let batches = &requests[before..];
+    assert_eq!(
+        batches.iter().map(|r| r.transaction_count).sum::<u32>(),
+        N as u32
+    );
+    assert!(
+        batches.len() <= N / 10,
+        "{} GRV requests for {N} transactions over 4 ms",
+        batches.len()
+    );
 }
 
 #[tokio::test(start_paused = true)]

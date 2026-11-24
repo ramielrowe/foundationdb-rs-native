@@ -18,7 +18,8 @@ FoundationDB **7.4** and **8.0** (tested with the `foundationdb/foundationdb:7.4
 of the cluster it connects to and speaks that release's message schemas, so other releases
 (7.3 and earlier) are not supported. How the client behaves toward a cluster (coordinators,
 `status json`, throttling, backoff, connections, upgrades), compared with `libfdb_c`, is in
-[docs/well-behaved-client.md](docs/well-behaved-client.md).
+[docs/well-behaved-client.md](docs/well-behaved-client.md). Throughput, latency and CPU against `libfdb_c` 7.4.10, with the method
+and the findings, are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Quick start
 
