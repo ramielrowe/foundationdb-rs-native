@@ -106,8 +106,11 @@
 //!   `batchTime` below the runtime's
 //!   [`TIMER_RESOLUTION`](fdb_native_transport::runtime::Runtime::TIMER_RESOLUTION) (tokio's
 //!   1 ms tick) is waited out by re-reading the clock between yields rather than on the
-//!   timer, as flow's precise `delay` would wait it. Every transaction of the batch gets the
-//!   same reply.
+//!   timer, as flow's precise `delay` would wait it. Where C++ would wait for nothing, so
+//!   does this client: after two batches in a row of one request, a request that arrives with
+//!   no batch in flight (a serial client) is sent after the usual yield instead of polling the
+//!   clock for company that cannot come; the next batch with company, or a request that finds
+//!   another batch in flight, waits again. Every transaction of the batch gets the same reply.
 //! * **The reply.** `extractReadVersion` (7.4:7763-7863): `database_locked` if the database
 //!   is locked and the transaction is not lock aware; the version otherwise.
 //!
@@ -253,7 +256,9 @@
 //!     `SECOND_REQUEST_MAX_BUDGET`, 100) and lowers `secondMultiplier` by
 //!     `SECOND_REQUEST_MULTIPLIER_DECAY` (0.00025; not below 1), and a second request costs 1
 //!     and raises `secondMultiplier` by `SECOND_REQUEST_MULTIPLIER_GROWTH` (0.01); the timer
-//!     is spent either way. The first good reply of the two wins; an error reply that is
+//!     is spent either way. The delay is timed with [`Runtime::sleep_until_precise`], since
+//!     flow's `delay` is precise and 0.5 ms is below tokio's timer tick. The first good reply
+//!     of the two wins; an error reply that is
 //!     returned (`wrong_shard_server`, ...) ends the call too; one that is retried
 //!     (`server_overloaded`, `process_behind` before all were tried, a lost connection)
 //!     leaves the other to answer, or goes on to the next replica. A request that no
