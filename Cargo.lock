@@ -527,6 +527,14 @@ dependencies = [
 [[package]]
 name = "fdb-native-stacktester"
 version = "0.0.0"
+dependencies = [
+ "fdb-native-client",
+ "fdb-native-testkit",
+ "fdb-native-tuple",
+ "futures-core",
+ "num-bigint 0.5.1",
+ "tokio",
+]
 
 [[package]]
 name = "fdb-native-testkit"

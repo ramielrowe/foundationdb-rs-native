@@ -10,3 +10,15 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+# Its default `tokio` feature: `Database::open` on the current tokio runtime.
+fdb-native-client = { path = "../fdb-native-client" }
+fdb-native-tuple = { path = "../fdb-native-tuple" }
+futures-core = "0.3.34"
+# The tuple layer's `Element::BigInt` (the same major version as `fdb-native-tuple`'s).
+num-bigint = "0.5.1"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[dev-dependencies]
+fdb-native-testkit = { path = "../fdb-native-testkit" }
