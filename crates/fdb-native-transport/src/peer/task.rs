@@ -170,6 +170,18 @@ async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
         return Err(PeerError::TlsNotConfigured);
     }
     let after = shared.config.connect_timeout;
+    let socket_addr = address.socket_addr();
+    if tls
+        && shared.tls_throttle.is_throttled(
+            socket_addr,
+            shared.rt.now(),
+            shared.config.tls_throttle_attempts,
+        )
+    {
+        // `SSLConnection::connect`: wait out the connect timeout, then fail, without dialing.
+        shared.rt.sleep(after).await;
+        return Err(PeerError::TlsThrottled);
+    }
     // Which part ran out of time.
     let tcp_done = AtomicBool::new(false);
     let work = async {
@@ -184,11 +196,20 @@ async fn dial<R: Runtime, W: StreamWrapper<R::Stream>>(
         tcp_done.store(true, Ordering::SeqCst);
         match shared.wrapper.wrap(socket, address).await {
             Ok(stream) => Ok(MaybeTls::Tls(stream)),
-            Err(e) => Err(PeerError::Tls {
-                kind: e.kind(),
-                message: e.to_string(),
-                source: e.into(),
-            }),
+            Err(e) => {
+                // `recordHandshakeFailure`. (A handshake that times out is cancelled first in
+                // C++, and records nothing: see `tls_throttle`.)
+                shared.tls_throttle.record_failure(
+                    socket_addr,
+                    shared.rt.now(),
+                    shared.config.tls_throttle_timeout,
+                );
+                Err(PeerError::Tls {
+                    kind: e.kind(),
+                    message: e.to_string(),
+                    source: e.into(),
+                })
+            }
         }
     };
     match timeout(&shared.rt, after, work).await {
