@@ -396,14 +396,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
         if let Err(e) = sim.run_for(Duration::from_secs(5)) {
             violations.push(format!("{when}: {e}"));
         }
-        let held_still = held.is_some();
-        let leaked: Vec<_> = sim
-            .live_tasks(client)
-            .into_iter()
-            .filter(|t| {
-                !(held_still && KNOWN_AFTER_SHUTDOWN.iter().any(|k| t.location.contains(k)))
-            })
-            .collect();
+        let leaked = sim.live_tasks(client);
         if !leaked.is_empty() {
             violations.push(format!(
                 "leak: {} client tasks alive 5 s {when}: {}",
@@ -423,10 +416,6 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     violations.extend(records.violations());
     report(violations, &sim, &cluster, convergence)
 }
-
-/// Client tasks known to outlive `Database::shutdown` while the database is still held (they
-/// end when it is dropped): the read-version batchers (bead foundationdb-rs-native-x4q).
-const KNOWN_AFTER_SHUTDOWN: &[&str] = &["fdb-native-client/src/read/grv.rs"];
 
 /// What the client knows, for a liveness report: its `ClientDBInfo` against the cluster's,
 /// and the servers its failure monitor marks failed.

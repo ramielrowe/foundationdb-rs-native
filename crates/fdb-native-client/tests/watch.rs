@@ -1297,7 +1297,19 @@ async fn a_watch_future_no_longer_polled_does_not_hold_the_commit() {
     env.set_value(b"k", Some(b"v"));
     resolved("the watch", &mut watch).await.unwrap();
 
-    // Dropped before its read ended: the commit goes on; nothing is left counted.
+    // The kept watch's read added its range.
+    let commit = env.commits.lock().unwrap().last().unwrap().clone();
+    assert!(
+        commit
+            .read_conflict_ranges
+            .contains(&KeyRange::single_key(b"k")),
+        "{:?}",
+        commit.read_conflict_ranges
+    );
+
+    // Dropped before its read ended: the read is cancelled, as C++'s `watch` actor is with
+    // its future: the commit goes on, without the watch's read conflict range; nothing is
+    // left counted or started.
     let tx = env.db.create_transaction();
     tx.set(b"w", b"2");
     {
@@ -1306,8 +1318,50 @@ async fn a_watch_future_no_longer_polled_does_not_hold_the_commit() {
         let _ = std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx))).await;
     }
     within("the commit", tx.commit()).await.unwrap();
+    let commit = env.commits.lock().unwrap().last().unwrap().clone();
+    assert!(
+        !commit
+            .read_conflict_ranges
+            .iter()
+            .any(|r| r.begin.as_slice() <= &b"j"[..] && &b"j"[..] < r.end.as_slice()),
+        "{:?}",
+        commit.read_conflict_ranges
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(env.db.outstanding_watches(), 0);
+    assert_eq!(env.request_count(), 1);
+}
+
+/// A set during the read of a watch whose key has a pending atomic operation (a dependent
+/// read) is compared with the value read with the writes as of the `watch` call: C++'s
+/// `it->skip(k)` after the read (RYW 7.4:128, 8.0:137) looks the key up again in the
+/// iterator's snapshot of the write map (`WriteMap.h` 7.4:158-160, 8.0:186-188). The folded
+/// value does not fire the watch; another value fires it when the read ends.
+#[tokio::test(start_paused = true)]
+async fn a_set_during_a_dependent_watch_read_is_compared_with_the_value_read() {
+    for (set, fires) in [(6u64, false), (9u64, true)] {
+        let env = standard(SchemaVersion::V8_0).await;
+        env.set_value(b"n", Some(&5u64.to_le_bytes()));
+        let tx = env.db.create_transaction();
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+        let watch = tx.watch(b"n");
+        let mut watch = std::pin::pin!(watch);
+        let reading =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(watch.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(reading);
+        tx.set(b"n", &set.to_le_bytes());
+        let mut watch = within("the watch", watch).await.unwrap();
+        if fires {
+            resolved("the watch", &mut watch).await.unwrap();
+            continue;
+        }
+        assert!(pending(&mut watch).await);
+        tx.commit().await.unwrap();
+        until("the watch request", || env.request_count() == 1).await;
+        assert_eq!(env.requests()[0].0.value, Some(6u64.to_le_bytes().to_vec()));
+        assert!(pending(&mut watch).await);
+    }
 }
 
 #[tokio::test(start_paused = true)]
