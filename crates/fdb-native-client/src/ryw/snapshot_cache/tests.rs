@@ -162,9 +162,9 @@ fn cpp_test_snapshot_cache_segments() {
         kv(b"e\0", b"zoo"),
         kv(b"f", b"foo"),
     ];
-    assert!(cache.insert_range(b"d", b"f\0", &rows));
-    assert!(cache.insert_range(b"g", b"h", &[]));
-    assert!(cache.insert_range(b"j", b"m", &[kv(b"k", b"koo"), kv(b"l", b"loo")]));
+    assert!(cache.insert_range(b"d", b"f\0", rows.to_vec()));
+    assert!(cache.insert_range(b"g", b"h", vec![]));
+    assert!(cache.insert_range(b"j", b"m", vec![kv(b"k", b"koo"), kv(b"l", b"loo")]));
     assert!(!cache.is_empty());
     cache.assert_invariants();
 
@@ -256,13 +256,13 @@ fn insert_key_values_and_absences() {
 #[test]
 fn insert_range_does_not_change_known_ends() {
     let mut cache = SnapshotCache::new();
-    assert!(cache.insert_range(b"c", b"f", &[kv(b"d", b"D")]));
-    assert!(cache.insert_range(b"j", b"m", &[kv(b"k", b"K")]));
+    assert!(cache.insert_range(b"c", b"f", vec![kv(b"d", b"D")]));
+    assert!(cache.insert_range(b"j", b"m", vec![kv(b"k", b"K")]));
     // Straddles both known ranges and covers the gap: only the unknown parts are new.
     assert!(cache.insert_range(
         b"e",
         b"l",
-        &[
+        vec![
             kv(b"e", b"E"),
             kv(b"g", b"G"),
             kv(b"k", b"K"),
@@ -294,13 +294,13 @@ fn insert_range_does_not_change_known_ends() {
     assert!(cache.insert_range(
         b"c",
         b"m",
-        &[kv(b"d", b"D"), kv(b"g", b"G"), kv(b"k", b"K")]
+        vec![kv(b"d", b"D"), kv(b"g", b"G"), kv(b"k", b"K")]
     ));
     cache.assert_invariants();
     assert_eq!(cache.entries.len(), 3);
     // Inside a single known entry, there is nothing new.
-    assert!(!cache.insert_range(b"d", b"e", &[kv(b"d", b"D")]));
-    assert!(!cache.insert_range(b"d", b"m", &[kv(b"d", b"D")]));
+    assert!(!cache.insert_range(b"d", b"e", vec![kv(b"d", b"D")]));
+    assert!(!cache.insert_range(b"d", b"m", vec![kv(b"d", b"D")]));
 }
 
 #[test]
@@ -309,7 +309,7 @@ fn insert_range_replaces_entries_inside() {
     cache.insert_key(b"c", Some(b"C"));
     cache.insert_key(b"e", None);
     cache.insert_key(b"g", Some(b"G"));
-    assert!(cache.insert_range(b"b", b"h", &[kv(b"c", b"C"), kv(b"g", b"G")]));
+    assert!(cache.insert_range(b"b", b"h", vec![kv(b"c", b"C"), kv(b"g", b"G")]));
     cache.assert_invariants();
     assert_eq!(
         forward(&cache),
@@ -330,15 +330,15 @@ fn insert_range_replaces_entries_inside() {
 fn insert_range_edge_cases() {
     let mut cache = SnapshotCache::new();
     // Empty and inverted ranges record nothing.
-    assert!(!cache.insert_range(b"b", b"b", &[]));
-    assert!(!cache.insert_range(b"c", b"b", &[kv(b"b", b"x")]));
-    assert!(!cache.insert_range(b"\xff\xff", b"\xff\xff\xff", &[]));
+    assert!(!cache.insert_range(b"b", b"b", vec![]));
+    assert!(!cache.insert_range(b"c", b"b", vec![kv(b"b", b"x")]));
+    assert!(!cache.insert_range(b"\xff\xff", b"\xff\xff\xff", vec![]));
     assert!(cache.is_empty());
     // From the very start, to the very end (and past it).
     assert!(cache.insert_range(
         b"",
         b"\xff\xff\xff",
-        &[kv(b"", b"empty key"), kv(b"z", b"Z")]
+        vec![kv(b"", b"empty key"), kv(b"z", b"Z")]
     ));
     cache.assert_invariants();
     assert!(!cache.is_empty());
@@ -356,8 +356,8 @@ fn insert_range_edge_cases() {
 
     // A known range to the start of the key space is replaced in place.
     let mut cache = SnapshotCache::new();
-    assert!(cache.insert_range(b"", b"m", &[]));
-    assert!(cache.insert_range(b"c", b"p", &[]));
+    assert!(cache.insert_range(b"", b"m", vec![]));
+    assert!(cache.insert_range(b"c", b"p", vec![]));
     cache.assert_invariants();
     assert_eq!(
         normalize(forward(&cache)),
@@ -369,7 +369,7 @@ fn insert_range_edge_cases() {
     );
     // An unknown range at the start is kept when the insert is not at the start.
     let mut cache = SnapshotCache::new();
-    assert!(cache.insert_range(b"c", b"p", &[]));
+    assert!(cache.insert_range(b"c", b"p", vec![]));
     assert_eq!(cache.segment_at(b"").end_key().to_vec(), b"c");
     assert!(cache.segment_at(b"").is_unknown_range());
 }
@@ -381,7 +381,7 @@ fn skip_contiguous_and_back() {
         .iter()
         .map(|k| kv(k, k))
         .collect();
-    cache.insert_range(b"a", b"f", &rows);
+    cache.insert_range(b"a", b"f", rows.to_vec());
     cache.insert_key(b"x", Some(b"X"));
 
     // Forward: the pairs from here up to (not including) the key.
@@ -432,7 +432,7 @@ fn skip_contiguous_and_back() {
 #[test]
 fn iterator_navigation() {
     let mut cache = SnapshotCache::new();
-    cache.insert_range(b"b", b"d", &[kv(b"b", b"1"), kv(b"b\0", b"2")]);
+    cache.insert_range(b"b", b"d", vec![kv(b"b", b"1"), kv(b"b\0", b"2")]);
     let mut it = cache.segment_at(b"b\0");
     assert_eq!(it.kv(), Some(&kv(b"b\0", b"2")));
     let at = it.clone();
@@ -476,9 +476,9 @@ fn range(
     }
 }
 
-fn outcome(rows: &[KeyValue], more: bool) -> RangeReadOutcome<'_> {
+fn outcome(rows: &[KeyValue], more: bool) -> RangeReadOutcome<'static> {
     RangeReadOutcome {
-        rows,
+        rows: rows.to_vec(),
         more,
         read_to_begin: false,
         read_through_end: false,
@@ -524,19 +524,19 @@ fn known_key_range_forward() {
     let mut o = outcome(&rows, true);
     o.read_through = Some(b"m");
     assert_eq!(
-        r(o, (b"a", 1), (b"z", 1)),
+        r(o.clone(), (b"a", 1), (b"z", 1)),
         Some((b"a".to_vec(), b"m".to_vec()))
     );
     o.read_through = Some(b"d");
     assert_eq!(
-        r(o, (b"a", 1), (b"z", 1)),
+        r(o.clone(), (b"a", 1), (b"z", 1)),
         Some((b"a".to_vec(), b"d".to_vec()))
     );
     let mut o = outcome(&[], true);
     o.read_to_begin = true;
     o.read_through_end = true;
     assert_eq!(
-        r(o, (b"a", 1), (b"z", 1)),
+        r(o.clone(), (b"a", 1), (b"z", 1)),
         Some((b"".to_vec(), b"\xff\xff".to_vec()))
     );
     // Empty ranges.
@@ -580,14 +580,14 @@ fn known_key_range_reverse() {
     let mut o = outcome(&rows, true);
     o.read_through = Some(b"b");
     assert_eq!(
-        r(o, (b"a", 1), (b"z", 1)),
+        r(o.clone(), (b"a", 1), (b"z", 1)),
         Some((b"b".to_vec(), b"z".to_vec()))
     );
     let mut o = outcome(&[], true);
     o.read_to_begin = true;
     o.read_through_end = true;
     assert_eq!(
-        r(o, (b"a", 1), (b"z", 1)),
+        r(o.clone(), (b"a", 1), (b"z", 1)),
         Some((b"".to_vec(), b"\xff\xff".to_vec()))
     );
     assert_eq!(r(outcome(&[], true), (b"a", 1), (b"z", 1)), None);
@@ -607,7 +607,7 @@ fn insert_read_reverses_rows_of_a_reverse_read() {
             offset: 1,
         },
     );
-    assert!(cache.insert_read(true, &outcome(&rows, true), b, e));
+    assert!(cache.insert_read(true, outcome(&rows, true), b, e));
     cache.assert_invariants();
     assert_eq!(
         normalize(forward(&cache)),
@@ -621,7 +621,7 @@ fn insert_read_reverses_rows_of_a_reverse_read() {
             seg(E, b"\xff\xff", b"\xff\xff\0"),
         ]
     );
-    assert!(!cache.insert_read(true, &outcome(&[], true), b, e));
+    assert!(!cache.insert_read(true, outcome(&[], true), b, e));
 }
 
 // ---- Randomized model test ----
@@ -724,6 +724,76 @@ impl Model {
     }
 }
 
+/// How a model read's selectors resolved and what the storage reply said, beyond the keys.
+#[derive(Clone, Debug)]
+struct ReadShape {
+    /// The begin selector's offset (1 is a plain key; 0 and below resolved at or before the
+    /// key, 2 and above after it).
+    begin_offset: i32,
+    /// The end selector's offset (1 and above resolved at or after its key, 0 and below
+    /// before it).
+    end_offset: i32,
+    /// How many keys away from the selector's key it resolved (in the model's key order).
+    begin_shift: usize,
+    end_shift: usize,
+    /// `read_to_begin`, if the begin selector can have hit the start of the key space.
+    read_to_begin: bool,
+    /// `read_through_end`, if the end selector can have hit the end.
+    read_through_end: bool,
+    /// `read_through`: a key (as an index into the model's keys) the read says it got through,
+    /// moved to the nearest one that is true.
+    read_through: Option<usize>,
+}
+
+impl ReadShape {
+    /// Two plain `firstGreaterOrEqual(key)` selectors, resolved exactly, and nothing else.
+    fn plain() -> ReadShape {
+        ReadShape {
+            begin_offset: 1,
+            end_offset: 1,
+            begin_shift: 0,
+            end_shift: 0,
+            read_to_begin: false,
+            read_through_end: false,
+            read_through: None,
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.begin_offset == 1
+            && self.end_offset == 1
+            && self.begin_shift == 0
+            && self.end_shift == 0
+            && !self.read_to_begin
+            && !self.read_through_end
+            && self.read_through.is_none()
+    }
+}
+
+fn shape_strategy() -> impl Strategy<Value = ReadShape> {
+    prop_oneof![
+        2 => Just(ReadShape::plain()),
+        3 => (
+            -1..4i32,
+            -1..4i32,
+            0..4usize,
+            0..4usize,
+            any::<bool>(),
+            any::<bool>(),
+            proptest::option::of(0..41usize),
+        )
+            .prop_map(|(bo, eo, bs, es, to_begin, through_end, rt)| ReadShape {
+                begin_offset: bo,
+                end_offset: eo,
+                begin_shift: bs,
+                end_shift: es,
+                read_to_begin: to_begin,
+                read_through_end: through_end,
+                read_through: rt,
+            }),
+    ]
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     /// `insert(key, value)` of a single key.
@@ -737,6 +807,7 @@ enum Op {
         begin: usize,
         end: usize,
         limit: usize,
+        shape: ReadShape,
     },
 }
 
@@ -745,14 +816,20 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         (0..40usize).prop_map(Op::Key),
         (0..40usize, 0..41usize).prop_map(|(b, e)| Op::Range(b, e)),
-        (any::<bool>(), 0..40usize, 0..41usize, 1..6usize).prop_map(
-            |(reverse, begin, end, limit)| Op::Read {
+        (
+            any::<bool>(),
+            0..40usize,
+            0..41usize,
+            1..6usize,
+            shape_strategy()
+        )
+            .prop_map(|(reverse, begin, end, limit, shape)| Op::Read {
                 reverse,
                 begin,
                 end,
-                limit
-            }
-        ),
+                limit,
+                shape,
+            }),
     ]
 }
 
@@ -838,11 +915,11 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
             Op::Range(b, e) => {
                 let (begin, end) = (bound(&model, b), bound(&model, e));
                 if begin >= end {
-                    assert!(!cache.insert_range(&begin, &end, &[]));
+                    assert!(!cache.insert_range(&begin, &end, vec![]));
                     continue;
                 }
                 let rows = model.rows(&begin, &end);
-                let changed = cache.insert_range(&begin, &end, &rows);
+                let changed = cache.insert_range(&begin, &end, rows.clone());
                 // Recorded unless everything in the range was already known (a range that is
                 // partly known is recorded: the entries inside it are replaced).
                 let all_known = model.known[model.point(&begin)..model.point(&end)]
@@ -858,58 +935,189 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                 begin,
                 end,
                 limit,
+                shape,
             } => {
-                let (begin, end) = (bound(&model, begin), bound(&model, end));
-                if begin >= end {
+                let at = |i: usize| bound(&model, i);
+                let (bk, ek) = (at(begin), at(end));
+                let (bo, eo) = (shape.begin_offset, shape.end_offset);
+                // What the storage read really covered, `[sb, se)`, given the selectors: a
+                // begin selector with offset <= 1 resolved at or before its key (so the read
+                // covers from the key on), one with a larger offset at or after it; an end
+                // selector with offset >= 1 resolved at or after its key, one with a smaller
+                // offset at or before it. `read_to_begin` / `read_through_end` say the
+                // resolution went to the end of the key space, so the read covers it (the
+                // C++ flags are only set when the selector's resolution hit the end; and a
+                // read that stopped at its limit going away from that end cannot claim it).
+                let to_begin = shape.read_to_begin && bo <= 0;
+                let through_end = shape.read_through_end && eo >= 1;
+                let sb = if to_begin {
+                    Vec::new()
+                } else if bo <= 1 {
+                    at(begin.saturating_sub(shape.begin_shift))
+                } else {
+                    at(begin + shape.begin_shift)
+                };
+                let se = if through_end {
+                    ALL_KEYS_END.to_vec()
+                } else if eo >= 1 {
+                    at(end + shape.end_shift)
+                } else {
+                    at(end.saturating_sub(shape.end_shift))
+                };
+                if sb >= se {
                     continue;
                 }
-                let mut rows = model.rows(&begin, &end);
-                let more = rows.len() > limit;
-                let known = if reverse {
-                    rows.reverse();
-                    rows.truncate(limit);
-                    // Known from the lowest row returned, if cut short.
-                    let from = if more {
-                        rows.last().expect("limit >= 1").key.clone()
-                    } else {
-                        begin.clone()
-                    };
-                    (from, end.clone())
+                let all_rows = model.rows(&sb, &se);
+                let more = all_rows.len() > limit;
+                if (reverse && more && to_begin) || (!reverse && more && through_end) {
+                    continue;
+                }
+                let rows: Vec<KeyValue> = if reverse {
+                    all_rows.iter().rev().take(limit).cloned().collect()
                 } else {
-                    rows.truncate(limit);
-                    // Known up to just past the last row returned, if cut short.
-                    let to = if more {
-                        [rows.last().expect("limit >= 1").key.as_slice(), &[0]].concat()
-                    } else {
-                        end.clone()
-                    };
-                    (begin.clone(), to)
+                    all_rows.iter().take(limit).cloned().collect()
                 };
+                // `read_through`: how far the read got, a key where nothing between the last
+                // row and it was skipped.
+                let read_through: Option<Vec<u8>> = shape.read_through.and_then(|idx| {
+                    let last = &rows.last()?.key;
+                    let (lo, hi) = if reverse {
+                        let lo = if more {
+                            let dropped = &all_rows[all_rows.len() - 1 - limit].key;
+                            [dropped.as_slice(), &[0]].concat()
+                        } else {
+                            sb.clone()
+                        };
+                        (lo, last.clone())
+                    } else {
+                        let hi = if more {
+                            all_rows[limit].key.clone()
+                        } else {
+                            se.clone()
+                        };
+                        ([last.as_slice(), &[0]].concat(), hi)
+                    };
+                    Some(at(idx).clamp(lo, hi))
+                });
                 let (b, e) = (
                     SelectorBound {
-                        key: &begin,
-                        offset: 1,
+                        key: &bk,
+                        offset: bo,
                     },
                     SelectorBound {
-                        key: &end,
-                        offset: 1,
+                        key: &ek,
+                        offset: eo,
                     },
                 );
                 let out = RangeReadOutcome {
-                    rows: &rows,
+                    rows: rows.clone(),
                     more,
-                    read_to_begin: false,
-                    read_through_end: false,
-                    read_through: None,
+                    read_to_begin: to_begin,
+                    read_through_end: through_end,
+                    read_through: read_through.as_deref(),
                 };
                 let range = if reverse {
                     known_key_range_back(&out, b, e)
                 } else {
                     known_key_range(&out, b, e)
                 };
-                assert_eq!(range.as_ref(), Some(&known), "known range of the read");
-                cache.insert_read(reverse, &out, b, e);
-                model.mark(&known.0, &known.1);
+                let desc = format!(
+                    "{shape:?} reverse={reverse} limit={limit} bk={bk:?} ek={ek:?} \
+                     scan=[{sb:?}, {se:?}) rows={rows:?} more={more}"
+                );
+                if shape.is_plain() {
+                    // The plain read: what `getKnownKeyRange` is described to give.
+                    let known = if reverse {
+                        // Known from the lowest row returned, if cut short.
+                        let from = if more {
+                            rows.last().expect("limit >= 1").key.clone()
+                        } else {
+                            bk.clone()
+                        };
+                        (from, ek.clone())
+                    } else {
+                        // Known up to just past the last row returned, if cut short.
+                        let to = if more {
+                            [rows.last().expect("limit >= 1").key.as_slice(), &[0]].concat()
+                        } else {
+                            ek.clone()
+                        };
+                        (bk.clone(), to)
+                    };
+                    assert_eq!(range.as_ref(), Some(&known), "known range of the read");
+                }
+                let Some((kb, ke)) = range else {
+                    assert!(!cache.insert_read(reverse, out, b, e), "{desc}");
+                    continue;
+                };
+                // Sound: only what the read covered is claimed, and the rows it returned
+                // are all the keys there are in the claim.
+                assert!(sb <= kb && ke <= se, "{desc}: claims [{kb:?}, {ke:?})");
+                let mut seen = rows.clone();
+                seen.retain(|r| kb <= r.key && r.key < ke);
+                seen.sort_by(|a, b| a.key.cmp(&b.key));
+                assert_eq!(
+                    seen,
+                    model.rows(&kb, &ke),
+                    "{desc}: claims [{kb:?}, {ke:?})"
+                );
+                // Not too timid: the rows are in the claim, and the ends the selectors and
+                // flags describe are known.
+                let first = rows.first().map(|r| r.key.clone());
+                let last = rows.last().map(|r| r.key.clone());
+                let after = |k: &Option<Vec<u8>>| k.as_ref().map(|k| [k.as_slice(), &[0]].concat());
+                let (lowest, highest) = if reverse {
+                    (&last, &first)
+                } else {
+                    (&first, &last)
+                };
+                if let (Some(lowest), Some(highest)) = (lowest, after(highest)) {
+                    assert!(
+                        kb <= *lowest && ke >= highest,
+                        "{desc}: claims [{kb:?}, {ke:?})"
+                    );
+                }
+                if to_begin {
+                    assert_eq!(kb, b"", "{desc}");
+                }
+                if through_end {
+                    assert_eq!(ke, ALL_KEYS_END, "{desc}");
+                }
+                if !rows.is_empty() {
+                    if reverse {
+                        if bo <= 1 && !more {
+                            assert!(kb <= bk, "{desc}");
+                        }
+                        if eo >= 1 {
+                            assert!(ke >= ek, "{desc}");
+                        } else if !through_end {
+                            assert_eq!(Some(&ke), after(&first).as_ref(), "{desc}");
+                        }
+                        if read_through.is_none() && !to_begin && (more || bo > 1) {
+                            assert_eq!(Some(&kb), last.as_ref(), "{desc}");
+                        }
+                        if let (true, Some(rt)) = (more, &read_through) {
+                            assert_eq!(&kb, rt, "{desc}");
+                        }
+                    } else {
+                        if eo >= 1 && !more {
+                            assert!(ke >= ek, "{desc}");
+                        }
+                        if bo <= 1 {
+                            assert!(kb <= bk, "{desc}");
+                        } else {
+                            assert_eq!(Some(&kb), first.as_ref(), "{desc}");
+                        }
+                        if more && read_through.is_none() {
+                            assert_eq!(Some(&ke), after(&last).as_ref(), "{desc}");
+                        }
+                        if let (true, Some(rt)) = (more, &read_through) {
+                            assert_eq!(&ke, rt, "{desc}");
+                        }
+                    }
+                }
+                cache.insert_read(reverse, out, b, e);
+                model.mark(&kb, &ke);
             }
         }
         check_against_model(&cache, &model);
@@ -941,17 +1149,64 @@ fn model_smoke_deterministic() {
             begin: 1,
             end: 30,
             limit: 2,
+            shape: ReadShape::plain(),
         },
         Op::Read {
             reverse: true,
             begin: 1,
             end: 30,
             limit: 3,
+            shape: ReadShape::plain(),
         },
         Op::Range(0, 40),
         Op::Key(7),
     ];
     run_model(vec![true, false, true], ops);
+}
+
+#[test]
+fn model_smoke_selector_offsets_and_flags() {
+    // Reads whose selectors did not resolve at their keys, and that reached the ends of the
+    // key space or say how far they got.
+    let shape = |bo, eo, bs, es, to_begin, through_end, rt| ReadShape {
+        begin_offset: bo,
+        end_offset: eo,
+        begin_shift: bs,
+        end_shift: es,
+        read_to_begin: to_begin,
+        read_through_end: through_end,
+        read_through: rt,
+    };
+    let read = |reverse, begin, end, limit, shape| Op::Read {
+        reverse,
+        begin,
+        end,
+        limit,
+        shape,
+    };
+    let ops = vec![
+        // Offsets past the key: known from the first row only.
+        read(false, 4, 30, 3, shape(2, 1, 1, 0, false, false, None)),
+        read(true, 8, 33, 3, shape(3, 1, 2, 1, false, false, None)),
+        // Offsets before the key and an end selector that resolved earlier.
+        read(false, 12, 36, 2, shape(0, 0, 1, 2, false, false, None)),
+        read(true, 15, 36, 4, shape(-1, 2, 1, 1, false, false, None)),
+        // Through the ends of the key space.
+        read(false, 20, 30, 5, shape(0, 1, 0, 0, true, true, None)),
+        read(true, 20, 30, 5, shape(0, 1, 0, 0, true, true, None)),
+        // `read_through` on cut-short reads, both directions.
+        read(false, 2, 38, 2, shape(1, 1, 0, 0, false, false, Some(25))),
+        read(true, 2, 38, 2, shape(1, 1, 0, 0, false, false, Some(6))),
+        read(false, 6, 40, 1, shape(1, 1, 0, 0, false, false, Some(40))),
+        read(true, 6, 40, 1, shape(1, 1, 0, 0, false, false, Some(0))),
+    ];
+    for mask in [
+        vec![true],
+        vec![true, false, true],
+        vec![false, true, true, false],
+    ] {
+        run_model(mask, ops.clone());
+    }
 }
 
 // ---- No panics ----
@@ -1035,12 +1290,12 @@ proptest! {
                     cache.insert_key(&k, v.as_deref());
                 }
                 Wild::Range(b, e, rows) => {
-                    cache.insert_range(&b, &e, &sorted_rows(rows, false));
+                    cache.insert_range(&b, &e, sorted_rows(rows, false));
                 }
                 Wild::Read { reverse, keys, begin, end, flags } => {
                     let rows = sorted_rows(keys, reverse);
                     let out = RangeReadOutcome {
-                        rows: &rows,
+                        rows,
                         more: flags.0,
                         read_to_begin: flags.1,
                         read_through_end: flags.2,
@@ -1048,7 +1303,7 @@ proptest! {
                     };
                     cache.insert_read(
                         reverse,
-                        &out,
+                        out,
                         SelectorBound { key: &begin.0, offset: begin.1 },
                         SelectorBound { key: &end.0, offset: end.1 },
                     );

@@ -90,14 +90,50 @@ fn check_structure(wm: &WriteMap) -> Vec<Seg> {
                 assert!(s.op.as_ref().is_some_and(|op| !op.is_empty()));
                 assert!(!s.cleared && !s.unmodified);
             }
-            WriteSegmentType::ClearedRange => assert!(s.cleared && s.op.is_none()),
+            WriteSegmentType::ClearedRange => {
+                assert!(s.cleared && s.op.is_none());
+                assert!(!s.unreadable, "a cleared range is readable: {s:?}");
+            }
             WriteSegmentType::UnmodifiedRange => assert!(s.unmodified && s.op.is_none()),
         }
         let at = wm.iter_at(&s.begin);
         assert_eq!(&seg(&at), s);
     }
     assert_eq!(segments_back(wm), segs);
+    check_entries(wm);
     segs
+}
+
+/// Invariants of the entries themselves (which the segments hide): cleared ranges are readable
+/// (`clear` makes its range readable, and making a range unreadable makes it unmodified), a
+/// dependent stack has no cleared keys after it (an operation on a cleared key starts from the
+/// clear, so is independent), and the sentinels bound the key space.
+fn check_entries(wm: &WriteMap) {
+    let keys: Vec<&[u8]> = wm.tree.keys().map(|k| &k[..]).collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] < w[1]),
+        "entries are not sorted"
+    );
+    assert_eq!(keys.first(), Some(&&b""[..]));
+    assert_eq!(keys[keys.len() - 2..], [ALL_KEYS_END, AFTER_ALL_KEYS]);
+    for (key, entry) in wm.tree.iter() {
+        let at = || format!("entry at {key:?}: {entry:?}");
+        assert!(
+            !(entry.following_keys_cleared && entry.following_keys_unreadable),
+            "cleared and unreadable after {}",
+            at()
+        );
+        assert!(
+            !(entry.stack.is_dependent() && entry.following_keys_cleared),
+            "dependent stack with cleared keys after {}",
+            at()
+        );
+        assert!(
+            entry.stack.is_empty() || key[..] < *ALL_KEYS_END,
+            "operations at or after \\xff\\xff: {}",
+            at()
+        );
+    }
 }
 
 // ---- The C++ unit tests -------------------------------------------------------------------
@@ -764,6 +800,53 @@ fn iterators_are_snapshots() {
     assert!(wm.iter_at(b"a").is_cleared_range());
 }
 
+/// The map and its iterators are held across `await`s by transactions that move between
+/// threads.
+#[test]
+fn map_and_iterators_are_send_and_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<WriteMap>();
+    check::<WriteMapIter>();
+    check::<OperationStack>();
+}
+
+/// Iterators held across many writes (the map shares its structure with them) still see the
+/// version they were made at, walking forward, backward and by `skip`, and a copy of the map
+/// is independent of the original.
+#[test]
+fn snapshots_stay_frozen_across_writes() {
+    fn walk(mut it: WriteMapIter) -> Vec<Seg> {
+        it.skip(b"");
+        let mut out = Vec::new();
+        while it.begin_key() < ExtKey::from(ALL_KEYS_END) {
+            out.push(seg(&it));
+            assert!(it.advance());
+        }
+        out
+    }
+    for seed in 0..100 {
+        let mut rng = Rng(seed ^ 0xf00d);
+        let mut wm = WriteMap::new();
+        let mut held: Vec<(WriteMapIter, Vec<Seg>)> = Vec::new();
+        let mut copies: Vec<(WriteMap, Vec<Seg>)> = Vec::new();
+        for step in 0..60 {
+            apply_to_map(&mut wm, &naive_random_op(&mut rng));
+            if step % 3 == 0 {
+                held.push((wm.iter_at(&key_for_index(rng.int(0, 30))), segments(&wm)));
+            }
+            if step % 20 == 0 {
+                copies.push((wm.clone(), segments(&wm)));
+            }
+        }
+        for (it, segs) in held {
+            assert_eq!(walk(it), segs, "seed {seed}");
+        }
+        for (copy, segs) in copies {
+            assert_eq!(check_structure(&copy), segs, "seed {seed}");
+        }
+    }
+}
+
 #[test]
 fn navigation_at_the_ends() {
     let mut wm = WriteMap::new();
@@ -839,6 +922,76 @@ fn bad_arguments() {
 struct History {
     base_cleared: bool,
     ops: Vec<(MutationType, Vec<u8>)>,
+    /// The stack the map should hold, worked out by [`model_stack_add`] (not by
+    /// `coalesce_over`): operation types and operands (`None`: a clear).
+    stack: Vec<ModelOp>,
+}
+
+/// One operation of a model stack.
+type ModelOp = (MutationType, Option<Vec<u8>>);
+
+/// `MutationRef::NON_ASSOCIATIVE_MASK`, written out again for the model.
+fn model_non_associative(kind: MutationType) -> bool {
+    [
+        M::ADD_VALUE,
+        M::OR,
+        M::XOR,
+        M::MAX,
+        M::MIN,
+        M::SET_VERSIONSTAMPED_KEY,
+        M::SET_VERSIONSTAMPED_VALUE,
+        M::MIN_V2,
+        M::COMPARE_AND_CLEAR,
+    ]
+    .contains(&kind)
+}
+
+/// Adds `kind` with `operand` on top of a readable key's `stack`, as the C++ rules say, with
+/// its own case analysis (the map's is `coalesce_over`, over `coalesce`): the model's
+/// operations are a set, a versionstamped set or an atomic operation, and only a set is not
+/// atomic.
+///
+/// * a set replaces the top operation;
+/// * a `CompareAndClear` over a set clears it if it is cleared already or equals the operand,
+///   and keeps it otherwise; over an atomic operation it is stacked;
+/// * another atomic operation over the same one is combined with it, unless it is not
+///   associative and the operands' lengths differ (then it is stacked); over a different
+///   atomic operation it is stacked; over a set it is applied to the set's value.
+fn model_stack_add(stack: &mut Vec<ModelOp>, kind: MutationType, operand: &[u8]) {
+    let new = (kind, Some(operand.to_vec()));
+    let Some(top) = stack.last().cloned() else {
+        stack.push(new);
+        return;
+    };
+    let top_value = top.1.as_deref();
+    let top_is_set = top.0 == M::SET_VALUE;
+    let result = match kind {
+        M::SET_VALUE | M::SET_VERSIONSTAMPED_VALUE => new,
+        M::COMPARE_AND_CLEAR if top_is_set => {
+            if top_value.is_none_or(|v| v == operand) {
+                (M::SET_VALUE, None)
+            } else {
+                top.clone()
+            }
+        }
+        _ if top.0 == kind && kind != M::COMPARE_AND_CLEAR => {
+            if model_non_associative(kind) && top_value.is_some_and(|v| v.len() != operand.len()) {
+                stack.push(new);
+                return;
+            }
+            let value = atomic::apply(kind, top_value, operand, VALUE_SIZE_LIMIT).unwrap();
+            (kind, value)
+        }
+        _ if !top_is_set => {
+            stack.push(new);
+            return;
+        }
+        _ => {
+            let value = atomic::apply(kind, top_value, operand, VALUE_SIZE_LIMIT).unwrap();
+            (M::SET_VALUE, value)
+        }
+    };
+    *stack.last_mut().expect("a top") = result;
 }
 
 /// What the write map should say, kept naively.
@@ -885,14 +1038,38 @@ impl Naive {
         match op {
             Op::Mutate(k, kind, v, add_conflict) => {
                 let base_cleared = self.cleared.at(k);
-                self.keys
-                    .entry(k.clone())
-                    .or_insert(History {
-                        base_cleared,
-                        ops: Vec::new(),
-                    })
-                    .ops
-                    .push((*kind, v.clone()));
+                let was_unreadable = self.unreadable.at(k);
+                let is_versionstamp = matches!(
+                    *kind,
+                    M::SET_VERSIONSTAMPED_KEY | M::SET_VERSIONSTAMPED_VALUE
+                );
+                let history = self.keys.entry(k.clone()).or_insert(History {
+                    base_cleared,
+                    ops: Vec::new(),
+                    stack: Vec::new(),
+                });
+                history.ops.push((*kind, v.clone()));
+                // The stack, by the rules `WriteMap::mutate` is documented to follow.
+                let new = (*kind, Some(v.clone()));
+                if history.stack.is_empty() {
+                    if base_cleared && *kind != M::SET_VALUE && !is_versionstamp {
+                        // An atomic operation on a cleared key is a set of its result.
+                        history.stack = vec![(M::SET_VALUE, None)];
+                        model_stack_add(&mut history.stack, *kind, v);
+                    } else {
+                        history.stack = vec![new];
+                    }
+                } else if !was_unreadable
+                    && matches!(*kind, M::SET_VALUE | M::SET_VERSIONSTAMPED_VALUE)
+                {
+                    // A set of a readable key replaces its operations.
+                    history.stack = vec![new];
+                } else if was_unreadable || is_versionstamp {
+                    // On an unreadable key, operations stack up.
+                    history.stack.push(new);
+                } else {
+                    model_stack_add(&mut history.stack, *kind, v);
+                }
                 if *add_conflict {
                     self.conflict.insert_key(k, true);
                 }
@@ -972,6 +1149,24 @@ fn check_against_model(wm: &WriteMap, model: &Naive) {
         .collect();
     let model_keys: Vec<&[u8]> = model.keys.keys().map(|k| &k[..]).collect();
     assert_eq!(op_keys, model_keys, "{segs:#?}");
+
+    // The stacks have the model's shape, readable or not (`model_stack_add`, which does not use
+    // `coalesce_over`).
+    for s in segs.iter().filter(|s| s.op.is_some()) {
+        let history = &model.keys[&s.begin];
+        let got: Vec<ModelOp> =
+            s.op.as_ref()
+                .unwrap()
+                .iter()
+                .map(|m| (m.kind, m.value.as_deref().map(<[u8]>::to_vec)))
+                .collect();
+        assert_eq!(got, history.stack, "stack of {s:?} after {:?}", history.ops);
+        assert_eq!(
+            s.unreadable,
+            model.unreadable.at(&s.begin),
+            "unreadable flag of {s:?}"
+        );
+    }
 
     for s in segs.iter().filter(|s| s.op.is_some() && !s.unreadable) {
         let history = &model.keys[&s.begin];

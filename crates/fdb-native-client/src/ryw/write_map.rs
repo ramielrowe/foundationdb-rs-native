@@ -31,11 +31,15 @@
 //! C++ keeps the entries in a persistent treap (`PTree`, `VersionedMap.h`) and every
 //! iterator is a snapshot of one version: writes made while an iterator lives do not change
 //! what it sees (the read path relies on this: a read that waits for a storage server keeps
-//! its iterator over the waits). Here the entries are a [`BTreeMap`] behind an [`Arc`]: a
-//! [`WriteMapIter`] holds a clone of the `Arc`, and a write clones the map first (copy on
-//! write) only if an iterator still holds it. Keys and values are `Arc<[u8]>` (cloning one
-//! is a reference count, not a copy), in place of C++'s arena references. Segment bounds
-//! are the snapshot cache's [`ExtKey`] (`ExtStringRef`).
+//! its iterator over the waits). Here the entries are an [`rpds::RedBlackTreeMapSync`], a
+//! persistent ordered map (a red-black tree whose nodes are shared by reference count): a
+//! [`WriteMapIter`] holds a clone of the map (a reference count), and a write while it lives copies only the nodes on
+//! the path to the entry it changes (O(log n)), not the whole map; with no iterator alive a
+//! write changes the nodes in place. An entry's operation stack is behind an [`Arc`] too, so
+//! copying an entry is cheap. The iterator also keeps copies of the entries of its segment and
+//! of the one after it, made when it moves, so its accessors do no lookups. Keys and values are
+//! `Arc<[u8]>` (cloning one is a reference count, not a copy), in place of C++'s arena
+//! references. Segment bounds are the snapshot cache's [`ExtKey`] (`ExtStringRef`).
 //!
 //! # Use by the read-your-writes layer
 //!
@@ -86,12 +90,12 @@
 //! 122-226 (128-254).
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
 use fdb_native_schema::domain::MutationType;
+use rpds::RedBlackTreeMapSync;
 
 use crate::atomic::{self, VALUE_SIZE_LIMIT};
 use crate::error::Error;
@@ -190,39 +194,50 @@ impl RywMutation {
 /// of different lengths for the non-associative ones), or any operation on an unreadable key.
 /// C++ keeps the first operation apart from a vector of the others to save an allocation;
 /// here it is one vector.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The vector is behind an [`Arc`] (and an empty stack has none): cloning a stack, as copying
+/// a write map entry does, is a reference count, and the first change to a shared stack copies
+/// it (a few operations).
+#[derive(Clone, Default)]
 pub(crate) struct OperationStack {
-    ops: Vec<RywMutation>,
+    ops: Option<Arc<Vec<RywMutation>>>,
 }
 
 impl OperationStack {
     /// A stack of `initial` (`OperationStack(RYWMutation)`).
     pub(crate) fn new(initial: RywMutation) -> OperationStack {
-        OperationStack { ops: vec![initial] }
+        OperationStack {
+            ops: Some(Arc::new(vec![initial])),
+        }
+    }
+
+    /// The operations, to change them (a copy if the stack is shared).
+    fn ops_mut(&mut self) -> &mut Vec<RywMutation> {
+        Arc::make_mut(self.ops.get_or_insert_with(Arc::default))
     }
 
     /// `reset`: the stack becomes `initial` alone.
     pub(crate) fn reset(&mut self, initial: RywMutation) {
-        self.ops.clear();
-        self.ops.push(initial);
+        *self = OperationStack::new(initial);
     }
 
     /// `poppush`: replaces the top operation (pushes onto an empty stack).
     pub(crate) fn poppush(&mut self, entry: RywMutation) {
-        self.ops.pop();
-        self.ops.push(entry);
+        let ops = self.ops_mut();
+        ops.pop();
+        ops.push(entry);
     }
 
     /// `push`: adds an operation on top.
     pub(crate) fn push(&mut self, entry: RywMutation) {
-        self.ops.push(entry);
+        self.ops_mut().push(entry);
     }
 
     /// `isDependent`: whether the value the stack gives depends on the key's value in the
     /// database: the first operation is not a `SetValue` (or `ClearRange`), nor a
     /// versionstamped set. An empty stack is not dependent.
     pub(crate) fn is_dependent(&self) -> bool {
-        match self.ops.first() {
+        match self.as_slice().first() {
             None => false,
             Some(first) => !matches!(
                 first.kind,
@@ -236,33 +251,49 @@ impl OperationStack {
 
     /// `top`: the newest operation.
     pub(crate) fn top(&self) -> Option<&RywMutation> {
-        self.ops.last()
+        self.as_slice().last()
     }
 
     /// `at(n)`: the `n`th operation, oldest first.
     pub(crate) fn at(&self, n: usize) -> Option<&RywMutation> {
-        self.ops.get(n)
+        self.as_slice().get(n)
     }
 
     /// `size`: the number of operations.
     pub(crate) fn len(&self) -> usize {
-        self.ops.len()
+        self.as_slice().len()
     }
 
     /// Whether there are no operations (a default-constructed stack, as the entries of
     /// ranges have).
     pub(crate) fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.as_slice().is_empty()
     }
 
     /// The operations, oldest first.
     pub(crate) fn as_slice(&self) -> &[RywMutation] {
-        &self.ops
+        self.ops.as_deref().map_or(&[], Vec::as_slice)
     }
 
     /// The operations, oldest first.
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, RywMutation> {
-        self.ops.iter()
+        self.as_slice().iter()
+    }
+}
+
+impl PartialEq for OperationStack {
+    fn eq(&self, other: &OperationStack) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for OperationStack {}
+
+impl fmt::Debug for OperationStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OperationStack")
+            .field("ops", &self.as_slice())
+            .finish()
     }
 }
 
@@ -271,7 +302,7 @@ impl<'a> IntoIterator for &'a OperationStack {
     type IntoIter = std::slice::Iter<'a, RywMutation>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.ops.iter()
+        self.iter()
     }
 }
 
@@ -313,13 +344,15 @@ impl Entry {
     }
 }
 
-type Tree = BTreeMap<Arc<[u8]>, Entry>;
+/// The entries by key: a persistent map, so cloning it (a [`WriteMapIter`] does) is a reference
+/// count, and a write to a map that is shared copies only the path to the entry it changes.
+type Tree = RedBlackTreeMapSync<Arc<[u8]>, Entry>;
 
 /// `WriteMap`: a transaction's writes (see the module documentation).
 #[derive(Clone)]
 pub(crate) struct WriteMap {
-    /// The entries, shared with the iterators that were made from them.
-    tree: Arc<Tree>,
+    /// The entries; the iterators that were made from them hold their own versions.
+    tree: Tree,
     /// `writeMapEmpty`: no write has been made (`addUnmodifiedAndUnreadableRange` does not
     /// count, as in C++).
     empty: bool,
@@ -334,14 +367,11 @@ impl Default for WriteMap {
 impl WriteMap {
     /// An empty write map: one unmodified range over the whole key space.
     pub(crate) fn new() -> WriteMap {
-        let mut tree = Tree::new();
+        let mut tree = Tree::new_sync();
         for key in [&b""[..], ALL_KEYS_END, AFTER_ALL_KEYS] {
-            tree.insert(Arc::from(key), Entry::default());
+            tree.insert_mut(Arc::from(key), Entry::default());
         }
-        WriteMap {
-            tree: Arc::new(tree),
-            empty: true,
-        }
+        WriteMap { tree, empty: true }
     }
 
     /// `empty`: whether no write has been made.
@@ -357,19 +387,12 @@ impl WriteMap {
 
     /// An iterator over a snapshot of the map, at the segment of `key` ([`WriteMapIter::skip`]).
     pub(crate) fn iter_at(&self, key: &[u8]) -> WriteMapIter {
-        let mut it = WriteMapIter {
-            tree: Arc::clone(&self.tree),
-            begin: Arc::from(&b""[..]),
-            end: Arc::from(ALL_KEYS_END),
-            offset: true,
-        };
-        it.skip(key);
-        it
+        WriteMapIter::at(self.tree.clone(), key)
     }
 
-    /// The entries, to change them; a copy if an iterator still holds them.
+    /// The entries, to change them (the nodes an iterator still holds are copied on the way).
     fn tree_mut(&mut self) -> &mut Tree {
-        Arc::make_mut(&mut self.tree)
+        &mut self.tree
     }
 
     /// `PTreeImpl::remove(begin, end)`: removes the entries in `[begin, end)`.
@@ -388,7 +411,7 @@ impl WriteMap {
         }
         let tree = self.tree_mut();
         for key in doomed {
-            tree.remove(&key);
+            tree.remove_mut(&key);
         }
     }
 
@@ -431,7 +454,7 @@ impl WriteMap {
         let new_op = RywMutation::new(op, Some(param));
 
         let it = self.iter_at(key);
-        let entry = it.entry();
+        let entry = &it.cur;
         let is_cleared = entry.following_keys_cleared;
         let following_conflict = entry.following_keys_conflict;
         let is_conflict = add_conflict || it.is_conflict_range();
@@ -448,7 +471,7 @@ impl WriteMap {
                 (OperationStack::new(new_op), is_cleared)
             };
             drop(it);
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(key),
                 Entry {
                     stack,
@@ -463,9 +486,10 @@ impl WriteMap {
             && (op == MutationType::SET_VALUE || op == MutationType::SET_VERSIONSTAMPED_VALUE)
         {
             // A set of a readable key replaces its operations.
+            let begin = Arc::clone(&it.begin);
             drop(it);
-            self.tree_mut().insert(
-                Arc::from(key),
+            self.tree_mut().insert_mut(
+                begin,
                 Entry {
                     stack: OperationStack::new(new_op),
                     following_keys_cleared: is_cleared,
@@ -485,14 +509,13 @@ impl WriteMap {
             } else {
                 stack.push(new_op);
             }
+            let begin = Arc::clone(&it.begin);
+            let mut entry = it.cur.clone();
             drop(it);
-            let entry = self
-                .tree_mut()
-                .get_mut(key)
-                .expect("the iterator found an entry at the key");
             entry.stack = stack;
             entry.is_conflict = is_conflict;
             entry.is_unreadable = is_unreadable;
+            self.tree_mut().insert_mut(begin, entry);
         }
         Ok(())
     }
@@ -553,10 +576,10 @@ impl WriteMap {
         );
         if insert_begin {
             self.tree_mut()
-                .insert(Arc::from(begin), Entry::range(true, true, false));
+                .insert_mut(Arc::from(begin), Entry::range(true, true, false));
         }
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -605,10 +628,10 @@ impl WriteMap {
         );
         if insert_begin {
             self.tree_mut()
-                .insert(Arc::from(begin), Entry::range(false, false, true));
+                .insert_mut(Arc::from(begin), Entry::range(false, false, true));
         }
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -691,7 +714,7 @@ impl WriteMap {
         }
         let tree = self.tree_mut();
         for (key, entry) in insertions {
-            tree.insert(key, entry);
+            tree.insert_mut(key, entry);
         }
     }
 
@@ -749,14 +772,14 @@ impl WriteMap {
 
         for key in conflict_ranges {
             self.tree_mut()
-                .insert(Arc::from(key), Entry::range(true, conflicted, false));
+                .insert_mut(Arc::from(key), Entry::range(true, conflicted, false));
             conflicted = !conflicted;
         }
 
         debug_assert!(conflicted != last_conflicted);
 
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -868,7 +891,7 @@ impl WriteMap {
         value: Option<&[u8]>,
     ) -> Result<RywMutation, Error> {
         if !stack.is_dependent() && stack.len() == 1 {
-            return Ok(stack.ops[0].clone());
+            return Ok(stack.as_slice()[0].clone());
         }
         let mut current = RywMutation::set(value.map(Arc::from));
         for op in stack {
@@ -915,47 +938,76 @@ pub(crate) enum WriteSegmentType {
 /// snapshot: later writes to the map do not change what it sees. The method names follow
 /// the snapshot cache's iterator ([`SnapshotCacheIter`](crate::ryw::SnapshotCacheIter)),
 /// which the read path walks together with this one.
+///
+/// The iterator keeps copies of its segment's entry and of the one after it (an entry is its
+/// flags and a reference counted operation stack), made when it moves, so the accessors read
+/// them without looking in the map; a move is one lookup in the snapshot.
 #[derive(Clone)]
 pub(crate) struct WriteMapIter {
     /// The snapshot.
-    tree: Arc<Tree>,
+    tree: Tree,
     /// The key of the segment's entry (`entry()`).
     begin: Arc<[u8]>,
     /// The key of the entry after it (`nextEntry()`).
     end: Arc<[u8]>,
+    /// The entry at `begin`.
+    cur: Entry,
+    /// The entry at `end`.
+    next: Entry,
     /// `false`: the segment is the entry's operation; `true`: the range after it.
     offset: bool,
 }
 
 impl WriteMapIter {
+    /// An iterator over `tree` at the segment of `key` ([`skip`](Self::skip)).
+    fn at(tree: Tree, key: &[u8]) -> WriteMapIter {
+        let (begin, cur, end, next, offset) = Self::locate(&tree, key);
+        WriteMapIter {
+            tree,
+            begin,
+            end,
+            cur,
+            next,
+            offset,
+        }
+    }
+
+    /// The segment of `key` in `tree`: its entry's key and entry, the next entry's, and
+    /// whether it is the range after the entry (see `offset`). A key past `\xff\xff` is taken
+    /// as `\xff\xff`.
+    fn locate(tree: &Tree, key: &[u8]) -> (Arc<[u8]>, Entry, Arc<[u8]>, Entry, bool) {
+        let key = if key > ALL_KEYS_END {
+            ALL_KEYS_END
+        } else {
+            key
+        };
+        // `upper_bound`: `\xff\xff\x00` is after any key up to `\xff\xff`, and `""` is at or
+        // before any key.
+        let (end, next) = Self::entry_after(tree, key)
+            .expect("the last sentinel is after every key up to \\xff\\xff");
+        let (begin, cur) =
+            Self::entry_before(tree, &end).expect("the first sentinel is before every other entry");
+        let offset = cur.stack.is_empty() || *begin != *key;
+        (begin, cur, end, next, offset)
+    }
+
     /// `entry()`: the segment's entry.
     fn entry(&self) -> &Entry {
-        self.tree
-            .get(&*self.begin)
-            .expect("an iterator's entries are in its snapshot")
+        &self.cur
     }
 
-    /// `nextEntry()`: the entry after the segment's.
-    fn next_entry(&self) -> &Entry {
-        self.tree
-            .get(&*self.end)
-            .expect("an iterator's entries are in its snapshot")
-    }
-
-    /// The first entry after `key`, if there is one.
-    fn entry_after(&self, key: &[u8]) -> Option<Arc<[u8]>> {
-        self.tree
-            .range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded))
+    /// The first entry after `key` in `tree`, if there is one: its key and a copy of it.
+    fn entry_after(tree: &Tree, key: &[u8]) -> Option<(Arc<[u8]>, Entry)> {
+        tree.range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded))
             .next()
-            .map(|(k, _)| Arc::clone(k))
+            .map(|(k, e)| (Arc::clone(k), e.clone()))
     }
 
-    /// The last entry before `key`, if there is one.
-    fn entry_before(&self, key: &[u8]) -> Option<Arc<[u8]>> {
-        self.tree
-            .range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key)))
+    /// The last entry before `key` in `tree`, if there is one: its key and a copy of it.
+    fn entry_before(tree: &Tree, key: &[u8]) -> Option<(Arc<[u8]>, Entry)> {
+        tree.range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key)))
             .next_back()
-            .map(|(k, _)| Arc::clone(k))
+            .map(|(k, e)| (Arc::clone(k), e.clone()))
     }
 
     /// `keyAtBegin`: the segment starts at its entry's key (it is an operation, or the
@@ -1061,16 +1113,18 @@ impl WriteMapIter {
             self.offset = true;
             return true;
         }
-        let Some(next) = self.entry_after(&self.end) else {
+        let Some((key, entry)) = Self::entry_after(&self.tree, &self.end) else {
             if self.begin != self.end {
                 // The sentinel: `end` is `\xff\xff\x00`, which has no entry after it.
                 self.begin = Arc::clone(&self.end);
+                self.cur = self.next.clone();
                 self.offset = true;
             }
             return false;
         };
-        self.begin = std::mem::replace(&mut self.end, next);
-        self.offset = self.entry().stack.is_empty();
+        self.begin = std::mem::replace(&mut self.end, key);
+        self.cur = std::mem::replace(&mut self.next, entry);
+        self.offset = self.cur.stack.is_empty();
         true
     }
 
@@ -1078,37 +1132,23 @@ impl WriteMapIter {
     /// first one.
     #[must_use]
     pub(crate) fn retreat(&mut self) -> bool {
-        if self.offset && !self.entry().stack.is_empty() {
+        if self.offset && !self.cur.stack.is_empty() {
             self.offset = false;
             return true;
         }
-        let Some(prev) = self.entry_before(&self.begin) else {
+        let Some((key, entry)) = Self::entry_before(&self.tree, &self.begin) else {
             return false;
         };
-        self.end = std::mem::replace(&mut self.begin, prev);
-        self.offset = self.entry().stack.is_empty() || !equals_key_after(&self.begin, &self.end);
+        self.end = std::mem::replace(&mut self.begin, key);
+        self.next = std::mem::replace(&mut self.cur, entry);
+        self.offset = self.cur.stack.is_empty() || !equals_key_after(&self.begin, &self.end);
         true
     }
 
     /// `skip`: moves to the segment that contains `key` (`begin_key() <= key < end_key()`).
     /// A key past `\xff\xff` is taken as `\xff\xff`.
     pub(crate) fn skip(&mut self, key: &[u8]) {
-        let key = if key > ALL_KEYS_END {
-            ALL_KEYS_END
-        } else {
-            key
-        };
-        // `upper_bound`: `\xff\xff\x00` is after any key up to `\xff\xff`, and `""` is at or
-        // before any key.
-        let end = self
-            .entry_after(key)
-            .expect("the last sentinel is after every key up to \\xff\\xff");
-        let begin = self
-            .entry_before(&end)
-            .expect("the first sentinel is before every other entry");
-        self.offset = self.tree[&*begin].stack.is_empty() || *begin != *key;
-        self.begin = begin;
-        self.end = end;
+        (self.begin, self.cur, self.end, self.next, self.offset) = Self::locate(&self.tree, key);
     }
 }
 
