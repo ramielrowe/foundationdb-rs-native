@@ -25,7 +25,12 @@
 //! 5. **Convergence** (a third of the seeds, with a replicated cluster): after a quiet
 //!    period the failure monitor marks no live server failed; a storage replica is powered
 //!    off, and reads of its shard keep succeeding, fast once the failure monitor has caught
-//!    up; it is restarted, and the client's load balancing sends it requests again.
+//!    up; it is restarted, and the client's load balancing sends it requests again. Half of
+//!    the seeds (`seed / 8 % 2 == 0`) model data distribution, which takes the dead replica
+//!    out of its teams a few seconds after it dies: the checks then hold with the location
+//!    cache's peer evictor too (without it, a cluster that keeps listing a dead replica has
+//!    the evictor make slow reads and an "available" failure monitor once a sweep, as C++
+//!    8.0 does), and the restarted server is expected to rejoin its teams instead.
 //! 6. **Shutdown**: `Database::shutdown`, then no task of the client's node may be left.
 //!    With two databases, the first one's shutdown must leave the second working (a read
 //!    succeeds, on the connections they shared), and the second one's ends everything.
@@ -72,6 +77,10 @@ pub struct SeedConfig {
     /// (every trust setting gets both), as C++'s simulation flips
     /// `LOCATION_CACHE_PEER_EVICTOR_ENABLED`.
     pub peer_evictor: Option<bool>,
+    /// Whether the cluster models data distribution
+    /// ([`ClusterConfig::data_distribution`]: a storage server that stays down is taken out
+    /// of its teams); `None` takes it from `seed / 8 % 2`, so every evictor setting gets both.
+    pub data_distribution: Option<bool>,
     /// How many databases the client opens (1 or 2; two share the node's connections, and
     /// the bank workloads use the second); `None` takes it from the seed: 2 when
     /// `seed % 3 == 2`.
@@ -89,6 +98,7 @@ impl SeedConfig {
             convergence: None,
             net: None,
             peer_evictor: None,
+            data_distribution: None,
             databases: None,
         }
     }
@@ -102,6 +112,12 @@ impl SeedConfig {
     /// The same, with or without the location cache's peer evictor.
     pub fn with_peer_evictor(mut self, on: bool) -> Self {
         self.peer_evictor = Some(on);
+        self
+    }
+
+    /// The same, with or without the cluster's model of data distribution.
+    pub fn with_data_distribution(mut self, on: bool) -> Self {
+        self.data_distribution = Some(on);
         self
     }
 
@@ -240,7 +256,8 @@ fn client_ip() -> IpAddr {
 fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     let sim = Sim::new(config.seed, config.level);
     let mut rng = sim.rng();
-    let cluster_config = ClusterConfig::randomized(&mut rng);
+    let mut cluster_config = ClusterConfig::randomized(&mut rng);
+    cluster_config.data_distribution = config.data_distribution.unwrap_or(config.seed / 8 % 2 == 0);
     let cluster = SimCluster::start(&sim, cluster_config.clone(), rng.fork());
     let client = sim.add_node("client", client_ip());
     let chaos_node = sim.add_node("chaos", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
@@ -429,6 +446,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
             db.clone(),
             rng.fork(),
             peer_evictor,
+            cluster_config.data_distribution,
         );
         match sim.block_on_within(Duration::from_secs(300), phase) {
             Ok(found) => violations.extend(found),
@@ -731,6 +749,7 @@ async fn convergence_phase<R: Runtime>(
     db: Database<R>,
     mut rng: SimRng,
     peer_evictor: bool,
+    data_distribution: bool,
 ) -> Vec<String> {
     let mut found = Vec::new();
     let address = |p: &crate::cluster::ProcessInfo| {
@@ -786,8 +805,13 @@ async fn convergence_phase<R: Runtime>(
     cluster.kill_process(victim, KillMode::PowerOff);
     let killed_at = sim.now();
     let mut slow_late = 0;
+    // The dials of the victim from 25 s after it died, for the data distribution check.
+    let mut dials_late = None;
     while sim.now() - killed_at < Duration::from_secs(35) {
         let t0 = sim.now();
+        if dials_late.is_none() && t0 - killed_at >= Duration::from_secs(25) {
+            dials_late = Some(sim.dials(info.addr));
+        }
         let read = read_once(&db, &key).await;
         let took = sim.now() - t0;
         sim.trace(
@@ -814,26 +838,51 @@ async fn convergence_phase<R: Runtime>(
         }
         sim.sleep(Duration::from_millis(100)).await;
     }
+    let dials_end = sim.dials(info.addr);
     // With the peer evictor (8.0's default), a sweep that sees the dead replica's connects
-    // failing forgets the cached locations that name it; the shard map still lists it (no
-    // data distribution here), so the next read caches it again with a new peer, which
-    // starts available (C++'s `Peer::Peer`) and is found failed again: a slow read and a
-    // failure monitor that says "available" for a while, once a sweep, as in C++ 8.0. Reads
-    // must still work (checked above); the late checks are for the evictor off.
-    if slow_late > 0 && !peer_evictor {
+    // failing forgets the cached locations that name it. If the shard map still lists the
+    // dead replica, the next read caches it again with a new peer, which starts available
+    // (C++'s `Peer::Peer`) and is found failed again: a slow read and a failure monitor that
+    // says "available" for a while, once a sweep, as in C++ 8.0. That is what a cluster
+    // without data distribution does, so the late checks are for the evictor off there.
+    //
+    // With data distribution the dead replica is taken out of its teams a few seconds after
+    // it dies (well within the 20 s), so a lookup after that no longer names it: the late
+    // checks hold with the evictor on too, except that the failure monitor can only be
+    // expected to mark the replica failed while the client still dials it. A client that
+    // looked the shard up again after the move (a stale token of another replica, or the
+    // evictor's sweep) stops probing the dead replica, possibly before the four seconds of
+    // failed connects that mark an address failed, and nothing resets what it saw: C++'s
+    // `Peer`s are not probed once nothing references them either.
+    if slow_late > 0 && (!peer_evictor || data_distribution) {
         found.push(format!(
             "convergence: {slow_late} reads were still slow (> 100 ms) 20 s after a replica \
              died"
         ));
     }
-    if !peer_evictor && !db.peers().failure_monitor().is_failed(&address(&info)) {
+    let failed = db.peers().failure_monitor().is_failed(&address(&info));
+    if data_distribution {
+        let dialled_late = dials_end - dials_late.unwrap_or(dials_end);
+        if dialled_late > 0 && !failed {
+            found.push(format!(
+                "convergence: {} was still dialed ({dialled_late} times) between 25 and 35 s \
+                 after it died, but the failure monitor does not mark it failed",
+                info.name
+            ));
+        }
+    } else if !peer_evictor && !failed {
         found.push(format!(
             "convergence: the failure monitor does not mark {} failed 35 s after it died",
             info.name
         ));
     }
 
-    // 3. Restart it: it comes back in the failure monitor and gets requests again.
+    // 3. Restart it: it comes back in the failure monitor and gets requests again. With data
+    // distribution it was taken out of its teams, though, and the client only dials a
+    // server that its cached locations name (or that a lookup after an invalidation
+    // does), as in C++: nothing makes it look again while the other replica answers. What
+    // is checked then is that reads keep working, and that the server rejoins its teams.
+    let evicted = cluster.dd_evicted(ss);
     cluster.restart_process(victim);
     let before = cluster.requests(victim);
     let restarted = sim.now();
@@ -845,15 +894,24 @@ async fn convergence_phase<R: Runtime>(
             ));
             return found;
         }
-        if cluster.requests(victim) > before
-            && !db.peers().failure_monitor().is_failed(&address(&info))
-        {
+        let ready = if evicted {
+            !cluster.dd_evicted(ss)
+        } else {
+            cluster.requests(victim) > before
+                && !db.peers().failure_monitor().is_failed(&address(&info))
+        };
+        if ready {
             back = true;
             break;
         }
         sim.sleep(Duration::from_millis(100)).await;
     }
-    if !back {
+    if !back && evicted {
+        found.push(format!(
+            "convergence: {} did not rejoin its teams 60 s after its restart (data distribution)",
+            info.name
+        ));
+    } else if !back {
         found.push(format!(
             "convergence: {} got no request (or is still marked failed) 60 s after its restart",
             info.name
