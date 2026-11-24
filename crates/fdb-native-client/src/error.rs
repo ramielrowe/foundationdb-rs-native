@@ -137,6 +137,9 @@ pub mod codes {
     /// `watch_cancelled` (1029): a storage server holds too many watches, so the client
     /// polls instead.
     pub const WATCH_CANCELLED: u16 = 1029;
+    /// `accessed_unreadable` (1036): a read of a key whose value the transaction's own
+    /// versionstamped operations make unknown until the commit (a watch of such a key).
+    pub const ACCESSED_UNREADABLE: u16 = 1036;
     /// `process_behind` (1037): the storage server lags too far behind.
     pub const PROCESS_BEHIND: u16 = 1037;
     /// `database_locked` (1038).

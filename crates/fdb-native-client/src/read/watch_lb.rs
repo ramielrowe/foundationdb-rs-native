@@ -4,7 +4,8 @@
 //! [`crate::watch`]; this is the read path's part.
 //!
 //! * **The request.** `getKeyLocation(key, ..., watchValue, version)` for the shard's
-//!   replicas, then `loadBalance` of a `WatchValueRequest(key, value, version)` over them.
+//!   replicas (a cached location is refreshed when the `watchValue` endpoint of one of them
+//!   failed on a server that is up, `checkOnlyEndpointFailed`), then `loadBalance` of a `WatchValueRequest(key, value, version)` over them.
 //!   The storage server answers when the key's value (at its latest version, at or after
 //!   `version`) differs from `value`, with the version it saw the difference at; a set of
 //!   the same value does not answer. It may also answer with an error (below).
@@ -20,7 +21,11 @@
 //! * **A reply is checked against the committed version.** `waitForCommittedVersion`
 //!   (NativeAPI 7.4:4142-4190): the storage server may have seen the change in a version that
 //!   is later rolled back by a recovery, so the client asks the GRV proxies (priority
-//!   `IMMEDIATE`, without batching) for read versions until one is at least the reply's. If
+//!   `IMMEDIATE`) for read versions until one is at least the reply's. C++ sends each request
+//!   on its own (`basicLoadBalance`); here they go through the read version batcher of the
+//!   `IMMEDIATE` priority: a request waits up to the batcher's current batch time (half the
+//!   recent reply latency, at most `GRV_BATCH_TIMEOUT`) and may share a request with others.
+//!   If
 //!   that version is `MAX_VERSIONS_IN_FLIGHT / 2` (50 000 000) or more ahead of the reply's
 //!   (a recovery may have happened in between), the watch is sent again at that version.
 //! * **Errors** (the `catch` of `watchValue`):
@@ -38,6 +43,7 @@
 use std::time::Duration;
 
 use fdb_native_schema::domain::{WatchValue, WatchValueReply};
+use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::rpc::RequestError;
@@ -114,8 +120,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         // Kept until the next location is known, as C++'s `state locationInfo`.
         let mut _previous: Option<std::sync::Arc<Location>> = None;
         loop {
+            // `getKeyLocation(..., &StorageServerInterface::watchValue, ...)`: a cached
+            // location is refreshed if a replica's `watchValue` endpoint failed.
             let (_, location) = shared
-                .key_location(key, version, use_provisional_proxies)
+                .key_location_for(
+                    key,
+                    version,
+                    use_provisional_proxies,
+                    false,
+                    STORAGE_SERVER_STREAMS.watch_value,
+                )
                 .await?;
             _previous = Some(location.clone());
             let request = WatchValue {
