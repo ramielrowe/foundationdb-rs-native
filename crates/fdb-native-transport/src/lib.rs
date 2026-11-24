@@ -18,7 +18,8 @@ pub mod tls;
 
 pub use connect_packet::{ConnectPacket, ConnectPacketError, process_transport_id};
 pub use connection::{
-    Connection, ConnectionConfig, ConnectionError, ConnectionState, Event, MonitorConfig, SendError,
+    Connection, ConnectionConfig, ConnectionError, ConnectionState, Event, IoError, MonitorConfig,
+    SendError,
 };
 pub use framing::{
     CHECKSUM_LEN, Checksum, ConsumeError, DEFAULT_PACKET_LIMIT, DEFAULT_PACKET_WARNING, Frame,
