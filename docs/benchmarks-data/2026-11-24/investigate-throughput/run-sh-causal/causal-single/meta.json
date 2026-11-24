@@ -1,0 +1,20 @@
+{
+  "backends": [
+    "native",
+    "c"
+  ],
+  "cluster": "single",
+  "cluster_file": "docker:docker@172.17.0.3:4500",
+  "configure": null,
+  "duration_s": 20.0,
+  "image": "foundationdb/foundationdb:7.4.10",
+  "reps": 1,
+  "status": "Using cluster file `/var/fdb/fdb.cluster'.\n\nUnable to retrieve all status information.\n\nConfiguration:\n  Redundancy mode        - single\n  Storage engine         - memory\n  Log engine             - ssd-2\n  Encryption at-rest     - disabled\n  Coordinators           - 1\n  Usable Regions         - 1\n\nCluster:\n  FoundationDB processes - 1\n  Zones                  - unknown\n  Machines               - 0\n  Fault Tolerance        - 0 machines\n  Server time            - 11/24/26 14:01:10\n\nData:\n  Replication health     - unknown\n  Moving data            - unknown\n  Sum of key-value sizes - unknown\n  Disk space used        - unknown\n\nOperating space:\n  Unable to retrieve operating space status\n\nWorkload:\n  Read rate              - 0 Hz\n  Write rate             - 0 Hz\n  Transactions started   - 0 Hz\n  Transactions committed - 0 Hz\n  Conflict rate          - 0 Hz\n\nBackup and DR:\n  Running backups        - 0\n  Running DRs            - 0\n\nClient time: 11/24/26 14:01:10\n",
+  "threads": [
+    "4"
+  ],
+  "warmup_s": 2.0,
+  "workloads": [
+    "causal"
+  ]
+}

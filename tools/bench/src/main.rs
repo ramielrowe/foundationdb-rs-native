@@ -1,12 +1,19 @@
 //! fdb-bench: fdb-native-client vs libfdb_c on a disposable testkit cluster. Dev-only.
 //!
 //! ```text
-//! fdb-bench run [--cluster single|triple] [--reps 3] [--duration 8] [--warmup 2]
-//!               [--backends native,c] [--threads 4] [--workloads get,set,...] [--out DIR]
-//! fdb-bench serve [--cluster single|triple]   # a cluster for manual `worker` runs / profiling
+//! fdb-bench run [--cluster single|triple] [--configure "grv_proxies=2 ..."] [--reps 3]
+//!               [--duration 8] [--warmup 2] [--backends native,c] [--threads 4]
+//!               [--workloads get,set,...] [--concs 1,16,256] [--causal-negative] [--out DIR]
+//! fdb-bench serve [--cluster single|triple] [--configure ...]  # a cluster for manual `worker` runs
 //! fdb-bench report RESULTS.jsonl
-//! fdb-bench worker --backend native|c --cluster-file F --workload W [--threads N] [--concs 1,16,256] ...
+//! fdb-bench worker --backend native|c --cluster-file F --workload W [--threads N]
+//!                  [--flavor multi|current] [--c-threads N] [--c-dbs N] [--concs 1,16,256]
+//!                  [--causal-negative] ...
 //! ```
+//!
+//! `--backends` takes client specs: `native`, `native:current` (a current-thread runtime: one
+//! thread runs the application and the client) and `c`, `c:N` (libfdb_c with N network threads
+//! and N database handles).
 //!
 //! `run` starts the cluster (a single-process container, or a 3-process `FdbCluster`),
 //! loads the keyspaces, and runs every (repetition, workload, thread count, client) as a
@@ -28,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use backend::{CClient, Native};
-use workloads::{Opts, WORKLOADS};
+use workloads::{OPT_IN_WORKLOADS, Opts, WORKLOADS};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -59,6 +66,19 @@ impl Args {
             })
             .unwrap_or(default)
     }
+}
+
+/// A positive number from the environment (hand runs), else `default`.
+fn env_num(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            v.parse()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| die(&format!("bad value for {name}")))
+        })
+        .unwrap_or(default)
 }
 
 fn die(msg: &str) -> ! {
@@ -117,17 +137,45 @@ fn worker(args: &Args) {
                 .collect();
             Vec::leak(v)
         }),
+        causal_negative: args.0.iter().any(|a| a == "--causal-negative"),
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(threads)
-        .enable_all()
-        .build()
-        .expect("runtime");
+    // `--flavor current`: a current-thread runtime, so one thread runs the application and,
+    // for native, the whole client. Otherwise a multi-thread runtime of `--threads` workers.
+    let current = match args.or("--flavor", "multi") {
+        "multi" => false,
+        "current" => true,
+        _ => die("--flavor multi|current"),
+    };
+    // libfdb_c: `--c-threads N` (or FDB_BENCH_C_THREADS) runs N client network threads
+    // (`ClientThreadsPerVersion`, which needs the multi-version client: the host's libfdb_c is
+    // loaded as the external client); the database handles, used round robin, default to N.
+    let c_threads: usize = args.num("--c-threads", env_num("FDB_BENCH_C_THREADS", 1));
+    let c_dbs: usize = args.num("--c-dbs", env_num("FDB_BENCH_C_DBS", c_threads));
+    let rt = if current {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    };
     let mut emit = {
         let backend = backend.clone();
         move |mut v: Value| {
             v["backend"] = json!(backend);
-            v["workers"] = json!(threads);
+            v["workers"] = json!(if current { 1 } else { threads });
+            // Only a non-default configuration says so, so older results keep their shape.
+            if current {
+                v["flavor"] = json!("current");
+            }
+            if backend == "c" && c_threads > 1 {
+                v["c_threads"] = json!(c_threads);
+                v["c_dbs"] = json!(c_dbs);
+            }
             println!("{v}");
         }
     };
@@ -139,16 +187,25 @@ fn worker(args: &Args) {
             r
         }),
         "c" => {
-            // libfdb_c: one network thread, started by `boot` (selected API version 740).
-            let network = unsafe {
-                foundationdb::api::FdbApiBuilder::default()
-                    .build()
-                    .expect("fdb api")
-                    .boot()
+            // libfdb_c: the network thread(s), started by `boot` (selected API version 740).
+            let mut api = foundationdb::api::FdbApiBuilder::default()
+                .build()
+                .expect("fdb api");
+            if c_threads > 1 {
+                use foundationdb::options::NetworkOption;
+                let lib = std::env::var("FDB_BENCH_LIBFDB_C")
+                    .unwrap_or_else(|_| "/usr/lib/libfdb_c.so".into());
+                api = api
+                    .set_option(NetworkOption::ExternalClientLibrary(lib))
+                    .and_then(|a| a.set_option(NetworkOption::DisableLocalClient))
+                    .and_then(|a| {
+                        a.set_option(NetworkOption::ClientThreadsPerVersion(c_threads as i32))
+                    })
+                    .expect("multi-version client options");
             }
-            .expect("boot libfdb_c network thread");
+            let network = unsafe { api.boot() }.expect("boot libfdb_c network thread");
             let r = rt.block_on(async {
-                let b = CClient::open(&cluster_file)?;
+                let b = CClient::open(&cluster_file, c_dbs)?;
                 workloads::run(b, &workload, opts, &mut emit).await
             });
             drop(rt);
@@ -181,14 +238,11 @@ impl Cluster {
     }
 }
 
-/// Starts a cluster, loads the keyspaces, prints the cluster file and waits for a signal (or
-/// stdin to close): for running `worker` by hand, e.g. under `perf record`.
-fn serve(args: &Args) {
-    unsafe {
-        libc::signal(libc::SIGINT, on_signal as *const () as usize);
-        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
-    }
-    let cluster = match args.or("--cluster", "single") {
+/// Starts the disposable cluster of `--cluster`. `configure` (`--configure`, triple only) is an
+/// `fdbcli configure` argument list, e.g. `grv_proxies=2 commit_proxies=2`; it is applied once
+/// the cluster is healthy, and the cluster is given time to recruit the new roles.
+fn start_cluster(kind: &str, configure: Option<&str>) -> Cluster {
+    let cluster = match kind {
         "single" => Cluster::Single(
             fdb_native_testkit::FdbContainer::start().unwrap_or_else(|e| die(&e.to_string())),
         ),
@@ -200,6 +254,29 @@ fn serve(args: &Args) {
         ),
         _ => die("--cluster single|triple"),
     };
+    if let Some(cfg) = configure {
+        let Cluster::Triple(c) = &cluster else {
+            die("--configure needs --cluster triple");
+        };
+        let out = c
+            .fdbcli(&format!("configure {cfg}"))
+            .unwrap_or_else(|e| die(&e.to_string()));
+        eprintln!("configure {cfg}: {}", out.trim());
+        c.wait_healthy(Duration::from_secs(120))
+            .unwrap_or_else(|e| die(&e.to_string()));
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    cluster
+}
+
+/// Starts a cluster, loads the keyspaces, prints the cluster file and waits for a signal (or
+/// stdin to close): for running `worker` by hand, e.g. under `perf record`.
+fn serve(args: &Args) {
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+    }
+    let cluster = start_cluster(args.or("--cluster", "single"), args.get("--configure"));
     let cluster_file = cluster.cluster_file();
     let exe = std::env::current_exe().expect("current_exe");
     let ok = Command::new(exe)
@@ -231,13 +308,28 @@ fn run(args: &Args) {
     let duration: f64 = args.num("--duration", 8.0);
     let warmup: f64 = args.num("--warmup", 2.0);
     let backends: Vec<&str> = args.or("--backends", "native,c").split(',').collect();
+    for b in &backends {
+        // Only to fail before the cluster starts.
+        client_args(b);
+    }
     let threads: Vec<&str> = args.or("--threads", "4").split(',').collect();
+    let configure = args.get("--configure");
     let default_wl = WORKLOADS.join(",");
     let workload_list: Vec<&str> = args.or("--workloads", &default_wl).split(',').collect();
     for w in &workload_list {
-        if !WORKLOADS.contains(w) {
-            die(&format!("unknown workload {w}; known: {WORKLOADS:?}"));
+        if !WORKLOADS.contains(w) && !OPT_IN_WORKLOADS.contains(w) {
+            die(&format!(
+                "unknown workload {w}; known: {WORKLOADS:?} and, when asked for, {OPT_IN_WORKLOADS:?}"
+            ));
         }
+    }
+    // Worker arguments `run` passes on as they are.
+    let mut passthrough: Vec<String> = Vec::new();
+    if let Some(c) = args.get("--concs") {
+        passthrough.extend(["--concs".to_string(), c.to_string()]);
+    }
+    if args.0.iter().any(|a| a == "--causal-negative") {
+        passthrough.push("--causal-negative".to_string());
     }
     let out = PathBuf::from(args.or("--out", "results/latest"));
     std::fs::create_dir_all(&out).expect("create out dir");
@@ -251,18 +343,7 @@ fn run(args: &Args) {
 
     // Containers are started here, outside any async runtime, and removed when `cluster` drops.
     eprintln!("== starting a {kind} cluster (image: FDB_IMAGE or the testkit default)");
-    let cluster = match kind {
-        "single" => Cluster::Single(
-            fdb_native_testkit::FdbContainer::start().unwrap_or_else(|e| die(&e.to_string())),
-        ),
-        "triple" => Cluster::Triple(
-            fdb_native_testkit::FdbCluster::builder()
-                .processes(3)
-                .start()
-                .unwrap_or_else(|e| die(&e.to_string())),
-        ),
-        _ => die("--cluster single|triple"),
-    };
+    let cluster = start_cluster(kind, configure);
     let cluster_file = cluster.cluster_file();
     let status = match &cluster {
         Cluster::Single(c) => c.fdbcli("status").unwrap_or_default(),
@@ -276,6 +357,7 @@ fn run(args: &Args) {
         out.join("meta.json"),
         serde_json::to_string_pretty(&json!({
             "cluster": kind,
+            "configure": configure,
             "image": image,
             "cluster_file": std::fs::read_to_string(&cluster_file).unwrap_or_default().trim(),
             "reps": reps, "duration_s": duration, "warmup_s": warmup,
@@ -287,7 +369,8 @@ fn run(args: &Args) {
     .unwrap();
 
     let exe = std::env::current_exe().expect("current_exe");
-    let cell = |backend: &str, workload: &str, threads: &str, rep: Option<usize>| -> bool {
+    let mut failed_cells = 0usize;
+    let mut cell = |backend: &str, workload: &str, threads: &str, rep: Option<usize>| -> bool {
         if INTERRUPTED.load(Ordering::SeqCst) {
             return false;
         }
@@ -298,25 +381,21 @@ fn run(args: &Args) {
             .and_then(|s| s.split(' ').next().and_then(|x| x.parse().ok()))
             .unwrap_or(0.0);
         let mut cmd = Command::new(&exe);
-        cmd.args([
-            "worker",
-            "--backend",
-            backend,
-            "--workload",
-            workload,
-            "--threads",
-            threads,
-        ])
-        .args([
-            "--duration",
-            &duration.to_string(),
-            "--warmup",
-            &warmup.to_string(),
-        ])
-        .arg("--cluster-file")
-        .arg(&cluster_file)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        cmd.arg("worker")
+            .args(client_args(backend))
+            .args(["--workload", workload])
+            .args(["--threads", threads])
+            .args(&passthrough)
+            .args([
+                "--duration",
+                &duration.to_string(),
+                "--warmup",
+                &warmup.to_string(),
+            ])
+            .arg("--cluster-file")
+            .arg(&cluster_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
         let mut child = cmd.spawn().expect("spawn worker");
         let stdout = child.stdout.take().unwrap();
         let reader = std::thread::spawn(move || {
@@ -339,6 +418,7 @@ fn run(args: &Args) {
         };
         let lines = reader.join().unwrap_or_default();
         if !status.success() {
+            failed_cells += 1;
             eprintln!("!! worker {backend}/{workload}/{threads}t failed: {status}");
         }
         if let Some(rep) = rep {
@@ -370,13 +450,17 @@ fn run(args: &Args) {
     'outer: for rep in 1..=reps {
         eprintln!("== repetition {rep}/{reps}");
         for w in &workload_list {
-            for t in &threads {
+            for (ti, t) in threads.iter().enumerate() {
                 // Alternate which client goes first so a drifting server favours neither.
                 let mut order = backends.clone();
                 if rep % 2 == 0 {
                     order.reverse();
                 }
                 for b in order {
+                    // A current-thread runtime has no thread count: once per workload.
+                    if b.ends_with(":current") && ti > 0 {
+                        continue;
+                    }
                     if INTERRUPTED.load(Ordering::SeqCst) {
                         eprintln!("== interrupted");
                         break 'outer;
@@ -391,4 +475,24 @@ fn run(args: &Args) {
     println!("{md}");
     eprintln!("== results in {}", out.display());
     drop(cluster); // removes the containers (and the network)
+    if failed_cells > 0 {
+        // A failed cell is a failed run: `causal` fails its cell on a violation.
+        die(&format!("{failed_cells} cell(s) failed"));
+    }
+}
+
+/// The worker arguments of a client spec of `--backends`: `native`, `native:current`, `c`,
+/// `c:N`.
+fn client_args(spec: &str) -> Vec<String> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
+    match spec.split_once(':') {
+        None if spec == "native" || spec == "c" => s(&["--backend", spec]),
+        Some(("native", "current")) => s(&["--backend", "native", "--flavor", "current"]),
+        Some(("c", n)) if n.parse::<usize>().is_ok_and(|n| n > 0) => {
+            s(&["--backend", "c", "--c-threads", n])
+        }
+        _ => die(&format!(
+            "unknown client {spec}; use native, native:current, c or c:N"
+        )),
+    }
 }

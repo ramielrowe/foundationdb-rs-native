@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
-use crate::workloads::WORKLOADS;
+use crate::workloads::{OPT_IN_WORKLOADS, WORKLOADS};
 
 fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
@@ -66,17 +66,72 @@ impl Cell {
     }
 }
 
-type Key = (String, String, u64, String, u64); // workload, variant, conc, backend, workers
+type Key = (String, String, u64, String, u64); // workload, variant, conc, client, workers
+
+/// The client of a row: `native`, `native/current` (a current-thread runtime), `c`, `c x2`
+/// (libfdb_c with 2 network threads).
+fn client(r: &Value) -> String {
+    let b = r["backend"].as_str().unwrap_or("");
+    if r["flavor"].as_str() == Some("current") {
+        format!("{b}/current")
+    } else if let Some(n) = r["c_threads"].as_u64() {
+        format!("{b} x{n}")
+    } else {
+        b.to_string()
+    }
+}
+
+/// The rows of the `causal` workload: checks, violations, backwards read versions.
+fn causal(out: &mut String, lines: &[Value]) {
+    let rows: Vec<&Value> = lines
+        .iter()
+        .filter(|r| r["workload"].as_str() == Some("causal"))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "#### `causal`\n");
+    let _ = writeln!(
+        out,
+        "| variant | background conc | client | threads | secs | same-task checks | cross-task checks | violations | backwards rv | errors | background gets/s |"
+    );
+    let _ = writeln!(
+        out,
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for r in rows {
+        let n = |f: &str| r[f].as_u64().unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} |",
+            r["variant"].as_str().unwrap_or(""),
+            n("conc"),
+            client(r),
+            n("workers"),
+            r["secs"].as_f64().unwrap_or(0.0),
+            n("same_task_checks"),
+            n("cross_task_checks"),
+            n("violations"),
+            n("rv_backwards"),
+            n("errors"),
+            fmt_rate(r["background_gets_per_s"].as_f64().unwrap_or(0.0)),
+        );
+    }
+    out.push('\n');
+}
 
 pub fn markdown(lines: &[Value]) -> String {
     let mut cells: BTreeMap<Key, Cell> = BTreeMap::new();
     let mut order: Vec<(String, String, u64)> = Vec::new();
     for r in lines {
+        if r["workload"].as_str() == Some("causal") {
+            continue; // its own table
+        }
         let k = (
             r["workload"].as_str().unwrap_or("").to_string(),
             r["variant"].as_str().unwrap_or("").to_string(),
             r["conc"].as_u64().unwrap_or(0),
-            r["backend"].as_str().unwrap_or("").to_string(),
+            client(r),
             r["workers"].as_u64().unwrap_or(0),
         );
         let ord = (k.0.clone(), k.1.clone(), k.2);
@@ -92,10 +147,11 @@ pub fn markdown(lines: &[Value]) -> String {
     backends.sort();
     backends.dedup();
     // The native client first.
-    backends.sort_by_key(|b| if b == "native" { 0 } else { 1 });
+    backends.sort_by_key(|b| if b.starts_with("native") { 0 } else { 1 });
 
     let mut out = String::new();
     let mut wl: Vec<&str> = WORKLOADS.to_vec();
+    wl.extend(OPT_IN_WORKLOADS.iter().filter(|w| **w != "causal"));
     wl.retain(|w| order.iter().any(|o| o.0 == *w));
     for w in wl {
         let _ = writeln!(out, "#### `{w}`\n");
@@ -135,7 +191,7 @@ pub fn markdown(lines: &[Value]) -> String {
         out.push('\n');
     }
 
-    // Native relative to libfdb_c, at equal application threads.
+    // Native relative to libfdb_c, at equal application threads (one network thread).
     if backends.iter().any(|b| b == "native") && backends.iter().any(|b| b == "c") {
         let _ = writeln!(out, "#### Native relative to libfdb_c\n");
         let _ = writeln!(
@@ -172,5 +228,6 @@ pub fn markdown(lines: &[Value]) -> String {
         }
         out.push('\n');
     }
+    causal(&mut out, lines);
     out
 }

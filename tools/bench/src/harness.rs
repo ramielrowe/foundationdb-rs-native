@@ -83,6 +83,8 @@ pub struct TaskCtx {
 
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
+    /// Every iteration started, warmup and stragglers included (what the server saw).
+    pub all_iters: u64,
     pub samples: Vec<u32>,
     pub ops: u64,
     pub iters: u64,
@@ -123,6 +125,7 @@ impl Measurement {
             "conc": conc,
             "ops": self.stats.ops,
             "iters": self.stats.iters,
+            "all_iters": self.stats.all_iters,
             "errors": self.stats.errors,
             "secs": self.secs,
             "ops_per_s": ops_s,
@@ -165,6 +168,7 @@ where
             while !stop.load(Ordering::Relaxed) {
                 ctx.measuring = measuring.load(Ordering::Relaxed);
                 let t = Instant::now();
+                st.all_iters += 1;
                 let r = f(&mut ctx).await;
                 let us = t.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 // Only iterations that started and ended inside the window count.
@@ -214,6 +218,7 @@ where
         total.ops += st.ops;
         total.iters += st.iters;
         total.errors += st.errors;
+        total.all_iters += st.all_iters;
     }
     total.samples.sort_unstable();
     Measurement {

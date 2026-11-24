@@ -11,13 +11,15 @@ import statistics
 import sys
 from collections import defaultdict
 
-ORDER = ["get", "get_seq", "set", "scan", "mixed", "many_tx", "watch"]
+ORDER = ["get", "get_seq", "set", "scan", "mixed", "many_tx", "watch", "grv_only"]
 
 
 def load(path):
     cells = defaultdict(list)
     for line in open(path):
         r = json.loads(line)
+        if r["workload"] == "causal" or "flavor" in r or "c_threads" in r:
+            continue  # not a native-vs-libfdb_c cell: `fdb-bench report` shows those
         cells[(r["workload"], r["variant"], r["conc"], r["backend"])].append(r)
     return cells
 

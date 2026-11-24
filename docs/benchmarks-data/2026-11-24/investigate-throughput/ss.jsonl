@@ -1,0 +1,4 @@
+{"backend": "native", "workload": "get", "all_iters": 4237824, "expected_gets": 4237824, "ss_get_value_queries": 4237866, "ops_per_s": 423487}
+{"backend": "native", "workload": "get_seq", "all_iters": 49940, "expected_gets": 4994000, "ss_get_value_queries": 4991465, "ops_per_s": 494397}
+{"backend": "c", "workload": "get", "all_iters": 1616147, "expected_gets": 1616147, "ss_get_value_queries": 1616189, "ops_per_s": 169674}
+{"backend": "c", "workload": "get_seq", "all_iters": 26842, "expected_gets": 2684200, "ss_get_value_queries": 2682835, "ops_per_s": 271944}

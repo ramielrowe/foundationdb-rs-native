@@ -18,10 +18,26 @@ Numbers are from one machine that was shared with other development work while t
 (see [Host and caveats](#host-and-caveats)). They show the shape of the difference, not
 absolute capabilities of either client; treat differences under about 20% as noise.
 
+**Read the throughput lead as parallelism.** Where this document says native is faster, it is
+comparing the multi-threaded native client (the application's tokio workers do its work) with
+libfdb_c's single network thread. Given 4 network threads libfdb_c reaches the same throughput
+(428k vs 444k fresh-transaction gets/s at 256), and per core native is slightly worse (7.1 vs
+6.3 to 6.4 us of CPU per get at 256). It does not take fewer read versions or relax
+consistency either. [Why native is faster: threads, not shortcuts](#why-native-is-faster-threads-not-shortcuts-7fy).
+
 ## Summary
 
+* **The throughput lead is multi-core parallelism, not efficiency or weaker guarantees.**
+  Native on 4 tokio workers against libfdb_c on its single network thread: 444k vs 181 to 191k
+  fresh-transaction gets/s at 256; native on one thread 204k, libfdb_c with 2 and 4 network
+  threads 311k and 428k. About 90% of the gap at 256 is parallelism (about 60% at 16, the
+  rest is fewer thread hand-offs per transaction: p50 90 vs 140 us). Per core native is
+  slightly worse (7.1 vs 6.3 to 6.4 us/op at 256). Native sends more GRV requests per
+  transaction, with the same flags on the wire; the storage servers see the same number of
+  reads; and 0 causal-consistency violations in 1.6M+ checks (its negative control is caught
+  thousands of times). [Details](#why-native-is-faster-threads-not-shortcuts-7fy).
 * **Point reads with a fresh transaction are now faster than libfdb_c at every concurrency**
-  (after 8jn: 13.9k vs 10.2k ops/s and p50 70 vs 97 us at concurrency 1; 152k vs 114k at 16;
+  (native on 4 workers against libfdb_c's one network thread; after 8jn: 13.9k vs 10.2k ops/s and p50 70 vs 97 us at concurrency 1; 152k vs 114k at 16;
   308k vs 174k at 256). Before the fix they were 8 to 11 times slower in latency at low
   concurrency (p50 1.11 ms): the GRV batcher's `sleep(batch_time)` on tokio rounded a
   sub-millisecond delay up to the timer tick, about 1.05 ms, so every transaction waited a
@@ -32,7 +48,7 @@ absolute capabilities of either client; treat differences under about 20% as noi
 * **Once the read version is paid for, reads are on par or faster.** 100 gets in one
   transaction: p50 28 us vs 38 us per get at concurrency 1, and 386k vs 272k gets/s at
   concurrency 256 (native spreads the work over the tokio worker threads; libfdb_c's single
-  network thread is its ceiling).
+  network thread is its ceiling: with 4 network threads it does 533k vs native's 526k).
 * **Range scans are at par in throughput** after rrx (6.4 to 7.1M rows/s vs 6.3 to 7.4M,
   p50 of a 100k-row scan 13.9 to 14.3 ms vs 13.6 to 14.3), with 1.25 to 1.45 times the CPU
   per row (0.084 to 0.091 us vs 0.058 to 0.071). They were 1.7 to 2.4 times slower before s1t
@@ -62,7 +78,8 @@ absolute capabilities of either client; treat differences under about 20% as noi
   tokio runtime, a get's task future was 11.5 KB, a get walked the write map of a
   transaction that had not written, SipHash. Native uses several cores where libfdb_c is
   capped at about one network thread, so it wins on throughput at equal application threads
-  (429k vs 178k gets/s at 256 after e82). At concurrency 1 the GRV batcher's clock wait
+  (429k vs 178k gets/s at 256 after e82), not on efficiency: per core it stays behind
+  ([threads](#why-native-is-faster-threads-not-shortcuts-7fy)). At concurrency 1 the GRV batcher's clock wait
   dominated (bead `foundationdb-rs-native-yw5`, fixed: [below](#waiting-less-yw5-iqy)).
   [Details](#range-scans-and-cpu-per-operation-s1t-e82). After 51w: 7.1 vs 6.4 us per get at
   256, 10.3 vs 7.0 at 16, 17.4 vs 28.6 at 1; 76 vs 50 us per 90/10 transaction at 256
@@ -267,7 +284,9 @@ concurrent gets it uses 1.2 cores and tops out near 176k gets/s, and with 100 ge
 transaction it uses 1.5 cores for 272k gets/s (its server round trips overlap, but the
 network thread is saturated). Native spreads its work over the tokio workers (1.6 cores at
 256 fresh gets, 3.7 cores for `get_seq`), so with 4 application threads it reaches 386k gets/s
-on `get_seq`. With a single application thread (and libfdb_c's network thread as its second)
+on `get_seq`. That is parallelism, not efficiency: native costs more CPU per operation, and
+libfdb_c given 4 network threads matches it ([below](#why-native-is-faster-threads-not-shortcuts-7fy)).
+With a single application thread (and libfdb_c's network thread as its second)
 native is behind in throughput at high concurrency (110k vs 166k gets/s; 146k vs 244k for
 `get_seq`) because it then has one core against libfdb_c's two, and it spends more CPU per
 operation (below).
@@ -375,7 +394,8 @@ average 3 to 23, median 6.8). `native` is before, `native+fix` after:
 | watch | writer_commit | 1 | 72.6 | 53.6 | 0.74 | 70.3 | 4.23 ms / 11.5 ms | 5.03 ms / 15.0 ms | 3.58 ms / 10.6 ms | 0.0 / 0.0 / 0.0 |
 
 The 1 ms is gone everywhere it showed: fresh-transaction reads are now ahead of libfdb_c in
-throughput and p50 at every concurrency, the low-concurrency `mixed` mix is at par (1231 vs
+throughput and p50 at every concurrency (native's 4 workers against libfdb_c's one network
+thread, [see below](#why-native-is-faster-threads-not-shortcuts-7fy)), the low-concurrency `mixed` mix is at par (1231 vs
 1228 transactions/s), watch setup is within 20 us of libfdb_c, and `set` is at or above it
 (commit-bound, noisy). CPU per operation is higher than before at low concurrency (the
 polling, above); at 256 it is within noise.
@@ -570,7 +590,8 @@ tables'). `native` is before, `native+fix` after:
   10.1; libfdb_c 5.3); the 90/10 mix at 256 78 us per transaction (was 107; libfdb_c 50),
   `many_tx` 35 and 41 (was 49 and 61; libfdb_c 23 and 31). Throughput follows where the
   client was the busy part: 429k vs 305k gets/s at 256 (libfdb_c 178k, held to one network
-  thread), 509k vs 397k with 100 gets per transaction. In the get profile at 256 (perf's
+  thread; [parallelism](#why-native-is-faster-threads-not-shortcuts-7fy)), 509k vs 397k with
+  100 gets per transaction. In the get profile at 256 (perf's
   per-symbol totals), clock reads went from 12.7% to 4.2% of the samples (what is left is
   mostly the GRV batcher's clock wait, bead `foundationdb-rs-native-yw5`), memmove 8.7% to
   5.8%, memcmp 7.6% to 2.5%, malloc/free 15.2% to 12.9%, SipHash 4.8% to 2.0% (what is left:
@@ -682,6 +703,208 @@ before, `native+fix` after:
   load balancer's per-request allocations; glibc's arena lock (`__lll_lock_wait_private`
   1%, tasks allocated on one worker and freed on another).
 
+## Why native is faster: threads, not shortcuts (7fy)
+
+Bead `foundationdb-rs-native-7fy`. The main tables show native ahead of libfdb_c in throughput
+and p50 (446k vs 185k fresh-transaction gets/s at 256 in the last table above). Two things
+could explain that: native does less per transaction (fewer or shared read versions, weaker
+guarantees, fewer reads), or it uses more cores. An investigation (a fork of the bench in a
+scratch directory, now merged into `tools/bench`) went through both. **The lead is
+parallelism: the multi-threaded native client against libfdb_c's single network thread. Native
+does the same work, takes as many read versions, and is slightly worse per core.** Data:
+[benchmarks-data/2026-11-24/investigate-throughput](benchmarks-data/2026-11-24/investigate-throughput).
+
+| question | evidence | verdict |
+|---|---|---|
+| Is it threads? | libfdb_c with 4 network threads (`c:4`) reaches 428k gets/s at 256 against native's 444k; native on one thread does 204k against libfdb_c's 181 to 191k ([below](#threads)) | About 90% of the gap at 256 is parallelism |
+| Does native reuse or share read versions? | The GRV proxy's counters (`GrvProxyMetrics`) count the same transactions as the client started (plus about 28 background ones per window), and native sends more GRV requests per transaction than libfdb_c ([below](#transactions-per-grv-request)) | No: no reuse |
+| Are the GRV requests weaker? | The same flags on the wire: `0x08000000`, `PRIORITY_DEFAULT`, no `CAUSAL_READ_RISKY`, max version -1, no tags ([below](#the-wire)) | No |
+| Does native read less? | The storage server's `GetValueQueries` equal the client's gets for both clients ([below](#storage-reads)) | No |
+| Is a committed write always visible to a later transaction? | 0 violations in 1.63M checks (single process), 1.74M (3 processes, 2 GRV and 2 commit proxies) and 375k for libfdb_c; a control that takes its read version too early is caught 2427 and 2261 times ([below](#causal-consistency)) | Yes |
+| Is native more efficient per core? | 7.1 against 6.3 to 6.4 us of CPU per fresh-transaction get at 256 with 4 workers (10.3 against 7.0 to 7.4 at 16) | **No, slightly worse** |
+| Is the comparison fair? | Same tasks, same keys; the `foundationdb` crate's wakeup layer is about 1% of the samples; libfdb_c's network thread spends 52.7% of the process's samples inside libfdb_c itself ([below](#fairness)) | Yes |
+
+So the sentences of the summary that say native is faster mean: **native on 4 tokio workers
+against libfdb_c on one network thread**. libfdb_c can be given more
+(`ClientThreadsPerVersion`, `fdb-bench`'s `c:N`), and then it catches up.
+
+### Threads
+
+One single-process cluster, 4 application workers unless noted, medians of one 8 s window per
+cell (the per-thread CPU is sampled from `/proc` for 4 s inside it). `cores` is the process's
+CPU time over the window; the last column is the busiest network thread (libfdb_c) or the busiest
+worker (native) at 256: 0.8 is not saturated, 1.0 is. Data: `matrix2.jsonl`; produced by
+`tools/bench/run.sh threads`, which does the same with `--backends`
+`native,native:current` and `c,c:2,c:4`.
+
+`get` (a fresh transaction and one read):
+
+| client | 16: ops/s | p50 | CPU us/op | cores | 256: ops/s | p50 | CPU us/op | cores | busiest thread at 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| native, current_thread runtime (1 thread) | 135k | 117 us | 4.5 | 0.61 | 204k | 1.25 ms | 4.3 | 0.88 | 0.88 |
+| native, 1 worker | 134k | 118 us | 4.5 | 0.61 | 199k | 1.31 ms | 5.0 | 0.98 | 0.98 |
+| native, 2 workers | 179k | 88 us | 8.8 | 1.57 | 299k | 839 us | 6.2 | 1.86 | 0.94 |
+| native, 4 workers | 175k | 90 us | 10.3 | 1.81 | 444k | 562 us | 7.1 | 3.15 | 0.79 |
+| libfdb_c, 1 network thread, 1 app worker | 114k | 140 us | 6.4 | 0.73 | 191k | 1.32 ms | 5.3 | 1.02 | 0.82 |
+| libfdb_c, 1 network thread, 4 app workers | 112k | 143 us | 7.0 | 0.79 | 181k | 1.47 ms | 6.3 | 1.15 | 0.79 |
+| libfdb_c, 2 network threads, 4 app workers | 137k | 118 us | 13.6 | 1.86 | 311k | 798 us | 8.7 | 2.71 | 0.79 |
+| libfdb_c, 4 network threads, 4 app workers | 133k | 119 us | 21.7 | 2.90 | 428k | 573 us | 10.7 | 4.58 | 0.69 |
+
+`get_seq` (one transaction, 100 sequential gets; latency per get):
+
+| client | 16: ops/s | p50 | CPU us/op | cores | 256: ops/s | p50 | CPU us/op | cores | busiest thread at 256 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| native, current_thread runtime (1 thread) | 234k | 71 us | 3.3 | 0.78 | 304k | 777 us | 3.3 | 1.00 | 1.00 |
+| native, 1 worker | 241k | 63 us | 3.4 | 0.82 | 303k | 765 us | 3.3 | 1.00 | 1.00 |
+| native, 2 workers | 329k | 46 us | 5.1 | 1.67 | 397k | 575 us | 4.8 | 1.92 | 0.96 |
+| native, 4 workers | 364k | 42 us | 6.2 | 2.27 | 526k | 459 us | 6.0 | 3.17 | 0.80 |
+| libfdb_c, 1 network thread, 1 app worker | 242k | 62 us | 4.7 | 1.13 | 263k | 932 us | 4.9 | 1.29 | 0.96 |
+| libfdb_c, 1 network thread, 4 app workers | 245k | 61 us | 5.4 | 1.32 | 278k | 914 us | 5.3 | 1.48 | 0.97 |
+| libfdb_c, 2 network threads, 4 app workers | 300k | 50 us | 8.1 | 2.43 | 383k | 665 us | 7.7 | 2.95 | 0.80 |
+| libfdb_c, 4 network threads, 4 app workers | 296k | 51 us | 11.6 | 3.44 | 533k | 460 us | 7.7 | 4.09 | 0.58 |
+
+(In every libfdb_c cell with 2 or 4 network threads each task's first operation fails with
+`The protocol version of the cluster has changed` (printed as `task N: first error`): the
+multi-version client switching to the external library as it connects, in the warmup; the
+measured windows have no errors. It is not a cluster event.)
+
+* **`get`, 256 in flight: parallelism, about 90% of the gap.** libfdb_c's one network thread
+  tops out near 181 to 191k gets/s (it is busy 0.79 to 0.82 of the time). Native on one thread already does 204k (4.3 us per get),
+  so the part of the lead that is not parallelism is about 10% (204k against 181 to 191k).
+  Native on 4 workers does 444k at 3.15 cores; libfdb_c with 2 and 4 network threads does 311k
+  and 428k. At equal parallelism the two are at par: 428k against 444k.
+* **`get_seq`, 256 in flight: parity with the same number of threads.** libfdb_c's network
+  thread is saturated (0.96 to 0.97 cores) at 263 to 278k gets/s; native on one thread does 304k
+  and is saturated too (1.00); with 4 threads each, libfdb_c reaches 533k and native 526k.
+* **`get`, 16 in flight: about 60% parallelism, about 40% latency.** Here libfdb_c's network
+  thread is not saturated (0.58 cores): 16 transactions in flight at 140 us p50 is 112 to 114k
+  per second, and more network threads help little (137k with 2, 133k with 4). Native on one
+  thread already has a p50 of 117 us and 135k gets/s; with 4 workers 90 us and 175k. The
+  investigation attributed the latency difference to hand-offs between threads: on the libfdb_c
+  path a transaction crosses between the application's threads and the network thread three to
+  four times, where native's tasks run on the thread that wakes them.
+* **Per core, native is slightly worse.** CPU per fresh-transaction get at 256 with 4
+  application workers: 7.1 us for native against 6.3 to 6.4 for libfdb_c (4.3 to 5.0 for
+  native on one thread against 5.3 for libfdb_c with one application worker: native's cost
+  rises with the number of workers). At 16 it is 10.3 against 7.0 to 7.4. libfdb_c's CPU rises the same way
+  as network threads are added (6.3, 8.7, 10.7 us at 256 for 1, 2 and 4). More threads are
+  what buys throughput; none of it is cheaper work.
+
+### Transactions per GRV request
+
+The GRV proxy's cumulative `GrvProxyMetrics` (`TxnRequestIn`, `TxnStartIn`,
+`TxnDefaultPriorityStartIn` and the system-priority count), read from the cluster's trace log
+before and after a cell. A transaction counted as started is one the proxy handed a read
+version; a GRV request is one the batcher sent for many. Transactions per request is what a
+client's batching achieves; a client that reused read versions would show fewer transactions
+at the proxy than it started. Data: `matrix1.jsonl` (2 repetitions, the client order rotated
+between them; `grv_only` once), produced by `scripts/grvcell.sh`.
+
+| workload | conc | client | ops/s | CPU us/op | transactions per GRV request (reps) | GRV requests per 1000 transactions |
+|---|---:|---|---:|---:|---|---:|
+| get | 16 | native | 174k | 10.3 | 7.6 / 7.7 | 132 / 130 |
+| get | 16 | libfdb_c | 113k | 7.0 | 15.1 / 15.8 | 66 / 63 |
+| get | 256 | native | 447k | 7.1 | 61.5 / 61.6 | 16 / 16 |
+| get | 256 | libfdb_c | 185k | 6.4 | 95.6 / 101.6 | 10 / 10 |
+| get_seq | 16 | native | 364k | 6.2 | 1.0 / 1.0 | 989 / 988 |
+| get_seq | 16 | libfdb_c | 241k | 5.6 | 1.1 / 1.1 | 903 / 896 |
+| get_seq | 256 | native | 526k | 6.0 | 2.9 / 2.9 | 347 / 341 |
+| get_seq | 256 | libfdb_c | 279k | 5.3 | 20.2 / 20.3 | 49 / 49 |
+| grv_only | 256 | native | 2564k | 1.5 | 125.4 | 8 |
+| grv_only | 256 | libfdb_c | 498k | 3.4 | 125.9 | 8 |
+
+* Native sends **more** GRV requests per transaction in every `get` and `get_seq` cell (7.7
+  against 15.1 to 15.8 transactions per request at 16; 61.5 against 95.6 to 101.6 at 256; 2.9
+  against 20.3 for `get_seq` at 256), and with `grv_only` at 256, where the batcher is all
+  there is, both do 125 to 126. So the lead is not from asking the proxy less often (why
+  libfdb_c's batches are larger in the other cells was not looked into).
+* The proxy's started-transaction count equals the client's started iterations (all
+  iterations, warmup included: `all_iters` in the results) plus about 28 background
+  transactions per window: no transaction got a read version it did not ask for.
+* libfdb_c's `grv_only` is capped by its network thread (498k per second against native's
+  2.56M); this is where its single thread shows most.
+
+### The wire
+
+A capture of the client to server stream of a native `get` run and of a libfdb_c `get` run at
+256 (a sidecar container sharing the disposable server's network namespace, `scripts/wire-capture-sniff.py`), with
+every `GetReadVersionRequest` decoded by this repository's own 7.4 schema
+(`scripts/wire-decode-main.rs`): both clients send **identical flags, `0x08000000`, with
+`PRIORITY_DEFAULT`, no `CAUSAL_READ_RISKY`, a max version of -1 and no tags**. (The captures
+themselves are not kept; they are tens of megabytes.)
+
+### Storage reads
+
+The storage server's `GetValueQueries` (`StorageMetrics`) before and after a cell, against
+the gets the client started (`all_iters`, times 100 for `get_seq`); `ss.jsonl`, produced by
+`scripts/sscell.sh`:
+
+| client | workload | client gets | server `GetValueQueries` |
+|---|---|---:|---:|
+| native | get | 4,237,824 | 4,237,866 |
+| libfdb_c | get | 1,616,147 | 1,616,189 |
+| native | get_seq | 4,994,000 | 4,991,465 |
+| libfdb_c | get_seq | 2,684,200 | 2,682,835 |
+
+The `get` rows differ by 42 in both clients (reads that are not the client's, probably the
+cluster's own);
+the `get_seq` rows are short by 0.05%, the transactions still in flight when the window ended
+(started iterations are counted whole).
+
+### Causal consistency
+
+A client that gets its read versions from fewer requests than it has transactions has to take
+care that a transaction started after another transaction's commit was acknowledged does not
+share a read version older than that commit. `tools/bench`'s `causal` workload checks exactly
+that, under load (a background of 256 tasks doing fresh-transaction gets, so that batches are
+always in flight; the checks are described in `workloads.rs` and
+[the README](../tools/bench/README.md)):
+
+| run | cluster | secs | same-task checks | cross-task checks | violations | backwards read versions |
+|---|---|---:|---:|---:|---:|---:|
+| native | single process | 60 | 135,863 | 1,495,236 | **0** | 0 |
+| native | 3 processes, 2 GRV + 2 commit proxies | 60 | 51,451 | 1,685,769 | **0** | 0 |
+| libfdb_c | single process | 30 | 73,171 | 301,346 | **0** | 0 |
+| native, negative control | single process | 20 | 58,379 | 490,529 | **2427** | 0 |
+| native, negative control | 3 processes, 2 GRV + 2 commit proxies | 15 | 24,538 | 405,486 | **2261** | 0 |
+
+The negative control takes its read version *before* looking at which commit was acknowledged,
+as a transaction that joined a GRV request already in flight would; the checker finds
+it thousands of times, so it is not blind. (`causal-*.json` in the data directory; the first
+violations of the control are in `causal-native-negative.err`.)
+
+The same check through the tool, `CAUSAL_SECS=20 tools/bench/run.sh causal` (both clients,
+4 workers, 20 s windows; [run-sh-causal](benchmarks-data/2026-11-24/investigate-throughput/run-sh-causal)):
+
+| cluster | client | checks | violations | negative control: checks | violations |
+|---|---|---:|---:|---:|---:|
+| single process | native | 565,044 | **0** | 569,011 | **1276** |
+| single process | libfdb_c | 255,159 | **0** | 251,865 | **9746** |
+| 3 processes, 2 GRV + 2 commit proxies | native | 546,950 | **0** | 466,911 | **945** |
+| 3 processes, 2 GRV + 2 commit proxies | libfdb_c | 140,752 | **0** | 260,151 | **2885** |
+
+The control finds libfdb_c's read versions as stale as native's, as it should: it checks the
+checker, not a client.
+
+### Fairness
+
+* The two clients run the same tasks, the same key sequences, the same value size and the
+  same closed loop (`Backend` trait); the application side of both is the same tokio
+  runtime. The `foundationdb` crate's future/waker layer is about 1% of the samples of the
+  libfdb_c run, and libfdb_c's network thread spends 52.7% of the process's samples inside
+  libfdb_c itself (`perf` of a libfdb_c `get` run at 256; `perf-c-get.json` is the cell's
+  output): the C numbers measure libfdb_c, not the binding.
+* What the comparison is *not*: a comparison of clients with equal CPU. Native on 4 workers
+  uses 3.15 cores for a fresh-transaction get at 256; libfdb_c with one network thread uses
+  1.15. With equal threads the throughputs are equal; at equal cores libfdb_c is ahead.
+
+### What this does not cover
+
+The version vector (off by default, `ENABLE_VERSION_VECTOR`; its read version batching is
+different), TLS, a network with latency (everything here is a host-local Docker bridge: a
+longer round trip lets a batcher gather more transactions per request for both clients),
+and recoveries or failovers during the causal check.
+
 ## Reproducing
 
 ```bash
@@ -703,7 +926,13 @@ docs/benchmarks-data/2026-11-24/single-4t-rrx-51w-fixed`. Those were run by hand
 serve` for the cluster, then `fdb-bench worker --workload W --threads 4 --duration 8 --warmup 2
 --cluster-file F` of each build (and `--backend c`), the JSON lines collected with `rep` and
 `load1` added. `--concs 256` (worker only) runs one concurrency of get, get_seq, set or mixed,
-for profiling.
+for profiling. The 7fy data ([benchmarks-data/2026-11-24/investigate-throughput](benchmarks-data/2026-11-24/investigate-throughput))
+was collected by hand with the same worker (`--flavor current`, `FDB_BENCH_C_THREADS`/`FDB_BENCH_C_DBS`,
+`--workload grv_only|causal`) and the shell helpers in its `scripts/` (proxy and
+storage counters from the trace logs of the container, per-thread CPU from `/proc`); the
+suites `tools/bench/run.sh threads|grv|causal` run the same cells through `fdb-bench run`
+(`--backends native,native:current,c,c:2,c:4`, `--causal-negative`, `--configure`), see
+`tools/bench/README.md`.
 
 Needs docker, the host `libfdb_c.so` 7.4.x (the `foundationdb` crate links it dynamically) and
 libclang (its bindgen). `FDB_IMAGE` selects the server image (a 7.4 image). Each suite
@@ -736,6 +965,7 @@ python3 -I tools/bench/perf_vdso.py get.data             # who reads the clock (
 | `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads (fixed: 1.15 to 1.6, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
 | `foundationdb-rs-native-rrx` | P3 | Range scans after s1t: 8 reference counts per row through the snapshot cache; keep reply buffers and row offsets there (fixed: 4 per row, scans at par in rows/s, [above](#range-rows-and-cpu-per-operation-continued-rrx-51w)) |
 | `foundationdb-rs-native-51w` | P4 | CPU per operation after e82: `PeerKey` SipHash, per-transaction allocations, the cluster monitor's mutex, the `[vdso]` entry (fixed: the entry is clock reads, 7.6 to 7.1 us per get at 256, [above](#range-rows-and-cpu-per-operation-continued-rrx-51w)) |
+| `foundationdb-rs-native-7fy` | P2 | Why native out-runs libfdb_c: threads, not shortcuts; the causal check and the thread knobs in `tools/bench` ([above](#why-native-is-faster-threads-not-shortcuts-7fy)) |
 | `foundationdb-rs-native-1r2` | P4 | Range rows: an API that lends rows from the replies, so a scan needs no reference count per row |
 | `foundationdb-rs-native-h7w` | P4 | `Transaction::guarded`'s interruption: a oneshot, a `Vec` push and the state lock per operation |
 | `foundationdb-rs-native-kbm` | P4 | Clock reads left on the get path: the load balancer's latency samples, the transaction's creation |
@@ -743,6 +973,8 @@ python3 -I tools/bench/perf_vdso.py get.data             # who reads the clock (
 
 ## Not covered
 
-TLS, 8.0 servers (libfdb_c 7.4 cannot talk to them), larger values and batches, multi-version
+TLS, the version vector, a network with latency (the causal check and the thread tables were
+run on a host-local bridge), recoveries during the causal check, 8.0 servers (libfdb_c 7.4
+cannot talk to them), larger values and batches, multi-version
 clients, a quiet dedicated machine, a remote (non-loopback) server, long-running soak, and the
 `smol` runtime adapter.

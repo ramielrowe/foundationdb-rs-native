@@ -1,0 +1,1 @@
+{"backend":"native","background_conc":256,"background_gets":6546739,"background_gets_per_s":436223.0266025692,"cross_task_checks":405486,"errors":0,"negative_control":true,"rv_backwards":0,"same_task_checks":24538,"secs":15.007779509,"violations":2261,"workers":4,"workload":"causal"}

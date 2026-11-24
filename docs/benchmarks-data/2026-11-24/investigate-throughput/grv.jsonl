@@ -1,0 +1,1 @@
+{"backend": "native", "workload": "get", "conc": 256, "args": "--threads 4", "ops_per_s": 441639.3787773334, "p50_us": 562, "cpu_us_per_op": 7.200943807378396, "cpu_cores": 3.1802203497010804, "srv_default_tx": 4413841, "srv_batch_prio_tx": 0, "srv_system_tx": 54, "srv_requests_nonsystem": 71832, "tx_per_grv": 61.446722909009914, "counter_window_s": 20.00003409385681}
