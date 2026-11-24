@@ -190,6 +190,7 @@ cache hint sent to storage servers, the directory layer, and a multi-version cli
 | `fdb-native-tuple` | Tuple and subspace layers |
 | `fdb-native-testkit` | Docker test harness (not published) |
 | `fdb-native-stacktester` | Binding tester stack machine binary (not published) |
+| `fdb-native-sim` | Deterministic simulation: a seeded `Runtime`, a faulty in-memory network and a model cluster, with a seed sweep (not published) |
 
 ## Golden vectors
 
@@ -209,6 +210,10 @@ Requires [cargo-nextest](https://nexte.st/).
 ```bash
 # Unit tests
 cargo nextest run --workspace
+
+# The deterministic simulation's seed sweep alone (part of the unit tests; see CLAUDE.md to
+# replay a seed with its trace)
+cargo nextest run -p fdb-native-sim --no-capture -E 'test(seed_sweep)'
 
 # Integration tests that need a live FoundationDB (requires Docker)
 cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'

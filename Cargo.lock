@@ -525,6 +525,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdb-native-sim"
+version = "0.0.0"
+dependencies = [
+ "fdb-native-client",
+ "fdb-native-schema",
+ "fdb-native-transport",
+ "fdb-native-wire",
+ "futures-channel",
+ "futures-io",
+ "futures-lite",
+]
+
+[[package]]
 name = "fdb-native-stacktester"
 version = "0.0.0"
 dependencies = [

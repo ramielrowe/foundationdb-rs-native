@@ -246,8 +246,11 @@
 //!   exists any more, the peer is removed from the manager and its task ends
 //!   (`connectionKeeper`'s `PeerDestroy`, 7.4:1082-1097). A vanished server is therefore
 //!   dialed until its callers stop and then forgotten, not dialed forever. The next
-//!   [`PeerManager::peer`] for the address creates a new peer with a new [`PeerId`], and
-//!   [`PeerEvent::Removed`] tells observers.
+//!   [`PeerManager::peer`] for the address creates a new peer with a new [`PeerId`], whose
+//!   address starts available again in the [`FailureMonitor`] (as C++'s `Peer::Peer` resets
+//!   it), and [`PeerEvent::Removed`] tells observers.
+//! * A peer referenced again while its address is marked failed is probed again (C++'s
+//!   `retryConnect` outlives the references).
 //!
 //! # `choosePrimaryAddress`
 //!
@@ -1110,6 +1113,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
             peer.queue.close();
             return handle;
         }
+        // As C++'s `Peer::Peer` (FlowTransport 7.4:1104-1113): a new peer starts with its
+        // address available, even if an earlier peer of it (since removed) had it marked
+        // failed. Nothing would probe it otherwise until something held on to the peer.
+        shared
+            .failures
+            .set_address_failed(address, false, shared.rt.now());
         let task = PeerTask::new(shared.clone(), key, peer.clone(), ctrl_rx);
         let task = shared.rt.spawn(task.run());
         peers.map.insert(

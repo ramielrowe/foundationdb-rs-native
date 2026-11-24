@@ -551,9 +551,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     return false;
                 }
                 self.set_phase(PeerPhase::Idle);
-                // Only a referenced peer is probed again after a failure.
+                // Only a referenced peer is probed again after a failure. One referenced again
+                // while its address is marked failed (its probes stopped while it was not) is
+                // probed again: C++'s `retryConnect` outlives the references, and a `Peer`
+                // made anew resets the address to available (`Peer::Peer`, 7.4:1104-1113).
                 if self.peer.references() <= 0 {
                     self.probe_at = None;
+                } else if self.probe_at.is_none()
+                    && self.shared.failures.is_failed(&self.peer.address)
+                {
+                    self.probe_at = Some(now + self.shared.config.failed_probe_interval);
                 }
                 sleep_until = match self.probe_at {
                     Some(at) if at <= now => {
