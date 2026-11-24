@@ -1,6 +1,6 @@
 //! A client-side `SimpleFailureMonitor`: which addresses and endpoints are known to be down.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -53,13 +53,14 @@ impl EndpointStatus {
 
 #[derive(Debug, Default)]
 struct State {
-    addresses: HashMap<PeerKey, Entry>,
-    endpoints: HashMap<(PeerKey, Uid), EndpointFailure>,
+    /// FxHash (here and below): the addresses are the cluster's, which is trusted.
+    addresses: FxHashMap<PeerKey, Entry>,
+    endpoints: FxHashMap<(PeerKey, Uid), EndpointFailure>,
     /// The waits on each address (its status, its disconnects, its endpoints). A change to one
     /// address wakes only that address's waiters.
-    topics: HashMap<PeerKey, Waiters>,
+    topics: FxHashMap<PeerKey, Waiters>,
     /// FlowTransport's `persistentConnectFailedCount`: failed connects per address.
-    connect_failures: HashMap<PeerKey, ConnectFailures>,
+    connect_failures: FxHashMap<PeerKey, ConnectFailures>,
     /// `persistentConnectFailedLastPrune`; `None` before the first failure.
     connect_failures_pruned: Option<Instant>,
 }

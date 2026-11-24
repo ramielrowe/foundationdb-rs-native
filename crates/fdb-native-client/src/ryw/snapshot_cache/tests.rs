@@ -167,7 +167,7 @@ fn lookup_of_a_new_cache_and_after_inserts() {
             assert!(cache.insert_range(b"a", b"c", vec![kv(b"a", b"1")]));
         }
         assert_eq!(
-            cache.lookup(b"a").map(|kv| kv.map(|kv| &kv.value[..])),
+            cache.lookup(b"a").map(|kv| kv.map(|kv| kv.value)),
             Some(Some(&b"1"[..]))
         );
         assert_eq!(cache.lookup(b"a\0"), if first { None } else { Some(None) });
@@ -217,7 +217,7 @@ fn cpp_test_snapshot_cache_segments() {
 
     // `skip` lands on the segment containing the key, and the values are right.
     let it = cache.segment_at(b"e\0");
-    assert_eq!(it.kv(), Some(&kv(b"e\0", b"zoo")));
+    assert_eq!(it.kv(), Some(kv(b"e\0", b"zoo").borrowed()));
     let it = cache.segment_at(b"e\0\0");
     assert!(it.is_empty_range());
     assert_eq!(it.begin_key().to_vec(), b"e\0\0");
@@ -275,7 +275,7 @@ fn insert_key_values_and_absences() {
             seg(E, b"\xff\xff", b"\xff\xff\0"),
         ]
     );
-    assert_eq!(cache.segment_at(b"b").kv(), Some(&kv(b"b", b"B")));
+    assert_eq!(cache.segment_at(b"b").kv(), Some(kv(b"b", b"B").borrowed()));
 }
 
 #[test]
@@ -412,18 +412,18 @@ fn skip_contiguous_and_back() {
     // Forward: the pairs from here up to (not including) the key.
     let mut it = cache.segment_at(b"b");
     assert_eq!(it.skip_contiguous(ExtKey::from(&b"d"[..])), &rows[1..3]);
-    assert_eq!(it.kv(), Some(&rows[2]));
+    assert_eq!(it.kv(), Some(rows[2].borrowed()));
     let mut it = cache.segment_at(b"b");
     assert_eq!(it.skip_contiguous(ExtKey::new(b"d", 1)), &rows[1..4]);
-    assert_eq!(it.kv(), Some(&rows[3]));
+    assert_eq!(it.kv(), Some(rows[3].borrowed()));
     // Past the entry's last value: stops at the entry's end.
     let mut it = cache.segment_at(b"b");
     assert_eq!(it.skip_contiguous(ExtKey::from(&b"zz"[..])), &rows[1..5]);
-    assert_eq!(it.kv(), Some(&rows[4]));
+    assert_eq!(it.kv(), Some(rows[4].borrowed()));
     // A single pair.
     let mut it = cache.segment_at(b"b");
     assert_eq!(it.skip_contiguous(ExtKey::from(&b"c"[..])), &rows[1..2]);
-    assert_eq!(it.kv(), Some(&rows[1]));
+    assert_eq!(it.kv(), Some(rows[1].borrowed()));
     // Not a key/value: nothing.
     let mut it = cache.segment_at(b"m");
     assert!(it.is_unknown_range());
@@ -436,13 +436,13 @@ fn skip_contiguous_and_back() {
         it.skip_contiguous_back(ExtKey::from(&b"b"[..])),
         &rows[1..4]
     );
-    assert_eq!(it.kv(), Some(&rows[1]));
+    assert_eq!(it.kv(), Some(rows[1].borrowed()));
     let mut it = cache.segment_at(b"d");
     assert_eq!(it.skip_contiguous_back(ExtKey::new(b"b", 1)), &rows[2..4]);
-    assert_eq!(it.kv(), Some(&rows[2]));
+    assert_eq!(it.kv(), Some(rows[2].borrowed()));
     let mut it = cache.segment_at(b"d");
     assert_eq!(it.skip_contiguous_back(ExtKey::EMPTY), &rows[0..4]);
-    assert_eq!(it.kv(), Some(&rows[0]));
+    assert_eq!(it.kv(), Some(rows[0].borrowed()));
     let mut it = cache.segment_at(b"d");
     assert_eq!(
         it.skip_contiguous_back(ExtKey::from(&b"d"[..])),
@@ -455,11 +455,67 @@ fn skip_contiguous_and_back() {
 }
 
 #[test]
+fn rows_of_replies_stay_in_the_replies() {
+    use fdb_native_wire::KeyValueVector;
+    let reply = |pairs: &[(&[u8], &[u8])]| {
+        SharedKeyValueVector::from(
+            KeyValueVector::from_pairs(pairs.iter().map(|&(k, v)| KeyValueRef::new(k, v))).unwrap(),
+        )
+    };
+    let first = reply(&[(b"a", b"1"), (b"b", b"")]);
+    let empty = reply(&[]);
+    let second = reply(&[(b"c", b"3"), (b"d", b"4")]);
+    let rows = CacheRows::from_chunks([&first, &empty, &second]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.get(2), KeyValueRef::new(b"c", b"3"));
+
+    let mut cache = SnapshotCache::new();
+    assert!(cache.insert_range(b"a", b"z", rows));
+    cache.assert_invariants();
+    // One buffer per (non-empty) reply, not one per row.
+    assert_eq!(cache.buffers.len(), 2);
+    let mut it = cache.segment_at(b"a");
+    let run = it.skip_contiguous(ExtKey::from(&b"z"[..]));
+    let mut out = Vec::new();
+    run.append_shared(0..run.len(), false, &mut out);
+    assert_eq!(
+        out,
+        [
+            kv(b"a", b"1"),
+            kv(b"b", b""),
+            kv(b"c", b"3"),
+            kv(b"d", b"4")
+        ]
+    );
+    // The rows are slices of the replies, not copies.
+    assert!(
+        first
+            .payload()
+            .as_ptr_range()
+            .contains(&out[0].value.as_ptr())
+    );
+    assert!(
+        second
+            .payload()
+            .as_ptr_range()
+            .contains(&out[3].key.as_ptr())
+    );
+    out.clear();
+    run.append_shared(1..3, true, &mut out);
+    assert_eq!(out, [kv(b"c", b"3"), kv(b"b", b"")]);
+
+    // A range that keeps none of a reply's rows does not keep the reply.
+    let mut cache = SnapshotCache::new();
+    assert!(cache.insert_range(b"e", b"z", CacheRows::from_chunks([&first])));
+    assert!(cache.buffers.is_empty());
+}
+
+#[test]
 fn iterator_navigation() {
     let mut cache = SnapshotCache::new();
     cache.insert_range(b"b", b"d", vec![kv(b"b", b"1"), kv(b"b\0", b"2")]);
     let mut it = cache.segment_at(b"b\0");
-    assert_eq!(it.kv(), Some(&kv(b"b\0", b"2")));
+    assert_eq!(it.kv(), Some(kv(b"b\0", b"2").borrowed()));
     let at = it.clone();
     assert!(it.advance());
     assert!(it != at);
@@ -468,7 +524,7 @@ fn iterator_navigation() {
     assert!(it == at);
     // Retreating over the degenerate empty range between "b" and "b\0".
     assert!(it.retreat());
-    assert_eq!(it.kv(), Some(&kv(b"b", b"1")));
+    assert_eq!(it.kv(), Some(kv(b"b", b"1").borrowed()));
     assert!(it.retreat());
     assert!(it.is_unknown_range());
     assert!(!it.retreat());
@@ -503,7 +559,7 @@ fn range(
 
 fn outcome(rows: &[KeyValue], more: bool) -> RangeReadOutcome<'static> {
     RangeReadOutcome {
-        rows: rows.to_vec(),
+        rows: rows.into(),
         more,
         read_to_begin: false,
         read_through_end: false,
@@ -890,10 +946,7 @@ fn check_against_model(cache: &SnapshotCache, model: &Model) {
         };
         assert_eq!(cache.lookup(p), expected, "lookup({p:?})");
         match it.kv() {
-            Some(row) => assert_eq!(
-                model.truth.get(&row.key[..]).map(Vec::as_slice),
-                Some(&row.value[..])
-            ),
+            Some(row) => assert_eq!(model.truth.get(row.key).map(Vec::as_slice), Some(row.value)),
             None => assert_ne!(it.segment_type(), V),
         }
         // `skip_contiguous` over a run of pairs: ascending, all `< limit`, nothing but empty
@@ -902,24 +955,27 @@ fn check_against_model(cache: &SnapshotCache, model: &Model) {
             for limit in model
                 .points
                 .iter()
-                .filter(|l| l.as_slice() > &first.key[..])
+                .filter(|l| l.as_slice() > first.key)
                 .take(8)
             {
                 let mut fwd_it = it.clone();
-                let run = fwd_it.skip_contiguous(ExtKey::from(limit));
-                assert_eq!(run.first(), Some(first));
-                assert_eq!(fwd_it.kv(), run.last());
+                let run: Vec<_> = fwd_it.skip_contiguous(ExtKey::from(limit)).iter().collect();
+                assert_eq!(run.first(), Some(&first));
+                assert_eq!(fwd_it.kv().as_ref(), run.last());
                 for pair in run.windows(2) {
                     assert!(pair[0].key < pair[1].key);
-                    let (lo, hi) = (model.point(&pair[0].key), model.point(&pair[1].key));
+                    let (lo, hi) = (model.point(pair[0].key), model.point(pair[1].key));
                     assert!(
                         model.known[lo..hi].iter().all(|&k| k),
                         "run spans unknown keys"
                     );
                 }
-                assert!(run.iter().all(|r| r.key < *limit));
+                assert!(run.iter().all(|r| r.key < limit.as_slice()));
                 let mut back_it = fwd_it.clone();
-                let back = back_it.skip_contiguous_back(ExtKey::from(&first.key));
+                let back: Vec<_> = back_it
+                    .skip_contiguous_back(ExtKey::from(first.key))
+                    .iter()
+                    .collect();
                 assert_eq!(back, run);
                 assert_eq!(back_it.kv(), Some(first));
             }
@@ -1045,7 +1101,7 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                     },
                 );
                 let out = RangeReadOutcome {
-                    rows: rows.clone(),
+                    rows: rows.clone().into(),
                     more,
                     read_to_begin: to_begin,
                     read_through_end: through_end,
@@ -1330,7 +1386,7 @@ proptest! {
                 Wild::Read { reverse, keys, begin, end, flags } => {
                     let rows = sorted_rows(keys, reverse);
                     let out = RangeReadOutcome {
-                        rows,
+                        rows: rows.into(),
                         more: flags.0,
                         read_to_begin: flags.1,
                         read_through_end: flags.2,

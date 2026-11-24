@@ -362,6 +362,8 @@
 //! of `fdbrpc/FlowTransport.cpp` on `release-8.0`, unless another file is named.
 
 use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1000,7 +1002,8 @@ struct Entry<R: Runtime> {
 }
 
 struct Peers<R: Runtime> {
-    map: HashMap<PeerKey, Entry<R>>,
+    /// FxHash: the addresses are the cluster's, which is trusted.
+    map: FxHashMap<PeerKey, Entry<R>>,
     shutdown: bool,
 }
 
@@ -1306,7 +1309,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
                 cluster_versions: Mutex::new(HashMap::new()),
                 seed,
                 peers: Mutex::new(Peers {
-                    map: HashMap::new(),
+                    map: FxHashMap::default(),
                     shutdown: false,
                 }),
                 next_peer: AtomicU64::new(1),

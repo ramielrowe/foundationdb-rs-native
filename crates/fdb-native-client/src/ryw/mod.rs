@@ -13,6 +13,7 @@ mod write_map;
 
 pub(crate) use conflicts::ReadConflicts;
 pub(crate) use snapshot_cache::{
-    ExtKey, RangeReadOutcome, SegmentType, SelectorBound, SnapshotCache, SnapshotCacheIter,
+    CacheRows, CachedRows, ExtKey, RangeReadOutcome, SegmentType, SelectorBound, SnapshotCache,
+    SnapshotCacheIter,
 };
 pub(crate) use write_map::{WriteMap, WriteMapIter, WriteSegmentType};

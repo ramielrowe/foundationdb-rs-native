@@ -491,7 +491,7 @@
 //!   read version requests waiting fail with `operation_cancelled`, and so does every later
 //!   one, without starting a batcher.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -737,7 +737,8 @@ struct Inner<R: Runtime, W> {
 
 /// The read version batchers, one per [`BatcherKey`] in use.
 struct Batchers<R: Runtime> {
-    running: HashMap<BatcherKey, Batcher<R>>,
+    /// FxHash: looked up for every read version request; the keys are the client's.
+    running: FxHashMap<BatcherKey, Batcher<R>>,
     /// [`Reader::shutdown`] was called: no batcher starts any more.
     shut_down: bool,
 }
@@ -849,7 +850,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             inner: Arc::new(Inner {
                 shared,
                 batchers: Mutex::new(Batchers {
-                    running: HashMap::new(),
+                    running: FxHashMap::default(),
                     shut_down: false,
                 }),
             }),

@@ -523,8 +523,9 @@ impl State {
         self.created.checked_add(self.persistent.timeout?)
     }
 
-    /// Fails if the transaction is dead, or its timeout has passed (which kills it).
-    fn check_alive(&mut self, now: Instant) -> Result<(), Error> {
+    /// Fails if the transaction is dead, or its timeout has passed (which kills it). `now`
+    /// reads the clock, which is done only if there is a deadline.
+    fn check_alive(&mut self, now: impl FnOnce() -> Instant) -> Result<(), Error> {
         self.fire_timebomb(now);
         match &self.dead {
             Some(e) => Err(e.clone()),
@@ -539,8 +540,12 @@ impl State {
     /// then, before anything else happens to it, as if the timer had fired at the deadline.
     /// So a later change of the timeout (`set_option(Timeout(0))` included), a `cancel` or
     /// a `used_during_commit` does not replace the timeout.
-    fn fire_timebomb(&mut self, now: Instant) {
-        if self.dead.is_none() && self.deadline().is_some_and(|deadline| deadline <= now) {
+    ///
+    /// `now` reads the clock; without a timeout it is not called (a clock read is
+    /// `rdtscp` in the vDSO's `clock_gettime`, and the transaction is looked at several
+    /// times per operation).
+    fn fire_timebomb(&mut self, now: impl FnOnce() -> Instant) {
+        if self.dead.is_none() && self.deadline().is_some_and(|deadline| deadline <= now()) {
             self.kill(Error::new(TRANSACTION_TIMED_OUT));
         }
     }
@@ -886,7 +891,7 @@ impl<R: Runtime> Transaction<R> {
     /// ([`State::fire_timebomb`]).
     fn state(&self) -> MutexGuard<'_, State> {
         let mut state = lock(&self.inner.state);
-        state.fire_timebomb(self.rt().now());
+        state.fire_timebomb(|| self.rt().now());
         state
     }
 
@@ -951,7 +956,7 @@ impl<R: Runtime> Transaction<R> {
     fn guard_check(&self, epoch: u64) -> Result<(), Error> {
         let mut state = self.state();
         self.check_handle(&state)?;
-        state.check_alive(self.rt().now())?;
+        state.check_alive(|| self.rt().now())?;
         if state.epoch != epoch {
             return Err(Error::new(TRANSACTION_CANCELLED));
         }
@@ -1131,7 +1136,7 @@ impl<R: Runtime> Transaction<R> {
             return Err(e);
         }
         state.check_not_committing()?;
-        state.check_alive(self.rt().now())?;
+        state.check_alive(|| self.rt().now())?;
         Ok(ReadStart {
             epoch: state.epoch,
             use_provisional_proxies: state.flags.use_provisional_proxies,
@@ -1427,9 +1432,7 @@ impl<R: Runtime> Transaction<R> {
         let (tx, rx) = oneshot::channel();
         // Detached: it ends with the read (which the transaction's reset, cancellation or
         // timeout interrupts).
-        drop(self.rt().spawn(async move {
-            let _ = tx.send(read.await);
-        }));
+        drop(self.rt().spawn(SendResult { read, tx: Some(tx) }));
         ReadTask(rx)
     }
 
@@ -1623,7 +1626,7 @@ impl<R: Runtime> Transaction<R> {
                 // `resetPromise.getFuture() || ready`: a transaction cancelled, timed out or
                 // poisoned (a use during the commit) while the reads ended does not commit,
                 // whichever of the two this sees first.
-                state.check_alive(self.rt().now())?;
+                state.check_alive(|| self.rt().now())?;
                 if state.reading.count == 0 {
                     state.reading.closed = true;
                     if !state.flags.read_your_writes_disabled {
@@ -1798,7 +1801,7 @@ impl<R: Runtime> Transaction<R> {
                 Some(Err(e))
             } else if let Err(e) = state
                 .check_not_committing()
-                .and_then(|()| state.check_alive(self.rt().now()))
+                .and_then(|()| state.check_alive(|| self.rt().now()))
             {
                 // `ReadYourWritesTransaction::getVersionstamp` (7.4:2515-2521, 8.0:2431-2437):
                 // `checkUsedDuringCommit()`, then `waitOrError(..., resetPromise)`, which
@@ -1867,7 +1870,7 @@ impl<R: Runtime> Transaction<R> {
         let delay = {
             let mut state = self.state();
             self.check_handle(&state)?;
-            state.check_alive(self.rt().now())?;
+            state.check_alive(|| self.rt().now())?;
             let limit_hit = state
                 .persistent
                 .retry_limit
@@ -1926,7 +1929,7 @@ impl<R: Runtime> Transaction<R> {
             // `resetTimeout`: the operations in progress see the new deadline (and fail at
             // once if it has passed). A deadline that passed before this call has killed
             // the transaction already (`state()`), and no new timeout brings it back.
-            if state.check_alive(self.rt().now()).is_ok() {
+            if state.check_alive(|| self.rt().now()).is_ok() {
                 state.interrupt(|| Interrupt::Deadline);
             }
         }
@@ -1964,6 +1967,38 @@ impl<R: Runtime> Transaction<R> {
     /// created or [reset](Self::reset).
     pub fn retries(&self) -> u32 {
         self.state().retries
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The task of [`Transaction::spawn_read`]: runs `read` and sends its result. (An
+    /// `async move { tx.send(read.await) }` keeps `read` twice, as the block's capture and
+    /// as the future it awaits: a get's task was 5.8 KB instead of 2.9.)
+    #[must_use = "futures do nothing unless polled"]
+    struct SendResult<F, T> {
+        #[pin]
+        read: F,
+        tx: Option<oneshot::Sender<Result<T, Error>>>,
+    }
+}
+
+impl<F, T> Future for SendResult<F, T>
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        if this.tx.is_none() {
+            // Done (`read` must not be polled again).
+            return Poll::Ready(());
+        }
+        let result = std::task::ready!(this.read.poll(cx));
+        if let Some(tx) = this.tx.take() {
+            let _ = tx.send(result);
+        }
+        Poll::Ready(())
     }
 }
 
@@ -2020,7 +2055,7 @@ async fn interruption<R: Runtime>(inner: Weak<Inner<R>>, rt: &R, epoch: u64) -> 
                 return Error::new(TRANSACTION_CANCELLED);
             };
             let mut state = lock(&inner.state);
-            if let Err(e) = state.check_alive(rt.now()) {
+            if let Err(e) = state.check_alive(|| rt.now()) {
                 return e;
             }
             if state.epoch != epoch {
@@ -2088,7 +2123,7 @@ async fn wait_versionstamp<R: Runtime>(
                 if let Some(inner) = inner.upgrade() {
                     let mut state = lock(&inner.state);
                     if state.epoch == epoch {
-                        let _ = state.check_alive(rt.now());
+                        let _ = state.check_alive(|| rt.now());
                     }
                 }
             }

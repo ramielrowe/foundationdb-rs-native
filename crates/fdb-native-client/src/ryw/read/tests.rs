@@ -140,7 +140,7 @@ impl Mem {
                     break;
                 }
                 let kv = KeyValue::new((*k).clone(), (*v).clone());
-                decrement(&mut limits, &kv);
+                decrement(&mut limits, kv.borrowed());
                 rows.push(kv);
             }
         }
