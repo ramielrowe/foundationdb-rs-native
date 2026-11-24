@@ -215,7 +215,10 @@ fn two_databases_share_connections_and_the_last_one_ends_everything() {
                 client,
             } = s;
             if shut_down {
+                assert!(db.reader().cached_location(b"k").is_some());
                 sim.block_on(db.shutdown()).unwrap();
+                // Its location cache let go of the servers, though the database is held.
+                assert_eq!(db.reader().cached_locations(), 0, "seed {seed}");
                 let e = sim
                     .block_on_within(Duration::from_millis(1), held.get_read_version())
                     .expect("at once")
@@ -262,5 +265,48 @@ fn two_databases_share_connections_and_the_last_one_ends_everything() {
                 "seed {seed}"
             );
         }
+    }
+}
+
+/// A reader that is shut down keeps no server referenced: its location cache is emptied, and
+/// a location fetched after (a reply that lands during `Database::shutdown`, here a read at a
+/// set version while the rest of the database runs) is used by its read but not kept.
+#[test]
+fn a_reader_shut_down_keeps_no_location() {
+    for seed in 0..4 {
+        let s = setup(seed);
+        let db = s.db.clone();
+        let version = s
+            .sim
+            .block_on_within(Duration::from_secs(60), async move {
+                let tx = db.create_transaction();
+                tx.set(b"k", b"v");
+                tx.commit().await.map(|c| c.committed_version())
+            })
+            .expect("in time")
+            .expect("committed");
+        let read = |db: Database<SimRuntime>| async move {
+            let tx = db.create_transaction();
+            tx.set_read_version(version);
+            tx.get(b"k").await
+        };
+        let value = s
+            .sim
+            .block_on_within(Duration::from_secs(60), read(s.db.clone()))
+            .expect("in time")
+            .expect("read");
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert!(s.db.reader().cached_locations() > 0);
+        s.db.reader().shutdown();
+        assert_eq!(s.db.reader().cached_locations(), 0, "seed {seed}");
+        let value = s
+            .sim
+            .block_on_within(Duration::from_secs(60), read(s.db.clone()))
+            .expect("in time")
+            .expect("read");
+        assert_eq!(value.as_deref(), Some(&b"v"[..]), "seed {seed}");
+        assert_eq!(s.db.reader().cached_locations(), 0, "seed {seed}");
+        assert!(s.db.reader().cached_location(b"k").is_none(), "seed {seed}");
+        s.sim.block_on(s.db.shutdown()).unwrap();
     }
 }

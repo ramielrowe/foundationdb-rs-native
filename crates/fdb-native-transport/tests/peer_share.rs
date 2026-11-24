@@ -115,7 +115,13 @@ async fn shutting_a_user_down_ends_only_its_own_requests() {
     assert!(!b.is_shut_down());
     assert!(!a.connections_shut_down());
     assert_eq!(a.users(), 1);
-    assert_eq!(silent.await.unwrap(), Err(RequestError::Cancelled));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(50), silent)
+            .await
+            .expect("ended at once")
+            .unwrap(),
+        Err(RequestError::Cancelled)
+    );
     assert_eq!(b_request.await.unwrap().unwrap().value, 7 + ECHO_ADDS);
     // A's handles fail without sending; B's go on, on the same connection.
     assert_eq!(
@@ -154,8 +160,9 @@ async fn shutting_a_user_down_ends_only_its_own_requests() {
 }
 
 /// A command of a user that is shut down while it is still queued (the peer is connecting)
-/// is taken back: `NotSent`, certainly not delivered, and the server never sees it; the
-/// other user's command, queued behind it, is sent once the connection is up.
+/// is refused at once, not when the connection is up: `NotSent`, certainly not delivered,
+/// and the server never sees it; the other user's command, queued behind it, is sent once
+/// the connection is up. So is one that waits for room in the queue.
 #[tokio::test(start_paused = true)]
 async fn a_queued_command_of_a_user_shut_down_is_not_sent() {
     let net = Net::new();
@@ -175,10 +182,145 @@ async fn a_queued_command_of_a_user_shut_down_is_not_sent() {
     });
     until("both are queued", || pb.queued_commands() == 2).await;
     a.shutdown().await;
-    assert_eq!(queued.await.unwrap(), Err(RequestError::NotSent(None)));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(50), queued)
+            .await
+            .expect("refused at once")
+            .unwrap(),
+        Err(RequestError::NotSent(None))
+    );
     assert_eq!(behind.await.unwrap().unwrap().value, 2 + ECHO_ADDS);
     assert_eq!(all_values(&server), vec![2]);
     b.shutdown().await;
+
+    // A full queue (one place, B's): A's request waits for room, and its shutdown ends the
+    // wait, unsent.
+    let net = Net::new();
+    net.set_connect_delay(Duration::from_millis(500));
+    let server = listen_one(&net, sock(4500), Script::echo(V74));
+    let mut config = config();
+    config.command_queue_len = 1;
+    let b = PeerManager::new(
+        MemRuntime::new(&net),
+        config,
+        fdb_native_transport::peer::DiscardEvents,
+    );
+    let a = b.share().expect("open");
+    let (pa, pb) = (a.peer(&server.address), b.peer(&server.address));
+    let first = tokio::spawn({
+        let pb = pb.clone();
+        async move { pb.request_as::<EchoReply, _>(ep(1), echo_encode(3)).await }
+    });
+    until("b's is queued", || pb.queued_commands() == 1).await;
+    let waiting = tokio::spawn({
+        let pa = pa.clone();
+        async move { pa.request(ep(1), echo_encode(4)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!waiting.is_finished());
+    a.shutdown().await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(50), waiting)
+            .await
+            .expect("ended at once")
+            .unwrap(),
+        Err(RequestError::NotSent(None))
+    );
+    assert_eq!(first.await.unwrap().unwrap().value, 3 + ECHO_ADDS);
+    assert_eq!(all_values(&server), vec![3]);
+    b.shutdown().await;
+}
+
+/// The review's race (b35.7): one user's shutdown races both users' requests on one
+/// connection, on a multi-thread runtime, with connects that are slow or not, queues of 1 to
+/// 5 places and shutdowns at varied moments. Every request of the user shut down is a reply,
+/// `NotSent` (and then never reached the server) or `Cancelled`; every request of the other
+/// succeeds.
+#[test]
+fn a_shutdown_racing_requests_keeps_at_most_once() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(6)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut not_sent, mut cancelled) = (0u64, 0u64);
+    for iter in 0..150u64 {
+        let (ns, ca) = rt.block_on(async move {
+            let net = Net::new();
+            if iter % 3 == 0 {
+                net.set_connect_delay(Duration::from_micros(200 + (iter % 7) * 100));
+            }
+            let server = listen_one(&net, sock(4500), Script::echo(V74));
+            let mut config = config();
+            config.command_queue_len = 1 + (iter as usize % 5);
+            let a = PeerManager::new(
+                MemRuntime::new(&net),
+                config,
+                fdb_native_transport::peer::DiscardEvents,
+            );
+            let b = a.share().unwrap();
+            let (pa, pb) = (a.peer(&server.address), b.peer(&server.address));
+            if iter % 3 == 1 {
+                pb.connect().await.unwrap();
+            }
+            let (mut ha, mut hb) = (Vec::new(), Vec::new());
+            for i in 0..40u64 {
+                let pa = pa.clone();
+                let va = iter * 100_000 + i;
+                ha.push((
+                    va,
+                    tokio::spawn(async move { pa.request(ep(1), echo_encode(va)).await }),
+                ));
+                let pb = pb.clone();
+                let vb = iter * 100_000 + 50_000 + i;
+                hb.push(tokio::spawn(async move {
+                    pb.request(ep(1), echo_encode(vb)).await
+                }));
+            }
+            for _ in 0..iter % 11 {
+                tokio::task::yield_now().await;
+            }
+            if iter % 5 == 0 {
+                tokio::time::sleep(Duration::from_micros(100 * (iter % 9))).await;
+            }
+            a.shutdown().await;
+            let (mut ns, mut ca, mut unsent) = (0, 0, Vec::new());
+            for (v, h) in ha {
+                match tokio::time::timeout(Duration::from_secs(20), h).await {
+                    Ok(Ok(Err(RequestError::NotSent(_)))) => {
+                        ns += 1;
+                        unsent.push(v);
+                    }
+                    Ok(Ok(Err(RequestError::Cancelled))) => ca += 1,
+                    Ok(Ok(Ok(_))) => {}
+                    r => panic!("iter {iter}: a's request {v} ended with {r:?}"),
+                }
+            }
+            for h in hb {
+                match tokio::time::timeout(Duration::from_secs(20), h).await {
+                    Ok(Ok(Ok(_))) => {}
+                    r => panic!("iter {iter}: b's request did not succeed: {r:?}"),
+                }
+            }
+            // Let anything still buffered reach the server.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let seen = all_values(&server);
+            for v in &unsent {
+                assert!(
+                    !seen.contains(v),
+                    "iter {iter}: a's request {v} was reported not sent but reached the server"
+                );
+            }
+            b.shutdown().await;
+            (ns, ca)
+        });
+        not_sent += ns;
+        cancelled += ca;
+    }
+    assert!(
+        not_sent > 0 && cancelled > 0,
+        "both outcomes exercised: {not_sent} not sent, {cancelled} cancelled"
+    );
 }
 
 /// The connections close with the last user, whether it is shut down or dropped, and are

@@ -263,3 +263,117 @@ async fn different_tls_configurations_have_their_own_connections() {
         db.shutdown().await;
     }
 }
+
+/// Each part of the TLS material decides alone: a configuration that differs from another in
+/// one field only (certificate, key, CA, password, verify-peers rules, plaintext refusal) has
+/// connections of its own. The PEM variants are the same certificate and key with a comment
+/// line before them (PEM parsers skip it), so only the bytes differ.
+#[cfg(feature = "tls")]
+#[tokio::test(start_paused = true)]
+async fn each_tls_setting_alone_keeps_managers_apart() {
+    use fdb_native_client::TlsConfig;
+    use fdb_native_testkit::tls::TestPki;
+
+    let net = Net::new();
+    let rt = MemRuntime::new(&net);
+    let one = TestPki::generate().unwrap();
+    let two = TestPki::generate().unwrap();
+    let base = || {
+        TlsConfig::new()
+            .ca_bytes(one.ca_pem())
+            .cert_bytes(one.client().cert_pem())
+            .key_bytes(one.client().key_pem())
+    };
+    let with = |config: TlsConfig| {
+        let mut options = options();
+        options.tls = Some(config);
+        options
+    };
+    let open = |options| Database::from_record(rt.clone(), record(), options).unwrap();
+    let reference = open(with(base()));
+    let again = open(with(base()));
+    assert!(reference.peers().shares_connections_with(again.peers()));
+    let variants: Vec<(&str, TlsConfig)> = vec![
+        (
+            "certificate",
+            base().cert_bytes(format!("# other bytes\n{}", one.client().cert_pem())),
+        ),
+        (
+            "key",
+            base().key_bytes(format!("# other bytes\n{}", one.client().key_pem())),
+        ),
+        ("CA", base().ca_bytes(two.ca_pem())),
+        ("password", base().password("unused")),
+        ("verify peers", base().verify_peers("Check.Valid=0")),
+        ("plaintext", base().disable_plaintext_connection(true)),
+    ];
+    let mut dbs = vec![reference, again];
+    for (what, config) in variants {
+        let db = open(with(config.clone()));
+        for other in &dbs {
+            assert!(
+                !db.peers().shares_connections_with(other.peers()),
+                "a different {what} shared"
+            );
+        }
+        // The same variant again shares with it.
+        let twin = open(with(config));
+        assert!(db.peers().shares_connections_with(twin.peers()), "{what}");
+        dbs.push(db);
+        dbs.push(twin);
+    }
+    for db in dbs {
+        db.shutdown().await;
+    }
+}
+
+/// `A` is shut down while `B`'s commit and its own are both at the commit proxy, on the
+/// same connection: `B`'s completes, `A`'s fails as maybe committed (it was sent:
+/// `commit_unknown_result`, never a not-sent error), and the late reply to `A`'s is ignored
+/// while `B` goes on.
+#[tokio::test(start_paused = true)]
+async fn shutting_one_database_down_while_both_commit() {
+    let mut cluster = Cluster::start();
+    let rt = MemRuntime::new(&cluster.net);
+    let a = cluster.open(&rt, options()).await;
+    let b = cluster.open(&rt, options()).await;
+    cluster.commit_one(&a, 100).await;
+    cluster.commit_one(&b, 150).await;
+    // B's commit reaches the proxy and is held.
+    let tb = b.create_transaction();
+    tb.set(b"kb", b"vb");
+    let hb = tokio::spawn(async move { tb.commit().await });
+    cluster.grv.next().await.reply_grv(200);
+    let held_b = cluster.commit.next().await;
+    // A's too.
+    let ta = a.create_transaction();
+    ta.set(b"ka", b"va");
+    let ha = tokio::spawn(async move { ta.commit().await });
+    cluster.grv.next().await.reply_grv(300);
+    let held_a = cluster.commit.next().await;
+    a.shutdown().await;
+    let ea = tokio::time::timeout(Duration::from_secs(60), ha)
+        .await
+        .expect("a's commit ends")
+        .unwrap()
+        .unwrap_err();
+    assert!(ea.is_maybe_committed(), "{ea:?}");
+    assert_eq!(ea.code(), codes::COMMIT_UNKNOWN_RESULT, "{ea:?}");
+    held_b.reply_commit(Ok(CommitId {
+        version: 201,
+        ..CommitId::default()
+    }));
+    let rb = tokio::time::timeout(Duration::from_secs(60), hb)
+        .await
+        .expect("b's commit ends")
+        .unwrap();
+    assert_eq!(rb.expect("b committed").committed_version(), 201);
+    // The reply to A's cancelled commit arrives and is dropped; B goes on.
+    held_a.reply_commit(Ok(CommitId {
+        version: 301,
+        ..CommitId::default()
+    }));
+    cluster.commit_one(&b, 400).await;
+    assert_eq!(cluster.connects(150), 1);
+    b.shutdown().await;
+}

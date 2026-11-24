@@ -328,10 +328,13 @@
 //! last clone, and that only ends what the user asked for:
 //!
 //! * its handles' commands fail from then on, as after a shutdown, and those in progress end
-//!   at once as if their futures were dropped: a command still queued is taken back
-//!   ([`RequestError::NotSent`]: it was certainly not sent), a request the task already took
-//!   fails with [`RequestError::Cancelled`] (it may have been sent; the task forgets it, and
-//!   the connection goes on for the other users);
+//!   at once: each peer's task is told, and refuses the user's commands still queued
+//!   ([`RequestError::NotSent`]: decided under the queue's lock, they were certainly not
+//!   sent) and fails its requests in flight with [`RequestError::Cancelled`] (they may have
+//!   been sent; their reply tokens are forgotten, and the connection goes on for the other
+//!   users). A command the task takes after it was told is refused unsent too (one it took
+//!   before is in flight, and cancelled). Nothing of this is on a request's path: a command
+//!   carries its user's id, and the reply is awaited without looking at shared state;
 //! * its [`connect`](PeerHandle::connect)s fail with [`PeerError::Shutdown`], its
 //!   [`close_connection`](PeerHandle::close_connection)s do nothing, and its
 //!   [`reference`](PeerHandle::reference)s do not count (those taken before stay until
@@ -340,6 +343,13 @@
 //!
 //! The peers shut down (as above) with the last user. [`PeerManager::users`] counts the users
 //! left and [`PeerManager::shares_connections_with`] tells whether two managers share.
+//!
+//! The limits of a peer are the connection's, so the users share them: the command queue
+//! ([`command_queue_len`](PeerManagerConfig::command_queue_len)), the output buffer and the
+//! reply registry's cap on requests in flight
+//! ([`RegistryConfig::max_pending`](crate::rpc::RegistryConfig::max_pending),
+//! [`RequestError::TooManyPending`]). A user that fills them makes the others' commands wait
+//! for room or fail as not sent (retryable), as one busy user already did.
 //!
 //! Citations `7.4:N` are lines of `fdbrpc/FlowTransport.actor.cpp` on `release-7.4` and `8.0:N`
 //! of `fdbrpc/FlowTransport.cpp` on `release-8.0`, unless another file is named.
@@ -449,6 +459,9 @@ pub(crate) enum Ctrl {
     Unregister(Uid),
     /// The request with this id was dropped after the task took it.
     Cancel(u64),
+    /// The user with this id was shut down (and others remain): its queued commands are
+    /// refused, its requests in flight cancelled.
+    UserClosed(u64),
     CloseConnection,
     /// The last [`PeerHandle`] was dropped.
     Released,
@@ -561,8 +574,6 @@ enum Called<T> {
     Refused(PeerError),
     /// The task ended without answering.
     Lost,
-    /// The user was shut down after the task took the command: it may have been sent.
-    Cancelled,
 }
 
 /// Takes a queued command back if its caller drops the future before the answer.
@@ -713,11 +724,12 @@ impl PeerHandle {
     /// Queues a command and waits for the task's answer. Dropping the future takes the
     /// command back if the task has not.
     ///
-    /// When the handle's user is [shut down](PeerManager::shutdown) the wait ends at once, as
-    /// if the future were dropped: a command still queued is taken back
-    /// ([`NeverQueued`](Called::NeverQueued): certainly not sent), one the task took is
-    /// cancelled ([`Cancelled`](Called::Cancelled): it may have been sent).
-    async fn call<T>(&self, make: impl FnOnce(u64, oneshot::Sender<T>) -> Cmd) -> Called<T> {
+    /// When the handle's user is [shut down](PeerManager::shutdown), the command is not
+    /// queued, a wait for room in the queue ends at once (nothing was queued), and the peer's
+    /// task answers what is queued or in flight ([`Ctrl::UserClosed`]). The user is checked
+    /// only with an atomic load here: the reply is awaited as is, with no shared state on the
+    /// way (a request's cost does not depend on sharing).
+    async fn call<T>(&self, make: impl FnOnce(u64, u64, oneshot::Sender<T>) -> Cmd) -> Called<T> {
         if self.user.is_closed() {
             return Called::NeverQueued;
         }
@@ -729,10 +741,11 @@ impl PeerHandle {
             queued: false,
             done: false,
         };
-        // A push abandoned while it waits for room has queued nothing.
+        // A push abandoned while it waits for room has queued nothing (and one that finds
+        // room at once never looks at the shutdown signal).
         match self
             .user
-            .unless_closed(self.shared.queue.push(make(id, tx)))
+            .unless_closed(self.shared.queue.push(make(id, self.user.id(), tx)))
             .await
         {
             None | Some(Err(Rejected::Closed)) => return Called::NeverQueued,
@@ -740,15 +753,7 @@ impl PeerHandle {
             Some(Err(Rejected::Refused(error))) => return Called::Refused(error),
         }
         guard.queued = true;
-        let Some(answer) = self.user.unless_closed(rx).await else {
-            guard.done = true;
-            if self.shared.queue.remove(id).is_some() {
-                return Called::NeverQueued;
-            }
-            // The task took it: it forgets a request it has sent (and ignores the rest).
-            let _ = self.shared.ctrl.unbounded_send(Ctrl::Cancel(id));
-            return Called::Cancelled;
-        };
+        let answer = rx.await;
         guard.done = true;
         match answer {
             Ok(answer) => Called::Answer(answer),
@@ -789,8 +794,9 @@ impl PeerHandle {
             });
         }
         let called = self
-            .call(|id, reply| Cmd::Request {
+            .call(|id, user, reply| Cmd::Request {
                 id,
+                user,
                 endpoint,
                 encode: Box::new(encode),
                 reply,
@@ -801,7 +807,6 @@ impl PeerHandle {
             Called::NeverQueued => Err(RequestError::NotSent(None)),
             Called::Refused(error) => Err(error.not_sent()),
             Called::Lost => Err(RequestError::MaybeDelivered(None)),
-            Called::Cancelled => Err(RequestError::Cancelled),
         }
     }
 
@@ -845,8 +850,9 @@ impl PeerHandle {
         F: FnOnce(ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static,
     {
         let called = self
-            .call(|id, ack| Cmd::Send {
+            .call(|id, user, ack| Cmd::Send {
                 id,
+                user,
                 token,
                 encode: Box::new(encode),
                 ack,
@@ -854,7 +860,7 @@ impl PeerHandle {
             .await;
         match called {
             Called::Answer(result) => result,
-            Called::NeverQueued | Called::Lost | Called::Cancelled => Err(SendError::Shutdown),
+            Called::NeverQueued | Called::Lost => Err(SendError::Shutdown),
             Called::Refused(error) => Err(SendError::NotSent(error)),
         }
     }
@@ -867,10 +873,17 @@ impl PeerHandle {
     /// rules. If the future is dropped after the registration was applied (the caller never
     /// saw the answer), the registration is undone.
     pub async fn register(&self, token: Uid) -> Result<Generation, SendError> {
-        let called = self.call(|id, ack| Cmd::Register { id, token, ack }).await;
+        let called = self
+            .call(|id, user, ack| Cmd::Register {
+                id,
+                user,
+                token,
+                ack,
+            })
+            .await;
         match called {
             Called::Answer(result) => result,
-            Called::NeverQueued | Called::Lost | Called::Cancelled => Err(SendError::Shutdown),
+            Called::NeverQueued | Called::Lost => Err(SendError::Shutdown),
             Called::Refused(error) => Err(SendError::NotSent(error)),
         }
     }
@@ -1103,8 +1116,26 @@ impl<R: Runtime, W> fmt::Debug for PeerManager<R, W> {
 impl<R: Runtime, W> Shared<R, W> {
     /// Shuts `user` down, if it was not. Returns whether it was the last user, whose
     /// departure shuts the peers down ([`stop_peers`](Self::stop_peers) is then due).
+    ///
+    /// When others remain, every peer's task is told ([`Ctrl::UserClosed`]): it refuses the
+    /// user's queued commands and cancels its requests in flight. A peer made after this
+    /// never gets a command of the user ([`PeerManager::peer`] looks at the flag under the
+    /// map's lock, which this takes after setting it).
     fn leave(&self, user: &User) -> bool {
-        user.close() && self.users.fetch_sub(1, Ordering::SeqCst) == 1
+        if !user.close() {
+            return false;
+        }
+        if self.users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            return true;
+        }
+        let peers = self.lock_peers();
+        for entry in peers.map.values() {
+            let _ = entry
+                .shared
+                .ctrl
+                .unbounded_send(Ctrl::UserClosed(user.id()));
+        }
+        false
     }
 
     /// Asks every peer to shut down, and hands back their tasks.
@@ -1167,8 +1198,20 @@ impl<R: Runtime, W> WeakPeerManager<R, W> {
     /// [`share`](Self::share), only for a user on `rt`: `None` unless the connections run on
     /// that very runtime ([`Runtime::same_runtime`]).
     pub fn share_on(&self, rt: &R) -> Option<PeerManager<R, W>> {
+        self.share_on_if(rt, |_, _| true)
+    }
+
+    /// [`share_on`](Self::share_on), only if `accept` takes the connections' configuration
+    /// and stream wrapper (it is asked before a user is made, so a refusal costs the
+    /// connections nothing). A registry keeps what it compares in the manager this way, and
+    /// lets go of it with the connections.
+    pub fn share_on_if(
+        &self,
+        rt: &R,
+        accept: impl FnOnce(&PeerManagerConfig, &W) -> bool,
+    ) -> Option<PeerManager<R, W>> {
         let inner = self.inner.upgrade()?;
-        if !inner.rt.same_runtime(rt) {
+        if !inner.rt.same_runtime(rt) || !accept(&inner.config, &inner.wrapper) {
             return None;
         }
         let user = inner.join()?;
@@ -1273,6 +1316,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
     /// The runtime the peers run on.
     pub fn runtime(&self) -> &R {
         &self.inner.rt
+    }
+
+    /// The stream wrapper the peers connect with.
+    pub fn stream_wrapper(&self) -> &W {
+        &self.inner.wrapper
     }
 
     /// The failure monitor all peers report to.

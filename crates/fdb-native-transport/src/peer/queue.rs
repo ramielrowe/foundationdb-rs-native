@@ -33,6 +33,10 @@ pub(crate) enum Cmd {
     /// A request, completed through `reply`.
     Request {
         id: u64,
+        /// The id of the user of the handle that sent it (see
+        /// [`PeerManager::share`](super::PeerManager::share)). An id, not the user: a
+        /// command touches no state shared between threads beyond the queue.
+        user: u64,
         endpoint: Uid,
         encode: RequestEncoder,
         reply: oneshot::Sender<Result<Reply, RequestError>>,
@@ -40,6 +44,7 @@ pub(crate) enum Cmd {
     /// A one-way frame, acknowledged through `ack`.
     Send {
         id: u64,
+        user: u64,
         token: Uid,
         encode: FrameEncoder,
         ack: oneshot::Sender<Result<Generation, SendError>>,
@@ -47,6 +52,7 @@ pub(crate) enum Cmd {
     /// A token to register for incoming frames.
     Register {
         id: u64,
+        user: u64,
         token: Uid,
         ack: oneshot::Sender<Result<Generation, SendError>>,
     },
@@ -64,6 +70,15 @@ impl Cmd {
     pub(crate) fn id(&self) -> u64 {
         match self {
             Cmd::Request { id, .. } | Cmd::Send { id, .. } | Cmd::Register { id, .. } => *id,
+        }
+    }
+
+    /// The id of the user of the handle that sent it.
+    pub(crate) fn user(&self) -> u64 {
+        match self {
+            Cmd::Request { user, .. } | Cmd::Send { user, .. } | Cmd::Register { user, .. } => {
+                *user
+            }
         }
     }
 
@@ -227,6 +242,29 @@ impl CommandQueue {
         }
     }
 
+    /// Takes back every queued command of the user `user` (it was shut down), and frees
+    /// their places for the senders waiting for room. Decided under the queue's lock: what it
+    /// returns was never taken by the task.
+    pub(crate) fn take_user(&self, user: u64) -> Vec<Cmd> {
+        let (taken, wakers) = {
+            let mut inner = self.lock();
+            if !inner.items.iter().any(|c| c.user() == user) {
+                return Vec::new();
+            }
+            let (taken, kept): (Vec<Cmd>, Vec<Cmd>) =
+                inner.items.drain(..).partition(|c| c.user() == user);
+            inner.items = kept.into();
+            let wakers = (0..taken.len())
+                .filter_map(|_| inner.senders.take_one())
+                .collect::<Vec<_>>();
+            (taken, wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+        taken
+    }
+
     /// Drops the commands whose callers gave up, and frees their places.
     pub(crate) fn purge_cancelled(&self) {
         let wakers = {
@@ -374,6 +412,7 @@ mod tests {
         let (ack, _) = oneshot::channel();
         Cmd::Register {
             id,
+            user: 0,
             token: Uid::new(1, id),
             ack,
         }
@@ -384,6 +423,7 @@ mod tests {
         (
             Cmd::Register {
                 id,
+                user: 0,
                 token: Uid::new(1, id),
                 ack,
             },

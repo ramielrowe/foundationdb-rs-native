@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 
 use super::watch::{WaitFor, Watch};
@@ -13,6 +13,9 @@ use super::watch::{WaitFor, Watch};
 /// out.
 #[derive(Debug)]
 pub(crate) struct User {
+    /// Unique in the process: the commands of the user carry it, and the peers' tasks are
+    /// told it when the user is shut down.
+    id: u64,
     /// Set once by [`close`](Self::close); read without the lock on every command.
     closed: AtomicBool,
     /// The same flag, for the commands that wait.
@@ -29,11 +32,17 @@ fn is_closed(closed: &bool) -> Option<()> {
 
 impl User {
     pub(crate) fn new() -> User {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
         User {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             closed: AtomicBool::new(false),
             signal: Watch::new(false),
             clones: AtomicUsize::new(1),
         }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -58,8 +67,9 @@ impl User {
 
     /// Runs `fut` until it completes (`Some`) or the user is shut down (`None`; `fut` is then
     /// dropped). `fut` is polled first: an answer that is ready wins over the shutdown. The
-    /// shutdown signal is only looked at (and a waker registered for it) while `fut` is
-    /// pending.
+    /// shutdown signal is only looked at (and a waker registered for it, under its lock)
+    /// while `fut` is pending, so a future that is ready at once costs nothing: keep it off
+    /// paths that always wait (a request's reply is ended by the peer's task instead).
     pub(crate) async fn unless_closed<F: Future>(&self, fut: F) -> Option<F::Output> {
         let mut fut = pin!(fut);
         let mut wait: Option<WaitFor<'_, bool, IsClosed>> = None;

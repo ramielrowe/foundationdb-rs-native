@@ -50,6 +50,16 @@
 //!
 //! The registry that finds a database's connections is process-wide but holds only weak
 //! references: it keeps nothing alive, and never hands out connections that are shut down.
+//! What it compares (the knobs, the TLS material with its key and password) is kept by the
+//! connections themselves and goes with them.
+//!
+//! **Limits are per connection, so the databases that share one share them**: the command
+//! queue of an address (`PeerManagerConfig::command_queue_len`), its output buffer and its
+//! cap on requests in flight (`RegistryConfig::max_pending`, in the transport's `rpc`
+//! module). One busy database can make another's requests wait for room, or fail them with
+//! a not-sent error (`connection_failed`, 1026), which is retryable and certainly not
+//! delivered, as one busy database alone already could. Give a database that must not be
+//! affected connections of its own (`share_connections = false`) or other knobs.
 //!
 //! # Shutdown
 //!
@@ -188,6 +198,11 @@ impl From<MaybeCommitted> for bool {
 pub struct ClientTls {
     #[cfg(feature = "tls")]
     wrapper: Option<fdb_native_transport::tls::peer::TlsStreamWrapper>,
+    /// What the wrapper was made from, when the client made it: the connections of
+    /// databases with equal material are shared (see [Sharing
+    /// connections](self#sharing-connections)). It lives (and its key and password are
+    /// zeroed) with the connections, not in the registry.
+    material: TlsMaterial,
 }
 
 impl ClientTls {
@@ -201,6 +216,7 @@ impl ClientTls {
     pub fn new(wrapper: fdb_native_transport::tls::peer::TlsStreamWrapper) -> ClientTls {
         ClientTls {
             wrapper: Some(wrapper),
+            material: None,
         }
     }
 
@@ -259,7 +275,10 @@ impl ClientTls {
             };
             let connector =
                 TlsConnector::new(loaded).map_err(|e| Error::with_source(TLS_ERROR, e))?;
-            Ok(ClientTls::new(TlsStreamWrapper::new(connector)))
+            Ok(ClientTls {
+                wrapper: Some(TlsStreamWrapper::new(connector)),
+                material: material.clone(),
+            })
         }
         #[cfg(not(feature = "tls"))]
         match *material {
@@ -492,7 +511,7 @@ impl<R: Runtime> Database<R> {
         let material = ClientTls::material(record.connection_string(), &options)?;
         let uses_tls = material.is_some();
         let peers = if options.share_connections {
-            connections::shared(&rt, &options.peers, material)?
+            connections::shared(&rt, &options.peers, &material)?
         } else {
             connections::own(&rt, &options.peers, &material)?
         };
