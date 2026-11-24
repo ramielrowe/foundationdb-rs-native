@@ -563,8 +563,9 @@ impl Limits {
     }
 }
 
-/// Both futures' results, or the first error (`a`'s if both fail): `wait(fb); wait(fe)` on
-/// two futures started together.
+/// Both futures' results, or an error as `wait(fb); wait(fe)` on two futures started
+/// together reports it: `a`'s as soon as `a` fails; `b`'s only once `a` succeeded (so `a`'s
+/// if both fail, whichever fails first).
 async fn try_join<A, B, T, U>(a: A, b: B) -> Result<(T, U), Error>
 where
     A: Future<Output = Result<T, Error>>,
@@ -573,7 +574,7 @@ where
     let mut a = pin!(a);
     let mut b = pin!(b);
     let mut ra = None;
-    let mut rb = None;
+    let mut rb: Option<Result<U, Error>> = None;
     poll_fn(|cx| {
         if ra.is_none() {
             if let Poll::Ready(r) = a.as_mut().poll(cx) {
@@ -582,11 +583,12 @@ where
         }
         if rb.is_none() {
             if let Poll::Ready(r) = b.as_mut().poll(cx) {
-                rb = Some(r?);
+                rb = Some(r);
             }
         }
         match (ra.take(), rb.take()) {
-            (Some(x), Some(y)) => Poll::Ready(Ok((x, y))),
+            (Some(x), Some(Ok(y))) => Poll::Ready(Ok((x, y))),
+            (Some(_), Some(Err(e))) => Poll::Ready(Err(e)),
             (x, y) => {
                 ra = x;
                 rb = y;
@@ -735,8 +737,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             }
             // Not in C++, which would look up the shard of `\xff\xff` (there is none): a
             // forward read whose begin resolves at or after the end of the key space has
-            // nothing more to read, and a reverse read whose end does reads up to it.
+            // nothing more to read, and a reverse read whose end does reads up to it. The
+            // forward read went through the end of the database (`readThroughEnd`, which C++
+            // reaches through `getRangeFallback`), so its read conflict range ends at
+            // `\xff\xff`, not after its last row.
             if !reverse && begin.key.as_slice() >= KEY_SPACE_END && !is_backward(&begin) {
+                output.read_through_end = true;
                 return Ok(output);
             }
             if reverse && end.key.as_slice() >= KEY_SPACE_END && !is_backward(&minus(&end, 1)) {
@@ -1386,5 +1392,35 @@ mod tests {
         assert_eq!(kvs.len(), 3);
         assert_eq!(kvs[2], KeyValue::new(b"c".to_vec(), b"3".to_vec()));
         assert_eq!(RangeRead::default().continuation(false), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_join_reports_errors_as_wait_fb_then_fe() {
+        use std::time::Duration;
+        use tokio::time::sleep;
+        let fail = |code, ms| async move {
+            sleep(Duration::from_millis(ms)).await;
+            Err::<(), _>(Error::new(code))
+        };
+        let ok = |ms| async move {
+            sleep(Duration::from_millis(ms)).await;
+            Ok::<(), Error>(())
+        };
+        // Both fail, the end first: the begin's error (C++ waits for `fb` first).
+        let e = try_join(fail(1, 20), fail(2, 10)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        let e = try_join(fail(1, 10), fail(2, 20)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        // Only the end fails: its error, once the begin succeeded.
+        let started = tokio::time::Instant::now();
+        let e = try_join(ok(30), fail(2, 10)).await.unwrap_err();
+        assert_eq!(e.code(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        // The begin fails: at once.
+        let started = tokio::time::Instant::now();
+        let e = try_join(fail(1, 10), ok(30)).await.unwrap_err();
+        assert_eq!(e.code(), 1);
+        assert!(started.elapsed() < Duration::from_millis(30));
+        assert!(try_join(ok(1), ok(2)).await.is_ok());
     }
 }

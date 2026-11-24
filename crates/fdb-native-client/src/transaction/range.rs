@@ -13,7 +13,7 @@ use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::KeyValue;
 use futures_core::Stream;
 
-use super::{Snapshot, Transaction};
+use super::{ReadGuard, Snapshot, Transaction};
 use crate::error::Error;
 use crate::error::codes::*;
 use crate::read::{RangeOptions, read_conflict_range, remove_or_equal};
@@ -35,6 +35,16 @@ impl RangeResult {
     pub fn new(kvs: Vec<KeyValue>, more: bool) -> RangeResult {
         RangeResult { kvs, more }
     }
+}
+
+/// A checked range read, for [`Transaction::range_read`].
+struct RangeRead {
+    begin: KeySelector,
+    end: KeySelector,
+    options: RangeOptions,
+    max_read_key: &'static [u8],
+    use_provisional_proxies: bool,
+    epoch: u64,
 }
 
 impl<R: Runtime> Transaction<R> {
@@ -169,13 +179,50 @@ impl<R: Runtime> Transaction<R> {
                 (!snapshot).then(|| self.start_read(&mut state)),
             )
         };
+        let read = RangeRead {
+            begin,
+            end,
+            options: *options,
+            max_read_key,
+            use_provisional_proxies,
+            epoch,
+        };
+        match guard {
+            None => self.range_read(read, None).await,
+            Some(guard) => {
+                let tx = self.clone();
+                self.spawn_read(async move {
+                    let result = tx.range_read(read, Some(&guard)).await;
+                    drop(guard);
+                    result
+                })
+                .await
+            }
+        }
+    }
+
+    /// The part of [`get_range_with`](Self::get_range_with) that reads (and adds the read
+    /// conflict range, for a non-snapshot read: `guard`).
+    async fn range_read(
+        &self,
+        read: RangeRead,
+        guard: Option<&ReadGuard<R>>,
+    ) -> Result<RangeResult, Error> {
+        let RangeRead {
+            begin,
+            end,
+            options,
+            max_read_key,
+            use_provisional_proxies,
+            epoch,
+        } = read;
+        let options = &options;
         let mut end = end;
         if options.reverse && end.offset > 1 {
             // `readThrough`: resolve the end first, so that a reverse read does not start in
             // keys the transaction may not read.
             let key =
-                Box::pin(self.native_get_key(&end, guard.as_ref(), epoch, use_provisional_proxies))
-                    .await?;
+                Box::pin(self.native_get_key(&end, guard, epoch, use_provisional_proxies)).await?;
             let key = if key.as_slice() > max_read_key {
                 max_read_key.to_vec()
             } else {
@@ -204,7 +251,7 @@ impl<R: Runtime> Transaction<R> {
                     .await
             })
             .await??;
-        if let Some(guard) = &guard {
+        if let Some(guard) = guard {
             if let Some(range) = read_conflict_range(&begin, &end, options.reverse, &read) {
                 self.add_read_conflict(guard, range)?;
             }

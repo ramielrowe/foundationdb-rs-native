@@ -29,17 +29,22 @@
 //! * **A commit waits for the reads in progress.** As C++'s read-your-writes layer (even with
 //!   read-your-writes disabled) counts every read in `reading` and makes the commit wait for
 //!   them (`ReadYourWrites.actor.cpp` 7.4:1359-1360, 8.0:1340-1341), the commit waits for
-//!   the non-snapshot reads that started before it, whether they succeed or fail, before it
-//!   takes the conflict ranges. A `get` adds its range when it starts; a `get_key` or
-//!   `get_range`, whose range depends on what it reads, when it ends; a read that fails adds
-//!   none. A read started after the commit fails with `used_during_commit`. The conflict
+//!   the `get_key`, `get_range` (and range stream batches) and `watch` reads that started
+//!   before it, whether they succeed or fail, before it takes the conflict ranges: their
+//!   ranges depend on what they read and are added when they end (a read that fails adds
+//!   none). A `get` adds its range when it starts, so the commit does not need to wait for
+//!   it, and does not. **Each of these reads runs as a task of its own**, as a C++ read
+//!   actor runs to its end: a read future that is dropped, or kept but no longer polled
+//!   (the loser of a `select`), does not hold a commit up; its read still ends and adds its
+//!   range. A read started after the commit fails with `used_during_commit`. The conflict
 //!   ranges of `get_key` and `get_range` are C++'s `extraConflictRanges`: they do not count
 //!   toward the transaction's size (the `SizeLimit` option and `transaction_too_large`).
 //!
 //! * **Watches** ([`watch`](Transaction::watch)) have the read-your-writes layer's semantics
-//!   already: the watch reads the key (the transaction's own write to it, if any, counts),
-//!   starts when the transaction commits (a read-only one too) and fails if it does not; see
-//!   [`crate::watch`].
+//!   already: the watch works out the key's value with the transaction's own writes
+//!   (atomic operations included, with a read conflict range when the database's value
+//!   counts), starts when the transaction commits (a read-only one too) and fails if it does
+//!   not; the transaction's later writes trigger it; see [`crate::watch`].
 //!
 //! # Retries: [`on_error`](Transaction::on_error)
 //!
@@ -112,13 +117,14 @@ use fdb_native_transport::runtime::TokioRuntime;
 use fdb_native_transport::runtime::{Instant, Runtime};
 use futures_channel::oneshot;
 
+use crate::atomic;
 use crate::commit::{CommitBuffer, CommitLimits, CommitOptions, CommitOutcome};
 use crate::database::Database;
 use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
 use crate::read::util::{Either, never, race};
 use crate::read::{ReadVersionOptions, key_after};
-use crate::watch::PendingWatches;
+use crate::watch::{PendingWatches, StampedKey, Written};
 
 mod range;
 mod watch;
@@ -342,6 +348,8 @@ struct State {
     watches: PendingWatches,
     /// The non-snapshot reads in progress (the read-your-writes layer's `reading`).
     reading: Reading,
+    /// The `SetVersionstampedKey`s of the buffer, for what [`Transaction::watch`] may read.
+    stamped_keys: Vec<StampedKey>,
 }
 
 /// The read-your-writes layer's `reading` (`ReadYourWrites.actor.cpp` 7.4:1707, 8.0:1694):
@@ -411,6 +419,7 @@ impl State {
             versionstamp_waiters: Vec::new(),
             watches: PendingWatches::default(),
             reading: Reading::default(),
+            stamped_keys: Vec::new(),
         }
     }
 
@@ -465,6 +474,7 @@ impl State {
         self.flags = Flags::default();
         self.commit = CommitStage::Idle;
         self.reading = Reading::default();
+        self.stamped_keys.clear();
     }
 
     /// The first deferred error stays.
@@ -476,17 +486,28 @@ impl State {
     /// transaction with `used_during_commit`, which may hide a commit if the request may
     /// have been sent (or the commit succeeded).
     fn check_not_committing(&mut self) -> Result<(), Error> {
+        let Some(e) = self.used_during_commit() else {
+            return Ok(());
+        };
+        self.kill(e.clone());
+        Err(e)
+    }
+
+    /// The `used_during_commit` an operation gets once the commit started (maybe committed
+    /// once the request may have been sent, or the commit succeeded), without killing the
+    /// transaction; `None` before.
+    fn used_during_commit(&self) -> Option<Error> {
         let maybe_committed = match &self.commit {
-            CommitStage::Idle => return Ok(()),
+            CommitStage::Idle => return None,
             CommitStage::Started(sent) => sent.load(Ordering::SeqCst),
             CommitStage::Committed(_) => true,
         };
-        let mut e = Error::new(USED_DURING_COMMIT);
-        if maybe_committed {
-            e = e.into_maybe_committed();
-        }
-        self.kill(e.clone());
-        Err(e)
+        let e = Error::new(USED_DURING_COMMIT);
+        Some(if maybe_committed {
+            e.into_maybe_committed()
+        } else {
+            e
+        })
     }
 
     fn read_version_options(&self, causal_read_risky: bool) -> ReadVersionOptions {
@@ -775,7 +796,7 @@ impl<R: Runtime> Transaction<R> {
     }
 
     async fn get_with(&self, key: &[u8], snapshot: bool) -> Result<Option<Vec<u8>>, Error> {
-        let (too_long, use_provisional_proxies, epoch, _guard) = {
+        let (too_long, use_provisional_proxies, epoch) = {
             let mut state = self.state();
             self.check_handle(&state)?;
             // `fdb_c` reports the deferred error first.
@@ -793,12 +814,12 @@ impl<R: Runtime> Transaction<R> {
                 state.buffer.add_read_conflict_range(key, &end)?;
             }
             let limits = *state.buffer.limits();
-            let guard = (!snapshot).then(|| self.start_read(&mut state));
+            // Its range is in already: the commit need not wait for it (see the module
+            // documentation), so it is not counted in `reading`.
             (
                 key.len() > limits.max_range_key_size(key),
                 state.flags.use_provisional_proxies,
                 state.epoch,
-                guard,
             )
         };
         if too_long {
@@ -865,9 +886,23 @@ impl<R: Runtime> Transaction<R> {
                 (!snapshot).then(|| self.start_read(&mut state)),
             )
         };
-        let key = self
-            .native_get_key(&selector, guard.as_ref(), epoch, use_provisional_proxies)
-            .await?;
+        let key = match guard {
+            None => {
+                self.native_get_key(&selector, None, epoch, use_provisional_proxies)
+                    .await?
+            }
+            Some(guard) => {
+                let tx = self.clone();
+                self.spawn_read(async move {
+                    let key = tx
+                        .native_get_key(&selector, Some(&guard), epoch, use_provisional_proxies)
+                        .await;
+                    drop(guard);
+                    key
+                })
+                .await?
+            }
+        };
         // `readThrough`: results in keys the transaction may not read are clamped.
         if key.as_slice() > max_read_key {
             return Ok(max_read_key.to_vec());
@@ -926,6 +961,26 @@ impl<R: Runtime> Transaction<R> {
         Ok(key)
     }
 
+    /// Runs `read`, the part of a non-snapshot read that waits for the cluster and adds the
+    /// read conflict range, holding its [`ReadGuard`], as a task of its own: as a C++ read
+    /// actor, it ends (and lets a waiting commit go on) whether or not the future that
+    /// started it is still polled or kept. The result goes to the future this returns.
+    fn spawn_read<T: Send + 'static>(
+        &self,
+        read: impl Future<Output = Result<T, Error>> + Send + 'static,
+    ) -> impl Future<Output = Result<T, Error>> + Send + 'static {
+        let (tx, rx) = oneshot::channel();
+        // Detached: it ends with the read (which the transaction's reset, cancellation or
+        // timeout interrupts).
+        drop(self.rt().spawn(async move {
+            let _ = tx.send(read.await);
+        }));
+        async move {
+            rx.await
+                .unwrap_or_else(|oneshot::Canceled| Err(Error::new(TRANSACTION_CANCELLED)))
+        }
+    }
+
     /// Counts a non-snapshot read in progress (`reading.add`) until the guard is dropped.
     fn start_read(&self, state: &mut State) -> ReadGuard<R> {
         state.reading.count += 1;
@@ -953,25 +1008,38 @@ impl<R: Runtime> Transaction<R> {
         Ok(())
     }
 
-    /// A write: `f` on the buffer, unless the transaction is committing (`used_during_commit`)
-    /// or dead, or the handle is stale; its error is deferred.
-    fn write(&self, f: impl FnOnce(&mut CommitBuffer, &Flags) -> Result<(), Error>) {
+    /// A write: `f` on the state (its buffer), unless the transaction is committing
+    /// (`used_during_commit`) or dead, or the handle is stale; its error is deferred. On
+    /// success, the state (still locked) and what `f` returned: the write's watches are
+    /// triggered then (`triggerWatches` comes after the write's checks).
+    fn write_then<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<T, Error>,
+    ) -> Option<(MutexGuard<'_, State>, T)> {
         let mut state = self.state();
         if self.is_stale(&state) {
             state.defer(Self::stale());
-            return;
+            return None;
         }
         if state.dead.is_some() {
-            return;
+            return None;
         }
         if let Err(e) = state.check_not_committing() {
             state.defer(e);
-            return;
+            return None;
         }
-        let flags = state.flags;
-        if let Err(e) = f(&mut state.buffer, &flags) {
-            state.defer(e);
+        match f(&mut state) {
+            Ok(t) => Some((state, t)),
+            Err(e) => {
+                state.defer(e);
+                None
+            }
         }
+    }
+
+    /// [`write_then`](Self::write_then) for a write that triggers no watch.
+    fn write(&self, f: impl FnOnce(&mut State) -> Result<(), Error>) {
+        drop(self.write_then(f));
     }
 
     /// `set(key, value)`: writes `value` to `key` when the transaction commits. Errors are
@@ -979,55 +1047,91 @@ impl<R: Runtime> Transaction<R> {
     /// a value over 100 000 bytes), `key_outside_legal_range` (2004, a key from `\xff` on
     /// without the `AccessSystemKeys` option).
     pub fn set(&self, key: &[u8], value: &[u8]) {
-        self.watches_on_set(key, value);
-        self.write(|buffer, flags| {
-            if key >= flags.max_write_key() {
+        let written = self.write_then(|state| {
+            if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.set(key, value)
+            state.buffer.set(key, value)
         });
+        if let Some((mut state, ())) = written {
+            state
+                .watches
+                .trigger(key, None, Written::Value(Some(value)));
+        }
     }
 
     /// `clear(key)`: removes `key` when the transaction commits.
     pub fn clear(&self, key: &[u8]) {
-        self.watches_on_clear(key);
-        self.write(|buffer, flags| {
-            if key >= flags.max_write_key() {
+        let written = self.write_then(|state| {
+            if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.clear(key);
+            state.buffer.clear(key);
             Ok(())
         });
+        if let Some((mut state, ())) = written {
+            state.watches.trigger(key, None, Written::Value(None));
+        }
     }
 
     /// `clear(begin, end)`: removes every key in `[begin, end)` when the transaction
     /// commits. Deferred errors: `inverted_range` (2005) if `begin > end`,
     /// `key_outside_legal_range` if either is past `\xff` (without `AccessSystemKeys`).
     pub fn clear_range(&self, begin: &[u8], end: &[u8]) {
-        self.watches_on_clear_range(begin, end);
-        self.write(|buffer, flags| {
-            let max = flags.max_write_key();
+        let written = self.write_then(|state| {
+            let max = state.flags.max_write_key();
             if begin > max || end > max {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.clear_range(begin, end)
+            state.buffer.clear_range(begin, end)
         });
+        if let Some((mut state, ())) = written {
+            state
+                .watches
+                .trigger(begin, Some(end), Written::Value(None));
+        }
     }
 
     /// `atomicOp(key, operand, op)`: an atomic operation on `key` when the transaction
-    /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`]), including the two
-    /// versionstamp operations (see [`set_versionstamped_key`](Self::set_versionstamped_key)).
-    /// Deferred errors: `invalid_mutation_type` (2018) if `op` is not an atomic operation,
-    /// `key_too_large`, `value_too_large`, `key_outside_legal_range`, and for the versionstamp
-    /// operations `client_invalid_operation` (2000) if the 4-byte offset is invalid.
+    /// commits (`ADD_VALUE`, `BIT_AND`, ...; see [`MutationType`], and [`crate::atomic`] for
+    /// what each does to the value), including the two versionstamp operations (see
+    /// [`set_versionstamped_key`](Self::set_versionstamped_key)). Deferred errors:
+    /// `invalid_mutation_type` (2018) if `op` is not an atomic operation, `key_too_large`,
+    /// `value_too_large`, `key_outside_legal_range`, and for the versionstamp operations
+    /// `client_invalid_operation` (2000) if the 4-byte offset is invalid.
     pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: MutationType) {
-        self.watches_on_atomic_op(key, op);
-        self.write(|buffer, flags| {
-            if key >= flags.max_write_key() {
+        let written = self.write_then(|state| {
+            if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.atomic_op(key, operand, op)
+            state.buffer.atomic_op(key, operand, op)?;
+            if op != MutationType::SET_VERSIONSTAMPED_KEY {
+                return Ok(None);
+            }
+            // `getVersionstampKeyRange` and `transformVersionstampKey` with the read version
+            // the transaction has now (`getCachedReadVersion`), for its watches.
+            let read_version = match state.read_version {
+                ReadVersion::Set(v) => Some(v),
+                _ => None,
+            };
+            let max_read_key = state.flags.max_read_key();
+            let range = atomic::versionstamp_key_range(key, read_version, max_read_key);
+            let stamped =
+                atomic::transform_versionstamp_key(key, read_version.map_or(0, |v| v + 1), 0)
+                    .unwrap_or_else(|_| key.to_vec());
+            state.stamped_keys.push(StampedKey {
+                index: state.buffer.mutations().len() - 1,
+                range: range.as_ref().ok().cloned(),
+                key: stamped.clone(),
+            });
+            // C++ throws `inverted_range` here (for a range past the readable keys).
+            range?;
+            Ok(Some(stamped))
         });
+        if let Some((mut state, stamped)) = written {
+            let key = stamped.as_deref().unwrap_or(key);
+            state.watches.trigger(key, None, Written::Unknown);
+        }
     }
 
     /// `atomicOp(key, value, SetVersionstampedKey)`: when the transaction commits, sets
@@ -1049,7 +1153,11 @@ impl<R: Runtime> Transaction<R> {
     /// commit (C++ adds none either: `Transaction::atomicOp` skips it for
     /// `SetVersionstampedKey`). A transaction that writes nothing else is still sent, with
     /// the self-conflicting key, as any blind write. Reads of the transaction do not see the
-    /// key (nothing is read-your-writes yet).
+    /// key (nothing is read-your-writes yet); a [`watch`](Self::watch) of a key in the range
+    /// the key may take (see [`atomic::versionstamp_key_range`]) fails with
+    /// `accessed_unreadable` (1036) until a clear covers it, and a watch of the key with the
+    /// placeholder stamped (`transformVersionstampKey`) is triggered, as C++'s
+    /// read-your-writes layer does.
     ///
     /// ```no_run
     /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
@@ -1076,7 +1184,9 @@ impl<R: Runtime> Transaction<R> {
     /// (see [`set_versionstamped_key`](Self::set_versionstamped_key)). `value` ends with the
     /// 4-byte little-endian position of the placeholder: `client_invalid_operation` (2000,
     /// deferred) if it has fewer than 4 bytes, or the position is negative or
-    /// `position + 10 > len - 4`. The key gets a write conflict range as for `set`.
+    /// `position + 10 > len - 4`. The key gets a write conflict range as for `set`. A
+    /// [`watch`](Self::watch) of the key fails with `accessed_unreadable` (1036) until a
+    /// clear of it (its value is not known before the commit).
     pub fn set_versionstamped_value(&self, key: &[u8], value: &[u8]) {
         self.atomic_op(key, value, MutationType::SET_VERSIONSTAMPED_VALUE);
     }
@@ -1084,24 +1194,24 @@ impl<R: Runtime> Transaction<R> {
     /// `addReadConflictRange(begin, end)`: the commit conflicts if another transaction
     /// wrote in `[begin, end)` after the read version, as if the range had been read.
     pub fn add_read_conflict_range(&self, begin: &[u8], end: &[u8]) {
-        self.write(|buffer, flags| {
-            let max = flags.max_read_key();
+        self.write(|state| {
+            let max = state.flags.max_read_key();
             if begin > max || end > max {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.add_read_conflict_range(begin, end)
+            state.buffer.add_read_conflict_range(begin, end)
         });
     }
 
     /// `addWriteConflictRange(begin, end)`: other transactions that read in
     /// `[begin, end)` conflict with this one, as if it had written there.
     pub fn add_write_conflict_range(&self, begin: &[u8], end: &[u8]) {
-        self.write(|buffer, flags| {
-            let max = flags.max_write_key();
+        self.write(|state| {
+            let max = state.flags.max_write_key();
             if begin > max || end > max {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            buffer.add_write_conflict_range(begin, end)
+            state.buffer.add_write_conflict_range(begin, end)
         });
     }
 
@@ -1162,6 +1272,7 @@ impl<R: Runtime> Transaction<R> {
                     state.reading.closed = true;
                     let limits = *state.buffer.limits();
                     let buffer = std::mem::replace(&mut state.buffer, CommitBuffer::new(limits));
+                    state.stamped_keys.clear();
                     break (buffer, state.commit_options());
                 }
                 let (tx, rx) = oneshot::channel();

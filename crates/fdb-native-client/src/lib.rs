@@ -72,6 +72,7 @@
 //!   key selectors and ranges.
 //! * [`commit`]: the commit path, [`Committer`] and [`CommitBuffer`].
 //! * [`watch`]: watches ([`Transaction::watch`]).
+//! * [`atomic`]: what each atomic operation does to a value (a port of `Atomic.h`).
 //!
 //! # Features
 //!
@@ -81,6 +82,7 @@
 //! * `tls`: TLS clusters (`:tls` coordinators), configured as FoundationDB is (the
 //!   `FDB_TLS_*` variables, or [`DatabaseOptions`]`::tls`).
 
+pub mod atomic;
 pub mod cluster;
 pub mod cluster_file;
 pub mod commit;
