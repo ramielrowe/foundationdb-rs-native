@@ -39,6 +39,7 @@ fdb-native-tuple = { path = "../fdb-native-tuple" }
 fdb-native-transport = { workspace = true, features = ["tokio"] }
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "test-util", "net", "io-util", "sync", "time"] }
 divan = "0.1.21"
+futures-lite = "2.6.1"
 proptest = "1.11.0"
 regex = { version = "1.11", default-features = false, features = ["std", "perf"] }
 tempfile = "3.27.0"
@@ -47,3 +48,33 @@ tempfile = "3.27.0"
 name = "ryw"
 harness = false
 required-features = ["bench-internals"]
+
+# The examples run on tokio (the default `tokio` feature); `tests/docker_examples.rs` runs
+# them against a testkit container.
+[[example]]
+name = "basic"
+required-features = ["tokio"]
+
+[[example]]
+name = "range_scan"
+required-features = ["tokio"]
+
+[[example]]
+name = "watch"
+required-features = ["tokio"]
+
+[[example]]
+name = "versionstamp"
+required-features = ["tokio"]
+
+[[example]]
+name = "counter"
+required-features = ["tokio"]
+
+[[example]]
+name = "options"
+required-features = ["tokio"]
+
+[[example]]
+name = "tls"
+required-features = ["tokio", "tls"]

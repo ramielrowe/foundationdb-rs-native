@@ -28,11 +28,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --features fdb-native-transport/tls -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features fdb-native-transport/tls,fdb-native-client/tls -- -D warnings
+      # The examples (clippy's --all-targets checks them; this builds them, TLS one included).
+      - run: cargo build --workspace --examples --features fdb-native-client/tls
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo doc --workspace --no-deps --features fdb-native-transport/tls
+      - run: cargo doc --workspace --no-deps --features fdb-native-transport/tls,fdb-native-client/tls
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -45,7 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
-      - run: cargo check --workspace --all-targets --features fdb-native-transport/tls
+      - run: cargo check --workspace --all-targets --features fdb-native-transport/tls,fdb-native-client/tls
       - run: cargo check -p fdb-native-wire --no-default-features --all-targets
 
   test:
@@ -74,8 +76,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --features fdb-native-transport/tls
-      - run: cargo test --doc --workspace --features fdb-native-transport/tls
+      - run: cargo nextest run --workspace --features fdb-native-transport/tls,fdb-native-client/tls
+      - run: cargo test --doc --workspace --features fdb-native-transport/tls,fdb-native-client/tls
 
   docker-integration:
     runs-on: ubuntu-latest
@@ -94,6 +96,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # cpp_crosscheck (the binary, and the cpp_crosscheck_* tests in other binaries) is ignored because it
       # needs the dev-only golden-vectors tool, not Docker.
-      # The tls feature is on so that the TLS docker tests (peer_tls_docker, tls_peer_wrapper) run too;
+      # The tls features are on so that the TLS docker tests (peer_tls_docker, tls_peer_wrapper, and the
+      # client's docker_database and docker_examples TLS tests) run too;
       # the plain tests are unaffected by it.
-      - run: cargo nextest run --workspace --features fdb-native-transport/tls --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
+      - run: cargo nextest run --workspace --features fdb-native-transport/tls,fdb-native-client/tls --profile ci --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'
