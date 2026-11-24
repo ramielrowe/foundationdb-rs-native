@@ -270,6 +270,8 @@ pub(crate) struct NetState {
     hosts: BTreeMap<String, Vec<IpAddr>>,
     stats: NetStats,
     violations: Vec<String>,
+    /// Connects started, by destination.
+    dials: BTreeMap<SocketAddr, u64>,
 }
 
 fn pair(a: IpAddr, b: IpAddr) -> (IpAddr, IpAddr) {
@@ -291,6 +293,7 @@ impl NetState {
             hosts: BTreeMap::new(),
             stats: NetStats::default(),
             violations: Vec::new(),
+            dials: BTreeMap::new(),
         }
     }
 
@@ -862,6 +865,7 @@ pub(crate) async fn connect(
         shared: shared.clone(),
     };
     let src_ip = shared.node_ip(node);
+    *lock(&shared.net).dials.entry(addr).or_default() += 1;
     loop {
         let syn = lock(&shared.net).latency();
         sim.sleep(syn).await;
@@ -1192,6 +1196,15 @@ impl Sim {
     /// The fault counters.
     pub fn net_stats(&self) -> NetStats {
         lock(&self.shared.net).stats
+    }
+
+    /// How many connects to `addr` were started (whatever became of them).
+    pub fn dials(&self, addr: SocketAddr) -> u64 {
+        lock(&self.shared.net)
+            .dials
+            .get(&addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Breaches of the stream contract by the code under test (a write after an untrusted

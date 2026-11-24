@@ -763,6 +763,47 @@ async fn a_tcp_connect_is_bounded_by_two_seconds() {
     )));
 }
 
+/// `persistentConnectFailedCount`: every failed dial (refused, timed out) counts, a failed
+/// FlowTransport handshake after a connect does not, and an address that stops failing is
+/// forgotten on a failure once the TTL has passed.
+#[tokio::test(start_paused = true)]
+async fn failed_connects_are_counted_per_address() {
+    let net = Net::new();
+    let refused = na(sock(4500), false);
+    net.set(sock(4501), Behavior::Hang);
+    let hangs = na(sock(4501), false);
+    let mut script = Script::new(V74);
+    script.hello = false;
+    let silent = listen_one(&net, sock(4502), script);
+    let mut c = config();
+    c.connect_failed_count_ttl = Duration::from_secs(600);
+    let (mgr, _events) = manager(&net, c);
+    let fm = mgr.failure_monitor().clone();
+    let count = |a: &NetworkAddress| {
+        fm.connect_failures()
+            .into_iter()
+            .find(|(x, _)| x == a)
+            .map(|(_, n)| n)
+    };
+    for _ in 0..3 {
+        let _ = mgr.peer(&refused).connect().await.unwrap_err();
+    }
+    let _ = mgr.peer(&hangs).connect().await.unwrap_err();
+    let _ = mgr.peer(&silent.address).connect().await.unwrap_err();
+    assert_eq!(count(&refused), Some(3));
+    assert_eq!(count(&hangs), Some(1));
+    assert_eq!(
+        count(&silent.address),
+        None,
+        "it connected; the handshake failed"
+    );
+    // Ten minutes later, the next failure forgets the addresses that have not failed since.
+    tokio::time::sleep(Duration::from_secs(601)).await;
+    let _ = mgr.peer(&hangs).connect().await.unwrap_err();
+    assert_eq!(count(&refused), None);
+    assert_eq!(count(&hangs), Some(2), "it just failed again");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_silent_server_hits_the_handshake_timeout() {
     let net = Net::new();

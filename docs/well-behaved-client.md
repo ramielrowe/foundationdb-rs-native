@@ -57,7 +57,7 @@ server files).
 | Connections | TLS handshake throttle (`TLS_CLIENT_CONNECTION_THROTTLE_*`) | **Fixed** |
 | Connections | Several `Database` handles on one cluster share no connections | Gap: b35.7 |
 | Location cache | Size, eviction, endpoint-failure refresh | OK |
-| Location cache | Peer evictor for dead servers (8.0 default on) | Gap: b35.6 |
+| Location cache | Peer evictor for dead servers (8.0 default on) | **Fixed** (b35.6; on for both releases) |
 | Reads | `READ_PRIORITY_*` / `READ_SERVER_SIDE_CACHE_*` sent to storage | **Fixed** (b35.8) |
 | Errors | `process_behind`, `future_version`, `database_locked`, ... | OK |
 | Errors | `cluster_version_changed` | N/A (never produced) |
@@ -157,7 +157,7 @@ nothing from it: untagged requests are throttled only by ratekeeper's priority r
 | --- | --- | --- | --- |
 | Size and eviction | `LOCATION_CACHE_EVICTION_SIZE` 600 000 ranges, random eviction before an insert (CK 7.4:99, 8.0:209). | Same (`ReadConfig::location_cache_size`, `read/location.rs`). | OK |
 | Failed endpoints | A cached location whose endpoint failed on a healthy server is refreshed, for `LOCATION_CACHE_ENDPOINT_FAILURE_GRACE_PERIOD` (60 s) and then every `LOCATION_CACHE_FAILED_ENDPOINT_RETRY_INTERVAL` (60 s), so a dead role does not make every read ask a proxy (NativeAPI 7.4:3329-3355; CK 7.4:101-102, 8.0:211-212). | Same (`read/mod.rs`, "Key locations"). | OK |
-| Dead servers | Cached interfaces hold peer references, so their servers are probed while cached. 8.0 turns on `locationCachePeerEvictorActor` (`LOCATION_CACHE_PEER_EVICTOR_ENABLED`, false on 7.4, CK 7.4:103; **true on 8.0**, CK 8.0:213-216; DBC 8.0:1267-1336): every 60 s, cached ranges on addresses whose connects keep failing are invalidated, which stops the probes. | 7.4's behaviour: a server that is gone for good is probed every second while a cached shard names it. | Gap: b35.6 |
+| Dead servers | Cached interfaces hold peer references, so their servers are probed (every `SERVER_REQUEST_INTERVAL`, 1 s) while cached. 8.0 turns on `locationCachePeerEvictorActor` (`LOCATION_CACHE_PEER_EVICTOR_ENABLED`: false on 7.4, CK 7.4:103, the same code in NativeAPI 7.4:1169-1362; **true on 8.0**, CK 8.0:213-216; DBC 8.0:1144-1336, started at 1414-1416): every `LOCATION_CACHE_PEER_EVICTOR_DELAY` (60 s) it reads FlowTransport's per-address count of failed connects (`persistentConnectFailedCount`, FT 7.4:886-923, 8.0:980-1016, kept while an address fails at least once per `PERSISTENT_CONNECT_FAILED_COUNT_TTL`, 600 s, FK 7.4:56, 8.0:61) and invalidates every cached range with a replica at an address whose count grew by more than `..._FAILED_THRESHOLD` (0) since the last sweep, which drops the peer references and stops the probes; the next read of such a range looks it up again. | **Was missing** (7.4's behaviour: a server gone for good was probed every second while a cached shard named it). Now the same as 8.0: the transport counts failed dials per address (`FailureMonitor::connect_failures`, `PeerManagerConfig::connect_failed_count_ttl`), and the reader runs the evictor (`read/evictor.rs`, `LocationCache::invalidate_addresses`; `ReadConfig::location_cache_peer_evictor`, `_delay`, `_failed_threshold`). **On by default for 7.4 clusters too** (a client-side choice: it spares a 7.4 cluster the same probes, for one location lookup per evicted range; `false` restores 7.4's behaviour). As in 8.0, a dead server the shard map still lists is rediscovered (and found failed again) after each sweep that evicts it. Sim tests `peer_evictor::*` (a removed storage server, killed or powered off, is dialed 5 to 16 times in its first 20 s, never after one sweep, and the next reads of its shards make fresh lookups and never dial it; without the evictor it is probed for as long as the client runs); the seed sweep runs half its seeds with the evictor. | **Fixed** |
 
 ## Reads
 
@@ -221,8 +221,11 @@ message is part of being well behaved. Status: **Deferred**.
 * **Read options** (b35.8, `fdb-native-client` `read` and `transaction`): see the Reads
   row. `ReadParams` carries them through the read path; `ReadSnapshot::with_read_options`
   for readers.
+* **Location cache peer evictor** (b35.6, `fdb-native-transport` failure monitor and
+  `fdb-native-client` `read/evictor.rs`): see the Location cache row. The model cluster can
+  remove a storage server for good (`SimCluster::remove_storage`) and the simulated network
+  counts dials per address (`Sim::dials`).
 
 ## Open beads
 
-* `foundationdb-rs-native-b35.6`: location cache peer evictor (8.0's default).
 * `foundationdb-rs-native-b35.7`: share connections between `Database` handles on one cluster.

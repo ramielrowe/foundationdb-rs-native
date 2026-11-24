@@ -63,6 +63,11 @@ pub struct SeedConfig {
     /// The network's behaviour during the chaos; `None` draws it
     /// ([`NetConfig::randomized`]).
     pub net: Option<NetConfig>,
+    /// Whether the client runs the location cache's peer evictor
+    /// (`ReadConfig::location_cache_peer_evictor`); `None` takes it from `seed / 4 % 2`
+    /// (every trust setting gets both), as C++'s simulation flips
+    /// `LOCATION_CACHE_PEER_EVICTOR_ENABLED`.
+    pub peer_evictor: Option<bool>,
 }
 
 impl SeedConfig {
@@ -75,7 +80,14 @@ impl SeedConfig {
             chaos: None,
             convergence: None,
             net: None,
+            peer_evictor: None,
         }
+    }
+
+    /// The same, with or without the location cache's peer evictor.
+    pub fn with_peer_evictor(mut self, on: bool) -> Self {
+        self.peer_evictor = Some(on);
+        self
     }
 
     /// The same, with the network behaving as `net` during the chaos.
@@ -136,6 +148,8 @@ pub struct SeedReport {
     pub faults: BTreeMap<&'static str, u64>,
     /// Whether the convergence phase ran.
     pub convergence: bool,
+    /// Whether the client ran the location cache's peer evictor.
+    pub peer_evictor: bool,
 }
 
 impl SeedReport {
@@ -160,8 +174,8 @@ impl fmt::Display for SeedReport {
         )?;
         writeln!(
             f,
-            "  faults: {:?}, convergence: {}",
-            self.faults, self.convergence
+            "  faults: {:?}, convergence: {}, peer evictor: {}",
+            self.faults, self.convergence, self.peer_evictor
         )?;
         writeln!(f, "  network: {:?}", self.net)?;
         writeln!(f, "  cluster: {:?}", self.cluster)?;
@@ -222,6 +236,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     let convergence =
         config.convergence.unwrap_or_else(|| rng.chance(0.33)) && cluster_config.replication >= 2;
     let accounts = rng.range(3, 8);
+    let peer_evictor = config.peer_evictor.unwrap_or(config.seed / 4 % 2 == 0);
     let records = Records::new(&sim);
     let faults = Arc::new(Mutex::new(BTreeMap::new()));
     let mut violations = Vec::new();
@@ -230,6 +245,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     options.peers.seed = Some(rng.next_u64());
     options.monitor.seed = Some(rng.next_u64());
     options.read.seed = Some(rng.next_u64());
+    options.read.location_cache_peer_evictor = peer_evictor;
     options.commit.seed = Some(rng.next_u64());
     let record = ConnectionRecord::memory(
         cluster
@@ -267,6 +283,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
             workload: records.stats(),
             faults: lock(&faults).clone(),
             convergence,
+            peer_evictor,
         }
     };
 
@@ -373,7 +390,13 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
 
     // 5. Convergence.
     if convergence {
-        let phase = convergence_phase(sim.clone(), cluster.clone(), db.clone(), rng.fork());
+        let phase = convergence_phase(
+            sim.clone(),
+            cluster.clone(),
+            db.clone(),
+            rng.fork(),
+            peer_evictor,
+        );
         match sim.block_on_within(Duration::from_secs(300), phase) {
             Ok(found) => violations.extend(found),
             Err(e) => violations.push(format!(
@@ -659,6 +682,7 @@ async fn convergence_phase<R: Runtime>(
     cluster: SimCluster,
     db: Database<R>,
     mut rng: SimRng,
+    peer_evictor: bool,
 ) -> Vec<String> {
     let mut found = Vec::new();
     let address = |p: &crate::cluster::ProcessInfo| {
@@ -742,13 +766,19 @@ async fn convergence_phase<R: Runtime>(
         }
         sim.sleep(Duration::from_millis(100)).await;
     }
-    if slow_late > 0 {
+    // With the peer evictor (8.0's default), a sweep that sees the dead replica's connects
+    // failing forgets the cached locations that name it; the shard map still lists it (no
+    // data distribution here), so the next read caches it again with a new peer, which
+    // starts available (C++'s `Peer::Peer`) and is found failed again: a slow read and a
+    // failure monitor that says "available" for a while, once a sweep, as in C++ 8.0. Reads
+    // must still work (checked above); the late checks are for the evictor off.
+    if slow_late > 0 && !peer_evictor {
         found.push(format!(
             "convergence: {slow_late} reads were still slow (> 100 ms) 20 s after a replica \
              died"
         ));
     }
-    if !db.peers().failure_monitor().is_failed(&address(&info)) {
+    if !peer_evictor && !db.peers().failure_monitor().is_failed(&address(&info)) {
         found.push(format!(
             "convergence: the failure monitor does not mark {} failed 35 s after it died",
             info.name

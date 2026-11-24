@@ -2,6 +2,7 @@
 //! ranges (shards) to the storage servers that hold them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -88,6 +89,20 @@ impl ServerInfo {
     pub(crate) fn server(&self) -> StorageServer {
         self.interface().server.clone()
     }
+
+    /// The address the client connects to (`getInterface(i).address()`).
+    pub(crate) fn address(&self) -> NetworkAddress {
+        self.interface().address
+    }
+}
+
+/// An address as the transport keys its peers (and counts its connect failures): where to
+/// dial, and whether with TLS.
+pub(crate) type AddressKey = (SocketAddr, bool);
+
+/// The [`AddressKey`] of `address`.
+pub(crate) fn address_key(address: &NetworkAddress) -> AddressKey {
+    (address.socket_addr(), address.is_tls())
 }
 
 /// The replicas of one shard (C++'s `LocationInfo`, a
@@ -388,6 +403,48 @@ impl LocationCache {
         self.set(&begin, &end, None);
     }
 
+    /// `invalidateCacheByAddresses` (`DatabaseContext.cpp` 8.0:1144-1259; NativeAPI
+    /// 7.4:1169-1285): forgets the location of every cached range with a replica at one of
+    /// `addresses` (all of a range's replicas go with it, as `insert(range, empty)` does),
+    /// which releases their servers' peer references once no read in progress holds them.
+    /// Returns how many ranges were forgotten. C++ scans the whole cache in chunks of
+    /// `LOCATION_CACHE_PEER_EVICTOR_SCAN_CHUNK`, yielding between them; the default chunk
+    /// (1 000 000) is above the cache's bound, so it never yields by default, and here the
+    /// scan is one step, skipped when no cached server is at one of the addresses.
+    pub(crate) fn invalidate_addresses(&mut self, addresses: &HashSet<AddressKey>) -> usize {
+        let at_addresses = |s: &ServerInfo| addresses.contains(&address_key(&s.address()));
+        if addresses.is_empty()
+            || !self
+                .servers
+                .values()
+                .filter_map(Weak::upgrade)
+                .any(|s| at_addresses(&s))
+        {
+            return 0;
+        }
+        let ranges: Vec<Vec<u8>> = self
+            .map
+            .iter()
+            .filter_map(|(begin, value)| {
+                let cached = value.as_ref()?;
+                let servers = &cached.location.servers;
+                servers
+                    .iter()
+                    .any(|s| at_addresses(s))
+                    .then(|| begin.clone())
+            })
+            .collect();
+        for begin in &ranges {
+            // Forgetting a range merges it only with unknown neighbours, so the others are
+            // still there.
+            if matches!(self.map.get(begin), Some(Some(_))) {
+                let end = self.end_of(begin);
+                self.set(begin, &end, None);
+            }
+        }
+        ranges.len()
+    }
+
     /// `invalidateCache(range)`: forgets the location of every range intersecting `range`.
     pub(crate) fn invalidate_range(&mut self, range: &KeyRange) {
         let end = clamp_end(&range.end);
@@ -644,6 +701,68 @@ mod tests {
                 cache.server_entries()
             );
         }
+        peers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ranges_with_a_replica_at_an_address_are_forgotten() {
+        use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
+        use fdb_native_transport::runtime::TokioRuntime;
+
+        let peers = PeerManager::new(
+            TokioRuntime::new(),
+            PeerManagerConfig::default(),
+            DiscardEvents,
+        );
+        let make = |e: &Endpoint| {
+            (
+                e.addresses.address,
+                peers.peer(&e.addresses.address).reference(),
+            )
+        };
+        let mut rng = Rng::new(Some(3));
+        let mut cache = LocationCache::new(100);
+        let servers: Vec<Arc<ServerInfo>> = (1..=3)
+            .map(|i| cache.server_info(&storage_server(i, i, b"dc"), None, make))
+            .collect();
+        // a: {1, 2}, b: {2, 3}, c: {3}, d: {1}, e: {3}.
+        let teams: [(&[u8], &[u8], &[usize]); 5] = [
+            (b"a", b"b", &[0, 1]),
+            (b"b", b"c", &[1, 2]),
+            (b"c", b"d", &[2]),
+            (b"d", b"e", &[0]),
+            (b"e", b"f", &[2]),
+        ];
+        for (b, e, team) in teams {
+            let infos = team.iter().map(|&i| servers[i].clone()).collect();
+            cache.insert(
+                &range(b, e),
+                Arc::new(Location::new(infos, &mut rng)),
+                &mut rng,
+            );
+        }
+        let key = |i: usize| address_key(&servers[i].address());
+        // No cached server there: nothing.
+        let elsewhere = address_key(&storage_server(9, 9, b"dc").base.addresses.address);
+        assert_eq!(cache.invalidate_addresses(&HashSet::from([elsewhere])), 0);
+        assert_eq!(cache.invalidate_addresses(&HashSet::new()), 0);
+        assert_eq!(cache.len(), 5);
+        // Server 1 (index 0): a and d go, with every replica of theirs.
+        assert_eq!(cache.invalidate_addresses(&HashSet::from([key(0)])), 2);
+        assert!(cache.get(b"a").is_none() && cache.get(b"d").is_none());
+        assert!(cache.get(b"b").is_some() && cache.get(b"c").is_some());
+        assert_eq!(cache.len(), 3);
+        // Servers 2 and 3 together: the rest (adjacent ranges, merged as they go).
+        assert_eq!(
+            cache.invalidate_addresses(&HashSet::from([key(1), key(2)])),
+            3
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.ranges(), 1);
+        // Once nothing holds the servers, their peers are unreferenced (not probed).
+        let peer = peers.peer(&servers[0].address());
+        drop(servers);
+        assert_eq!(peer.status().references, 0);
         peers.shutdown().await;
     }
 

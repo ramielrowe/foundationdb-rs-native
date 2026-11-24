@@ -145,7 +145,8 @@
 //!   the whole range containing the key; `invalidateCache(range)` every range intersecting
 //!   it. Each replica is interned by server id (`StorageServerInfo::getInterface`) and holds a
 //!   reference to its peer, so connections to the servers of cached shards stay up and a
-//!   failed one is probed until it comes back.
+//!   failed one is probed until it comes back (or [the peer evictor](#the-peer-evictor)
+//!   forgets the ranges that name it).
 //! * **Bound.** Before an insert, while the cache holds `LOCATION_CACHE_EVICTION_SIZE`
 //!   ranges ([`ReadConfig::location_cache_size`], 600 000; ClientKnobs 7.4:99,
 //!   8.0:209; the `LOCATION_CACHE_SIZE` database option changes it,
@@ -160,8 +161,48 @@
 //!   Server entries no range uses any more, their queue model data and their endpoint
 //!   failure records are pruned once they could outnumber the live ones.
 //! * **Not ported:** the TSS mapping (`resultsTssMapping` is ignored: testing storage
-//!   servers only shadow reads for comparison), the tag mapping (version vectors), the
-//!   periodic peer evictor (`LOCATION_CACHE_PEER_EVICTOR_*`, off on 7.4), and tenants.
+//!   servers only shadow reads for comparison), the tag mapping (version vectors), and
+//!   tenants.
+//!
+//! ## The peer evictor
+//!
+//! A cached range keeps its servers' peers referenced, and a referenced peer that failed is
+//! probed every `SERVER_REQUEST_INTERVAL` (1 s) until it comes back. So a storage server that
+//! is gone for good (excluded and removed, its machine dead) would be dialed every second
+//! for as long as a cached range names it: until a read of that range fails over and
+//! invalidates it, which an idle client or one reading other keys never does.
+//!
+//! * **C++.** 8.0 runs `locationCachePeerEvictorActor` (`DatabaseContext.cpp` 8.0:1260-1336,
+//!   started at 1414-1416) when `LOCATION_CACHE_PEER_EVICTOR_ENABLED` (true on 8.0,
+//!   ClientKnobs 8.0:213; 7.4 has the same code, NativeAPI 7.4:1169-1362 and 1826-1828,
+//!   with the knob false, ClientKnobs 7.4:103). Every `LOCATION_CACHE_PEER_EVICTOR_DELAY`
+//!   (60 s) it reads FlowTransport's per-address count of failed connects
+//!   (`getPersistentConnectFailedCounts`: every failed TCP connect or TLS handshake,
+//!   `FlowTransport.actor.cpp` 7.4:886-923, `FlowTransport.cpp` 8.0:980-1016; an address is
+//!   forgotten once it has not failed for `PERSISTENT_CONNECT_FAILED_COUNT_TTL`, 600 s, FlowKnobs
+//!   7.4:56, 8.0:61), takes the addresses whose count grew by more than
+//!   `LOCATION_CACHE_PEER_EVICTOR_FAILED_THRESHOLD` (0) since the last sweep (counting from
+//!   zero if it went down), and `invalidateCacheByAddresses` forgets every cached range with
+//!   a replica at one of them (8.0:1144-1259), which drops the peer references and so the
+//!   probes. The next read of such a range asks a commit proxy, which no longer lists a
+//!   removed server.
+//! * **Here.** The same, with the transport's
+//!   [`FailureMonitor::connect_failures`](fdb_native_transport::peer::FailureMonitor::connect_failures)
+//!   and [`ReadConfig::location_cache_peer_evictor`],
+//!   [`location_cache_peer_evictor_delay`](ReadConfig::location_cache_peer_evictor_delay) and
+//!   [`location_cache_peer_evictor_failed_threshold`](ReadConfig::location_cache_peer_evictor_failed_threshold).
+//!   The task starts with the first cached location and ends with the reader (or its peer
+//!   manager's shutdown, or its cluster monitor's). The scan is one step:
+//!   `LOCATION_CACHE_PEER_EVICTOR_SCAN_CHUNK` (1 000 000) is above the cache's bound, so C++
+//!   does not yield in it either. A server still in use by a read in progress keeps its peer
+//!   until that read ends.
+//! * **Both releases.** The evictor is on by default whichever release the cluster runs, a
+//!   choice: it only changes what the client caches, so it is the client's behaviour (a C++
+//!   client's is that of the library it loaded, 8.0's for an 8.0 cluster), and on a 7.4
+//!   cluster it spares the cluster the same dials of dead servers for the cost of one
+//!   location lookup per evicted range on its next read, which a C++ 7.4 client pays anyway
+//!   once its read fails over. A server that is only flapping loses its ranges too, as in
+//!   8.0; set `location_cache_peer_evictor` to `false` for 7.4's behaviour.
 //!
 //! ## Values
 //!
@@ -456,6 +497,7 @@ use crate::error::Error;
 use crate::error::codes::*;
 
 mod balance;
+mod evictor;
 mod grv;
 mod key;
 mod location;
@@ -517,6 +559,18 @@ pub struct ReadConfig {
     /// database option): replicas in it are preferred. `None` (the default) prefers none.
     /// [`Reader::set_client_dc_id`] changes it.
     pub client_dc_id: Option<Vec<u8>>,
+    /// `LOCATION_CACHE_PEER_EVICTOR_ENABLED`: whether cached locations whose storage
+    /// servers keep failing to connect are forgotten periodically (see [the peer
+    /// evictor](self#the-peer-evictor)). **Default `true`**, as 8.0 (ClientKnobs 8.0:213; 7.4
+    /// has the same evictor off, 7.4:103), whichever release the cluster runs.
+    pub location_cache_peer_evictor: bool,
+    /// `LOCATION_CACHE_PEER_EVICTOR_DELAY` (60 s; ClientKnobs 7.4:104, 8.0:214): the time
+    /// between two sweeps of the peer evictor.
+    pub location_cache_peer_evictor_delay: Duration,
+    /// `LOCATION_CACHE_PEER_EVICTOR_FAILED_THRESHOLD` (0; 7.4:105, 8.0:215): an address
+    /// whose failed connects grew by more than this since the last sweep loses its cached
+    /// locations.
+    pub location_cache_peer_evictor_failed_threshold: u64,
     /// Seed of the random choices (replica order, eviction, jitter). `None` draws one.
     pub seed: Option<u64>,
 }
@@ -530,6 +584,9 @@ impl Default for ReadConfig {
             wrong_shard_server_delay: Duration::from_millis(10),
             metadata_version_cache_size: 1000,
             client_dc_id: None,
+            location_cache_peer_evictor: true,
+            location_cache_peer_evictor_delay: Duration::from_secs(60),
+            location_cache_peer_evictor_failed_threshold: 0,
             seed: None,
         }
     }
@@ -615,6 +672,8 @@ struct State {
     /// References to the peers of the proxies of the info last used, so that they are
     /// connected and probed while the client uses them.
     proxy_references: Option<(u64, Vec<PeerRef>)>,
+    /// Cached ranges the peer evictor forgot.
+    peer_evictions: u64,
 }
 
 /// What the reader's handles and its batcher tasks share.
@@ -635,6 +694,8 @@ pub(crate) struct Shared<R: Runtime, W> {
     grv_model: Mutex<balance::GrvModel>,
     /// `DatabaseContext::metadataVersionCache`.
     metadata_versions: Mutex<MetadataVersionCache>,
+    /// The peer evictor's task, started with the first cached location.
+    evictor: Mutex<Option<R::Task<()>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -652,6 +713,9 @@ impl<R: Runtime, W> Drop for Inner<R, W> {
             batcher.task.abort();
         }
         self.shared.abort_lagging();
+        if let Some(task) = lock(&self.shared.evictor).take() {
+            task.abort();
+        }
     }
 }
 
@@ -712,6 +776,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                 location_backoff: 0.0,
                 failed_endpoints: HashMap::new(),
                 proxy_references: None,
+                peer_evictions: 0,
             }),
             this: this.clone(),
             lagging: Mutex::new(balance::Lagging::default()),
@@ -719,6 +784,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             metadata_versions: Mutex::new(MetadataVersionCache::new(
                 config.metadata_version_cache_size,
             )),
+            evictor: Mutex::new(None),
             config,
         });
         Reader {
@@ -1026,6 +1092,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     pub fn load_balance_stats(&self) -> LoadBalanceStats {
         self.inner.shared.load_balance_stats()
     }
+
+    /// How many cached ranges the peer evictor forgot. For tests.
+    #[doc(hidden)]
+    pub fn peer_evictions(&self) -> u64 {
+        lock(&self.inner.shared.state).peer_evictions
+    }
 }
 
 /// A read version and the reader to read at it: what a read-only transaction needs.
@@ -1312,7 +1384,27 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         drop(rng);
         drop(cache);
         self.prune();
+        self.start_peer_evictor();
         location
+    }
+
+    /// Starts the peer evictor, once, if it is enabled (C++ starts it with the
+    /// `DatabaseContext`; here it waits for something to evict).
+    fn start_peer_evictor(&self) {
+        if !self.config.location_cache_peer_evictor {
+            return;
+        }
+        let mut slot = lock(&self.evictor);
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(self.rt.spawn(evictor::run(
+            self.rt.clone(),
+            self.monitor.clone(),
+            self.this.clone(),
+            self.config.location_cache_peer_evictor_delay,
+            self.config.location_cache_peer_evictor_failed_threshold,
+        )));
     }
 
     /// Drops the queue model data and endpoint failure records of servers no cached range

@@ -33,7 +33,7 @@
 mod model;
 mod process;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
@@ -265,6 +265,9 @@ struct State {
     rng: SimRng,
     /// A recovery is scheduled (a proxy host died).
     recovery_pending: bool,
+    /// Storage servers removed for good ([`SimCluster::remove_storage`]): in no team, never
+    /// restarted.
+    removed: BTreeSet<usize>,
 }
 
 struct Inner {
@@ -421,7 +424,12 @@ impl SimCluster {
         let mut shards = Vec::new();
         let mut begin = Vec::new();
         for end in bounds.into_iter().chain([KEYSPACE_END.to_vec()]) {
-            let team = random_team(&mut rng, storage.len(), config.replication);
+            let team = random_team(
+                &mut rng,
+                storage.len(),
+                config.replication,
+                &BTreeSet::new(),
+            );
             shards.push(Shard {
                 begin: std::mem::replace(&mut begin, end.clone()),
                 end,
@@ -443,6 +451,7 @@ impl SimCluster {
             stats: ClusterStats::default(),
             rng,
             recovery_pending: false,
+            removed: BTreeSet::new(),
         };
         let cluster = SimCluster {
             inner: Arc::new(Inner {
@@ -635,7 +644,8 @@ impl SimCluster {
         }
     }
 
-    /// Starts process `index` again (a storage server gets new endpoint tokens).
+    /// Starts process `index` again (a storage server gets new endpoint tokens; one
+    /// [removed](Self::remove_storage) stays down).
     pub fn restart_process(&self, index: usize) {
         let process = &self.inner.processes[index];
         if process.is_alive() {
@@ -643,6 +653,9 @@ impl SimCluster {
         }
         if let ProcessClass::Storage(ss) = self.inner.classes[index] {
             let mut state = lock(&self.inner.state);
+            if state.removed.contains(&ss) {
+                return;
+            }
             let s = &mut state.storage[ss];
             s.restarts += 1;
             s.iface.base = endpoint(process.addr, token(3, s.restarts, ss as u64));
@@ -942,6 +955,34 @@ impl SimCluster {
         });
     }
 
+    /// Removes storage server `ss` for good, as an exclusion followed by the death of its
+    /// machine does: every shard its team holds moves to a team of the other storage servers
+    /// (of the configured size, or all of them if there are not enough), so the commit
+    /// proxies stop listing it, and its process is killed as `mode` says and never restarted
+    /// by [`heal`](Self::heal); later shard moves leave it out too. At least one storage
+    /// server must remain.
+    pub fn remove_storage(&self, ss: usize, mode: KillMode) {
+        let process = {
+            let mut state = lock(&self.inner.state);
+            let n = state.storage.len();
+            state.removed.insert(ss);
+            assert!(
+                state.removed.len() < n,
+                "the last storage server cannot be removed"
+            );
+            for i in 0..state.shards.len() {
+                if state.shards[i].team.contains(&ss) {
+                    let removed = state.removed.clone();
+                    let replication = self.inner.config.replication;
+                    state.shards[i].team = random_team(&mut state.rng, n, replication, &removed);
+                }
+            }
+            state.storage[ss].process
+        };
+        self.trace("remove-storage", &[ss as u64], || format!("storage {ss}"));
+        self.kill_process(process, mode);
+    }
+
     /// Moves a random shard to a new random team.
     pub fn move_shard(&self) {
         let (i, team) = {
@@ -949,7 +990,8 @@ impl SimCluster {
             let n = state.storage.len();
             let shards = state.shards.len();
             let i = state.rng.index(shards);
-            let team = random_team(&mut state.rng, n, self.inner.config.replication);
+            let removed = state.removed.clone();
+            let team = random_team(&mut state.rng, n, self.inner.config.replication, &removed);
             state.shards[i].team = team.clone();
             (i, team)
         };
@@ -974,7 +1016,8 @@ impl SimCluster {
                 let team = if state.rng.chance(0.5) {
                     shard.team.clone()
                 } else {
-                    random_team(&mut state.rng, n, self.inner.config.replication)
+                    let removed = state.removed.clone();
+                    random_team(&mut state.rng, n, self.inner.config.replication, &removed)
                 };
                 state.shards[i].end = key.clone();
                 state.shards.insert(
@@ -1550,13 +1593,21 @@ fn with(weak: &Weak<Inner>, f: impl FnOnce(&SimCluster)) {
     }
 }
 
-fn random_team(rng: &mut SimRng, servers: usize, size: usize) -> Vec<usize> {
+/// `size` (at least 1) random storage servers out of `servers`, none of `removed`.
+fn random_team(
+    rng: &mut SimRng,
+    servers: usize,
+    size: usize,
+    removed: &BTreeSet<usize>,
+) -> Vec<usize> {
     let mut all: Vec<usize> = (0..servers).collect();
     for i in (1..all.len()).rev() {
         let j = rng.index(i + 1);
         all.swap(i, j);
     }
-    all.truncate(size.clamp(1, servers));
+    all.retain(|s| !removed.contains(s));
+    let available = all.len();
+    all.truncate(size.clamp(1, available));
     all.sort_unstable();
     all
 }
