@@ -208,6 +208,10 @@ are checked in and Rust tests read them as files; nothing in the workspace build
 the opt-in `cpp_crosscheck` test runs it). Its README documents the fixture format, the
 wire-format details and the decoder strictness policy the `wire` codec follows.
 Regenerate with `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen.sh --check`.
+`tools/bench/` is a second dev-only tool outside the workspace (its own `[workspace]`): benchmarks
+of `fdb-native-client` against `libfdb_c` 7.4.10 (through the `foundationdb` crate) on a testkit
+cluster; `tools/bench/run.sh quick|full`, method and results in `docs/benchmarks.md`. It needs the
+host's `libfdb_c.so` and libclang, so CI does not build it.
 The message-level fixtures (`fixtures/release-7.4/`, `fixtures/release-8.0/`) come from
 `FDB_SRC=/path/to/foundationdb tools/golden-vectors/regen_messages.sh --check` (needs docker).
 The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/binary-release-8.0/`) are written by the same command; the types they test live in `fdb-native-transport` (`ConnectPacket`) and `fdb-native-schema` (span contexts, health metrics, idempotency records, conflict keys), the generic codec in `fdb-native-wire::binary`.
