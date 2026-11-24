@@ -69,10 +69,10 @@ pub enum RequestError {
     /// The request may have been acted on.
     #[error("the server dropped the request's reply promise (broken_promise)")]
     BrokenPromise,
-    /// The connection ended after the request was put on it (`request_maybe_delivered`,
-    /// 1030). The request may or may not have reached the server. The error is `None` when
-    /// the connection's end was not seen by the registry (it was moved to another connection,
-    /// see [`ReplyRegistry`](super::ReplyRegistry)).
+    /// The connection ended after at least one byte of the request was handed to the
+    /// transport (`request_maybe_delivered`, 1030). The request may or may not have reached
+    /// the server. The error is `None` when the connection's end was not seen by the registry
+    /// (it was moved to another connection, see [`ReplyRegistry`](super::ReplyRegistry)).
     #[error("request may have been delivered; the connection ended{}", match .0 {
         Some(e) => format!(": {e}"),
         None => String::new(),
@@ -80,7 +80,9 @@ pub enum RequestError {
     MaybeDelivered(#[source] Option<ConnectionError>),
     /// The request was never written: the connection ended before its handshake completed
     /// (requests sent then are held, see the [connection documentation](crate::connection#sending)),
-    /// or it had already ended (`None` when only the peer's side has closed). Safe to resend.
+    /// or before one byte of the request's frame was handed to the transport (see
+    /// [Written offsets](crate::connection#written-offsets)), or it had already ended (`None`
+    /// when only the peer's side has closed). Safe to resend.
     #[error("request not sent; the connection {}", match .0 {
         Some(e) => format!("ended: {e}"),
         None => "is closing".to_owned(),

@@ -85,6 +85,14 @@ impl Runtime for TokioRuntime {
     type Stream = TokioStream;
     type Task<T: Send + 'static> = TokioTask<T>;
 
+    /// A [`TokioStream`] write is one `send`/`write` call on the socket, which on an error has
+    /// written nothing (a partial write returns its count instead).
+    const WRITE_ERRORS_TAKE_NOTHING: bool = true;
+
+    /// A [`TokioStream`] write is pending only when the socket's `write` would block, which
+    /// wrote nothing.
+    const PENDING_TAKES_NOTHING: bool = true;
+
     fn now(&self) -> Instant {
         // The context decides which clock `tokio::time::Instant::now` reads.
         let _enter = self.handle.enter();

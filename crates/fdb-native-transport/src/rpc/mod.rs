@@ -66,14 +66,29 @@
 //! caller's (a load balancer's) decision, made from [`RequestError::should_retry`] (automatic
 //! retries), [`RequestError::certainly_not_delivered`] (the at-most-once safety predicate) and
 //! [`RequestError::maybe_delivered`]. It refines C++ in one place: C++ cannot tell an unsent
-//! packet from a sent one and reports `request_maybe_delivered` for both; here a request sent
-//! before the handshake completed is held by the connection and never written if the
-//! handshake fails (see the [connection documentation](crate::connection#sending)), so it
-//! fails with [`RequestError::NotSent`], which is safe to retry. A request put on an
-//! established connection fails with [`RequestError::MaybeDelivered`] when the connection
-//! ends, even if its bytes were still in the output buffer: conservative, as C++ is. Whether
-//! the handshake completed is the connection's own record
-//! ([`Connection::was_established`]), not only what the event stream showed.
+//! packet from a sent one and reports `request_maybe_delivered` for both (its
+//! `discardUnreliablePackets` drops them unsent); here a request none of whose bytes were
+//! handed to the transport when the connection ended fails with [`RequestError::NotSent`],
+//! which is safe to retry:
+//!
+//! * a request sent before the handshake completed is held by the connection and never
+//!   written if the handshake fails (see the [connection documentation](crate::connection#sending));
+//!   whether the handshake completed is the connection's own record
+//!   ([`Connection::was_established`]), not only what the event stream showed;
+//! * on a connection whose driver reports everything its transport may have taken
+//!   ([`ConnectionConfig::unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent),
+//!   which the peer manager sets), a request whose frame was still entirely in the output
+//!   buffer: the registry records where each frame starts in the connection's output stream
+//!   ([`Connection::output_offset`]) and compares it, at the end, with how far the stream may
+//!   have been handed to the transport ([`Connection::maybe_written`]; see
+//!   [Written offsets](crate::connection#written-offsets)).
+//!
+//! Every other request fails with [`RequestError::MaybeDelivered`] when the connection ends:
+//! one byte written is enough, and bytes taken by a TLS session or the socket's send buffer
+//! count as written, as do the bytes offered to a write that failed or was pending on a
+//! stream that does not promise it took nothing. Without `unwritten_not_sent` (the default
+//! for a [`Connection`] driven by other code), every request on an established connection is
+//! `MaybeDelivered`, as in C++.
 //!
 //! **Undecodable replies.** A reply that came but cannot be decoded (a wrong file identifier, a
 //! malformed table) proves the request was delivered without saying what became of it:
@@ -126,8 +141,8 @@
 //! | --- | --- | --- | --- | --- | --- |
 //! | `Fdb(e)` | the server replied with an error | `e.code` | no | no | for 1021, 1030, 1035, 1100 |
 //! | `BrokenPromise` | the server replied `broken_promise` | 1030 (see [`RequestError::fdb_code`]) | no | no | yes |
-//! | `MaybeDelivered` | the connection ended after the request was sent | 1030 | no | no | yes |
-//! | `NotSent` | the connection ended before the handshake, or had ended | 1026 | yes | yes | no |
+//! | `MaybeDelivered` | the connection ended after some of the request was written | 1030 | no | no | yes |
+//! | `NotSent` | the connection ended before any of the request was written, or had ended | 1026 | yes | yes | no |
 //! | `EndpointNotFound` | the endpoint is gone (pending / refused) | 1030 | no / yes | no / yes | yes / no |
 //! | `Unauthorized` | the peer refuses the endpoint | 6001 | yes | no | no |
 //! | `Decode` | a reply came but cannot be decoded (wrong file identifier, malformed) | 1044 | no | no | yes |
@@ -164,6 +179,7 @@
 //!                        Closed(e)                  → every request has completed; end the loop
 //!                        Frame / UnknownToken       → ignore (a late reply) or log
 //!         3. write     conn.pending_output(); conn.consume_output(n)
+//!                      (or conn.write_failed(offered, kind, now): see Written offsets)
 //!         4. wait      socket readable | conn.poll_timeout() | a command
 //! ```
 //!

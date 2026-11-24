@@ -95,6 +95,11 @@ where
 {
     type Stream = PeerTlsStream<S>;
 
+    /// `futures-rustls` 0.26 (without early data, which this crate does not enable) returns
+    /// `Pending` from `poll_write` only when its session took none of the buffer: once it took
+    /// some, it returns `Ok` with the count, whatever the socket did.
+    const PENDING_TAKES_NOTHING: bool = true;
+
     fn tls_enabled(&self) -> bool {
         true
     }
