@@ -62,7 +62,7 @@
 //!   `maxVersion` from the version-vector cache (`invalidVersion` here: version vectors are
 //!   off), and on 8.0 no `maxGrvQueueDelayMS` unless the transaction option is set
 //!   ([`ReadVersionOptions`] covers the priority, `CAUSAL_READ_RISKY`,
-//!   `USE_PROVISIONAL_PROXIES` and lock awareness).
+//!   `USE_PROVISIONAL_PROXIES`, lock awareness and, on 8.0, `MAX_GRV_QUEUE_DELAY`).
 //! * **Load balancing.** `basicLoadBalance` (LB 7.4:1031-1131, 8.0:645-760) over the GRV
 //!   proxies the client uses (the monitor's sample): start with the "best" one, walk the
 //!   others, skip those the failure monitor says are failed, and on `broken_promise` or
@@ -74,14 +74,55 @@
 //!   ([`ClusterMonitor::proxies_changed`]): new proxies get the request again. While there
 //!   are no (non-provisional) GRV proxies it waits for some
 //!   ([`ClusterMonitor::grv_proxies`]).
-//! * **Batching.** `readVersionBatcher` (7.4:7671-7761, 8.0:5383-5482): one batcher per set
-//!   of flags collects requests and sends a batch when it has `MAX_BATCH_SIZE` (1000) of
-//!   them, or `batchTime` after the first; `batchTime` starts at 0 (a batch is what arrives
-//!   before the batcher runs again) and follows half the reply latency, smoothed
-//!   (`0.1 * target + 0.9 * batchTime`) and capped at `GRV_BATCH_TIMEOUT` (5 ms; ClientKnobs
-//!   7.4:94-96, 8.0:204-206). Every transaction of the batch gets the same reply.
+//! * **Which proxy first.** `ModelInterface::getBest` (`fdbrpc/MultiInterface.h` 7.4:116-165,
+//!   8.0:111-160): the GRV proxies (`GrvProxyInfo`, built with `BalanceOnRequests::True` on
+//!   7.4, NativeAPI 2366, 2382, 3019, and as `ProxyGrvMetric` on 8.0,
+//!   `ProxyLoadBalanceMetrics.h`) are chosen with probabilities that start even and follow
+//!   the `processBusyTime` of their replies (`updateRecent`, LB 7.4:1102, 8.0:729): a GRV
+//!   proxy packs the recent request count in the quotient by
+//!   `BASIC_LOAD_BALANCE_COMPUTE_PRECISION` (10 000) and its CPU busyness in the remainder
+//!   (`GrvProxyServer` 7.4:695-700, 8.0:755-760); every `BASIC_LOAD_BALANCE_UPDATE_RATE`
+//!   (10 s), if every proxy reported in the last half of that and together they released at
+//!   least `BASIC_LOAD_BALANCE_MIN_REQUESTS` (20) each, a proxy's probability moves by
+//!   `BASIC_LOAD_BALANCE_MAX_CHANGE` (0.1) times (its fair share minus its share of the
+//!   requests), within `1 / (MAX_PROB * n)` and `MAX_PROB / n` (`MAX_PROB` is 2), and the
+//!   probabilities are normalized (FlowKnobs 7.4:307-313, 8.0:306-312). A new proxy set
+//!   (a new `ClientDBInfo`) starts over with even probabilities. The commit proxies' model
+//!   is by CPU (`processBusyTime % PRECISION`), but their replies carry no
+//!   `processBusyTime` (a `GetKeyServerLocationsReply` is not a `BasicLoadBalancedReply`),
+//!   so their choice stays uniform.
+//! * **Batching and priorities.** `readVersionBatcher` (7.4:7671-7761, 8.0:5383-5482): one
+//!   batcher per set of request flags (`cx->versionBatcher[flags]`, 7.4:7935; on 8.0 the
+//!   key also has `maxGrvQueueDelayMS`, 8.0:5741). The flags are the priority in the high
+//!   byte (`PRIORITY_BATCH` `1 << 24`, `PRIORITY_DEFAULT` `8 << 24`,
+//!   `PRIORITY_SYSTEM_IMMEDIATE` `15 << 24`, set from the transaction's priority in
+//!   `getReadVersion`, 7.4:7884-7899) and `FLAG_CAUSAL_READ_RISKY` / `FLAG_USE_PROVISIONAL_PROXIES`
+//!   (7.4:7309, 7455), so requests of different priorities are never sent together, and
+//!   each batch's request has one priority ([`Priority`], [`ReadVersionOptions`]). A batcher
+//!   sends a batch when it has `MAX_BATCH_SIZE` (1000) of them, or `batchTime` after the
+//!   first; `batchTime` starts at 0 (a batch is what arrives before the batcher runs again)
+//!   and follows half the reply latency, smoothed (`0.1 * target + 0.9 * batchTime`) and
+//!   capped at `GRV_BATCH_TIMEOUT` (5 ms; ClientKnobs 7.4:94-96, 8.0:204-206). Every
+//!   transaction of the batch gets the same reply.
 //! * **The reply.** `extractReadVersion` (7.4:7763-7863): `database_locked` if the database
 //!   is locked and the transaction is not lock aware; the version otherwise.
+//!
+//! ## The metadata version
+//!
+//! `\xff/metadataVersion` ([`METADATA_VERSION_KEY`]) is the one key a transaction may read
+//! without a storage server. Every GRV reply carries its value at the reply's version
+//! (`GetReadVersionReply::metadataVersion`), and a commit reply carries it at the commit
+//! version. `DatabaseContext::metadataVersionCache` (`METADATA_VERSION_CACHE_SIZE`, 1000
+//! entries, ClientKnobs 7.4:83, 8.0:188) keeps `(version, value)` for the latest of those:
+//! `extractReadVersion` adds the reply's (7.4:7830-7837, 8.0:5557-5562) after the
+//! `database_locked` check, `tryCommit` the commit's (7.4:6990-6996, 8.0:4672), each only if
+//! its version is greater than the newest in the cache. A transaction reading the key
+//! (`Transaction::get`, 7.4:5860-5897, 8.0:3647-3677) is answered from its own GRV reply if
+//! that is not in yet, else from the cache if its read version is exactly one of the cached
+//! ones (a binary search over the ring), else it reads the key from a storage server like
+//! any other. [`Reader::get_read_version_and_metadata`] is the first,
+//! [`Reader::cached_metadata_version`] the second and [`Reader::metadata_version`] all
+//! three; [`Reader::note_committed_version`] is for the commit path.
 //!
 //! ## Key locations
 //!
@@ -156,6 +197,28 @@
 //!     reached (`triedAllOptions` is set when the walk wraps around to its start, which one
 //!     alternative never does), so, as in C++, `process_behind` is retried with the backoff
 //!     (up to 5 s apart) until the server catches up or the read is abandoned.
+//!   - **Second (hedged) requests** (LB 7.4:795-815, 957-1017, 8.0:405-420, 575-621). The
+//!     model's second-best replica (the next with the fewest outstanding requests) gets a
+//!     second request if the first is slow: after `secondMultiplier * latency(second) +
+//!     BASE_SECOND_REQUEST_TIME` (0.5 ms) since the replicas were picked, or at once if the
+//!     first replica's last latency is more than `INSTANT_SECOND_REQUEST_MULTIPLIER` (2)
+//!     times that. Only if the model's `secondBudget` has a whole unit: each reply to a first
+//!     request adds `SECOND_REQUEST_BUDGET_GROWTH` (0.05; capped at
+//!     `SECOND_REQUEST_MAX_BUDGET`, 100) and lowers `secondMultiplier` by
+//!     `SECOND_REQUEST_MULTIPLIER_DECAY` (0.00025; not below 1), and a second request costs 1
+//!     and raises `secondMultiplier` by `SECOND_REQUEST_MULTIPLIER_GROWTH` (0.01); the timer
+//!     is spent either way. The first good reply of the two wins; an error reply that is
+//!     returned (`wrong_shard_server`, ...) ends the call too; one that is retried
+//!     (`server_overloaded`, `process_behind` before all were tried, a lost connection)
+//!     leaves the other to answer, or goes on to the next replica. A request that no
+//!     longer matters is not cancelled but becomes a *lagging request* (`~RequestData`,
+//!     `makeLaggingRequest`, LB 7.4:649-678, 8.0:265-287): it is kept (up to
+//!     `MAX_LAGGING_REQUESTS_OUTSTANDING`, 100 000; FlowKnobs 7.4:288, 8.0:287;
+//!     then all are dropped) only to feed its reply to the model (its latency, penalty and
+//!     `future_version` backoff, and its outstanding count until it ends), so a slow
+//!     replica is learned to be slow and avoided. Reads only: this balancer is never
+//!     `AtMostOnce` (commits use their own path), so a request that may have been delivered
+//!     is just sent again. An unsent request still waiting out its backoff is dropped.
 //!   - When every replica is failed, `allAlternativesFailedDelay` (`fdbrpc/LoadBalance.cpp`
 //!     8.0:29-53) waits for one to come back for 50 ms, growing to 1 s (and, after minutes,
 //!     30 s) while failures continue, jittered, then fails with `all_alternatives_failed`.
@@ -254,15 +317,12 @@
 //!
 //! ## Deliberate differences
 //!
-//! * **No second requests.** C++'s `loadBalance` sends a speculative second request to the
-//!   next replica when the first is slow (`secondDelay`, the `secondMultiplier` /
-//!   `secondBudget` of the model, `INSTANT_SECOND_REQUEST_MULTIPLIER`,
-//!   `BASE_SECOND_REQUEST_TIME`), and keeps processing "lagging" replies for the model. Here
-//!   one request is outstanding at a time: a slow replica is waited for (the transport's
-//!   failure detection still ends a dead one). The model's latency is tracked but unused.
-//! * **GRV proxy choice.** `ModelInterface::getBest` weights the proxies by their reported
-//!   `processBusyTime`, re-evaluated every 10 s (`BASIC_LOAD_BALANCE_*`); here the first
-//!   choice is uniform at random.
+//! * **Lagging requests** are tasks on the runtime ([`Runtime::spawn`]), one per request, where
+//!   C++ keeps them in one `actorCollection`; the reader's last handle dropping cancels them.
+//!   The periodic `ModelInterface` update is evaluated lazily, in order, when the model is
+//!   next used, instead of by a timer.
+//! * **The queue model** is per server (by its `getValue` token), where C++ keeps it per
+//!   endpoint, so a server's `getValue`, `getKey` and watch streams share what is learned.
 //! * **Not modelled:** the GRV cache (`USE_GRV_CACHE`), tag throttling (no tags are sent),
 //!   version vectors, TSS duplicate requests and replica consistency checks
 //!   (`enableReplicaConsistencyCheck`), `connectionFileChanged` (a `switchConnectionRecord`
@@ -278,7 +338,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use fdb_native_schema::Request;
@@ -302,13 +362,13 @@ mod range;
 pub(crate) mod util;
 mod watch_lb;
 
-pub use grv::{Priority, ReadVersionOptions};
+pub use grv::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
 pub use range::{RangeLimits, RangeOptions, RangeRead, StreamingMode};
 pub(crate) use range::{key_after, read_conflict_range, remove_or_equal};
 pub use watch_lb::WatchTimings;
 
-use grv::Batcher;
+use grv::{Batcher, BatcherKey, MetadataVersionCache};
 use location::{Location, LocationCache};
 use util::{Either, Rng, never, now_secs, race};
 
@@ -341,6 +401,9 @@ pub struct ReadConfig {
     /// `WRONG_SHARD_SERVER_DELAY` (10 ms): the wait before locating a key again after
     /// `wrong_shard_server` or `all_alternatives_failed`.
     pub wrong_shard_server_delay: Duration,
+    /// `METADATA_VERSION_CACHE_SIZE` (1000): how many read versions' `\xff/metadataVersion`
+    /// the reader remembers (see [`Reader::metadata_version`]).
+    pub metadata_version_cache_size: usize,
     /// The client's data center id (C++'s client locality `dcid`, the `datacenter_id`
     /// network option): replicas in it are preferred. `None` (the default) prefers none.
     pub client_dc_id: Option<Vec<u8>>,
@@ -355,6 +418,7 @@ impl Default for ReadConfig {
             grv_batch_timeout: Duration::from_millis(5),
             location_cache_size: 600_000,
             wrong_shard_server_delay: Duration::from_millis(10),
+            metadata_version_cache_size: 1000,
             client_dc_id: None,
             seed: None,
         }
@@ -408,6 +472,14 @@ pub(crate) struct Shared<R: Runtime, W> {
     locations: Mutex<LocationCache>,
     model: Mutex<balance::QueueModel>,
     state: Mutex<State>,
+    /// This, for the tasks that outlive the call that starts them (lagging requests).
+    this: Weak<Shared<R, W>>,
+    /// The tasks of the lagging requests of [`Shared::load_balance`].
+    lagging: Mutex<balance::Lagging<R>>,
+    /// `ModelInterface` of the GRV proxies: their probabilities.
+    grv_model: Mutex<balance::GrvModel>,
+    /// `DatabaseContext::metadataVersionCache`.
+    metadata_versions: Mutex<MetadataVersionCache>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -416,7 +488,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Inner<R: Runtime, W> {
     shared: Arc<Shared<R, W>>,
-    batchers: Mutex<HashMap<u32, Batcher<R>>>,
+    batchers: Mutex<HashMap<BatcherKey, Batcher<R>>>,
 }
 
 impl<R: Runtime, W> Drop for Inner<R, W> {
@@ -424,6 +496,7 @@ impl<R: Runtime, W> Drop for Inner<R, W> {
         for (_, batcher) in lock(&self.batchers).drain() {
             batcher.task.abort();
         }
+        self.shared.abort_lagging();
     }
 }
 
@@ -461,7 +534,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         monitor: Arc<ClusterMonitor<R>>,
         config: ReadConfig,
     ) -> Reader<R, W> {
-        let shared = Shared {
+        let shared = Arc::new_cyclic(|this| Shared {
             rt,
             peers,
             monitor,
@@ -478,11 +551,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                 failed_endpoints: HashMap::new(),
                 proxy_references: None,
             }),
+            this: this.clone(),
+            lagging: Mutex::new(balance::Lagging::default()),
+            grv_model: Mutex::new(balance::GrvModel::default()),
+            metadata_versions: Mutex::new(MetadataVersionCache::new(
+                config.metadata_version_cache_size,
+            )),
             config,
-        };
+        });
         Reader {
             inner: Arc::new(Inner {
-                shared: Arc::new(shared),
+                shared,
                 batchers: Mutex::new(HashMap::new()),
             }),
         }
@@ -503,15 +582,28 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 
     /// A read version, requested with `options`.
     pub async fn get_read_version_with(&self, options: ReadVersionOptions) -> Result<i64, Error> {
-        let flags = options.flags();
+        Ok(self.get_read_version_and_metadata(options).await?.0)
+    }
+
+    /// A read version requested with `options`, and the value of `\xff/metadataVersion` at
+    /// it (`None`: the key is not set), as the GRV proxy reported it
+    /// (`GetReadVersionReply::metadataVersion`): what a transaction's first read of the key
+    /// needs, with no read of the key (C++'s `TransactionState::metadataVersion` promise).
+    /// Like [`get_read_version_with`](Self::get_read_version_with), it remembers the pair for
+    /// [`metadata_version`](Self::metadata_version).
+    pub async fn get_read_version_and_metadata(
+        &self,
+        options: ReadVersionOptions,
+    ) -> Result<(i64, Option<Vec<u8>>), Error> {
+        let key = options.batcher_key();
         let (tx, rx) = oneshot::channel();
         let mut waiter = Some(tx);
         for _ in 0..2 {
             let sent = {
                 let mut batchers = lock(&self.inner.batchers);
                 let batcher = batchers
-                    .entry(flags)
-                    .or_insert_with(|| Batcher::start(self.inner.shared.clone(), flags));
+                    .entry(key)
+                    .or_insert_with(|| Batcher::start(self.inner.shared.clone(), key));
                 match batcher
                     .sender
                     .unbounded_send(waiter.take().expect("a waiter"))
@@ -520,7 +612,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                     Err(e) => {
                         // The batcher ended (it panicked): start another.
                         waiter = Some(e.into_inner());
-                        if let Some(old) = batchers.remove(&flags) {
+                        if let Some(old) = batchers.remove(&key) {
                             old.task.abort();
                         }
                         false
@@ -538,7 +630,41 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if reply.locked && !options.lock_aware {
             return Err(Error::new(DATABASE_LOCKED));
         }
-        Ok(reply.version)
+        // `extractReadVersion` (NativeAPI 7.4:7830-7837, 8.0:5557-5562).
+        lock(&self.inner.shared.metadata_versions)
+            .insert(reply.version, reply.metadata_version.clone());
+        Ok((reply.version, reply.metadata_version.clone()))
+    }
+
+    /// The value of `\xff/metadataVersion` at `version`: from what the reader has seen of
+    /// read versions and commits ([`cached_metadata_version`](Self::cached_metadata_version)),
+    /// else read from a storage server like any key. `None`: the key is not set.
+    ///
+    /// This is how C++ serves a transaction's read of the key
+    /// (`Transaction::get`, NativeAPI 7.4:5860-5897): the key is the one read that is
+    /// answered without a storage server whenever the transaction's read version is one the
+    /// proxies reported it for.
+    pub async fn metadata_version(&self, version: i64) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(cached) = self.cached_metadata_version(version) {
+            return Ok(cached);
+        }
+        self.get(METADATA_VERSION_KEY, version).await
+    }
+
+    /// The value of `\xff/metadataVersion` at `version` if the reader knows it without asking:
+    /// `Some(value)` (the value itself `None` if the key is not set) if `version` is one of
+    /// the last [`ReadConfig::metadata_version_cache_size`] versions a GRV proxy reply or a
+    /// commit ([`note_committed_version`](Self::note_committed_version)) reported it for.
+    pub fn cached_metadata_version(&self, version: i64) -> Option<Option<Vec<u8>>> {
+        lock(&self.inner.shared.metadata_versions).get(version)
+    }
+
+    /// Remembers that a commit at `version` (a `CommitID` reply) left `\xff/metadataVersion`
+    /// as `metadata_version`, as C++'s `tryCommit` does (NativeAPI 7.4:6990-6996): later
+    /// transactions reading at exactly that version need not read the key. Only a version
+    /// newer than every one remembered is kept.
+    pub fn note_committed_version(&self, version: i64, metadata_version: Option<Vec<u8>>) {
+        lock(&self.inner.shared.metadata_versions).insert(version, metadata_version);
     }
 
     /// A [`ReadSnapshot`] at a new read version.
@@ -866,10 +992,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 span_context: Default::default(),
                 min_tenant_version: version,
             };
+            // Commit proxies are balanced by CPU (`ProxyCpuMetric`), but their replies carry no
+            // `processBusyTime`, so the choice stays uniform.
             let reply = self.basic_load_balance(
                 &alternatives,
                 move |schema, reply, out| request.encode_request_into(schema, reply, out),
                 GetKeyServerLocations::decode_reply,
+                None,
             );
             let changed = async {
                 match self.monitor.proxies_changed(&info).await {

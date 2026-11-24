@@ -9,12 +9,14 @@ mod support;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdb_native_client::error::codes;
-use fdb_native_client::read::{KEY_SPACE_END, ReadConfig, ReadVersionOptions, Reader};
+use fdb_native_client::read::{
+    KEY_SPACE_END, METADATA_VERSION_KEY, Priority, ReadConfig, ReadVersionOptions, Reader,
+};
 use fdb_native_client::{
     ClusterConnectionString, ClusterMonitor, ClusterMonitorConfig, ConnectionRecord,
     TransactionRetry,
@@ -114,6 +116,10 @@ struct FakeGrv {
     requests: Arc<Mutex<Vec<GetReadVersion>>>,
     /// What to answer: `Ok(locked)` with the next version, or an error.
     answer: Arc<Mutex<Result<bool, Option<u16>>>>,
+    /// The `processBusyTime` of the replies.
+    busy: Arc<AtomicI32>,
+    /// The `metadataVersion` of the replies.
+    metadata: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 struct FakeCommit {
@@ -262,21 +268,25 @@ impl Cluster {
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let answer = Arc::new(Mutex::new(Ok(false)));
+        let busy = Arc::new(AtomicI32::new(0));
+        let metadata = Arc::new(Mutex::new(None));
         {
             let requests = requests.clone();
             let answer = answer.clone();
             let version = self.version.clone();
+            let busy = busy.clone();
+            let metadata = metadata.clone();
             let proxy_id = token;
             process.handle(token, move |incoming: Incoming| {
                 let (request, reply) =
                     GetReadVersion::decode_request(incoming.schema, &incoming.payload).unwrap();
                 requests.lock().unwrap().push(request);
                 let reply_value = match *answer.lock().unwrap() {
-                    Ok(locked) => Ok(read_version(
-                        version.fetch_add(10, Ordering::SeqCst),
-                        locked,
-                        proxy_id,
-                    )),
+                    Ok(locked) => Ok(ReadVersion {
+                        process_busy_time: busy.load(Ordering::SeqCst),
+                        metadata_version: metadata.lock().unwrap().clone(),
+                        ..read_version(version.fetch_add(10, Ordering::SeqCst), locked, proxy_id)
+                    }),
                     Err(None) => return Action::Close,
                     Err(Some(code)) => Err(FdbError::new(code)),
                 };
@@ -289,6 +299,8 @@ impl Cluster {
             proxy,
             requests,
             answer,
+            busy,
+            metadata,
         }
     }
 
@@ -1152,4 +1164,440 @@ async fn monitor_shutdown_ends_parked_location_requests() {
     cluster.monitor.shutdown().await;
     let e = within("parked get", parked).await.unwrap().unwrap_err();
     assert_eq!(e.code(), codes::OPERATION_CANCELLED);
+}
+
+// ---- load balancing: second requests, priorities, GRV proxy choice, metadata version --------
+
+/// Reads `key` at `version`, with the virtual time it took.
+async fn timed_get(
+    reader: &Reader<MemRuntime>,
+    key: &[u8],
+    version: i64,
+) -> (Option<Vec<u8>>, Duration) {
+    let start = tokio::time::Instant::now();
+    let value = within("get", reader.get(key, version)).await.unwrap();
+    (value, start.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_replica_is_raced_by_a_second_request() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, _grv, _commit) = Cluster::ready(schema, 2).await;
+        cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+        cluster.set(b"k", b"v");
+        let reader = cluster.reader();
+        let version = within("GRV", reader.get_read_version()).await.unwrap();
+
+        // Replies to first requests earn the budget for second ones (0.05 each).
+        for _ in 0..400 {
+            let (value, _) = timed_get(&reader, b"k", version).await;
+            assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        }
+
+        // With no time passing in a reply, the replicas look equally loaded and the first
+        // in the location's order is the first choice. Make that one slow.
+        let order = reader.locate(b"k").await.unwrap().servers;
+        let slow = cluster
+            .storage
+            .iter()
+            .position(|s| s.server.id == order[0].id)
+            .unwrap();
+        let fast = 1 - slow;
+        const SLOW: Duration = Duration::from_secs(5);
+        cluster.storage[slow].set(|b| b.delay = SLOW);
+        let served = |i: usize| cluster.storage[i].served();
+
+        // The first request is given `latency + BASE_SECOND_REQUEST_TIME` (0.5 ms), then a
+        // second goes to the other replica, which answers at once.
+        let (slow_before, fast_before) = (served(slow), served(fast));
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]), "{schema}");
+        assert!(took >= Duration::from_micros(500), "{schema}: {took:?}");
+        assert!(took < Duration::from_millis(50), "{schema}: {took:?}");
+        assert_eq!(
+            (served(slow) - slow_before, served(fast) - fast_before),
+            (1, 1),
+            "{schema}: both were asked"
+        );
+
+        // The slow request goes on without the read (a lagging request) and ends on its own;
+        // the model learned from it.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // Later, the fast replica gets a little slower, so that the slow one (its load
+        // decayed) is again the first choice, now known to take 5 s: the second request
+        // goes out at once. Whatever the first choice, no read waits for the slow replica.
+        cluster.storage[fast].set(|b| b.delay = Duration::from_millis(1));
+        let mut raced = 0;
+        for attempt in 0..40 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let slow_before = served(slow);
+            let (value, took) = timed_get(&reader, b"k", version).await;
+            assert_eq!(
+                value.as_deref(),
+                Some(&b"v"[..]),
+                "{schema} attempt {attempt}"
+            );
+            assert!(
+                took < Duration::from_millis(100),
+                "{schema} attempt {attempt}: {took:?}"
+            );
+            raced += served(slow) - slow_before;
+        }
+        assert!(raced >= 1, "{schema}: the slow replica was not asked again");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_budget_no_second_request() {
+    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 2).await;
+    cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+    cluster.set(b"k", b"v");
+    const SLOW: Duration = Duration::from_secs(3);
+    cluster.storage[0].set(|b| b.delay = SLOW);
+    let version = {
+        let reader = cluster.reader();
+        within("GRV", reader.get_read_version()).await.unwrap()
+    };
+    // A reader with nothing earned yet waits for the slow replica when it is first.
+    let mut waited = 0;
+    for seed in 0..40 {
+        let mut config = ReadConfig::default();
+        config.seed = Some(seed);
+        let reader = cluster.reader_with(config);
+        let (slow_before, fast_before) = (cluster.storage[0].served(), cluster.storage[1].served());
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        if cluster.storage[0].served() > slow_before {
+            assert!(took >= SLOW, "seed {seed}: {took:?}");
+            assert_eq!(
+                cluster.storage[1].served(),
+                fast_before,
+                "no second request"
+            );
+            waited += 1;
+            if waited == 3 {
+                break;
+            }
+        } else {
+            assert!(took < Duration::from_secs(1));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    assert_eq!(waited, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_lagging_request_is_not_abandoned_by_its_replica() {
+    // The loser of a hedged read still completes on its server (its reply feeds the model);
+    // the read does not wait for it, and shutting the reader down ends it.
+    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V8_0, 2).await;
+    cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+    cluster.set(b"k", b"v");
+    let reader = cluster.reader();
+    let version = within("GRV", reader.get_read_version()).await.unwrap();
+    for _ in 0..200 {
+        timed_get(&reader, b"k", version).await;
+    }
+    cluster.storage[0].set(|b| b.delay = Duration::from_secs(30));
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+    drop(reader);
+    // Dropping the reader cancels what was left; nothing is left to panic or hang.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_versions_batch_separately_by_priority() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, grv, _commit) = Cluster::ready(schema, 1).await;
+        let reader = cluster.reader();
+        let with = |priority: Priority, causal_read_risky: bool, lock_aware: bool| {
+            let mut options = ReadVersionOptions::default();
+            options.priority = priority;
+            options.causal_read_risky = causal_read_risky;
+            options.lock_aware = lock_aware;
+            options
+        };
+        // Concurrent requests of every priority, and a flag that changes the request.
+        let mut requests = Vec::new();
+        for (options, count) in [
+            (with(Priority::Batch, false, false), 3),
+            (with(Priority::Default, false, false), 4),
+            // Lock awareness is not part of the request: it batches with the default ones.
+            (with(Priority::Default, false, true), 2),
+            (with(Priority::Immediate, false, false), 5),
+            (with(Priority::Default, true, false), 2),
+            // 8.0's `MAX_GRV_QUEUE_DELAY` is part of the request, and of the batcher's key.
+            (
+                {
+                    let mut options = with(Priority::Default, false, false);
+                    options.max_grv_queue_delay_ms = Some(50);
+                    options
+                },
+                3,
+            ),
+        ] {
+            for _ in 0..count {
+                let reader = reader.clone();
+                requests.push(tokio::spawn(async move {
+                    reader.get_read_version_with(options).await
+                }));
+            }
+        }
+        for request in requests {
+            within("GRV", request).await.unwrap().unwrap();
+        }
+        let sent = grv.requests.lock().unwrap().clone();
+        let count = |flags: u32| -> u32 {
+            sent.iter()
+                .filter(|r| r.flags == flags)
+                .map(|r| r.transaction_count)
+                .sum()
+        };
+        assert_eq!(count(GetReadVersion::PRIORITY_BATCH), 3, "{schema}");
+        // (A 7.4 request cannot carry the delay.)
+        let delayed = if schema == SchemaVersion::V8_0 { 3 } else { 0 };
+        assert_eq!(count(GetReadVersion::PRIORITY_DEFAULT), 9, "{schema}");
+        assert_eq!(
+            sent.iter()
+                .filter(|r| r.max_grv_queue_delay_ms == Some(50))
+                .map(|r| r.transaction_count)
+                .sum::<u32>(),
+            delayed,
+            "{schema}"
+        );
+        // Whatever the cluster, the delayed requests were batched on their own: the default
+        // ones (9 transactions in all, 4 + 2 + 3) made at least two batches.
+        assert!(
+            sent.iter()
+                .filter(|r| r.flags == GetReadVersion::PRIORITY_DEFAULT)
+                .count()
+                >= 2,
+            "{schema}"
+        );
+        assert_eq!(
+            count(GetReadVersion::PRIORITY_SYSTEM_IMMEDIATE),
+            5,
+            "{schema}"
+        );
+        assert_eq!(
+            count(GetReadVersion::PRIORITY_DEFAULT | GetReadVersion::FLAG_CAUSAL_READ_RISKY),
+            2,
+            "{schema}"
+        );
+        assert_eq!(
+            sent.iter().map(|r| r.transaction_count).sum::<u32>(),
+            19,
+            "every transaction is in exactly one batch"
+        );
+        // Each request has one priority only (the batchers do not mix them).
+        for r in &sent {
+            let priority = r.flags & GetReadVersion::FLAG_PRIORITY_MASK;
+            assert!(
+                [
+                    GetReadVersion::PRIORITY_BATCH,
+                    GetReadVersion::PRIORITY_DEFAULT,
+                    GetReadVersion::PRIORITY_SYSTEM_IMMEDIATE
+                ]
+                .contains(&priority),
+                "{:#x}",
+                r.flags
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_grv_proxies_are_chosen_less_often() {
+    let mut cluster = Cluster::new(SchemaVersion::V7_4, 1).await;
+    let busy = cluster.grv_proxy(10);
+    let idle = cluster.grv_proxy(11);
+    let commit = cluster.commit_proxy(20, 1);
+    cluster.publish(&[&busy, &idle], &[&commit]);
+    // `processBusyTime` is the recent request count times 10 000 plus the CPU busyness.
+    busy.busy.store(80 * 10_000 + 1_000, Ordering::SeqCst);
+    idle.busy.store(20 * 10_000 + 9_000, Ordering::SeqCst);
+    let reader = cluster.reader();
+    // Probabilities start even, and move by at most 0.1 of the load difference every 10 s
+    // when both proxies reported within the last 5 s.
+    for _ in 0..30 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let (busy_early, idle_early) = (
+        busy.requests.lock().unwrap().len(),
+        idle.requests.lock().unwrap().len(),
+    );
+    assert!(
+        busy_early >= 6 && idle_early >= 6,
+        "{busy_early} {idle_early}"
+    );
+    for _ in 0..200 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let (busy_before, idle_before) = (
+        busy.requests.lock().unwrap().len(),
+        idle.requests.lock().unwrap().len(),
+    );
+    // By now the busy proxy's probability is at its floor, 1 / (MAX_PROB * 2) = 0.25 of the
+    // total before normalization (0.25 / 1.25 = 0.2 after).
+    for _ in 0..200 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let busy_late = busy.requests.lock().unwrap().len() - busy_before;
+    let idle_late = idle.requests.lock().unwrap().len() - idle_before;
+    println!("late share: {busy_late} to the busy proxy, {idle_late} to the idle one");
+    assert!(busy_late + idle_late >= 200);
+    assert!(
+        busy_late * 10 < (busy_late + idle_late) * 4,
+        "{busy_late} vs {idle_late}"
+    );
+    assert!(busy_late > 0, "the busy proxy is still used");
+}
+
+#[tokio::test(start_paused = true)]
+async fn grv_proxies_without_load_stay_uniform() {
+    let mut cluster = Cluster::new(SchemaVersion::V8_0, 1).await;
+    let a = cluster.grv_proxy(10);
+    let b = cluster.grv_proxy(11);
+    let commit = cluster.commit_proxy(20, 1);
+    cluster.publish(&[&a, &b], &[&commit]);
+    // Little load (less than 20 requests per proxy): no adjustment, whatever the CPU says.
+    a.busy.store(5 * 10_000 + 9_000, Ordering::SeqCst);
+    b.busy.store(1_000, Ordering::SeqCst);
+    let reader = cluster.reader();
+    for _ in 0..300 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let (na, nb) = (
+        a.requests.lock().unwrap().len(),
+        b.requests.lock().unwrap().len(),
+    );
+    assert!(na > 100 && nb > 100, "{na} {nb}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_version_comes_from_read_versions_and_commits() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, grv, _commit) = Cluster::ready(schema, 1).await;
+        // What the storage server has for the key is not what the proxies report: reads
+        // answered by the cache are told apart.
+        cluster.set(METADATA_VERSION_KEY, b"from storage");
+        let reader = cluster.reader();
+        let served = || cluster.storage[0].served();
+
+        assert_eq!(reader.cached_metadata_version(1000), None);
+        *grv.metadata.lock().unwrap() = Some(b"m1".to_vec());
+        let (v1, m1) = within(
+            "GRV",
+            reader.get_read_version_and_metadata(ReadVersionOptions::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(m1.as_deref(), Some(&b"m1"[..]));
+        assert_eq!(
+            reader.cached_metadata_version(v1),
+            Some(Some(b"m1".to_vec()))
+        );
+        assert_eq!(
+            within("metadata", reader.metadata_version(v1))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"m1"[..])
+        );
+        assert_eq!(served(), 0, "{schema}: served from the cache");
+
+        // The key not being set is cached too.
+        *grv.metadata.lock().unwrap() = None;
+        let v2 = within("GRV", reader.get_read_version()).await.unwrap();
+        assert!(v2 > v1);
+        assert_eq!(reader.cached_metadata_version(v2), Some(None));
+        assert_eq!(
+            within("metadata", reader.metadata_version(v2))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(served(), 0);
+        // And the older one is still there.
+        assert_eq!(
+            reader.cached_metadata_version(v1),
+            Some(Some(b"m1".to_vec()))
+        );
+
+        // A version no reply was for is read from the storage server.
+        assert_eq!(reader.cached_metadata_version(v2 + 1), None);
+        let read = within("metadata", reader.metadata_version(v2 + 1))
+            .await
+            .unwrap();
+        assert_eq!(read.as_deref(), Some(&b"from storage"[..]));
+        assert_eq!(served(), 1);
+
+        // A locked database fails the read version for a transaction that is not lock aware,
+        // before its reply is cached (the proxy's version moves on); a lock-aware one
+        // caches it.
+        *grv.answer.lock().unwrap() = Ok(true);
+        *grv.metadata.lock().unwrap() = Some(b"locked".to_vec());
+        let e = within("GRV", reader.get_read_version()).await.unwrap_err();
+        assert_eq!(e.code(), codes::DATABASE_LOCKED);
+        let mut options = ReadVersionOptions::default();
+        options.lock_aware = true;
+        let (v3, m3) = within("GRV", reader.get_read_version_and_metadata(options))
+            .await
+            .unwrap();
+        assert_eq!(m3.as_deref(), Some(&b"locked"[..]));
+        assert_eq!(v3, v2 + 20, "the refused reply consumed a version");
+        assert_eq!(reader.cached_metadata_version(v3 - 10), None);
+        assert_eq!(
+            reader.cached_metadata_version(v3),
+            Some(Some(b"locked".to_vec()))
+        );
+
+        // A commit's version and metadata version are remembered, if newer than the rest.
+        reader.note_committed_version(v3 + 100, Some(b"c".to_vec()));
+        assert_eq!(
+            within("metadata", reader.metadata_version(v3 + 100))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"c"[..])
+        );
+        reader.note_committed_version(v3 + 50, Some(b"stale".to_vec()));
+        assert_eq!(
+            reader.cached_metadata_version(v3 + 50),
+            None,
+            "older than the newest"
+        );
+        assert_eq!(served(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_metadata_version_cache_is_bounded() {
+    let (cluster, grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    let mut config = ReadConfig::default();
+    config.metadata_version_cache_size = 3;
+    let reader = cluster.reader_with(config);
+    let mut versions = Vec::new();
+    for i in 0..5u8 {
+        *grv.metadata.lock().unwrap() = Some(vec![i]);
+        versions.push(within("GRV", reader.get_read_version()).await.unwrap());
+    }
+    for (i, v) in versions.iter().enumerate() {
+        let cached = reader.cached_metadata_version(*v);
+        if i < 2 {
+            assert_eq!(cached, None, "{i}");
+        } else {
+            assert_eq!(cached, Some(Some(vec![i as u8])), "{i}");
+        }
+    }
 }

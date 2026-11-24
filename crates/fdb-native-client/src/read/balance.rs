@@ -1,16 +1,22 @@
-//! The load balancers: `basicLoadBalance` (proxies) and a simplified `loadBalance` with its
-//! `QueueModel` (storage servers). See the [module documentation](super) for what is ported
-//! and what is left out.
+//! The load balancers: `basicLoadBalance` (proxies, with the `ModelInterface` weighting the
+//! GRV proxies by their `processBusyTime`) and `loadBalance` with its `QueueModel` (storage
+//! servers), including second (hedged) requests and lagging requests. See the [module
+//! documentation](super) for what is ported and what is left out.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::future::{Future, poll_fn};
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 
 use fdb_native_schema::domain::{GetKey, GetKeyReply, GetValue, GetValueReply, KeySelector};
 use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::rpc::RequestError;
-use fdb_native_transport::runtime::Runtime;
+use fdb_native_transport::runtime::{Runtime, TaskHandle};
 use fdb_native_wire::{DecodeError, EncodeError, Endpoint, ErrorOr, NetworkAddress, Uid};
 
 use super::Shared;
@@ -53,6 +59,30 @@ const ALTERNATIVES_FAILURE_SLOW_DELAY_RATIO: f64 = 0.04;
 const ALTERNATIVES_FAILURE_SLOW_MAX_DELAY: f64 = 30.0;
 /// `ALTERNATIVES_FAILURE_SKIP_DELAY` (1 s; 301 / 300).
 const ALTERNATIVES_FAILURE_SKIP_DELAY: f64 = 1.0;
+/// `MAX_LAGGING_REQUESTS_OUTSTANDING` (100 000; 288 / 287).
+const MAX_LAGGING_REQUESTS_OUTSTANDING: usize = 100_000;
+/// `INSTANT_SECOND_REQUEST_MULTIPLIER` (2; 289 / 288).
+const INSTANT_SECOND_REQUEST_MULTIPLIER: f64 = 2.0;
+/// `BASE_SECOND_REQUEST_TIME` (0.5 ms; 290 / 289).
+const BASE_SECOND_REQUEST_TIME: f64 = 0.0005;
+/// `SECOND_REQUEST_MULTIPLIER_GROWTH` (0.01; 291 / 290).
+const SECOND_REQUEST_MULTIPLIER_GROWTH: f64 = 0.01;
+/// `SECOND_REQUEST_MULTIPLIER_DECAY` (0.00025; 292 / 291).
+const SECOND_REQUEST_MULTIPLIER_DECAY: f64 = 0.00025;
+/// `SECOND_REQUEST_BUDGET_GROWTH` (0.05; 293 / 292).
+const SECOND_REQUEST_BUDGET_GROWTH: f64 = 0.05;
+/// `SECOND_REQUEST_MAX_BUDGET` (100; 294 / 293).
+const SECOND_REQUEST_MAX_BUDGET: f64 = 100.0;
+/// `BASIC_LOAD_BALANCE_UPDATE_RATE` (10 s; 307 / 306).
+const BASIC_LOAD_BALANCE_UPDATE_RATE: f64 = 10.0;
+/// `BASIC_LOAD_BALANCE_MAX_CHANGE` (0.10; 308 / 307).
+const BASIC_LOAD_BALANCE_MAX_CHANGE: f64 = 0.10;
+/// `BASIC_LOAD_BALANCE_MAX_PROB` (2; 309 / 308).
+const BASIC_LOAD_BALANCE_MAX_PROB: f64 = 2.0;
+/// `BASIC_LOAD_BALANCE_MIN_REQUESTS` (20; 310 / 309).
+const BASIC_LOAD_BALANCE_MIN_REQUESTS: f64 = 20.0;
+/// `BASIC_LOAD_BALANCE_COMPUTE_PRECISION` (10000; 313 / 312).
+const BASIC_LOAD_BALANCE_COMPUTE_PRECISION: i32 = 10_000;
 
 /// `Smoother` (`fdbrpc/include/fdbrpc/Smoother.h`): a total, and an estimate that follows it
 /// exponentially with time constant `e_folding`.
@@ -121,11 +151,27 @@ impl Default for QueueData {
     }
 }
 
-/// `QueueModel` (`fdbrpc/QueueModel.cpp`), keyed by the endpoint token's `first`, without
-/// the second-request budget.
-#[derive(Debug, Default)]
+/// `QueueModel` (`fdbrpc/QueueModel.cpp`), keyed by the endpoint token's `first`, with the
+/// second-request state (`secondMultiplier`, `secondBudget`).
+#[derive(Debug)]
 pub(crate) struct QueueModel {
     data: HashMap<u64, QueueData>,
+    /// `secondMultiplier`: scales how long the first request is given before a second one
+    /// is sent (at least 1; grows with each second request, decays with each reply).
+    pub(crate) second_multiplier: f64,
+    /// `secondBudget`: how many second requests may be sent; earned by replies to first
+    /// requests, spent one per second request.
+    pub(crate) second_budget: f64,
+}
+
+impl Default for QueueModel {
+    fn default() -> Self {
+        QueueModel {
+            data: HashMap::new(),
+            second_multiplier: 1.0,
+            second_budget: 0.0,
+        }
+    }
 }
 
 impl QueueModel {
@@ -187,26 +233,65 @@ impl QueueModel {
     pub(crate) fn measurement(&mut self, id: u64) -> &mut QueueData {
         self.data.entry(id).or_default()
     }
+
+    /// A first request got its reply (`loadBalance`, in the branch that sends one request):
+    /// the multiplier decays toward 1 and the budget grows.
+    pub(crate) fn first_request_replied(&mut self) {
+        self.second_multiplier =
+            (self.second_multiplier - SECOND_REQUEST_MULTIPLIER_DECAY).max(1.0);
+        self.second_budget =
+            (self.second_budget + SECOND_REQUEST_BUDGET_GROWTH).min(SECOND_REQUEST_MAX_BUDGET);
+    }
+
+    /// The second-request delay timer fired: spends one unit of budget on a second request
+    /// if there is one (and makes the next one wait longer), else it is not sent.
+    pub(crate) fn try_second_request(&mut self) -> bool {
+        if self.second_budget >= 1.0 {
+            self.second_multiplier += SECOND_REQUEST_MULTIPLIER_GROWTH;
+            self.second_budget -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// How long `loadBalance` gives the first request before sending a second one to the
+/// next-best replica, from the latencies of the best and the next replica: `None` if the
+/// next one's latency is unknown (`nextTime >= 1e9`: there is no second choice), `Some(0)`
+/// to send it at once (the best replica is more than `INSTANT_SECOND_REQUEST_MULTIPLIER`
+/// times slower than the delay would be), else `secondMultiplier * nextTime +
+/// BASE_SECOND_REQUEST_TIME`.
+fn second_delay_secs(best_time: f64, next_time: f64, multiplier: f64) -> Option<f64> {
+    if next_time >= 1e9 {
+        return None;
+    }
+    let delay = multiplier * next_time + BASE_SECOND_REQUEST_TIME;
+    if best_time > INSTANT_SECOND_REQUEST_MULTIPLIER * delay {
+        Some(0.0)
+    } else {
+        Some(delay)
+    }
 }
 
 /// `ModelHolder`: a request counted in the model, released once with its outcome, or as
-/// unclean (with no latency and no penalty) if the request is abandoned.
-struct ModelHolder<'a, R> {
-    model: &'a Mutex<QueueModel>,
-    rt: &'a R,
+/// unclean (with no latency and no penalty) if the request is abandoned. Owns what it needs
+/// to outlive the call that made it: a request that lost to its second request goes on as a
+/// lagging request (see [`RequestData`]).
+struct ModelHolder<R: Runtime, W> {
+    shared: Arc<Shared<R, W>>,
     id: u64,
     delta: f64,
     start: f64,
     released: bool,
 }
 
-impl<'a, R: Runtime> ModelHolder<'a, R> {
-    fn new(model: &'a Mutex<QueueModel>, rt: &'a R, id: u64) -> Self {
-        let start = now_secs(rt.now());
-        let delta = lock(model).add_request(id, start);
+impl<R: Runtime, W> ModelHolder<R, W> {
+    fn new(shared: Arc<Shared<R, W>>, id: u64) -> Self {
+        let start = now_secs(shared.rt.now());
+        let delta = lock(&shared.model).add_request(id, start);
         ModelHolder {
-            model,
-            rt,
+            shared,
             id,
             delta,
             start,
@@ -219,13 +304,13 @@ impl<'a, R: Runtime> ModelHolder<'a, R> {
             return;
         }
         self.released = true;
-        let now = now_secs(self.rt.now());
+        let now = now_secs(self.shared.rt.now());
         let latency = if clean || measure {
             now - self.start
         } else {
             0.0
         };
-        lock(self.model).end_request(
+        lock(&self.shared.model).end_request(
             self.id,
             latency,
             penalty,
@@ -237,12 +322,12 @@ impl<'a, R: Runtime> ModelHolder<'a, R> {
     }
 }
 
-impl<R> Drop for ModelHolder<'_, R> {
+impl<R: Runtime, W> Drop for ModelHolder<R, W> {
     fn drop(&mut self) {
         if !self.released {
             // `~ModelHolder`: unclean, no latency, no penalty. Time is not needed for that,
             // except to update the smoother, which the next use does anyway.
-            let mut model = lock(self.model);
+            let mut model = lock(&self.shared.model);
             let d = model.data.entry(self.id).or_default();
             let time = d.smooth_outstanding.time;
             d.smooth_outstanding.add_delta(-self.delta, time);
@@ -280,6 +365,168 @@ fn grow_backoff(backoff: f64) -> f64 {
         .min(LOAD_BALANCE_START_BACKOFF.max(backoff * LOAD_BALANCE_BACKOFF_RATE))
 }
 
+/// `ModelInterface` (`fdbrpc/MultiInterface.h`): the probabilities with which
+/// `basicLoadBalance` first tries each of a set of proxies. They start uniform, and follow
+/// what the proxies report as their `processBusyTime`: every
+/// `BASIC_LOAD_BALANCE_UPDATE_RATE` (10 s, as C++'s `recurring` updater) each probability
+/// moves by up to `BASIC_LOAD_BALANCE_MAX_CHANGE` toward the share of the proxy's load, when
+/// every proxy has reported within half that period and there is enough load to tell.
+///
+/// Ported for GRV proxies, which C++ builds with `BalanceOnRequests::True` (7.4,
+/// `NativeAPI` 2366, 2382, 3019) / `ProxyGrvMetric` (8.0, `ProxyLoadBalanceMetrics.h`): the
+/// load is the number of recent requests, `processBusyTime / COMPUTE_PRECISION`
+/// (`GrvProxyServer` packs the proxy's recent request count in the quotient and its CPU
+/// busyness in the remainder). Commit proxies are modelled on CPU
+/// (`processBusyTime % COMPUTE_PRECISION`), but nothing feeds them (a
+/// `GetKeyServerLocationsReply` is not a `BasicLoadBalancedReply`), so their probabilities
+/// stay uniform and need no model.
+#[derive(Debug)]
+pub(crate) struct ProxyModel {
+    alternatives: Vec<ProxyAlternative>,
+    /// When the next periodic update is due (the updater is evaluated lazily, in order,
+    /// before each use).
+    next_update: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ProxyAlternative {
+    probability: f64,
+    cumulative_probability: f64,
+    /// `processBusyTime` of the last reply (-1: none yet).
+    process_busy_time: i32,
+    last_update: f64,
+}
+
+impl ProxyModel {
+    /// A model of `n` proxies, uniform, created at `now` (seconds).
+    pub(crate) fn new(n: usize, now: f64) -> ProxyModel {
+        ProxyModel {
+            alternatives: (0..n)
+                .map(|i| ProxyAlternative {
+                    probability: 1.0 / n as f64,
+                    cumulative_probability: (i as f64 + 1.0) / n as f64,
+                    process_busy_time: -1,
+                    last_update: f64::NEG_INFINITY,
+                })
+                .collect(),
+            next_update: now + BASIC_LOAD_BALANCE_UPDATE_RATE,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.alternatives.len()
+    }
+
+    /// The probability of the `i`-th proxy being tried first.
+    #[cfg(test)]
+    fn probability(&self, i: usize) -> f64 {
+        self.alternatives[i].probability
+    }
+
+    /// `getBest`: the first proxy whose cumulative probability reaches `r` (a number in
+    /// `[0, 1)`).
+    pub(crate) fn get_best(&mut self, r: f64, now: f64) -> usize {
+        self.run_updates(now);
+        self.alternatives
+            .partition_point(|a| a.cumulative_probability < r)
+            .min(self.alternatives.len().saturating_sub(1))
+    }
+
+    /// `updateRecent`: the proxy answered, reporting `process_busy_time`.
+    pub(crate) fn update_recent(&mut self, index: usize, process_busy_time: i32, now: f64) {
+        self.run_updates(now);
+        if let Some(a) = self.alternatives.get_mut(index) {
+            a.process_busy_time = process_busy_time;
+            a.last_update = now;
+        }
+    }
+
+    /// The periodic updates due by `now`, each as of its own time (nothing changes the
+    /// model between calls, so what the updater would have seen is what is here).
+    fn run_updates(&mut self, now: f64) {
+        while self.next_update <= now {
+            let at = self.next_update;
+            self.next_update += BASIC_LOAD_BALANCE_UPDATE_RATE;
+            if !self.update_probabilities(at) {
+                // Nothing changed, so no later update before the next report does either.
+                let missed = ((now - self.next_update) / BASIC_LOAD_BALANCE_UPDATE_RATE).floor();
+                if missed > 0.0 {
+                    self.next_update += missed * BASIC_LOAD_BALANCE_UPDATE_RATE;
+                }
+            }
+        }
+    }
+
+    /// `updateProbabilities` for `balanceOnRequests`. Returns whether it changed anything.
+    fn update_probabilities(&mut self, now: f64) -> bool {
+        let n = self.alternatives.len() as f64;
+        let metric = |a: &ProxyAlternative| {
+            f64::from(a.process_busy_time / BASIC_LOAD_BALANCE_COMPUTE_PRECISION)
+        };
+        let mut total_busy = 0.0;
+        for a in &self.alternatives {
+            total_busy += metric(a);
+            if now - a.last_update > BASIC_LOAD_BALANCE_UPDATE_RATE / 2.0 {
+                return false;
+            }
+        }
+        if total_busy < BASIC_LOAD_BALANCE_MIN_REQUESTS * n {
+            return false;
+        }
+        let mut total_probability = 0.0;
+        for a in &mut self.alternatives {
+            let busy = metric(a);
+            a.probability += (1.0 / n - (busy / total_busy)) * BASIC_LOAD_BALANCE_MAX_CHANGE;
+            a.probability = a.probability.max(1.0 / (BASIC_LOAD_BALANCE_MAX_PROB * n));
+            a.probability = a.probability.min(BASIC_LOAD_BALANCE_MAX_PROB / n);
+            total_probability += a.probability;
+        }
+        for a in &mut self.alternatives {
+            a.probability /= total_probability;
+        }
+        let mut cumulative = 0.0;
+        for a in &mut self.alternatives {
+            cumulative += a.probability;
+            a.cumulative_probability = cumulative;
+        }
+        if let Some(last) = self.alternatives.last_mut() {
+            last.cumulative_probability = 1.0;
+        }
+        true
+    }
+}
+
+/// Which proxies a [`ProxyModel`] weights, so that the model is replaced when they change
+/// (C++ builds a new `ModelInterface` for each new `ClientDBInfo`).
+pub(crate) type ProxyModelKey = (Uid, Vec<Uid>);
+
+/// The GRV proxies' model, for the info it was built for.
+#[derive(Debug, Default)]
+pub(crate) struct GrvModel {
+    current: Option<(ProxyModelKey, Arc<Mutex<ProxyModel>>)>,
+}
+
+impl GrvModel {
+    /// The model for `key`'s proxies: the current one, or a new uniform one.
+    pub(crate) fn get(&mut self, key: ProxyModelKey, now: f64) -> Arc<Mutex<ProxyModel>> {
+        match &self.current {
+            Some((k, model)) if *k == key => model.clone(),
+            _ => {
+                let model = Arc::new(Mutex::new(ProxyModel::new(key.1.len(), now)));
+                self.current = Some((key, model.clone()));
+                model
+            }
+        }
+    }
+}
+
+/// How `basicLoadBalance` weights its choice of proxy by the replies' `processBusyTime`.
+pub(crate) struct ProxyBalance<'a, T> {
+    pub(crate) model: &'a Mutex<ProxyModel>,
+    /// The reply's `processBusyTime` (`BasicLoadBalancedReply`).
+    pub(crate) busy_time: fn(&T) -> i32,
+}
+
 impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     fn is_failed(&self, (address, token): &(NetworkAddress, Uid)) -> bool {
         self.peers
@@ -293,11 +540,16 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     /// try them in turn, skipping failed ones, until one answers; a
     /// `broken_promise`/`request_maybe_delivered` moves on (with backoff once all were
     /// tried), any other error is returned. If all are failed, wait for one to come back.
+    ///
+    /// With `balance`, the first choice is weighted by what the proxies reported as their
+    /// `processBusyTime` (`ModelInterface::getBest`, `updateRecent`); without, it is uniform
+    /// (what a `ModelInterface` that is never told anything does).
     pub(crate) async fn basic_load_balance<T, E, D>(
         &self,
         alternatives: &[Endpoint],
         encode: E,
         decode: D,
+        balance: Option<ProxyBalance<'_, T>>,
     ) -> Result<T, Error>
     where
         E: Fn(SchemaVersion, Uid, &mut Vec<u8>) -> Result<(), EncodeError> + Clone + Send + 'static,
@@ -309,11 +561,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             .iter()
             .map(|e| (self.peers.primary_address(&e.addresses), e.token))
             .collect();
+        let balance = balance.filter(|b| lock(b.model).len() == n);
         let (best_alt, mut next_alt) = {
             let mut rng = lock(&self.rng);
             // `ModelInterface::getBest` picks by probabilities that start uniform and are
-            // adjusted from the proxies' `processBusyTime`; here they stay uniform.
-            let best = rng.below(n);
+            // adjusted from the proxies' `processBusyTime`.
+            let best = match &balance {
+                Some(b) => {
+                    let r = rng.unit();
+                    lock(b.model).get_best(r, now_secs(self.rt.now()))
+                }
+                None => rng.below(n),
+            };
             let mut next = rng.below((n - 1).max(1));
             if next >= best {
                 next += 1;
@@ -349,15 +608,22 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                         self.rt.sleep(secs(backoff)).await;
                     }
                     let (address, token) = targets[alt];
-                    let error =
-                        match try_get_reply(&self.peers, &address, token, encode.clone()).await {
-                            Ok((schema, payload)) => match decode(schema, &payload) {
-                                Ok(Ok(reply)) => return Ok(reply),
-                                Ok(Err(e)) => RequestError::from_reply_error(e),
-                                Err(e) => RequestError::Decode(e),
-                            },
-                            Err(e) => e,
-                        };
+                    let error = match try_get_reply(&self.peers, &address, token, encode.clone())
+                        .await
+                    {
+                        Ok((schema, payload)) => match decode(schema, &payload) {
+                            Ok(Ok(reply)) => {
+                                if let Some(b) = &balance {
+                                    let busy = (b.busy_time)(&reply);
+                                    lock(b.model).update_recent(alt, busy, now_secs(self.rt.now()));
+                                }
+                                return Ok(reply);
+                            }
+                            Ok(Err(e)) => RequestError::from_reply_error(e),
+                            Err(e) => RequestError::Decode(e),
+                        },
+                        Err(e) => e,
+                    };
                     let code = try_get_reply_code(&error);
                     if code != BROKEN_PROMISE && code != REQUEST_MAYBE_DELIVERED {
                         return Err(client_error(error));
@@ -421,10 +687,22 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     }
 
     /// `loadBalance` (`LoadBalance.actor.h` 7.4:686-1022, `LoadBalance.h` 8.0:307-620) of a
-    /// request to one stream of a shard's replicas ([`LoadBalanced`]), with the queue model
-    /// and without second (speculative) requests. Returns the reply's result, or the error to
-    /// surface (`wrong_shard_server`, `all_alternatives_failed`, `future_version`,
+    /// request to one stream of a shard's replicas ([`LoadBalanced`]), with the queue model,
+    /// second (speculative) requests and lagging requests. Returns the reply's result, or the
+    /// error to surface (`wrong_shard_server`, `all_alternatives_failed`, `future_version`,
     /// `transaction_too_old`, ...).
+    ///
+    /// **Second requests.** When the model has a second choice, the first request is given
+    /// `secondMultiplier * latency(second choice) + BASE_SECOND_REQUEST_TIME` (nothing, if
+    /// the first choice is more than `INSTANT_SECOND_REQUEST_MULTIPLIER` times slower than
+    /// that) before a second request goes to the next-best replica, if the model's
+    /// `secondBudget` has a whole unit to spend (replies to first requests earn it back at
+    /// `SECOND_REQUEST_BUDGET_GROWTH` each). The first good reply of the two is the result.
+    /// The other request is not cancelled but becomes a *lagging request*: it is awaited in
+    /// a task of its own so that its reply still updates the queue model (latency, penalty,
+    /// `future_version` backoff) and its outstanding count is released when it ends, as C++'s
+    /// `~RequestData` / `makeLaggingRequest` does. Only idempotent reads are sent this way;
+    /// there is no `AtMostOnce` mode here (commits do not use this balancer).
     ///
     /// The failure monitor is asked about the stream's own endpoint, as C++ does; the queue
     /// model is kept per server (by its `getValue` token), where C++ keeps it per endpoint.
@@ -433,6 +711,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         location: &Location,
         request: Q,
     ) -> Result<Q::Output, Error> {
+        let Some(this) = self.this.upgrade() else {
+            return Err(Error::new(OPERATION_CANCELLED));
+        };
         let alternatives = &location.servers;
         let n = alternatives.len();
         if n == 0 {
@@ -456,13 +737,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             (best, next)
         };
 
+        // When to send the second request, if the first is still out (`secondDelay`).
+        let mut second_delay: Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = None;
+
         // The model's choice: the replica with the fewest (smoothed, penalty-weighted)
         // outstanding requests, among the nearest unless too many of those are bad.
         {
             let now = now_secs(self.rt.now());
+            let started = self.rt.now();
             let mut model = lock(&self.model);
             let mut best_metric = 1e9;
             let mut next_metric = 1e9;
+            // The latency of the replica with the fewest outstanding requests, and of the
+            // one chosen to be second.
+            let mut best_time = 1e9;
+            let mut next_time = 1e9;
             let mut bad_servers = 0;
             for (i, target) in targets.iter().enumerate() {
                 if bad_servers < i.min(LOAD_BALANCE_MAX_BAD_OPTIONS + 1) && i == count_best {
@@ -475,6 +764,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 let qd = model.measurement(ids[i]);
                 if now > qd.failed_until {
                     let metric = qd.smooth_outstanding.smooth_total(now);
+                    let time = qd.latency;
                     if LOAD_BALANCE_PENALTY_IS_BAD && qd.penalty > 1.001 {
                         bad_servers += 1;
                     }
@@ -482,12 +772,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                         if i != best_alt {
                             next_alt = best_alt;
                             next_metric = best_metric;
+                            next_time = best_time;
                         }
                         best_alt = i;
                         best_metric = metric;
+                        best_time = time;
                     } else if metric < next_metric {
                         next_alt = i;
                         next_metric = metric;
+                        next_time = time;
                     }
                 } else {
                     bad_servers += 1;
@@ -501,12 +794,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     let qd = model.measurement(ids[i]);
                     if now > qd.failed_until {
                         let metric = qd.smooth_outstanding.smooth_total(now);
+                        let time = qd.latency;
                         if metric < next_metric {
                             next_alt = i;
                             next_metric = metric;
+                            next_time = time;
                         }
                     }
                 }
+            }
+            // Decide when to send the request to the second best choice.
+            if let Some(delay) = second_delay_secs(best_time, next_time, model.second_multiplier) {
+                second_delay = Some(Box::pin(self.rt.sleep_until(started + secs(delay))));
             }
         }
 
@@ -515,12 +814,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let mut num_attempts = 0;
         let mut backoff = 0.0;
         let mut tried_all = false;
+        // `firstRequestData` (`isValid()` is `is_some()`), and the endpoint of the first
+        // request, which no other request goes to.
+        let mut first: Option<RequestData<R, W, Q>> = None;
+        let mut first_endpoint: Option<u64> = None;
         loop {
             self.check_open()?;
+            // Find an alternative that is not failed, and not the first request's.
             let mut chosen = None;
             for _ in 0..n {
                 let alt = use_alt(next_alt, start_alt, best_alt, start_distance, n);
-                if !self.is_failed(&targets[alt]) {
+                if !self.is_failed(&targets[alt]) && first_endpoint != Some(ids[alt]) {
                     chosen = Some(alt);
                     break;
                 }
@@ -529,26 +833,118 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     tried_all = true;
                 }
             }
-            match chosen {
-                None => {
+            match (chosen, first.is_some()) {
+                (None, false) => {
+                    // Everything is down: wait for someone to be up.
                     self.all_alternatives_failed_delay(&targets).await?;
                     num_attempts = 0;
                 }
-                Some(alt) => {
-                    if backoff > 0.0 {
-                        self.rt.sleep(secs(backoff)).await;
-                    }
-                    let (address, token) = targets[alt];
-                    let mut holder = ModelHolder::new(&self.model, &self.rt, ids[alt]);
-                    let request = request.clone();
-                    let result = try_get_reply(&self.peers, &address, token, move |s, r, out| {
-                        request.encode_request_into(s, r, out)
-                    })
-                    .await;
-                    match check_and_process::<R, Q>(result, &mut holder, tried_all) {
+                (None, true) => {
+                    // Only the first location is available.
+                    let sent = poll_fn(|cx| first.as_mut().expect("first").poll_response(cx)).await;
+                    let tried = first.take().map_or(tried_all, |f| f.tried_all);
+                    match process::<R, W, Q>(sent, tried) {
                         Outcome::Done(value) => return Ok(value),
                         Outcome::Fail(error) => return Err(error),
                         Outcome::Retry => {}
+                    }
+                    first_endpoint = None;
+                }
+                (Some(alt), true) => {
+                    // Issue a second request, the first one is taking a long time.
+                    // `secondRequestData`.
+                    let mut second = Some(RequestData::start(
+                        &this,
+                        backoff,
+                        tried_all,
+                        targets[alt],
+                        ids[alt],
+                        request.clone(),
+                    ));
+                    loop {
+                        let ready = poll_fn(|cx| {
+                            if let Some(f) = first.as_mut() {
+                                if let Poll::Ready(sent) = f.poll_response(cx) {
+                                    return Poll::Ready(Either::Left(sent));
+                                }
+                            }
+                            match second.as_mut().expect("second").poll_response(cx) {
+                                Poll::Ready(sent) => Poll::Ready(Either::Right(sent)),
+                                Poll::Pending => Poll::Pending,
+                            }
+                        })
+                        .await;
+                        match ready {
+                            Either::Left(sent) => {
+                                let tried = first.take().map_or(tried_all, |f| f.tried_all);
+                                match process::<R, W, Q>(sent, tried) {
+                                    Outcome::Done(value) => return Ok(value),
+                                    Outcome::Fail(error) => return Err(error),
+                                    Outcome::Retry => {}
+                                }
+                                first_endpoint = None;
+                            }
+                            Either::Right(sent) => {
+                                let tried = second.take().map_or(tried_all, |f| f.tried_all);
+                                match process::<R, W, Q>(sent, tried) {
+                                    Outcome::Done(value) => return Ok(value),
+                                    Outcome::Fail(error) => return Err(error),
+                                    Outcome::Retry => break,
+                                }
+                            }
+                        }
+                    }
+                    num_attempts += 1;
+                    if num_attempts >= n {
+                        backoff = grow_backoff(backoff);
+                    }
+                }
+                (Some(alt), false) => {
+                    // Issue a request; if it takes too long to get a reply, send a second
+                    // one (budget allowing) or go around the loop.
+                    first = Some(RequestData::start(
+                        &this,
+                        backoff,
+                        tried_all,
+                        targets[alt],
+                        ids[alt],
+                        request.clone(),
+                    ));
+                    first_endpoint = Some(ids[alt]);
+                    loop {
+                        let ready = poll_fn(|cx| {
+                            if let Poll::Ready(sent) =
+                                first.as_mut().expect("first").poll_response(cx)
+                            {
+                                return Poll::Ready(Either::Left(sent));
+                            }
+                            if let Some(delay) = second_delay.as_mut() {
+                                if delay.as_mut().poll(cx).is_ready() {
+                                    return Poll::Ready(Either::Right(()));
+                                }
+                            }
+                            Poll::Pending
+                        })
+                        .await;
+                        match ready {
+                            Either::Left(sent) => {
+                                lock(&self.model).first_request_replied();
+                                let tried = first.take().map_or(tried_all, |f| f.tried_all);
+                                match process::<R, W, Q>(sent, tried) {
+                                    Outcome::Done(value) => return Ok(value),
+                                    Outcome::Fail(error) => return Err(error),
+                                    Outcome::Retry => {}
+                                }
+                                first_endpoint = None;
+                                break;
+                            }
+                            Either::Right(()) => {
+                                second_delay = None;
+                                if lock(&self.model).try_second_request() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     num_attempts += 1;
                     if num_attempts >= n {
@@ -563,8 +959,167 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             if next_alt == start_alt {
                 tried_all = true;
             }
+            second_delay = None;
         }
     }
+}
+
+/// A reply, or why there is none, with the model entry its request was counted in.
+type Sent<R, W> = (
+    ModelHolder<R, W>,
+    Result<(SchemaVersion, Vec<u8>), RequestError>,
+);
+
+/// A request in flight: resolves with its reply once it is done.
+type Response<R, W> = Pin<Box<dyn Future<Output = Sent<R, W>> + Send>>;
+
+/// `RequestData`: a request `load_balance` has started (after its backoff, if any), and what
+/// its reply has to update. If it is dropped before its reply was processed (the other
+/// request won, or `load_balance` returned or was cancelled), it goes on as a lagging
+/// request (`makeLaggingRequest`): a task awaits the reply and updates the queue model, so
+/// that a slow server's latency and penalty are learned, and its outstanding request counts
+/// until it ends. Dropping one that has not been sent yet (still in its backoff) is
+/// harmless.
+struct RequestData<R: Runtime, W: StreamWrapper<R::Stream>, Q: LoadBalanced> {
+    shared: Arc<Shared<R, W>>,
+    /// The reply, once the request is done. `None` once it was taken.
+    response: Option<Response<R, W>>,
+    /// Whether the request was sent (`requestStarted`).
+    started: Arc<AtomicBool>,
+    /// `triedAllOptions` when the request was started.
+    tried_all: bool,
+    request: PhantomData<fn() -> Q>,
+}
+
+impl<R: Runtime, W: StreamWrapper<R::Stream>, Q: LoadBalanced> RequestData<R, W, Q> {
+    /// `startRequest`: sends `request` to `target` after `backoff` seconds, counting it in
+    /// the queue model as `id`.
+    fn start(
+        shared: &Arc<Shared<R, W>>,
+        backoff: f64,
+        tried_all: bool,
+        target: (NetworkAddress, Uid),
+        id: u64,
+        request: Q,
+    ) -> Self {
+        let started = Arc::new(AtomicBool::new(false));
+        let response: Response<R, W> = {
+            let shared = shared.clone();
+            let started = started.clone();
+            Box::pin(async move {
+                if backoff > 0.0 {
+                    shared.rt.sleep(secs(backoff)).await;
+                }
+                started.store(true, Ordering::Release);
+                let holder = ModelHolder::new(shared.clone(), id);
+                let (address, token) = target;
+                let result = try_get_reply(&shared.peers, &address, token, move |s, r, out| {
+                    request.encode_request_into(s, r, out)
+                })
+                .await;
+                (holder, result)
+            })
+        };
+        RequestData {
+            shared: shared.clone(),
+            response: Some(response),
+            started,
+            tried_all,
+            request: PhantomData,
+        }
+    }
+
+    /// Polls for the reply; pending for good once it was taken.
+    fn poll_response(&mut self, cx: &mut Context<'_>) -> Poll<Sent<R, W>> {
+        let Some(response) = self.response.as_mut() else {
+            return Poll::Pending;
+        };
+        match response.as_mut().poll(cx) {
+            Poll::Ready(sent) => {
+                self.response = None;
+                Poll::Ready(sent)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<R: Runtime, W: StreamWrapper<R::Stream>, Q: LoadBalanced> Drop for RequestData<R, W, Q> {
+    fn drop(&mut self) {
+        let Some(response) = self.response.take() else {
+            return;
+        };
+        if !self.started.load(Ordering::Acquire) {
+            return;
+        }
+        let tried_all = self.tried_all;
+        let task = self.shared.rt.spawn(async move {
+            let (mut holder, result) = response.await;
+            // Only what the model learns from it matters: the reply is not used.
+            let _ = check_and_process::<R, W, Q>(result, &mut holder, tried_all);
+        });
+        self.shared.add_lagging(task);
+    }
+}
+
+impl<R: Runtime, W> Shared<R, W> {
+    /// Keeps the task of a lagging request (`laggingRequests`, an `actorCollection`) so that it
+    /// can be cancelled with the reader. As C++ does, past
+    /// `MAX_LAGGING_REQUESTS_OUTSTANDING` it cancels them all and starts over.
+    fn add_lagging(&self, task: R::Task<()>) {
+        let mut lagging = lock(&self.lagging);
+        if lagging.tasks.len() >= lagging.prune_at {
+            lagging.tasks.retain(|t| !t.is_finished());
+            lagging.prune_at = (2 * lagging.tasks.len()).max(64);
+        }
+        if lagging.tasks.len() > MAX_LAGGING_REQUESTS_OUTSTANDING {
+            for old in lagging.tasks.drain(..) {
+                old.abort();
+            }
+            lagging.prune_at = 64;
+        }
+        lagging.tasks.push(task);
+    }
+
+    /// Cancels the lagging requests (the reader ended).
+    pub(super) fn abort_lagging(&self) {
+        for task in lock(&self.lagging).tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// The lagging requests' tasks.
+pub(crate) struct Lagging<R: Runtime> {
+    tasks: Vec<R::Task<()>>,
+    /// The size at which finished tasks are dropped from `tasks`.
+    prune_at: usize,
+}
+
+impl<R: Runtime> Default for Lagging<R> {
+    fn default() -> Self {
+        Lagging {
+            tasks: Vec::new(),
+            prune_at: 64,
+        }
+    }
+}
+
+impl<R: Runtime> std::fmt::Debug for Lagging<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lagging")
+            .field("tasks", &self.tasks.len())
+            .finish()
+    }
+}
+
+/// [`check_and_process`] of a reply that arrived in `load_balance`.
+fn process<R: Runtime, W, Q: LoadBalanced>(
+    sent: Sent<R, W>,
+    tried_all: bool,
+) -> Outcome<Q::Output> {
+    let (mut holder, result) = sent;
+    check_and_process::<R, W, Q>(result, &mut holder, tried_all)
 }
 
 /// A request [`Shared::load_balance`] sends to one stream of a shard's storage servers, whose
@@ -615,9 +1170,9 @@ enum Outcome<T> {
 
 /// `RequestData::checkAndProcessResultImpl` (`LoadBalance.actor.h` 7.4:572-627,
 /// `LoadBalance.h` 8.0:175-229) for a `LoadBalancedReply`, not `AtMostOnce`.
-fn check_and_process<R: Runtime, Q: LoadBalanced>(
+fn check_and_process<R: Runtime, W, Q: LoadBalanced>(
     result: Result<(SchemaVersion, Vec<u8>), RequestError>,
-    holder: &mut ModelHolder<'_, R>,
+    holder: &mut ModelHolder<R, W>,
     tried_all: bool,
 ) -> Outcome<Q::Output> {
     // The reply decoded: `Ok` is a `LoadBalancedReply` (penalty, error, result).
@@ -684,6 +1239,120 @@ mod tests {
         // A clean reply resets the future-version backoff.
         m.end_request(1, 0.01, 1.0, 0.0, true, false, 5.0);
         assert_eq!(m.measurement(1).future_version_backoff, 1.0);
+    }
+
+    #[test]
+    fn second_delay_follows_the_latencies() {
+        // No second choice: never.
+        assert_eq!(second_delay_secs(0.001, 1e9, 1.0), None);
+        // Comparable latencies: the second one's latency plus the base time.
+        let d = second_delay_secs(0.001, 0.001, 1.0).unwrap();
+        assert!((d - 0.0015).abs() < 1e-12, "{d}");
+        // The multiplier stretches it.
+        let d = second_delay_secs(0.001, 0.001, 2.0).unwrap();
+        assert!((d - 0.0025).abs() < 1e-12, "{d}");
+        // A first choice more than twice as slow as that is not waited for.
+        assert_eq!(second_delay_secs(0.01, 0.001, 1.0), Some(0.0));
+        // Not quite twice as slow is still waited for (`>`).
+        assert!(second_delay_secs(0.003, 0.001, 1.0).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn second_requests_spend_the_budget() {
+        let mut m = QueueModel::default();
+        assert_eq!(m.second_multiplier, 1.0);
+        // No budget at first.
+        assert!(!m.try_second_request());
+        assert_eq!(m.second_multiplier, 1.0);
+        // 20 replies earn one request.
+        for _ in 0..19 {
+            m.first_request_replied();
+        }
+        assert!(!m.try_second_request(), "{}", m.second_budget);
+        m.first_request_replied();
+        assert!(m.try_second_request());
+        assert!((m.second_multiplier - 1.01).abs() < 1e-12);
+        assert!(m.second_budget < 1e-9);
+        // Replies decay the multiplier toward 1, never below.
+        for _ in 0..20 {
+            m.first_request_replied();
+        }
+        assert!((m.second_multiplier - (1.01 - 20.0 * 0.00025)).abs() < 1e-9);
+        for _ in 0..1000 {
+            m.first_request_replied();
+        }
+        assert_eq!(m.second_multiplier, 1.0);
+        // The budget is capped.
+        for _ in 0..10_000 {
+            m.first_request_replied();
+        }
+        assert_eq!(m.second_budget, 100.0);
+    }
+
+    #[test]
+    fn proxy_model_follows_busy_time_like_cpp() {
+        // The numbers of `/fdbclient/NativeAPI/proxyLoadBalanceMetrics` (8.0), GRV model.
+        let precision = BASIC_LOAD_BALANCE_COMPUTE_PRECISION;
+        let mut m = ProxyModel::new(2, 0.0);
+        assert_eq!((m.probability(0), m.probability(1)), (0.5, 0.5));
+        let update = |m: &mut ProxyModel, first: i32, second: i32| {
+            m.update_recent(0, first, 1.0);
+            m.update_recent(1, second, 1.0);
+            m.update_probabilities(1.0)
+        };
+        assert!(update(&mut m, 80 * precision + 1000, 20 * precision + 9000));
+        assert!((m.probability(0) - 0.47).abs() < 1e-12);
+        assert!((m.probability(1) - 0.53).abs() < 1e-12);
+        // Too little load (39 < 20 per proxy): unchanged.
+        assert!(!update(
+            &mut m,
+            19 * precision + 9000,
+            20 * precision + 1000
+        ));
+        assert!((m.probability(0) - 0.47).abs() < 1e-12);
+        // Only the quotient counts: the CPU part is ignored.
+        assert!(update(&mut m, 40 * precision, 0));
+        assert!((m.probability(0) - 0.42).abs() < 1e-12);
+        // Selection by cumulative probability.
+        assert_eq!(m.get_best(0.0, 1.0), 0);
+        assert_eq!(m.get_best(0.41, 1.0), 0);
+        assert_eq!(m.get_best(0.43, 1.0), 1);
+        assert_eq!(m.get_best(0.999, 1.0), 1);
+    }
+
+    #[test]
+    fn proxy_model_updates_every_period_and_only_from_fresh_reports() {
+        let precision = BASIC_LOAD_BALANCE_COMPUTE_PRECISION;
+        let mut m = ProxyModel::new(2, 0.0);
+        m.update_recent(0, 80 * precision, 8.0);
+        m.update_recent(1, 20 * precision, 8.0);
+        // Before the first period nothing moved.
+        m.get_best(0.5, 9.0);
+        assert_eq!(m.probability(0), 0.5);
+        // The tick at 10 s saw reports 2 s old.
+        m.get_best(0.5, 12.0);
+        assert!((m.probability(0) - 0.47).abs() < 1e-12);
+        // The tick at 20 s saw reports 12 s old, and so did every later one.
+        m.get_best(0.5, 1000.0);
+        assert!((m.probability(0) - 0.47).abs() < 1e-12);
+        // A proxy that has not reported yet holds the update back.
+        let mut m = ProxyModel::new(3, 0.0);
+        m.update_recent(0, 80 * precision, 9.0);
+        m.update_recent(1, 20 * precision, 9.0);
+        m.get_best(0.5, 10.5);
+        assert_eq!(m.probability(0), 1.0 / 3.0);
+    }
+
+    #[test]
+    fn grv_model_is_replaced_with_the_proxies() {
+        let mut g = GrvModel::default();
+        let key = (Uid::new(1, 1), vec![Uid::new(2, 2), Uid::new(3, 3)]);
+        let a = g.get(key.clone(), 0.0);
+        assert!(Arc::ptr_eq(&a, &g.get(key.clone(), 5.0)));
+        let other = (Uid::new(1, 2), key.1.clone());
+        let b = g.get(other, 6.0);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(b.lock().unwrap().len(), 2);
     }
 
     #[test]
