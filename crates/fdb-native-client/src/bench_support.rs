@@ -91,6 +91,6 @@ impl Cursor {
             + usize::from(it.is_unreadable())
             + usize::from(it.is_cleared_range())
             + usize::from(it.is_operation())
-            + it.op().map_or(0, ryw::OperationStack::len)
+            + it.op().map_or(0, |stack| stack.len())
     }
 }
