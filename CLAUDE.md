@@ -141,6 +141,29 @@ the bytes of seeded messages (digests recorded from the pre-vvh.8 encoder).
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.
 
+## Bindingtester conformance
+
+`tools/bindingtester/run.sh` runs the upstream bindingtester (Python binding + `libfdb_c`, in Docker,
+pinned to FDB 7.4.10 and 8.0.1) comparing the Python stack machine against `fdb-native-stacktester`
+on the `api`, `scripted` and `tuple` suites; the stacktester is registered as `rust` through a
+wrapper (`overlay/run_bindingtester.py`: min API 520, all types, 2040-bit ints, no tenants, no
+directory layer). Dev-only, manual (`.github/workflows/bindingtester.yml` is `workflow_dispatch`).
+
+```bash
+tools/bindingtester/run.sh -V 7.4                      # builds the tester, 3 seeds of api+scripted+tuple (~100 s)
+tools/bindingtester/run.sh -V 8.0 -s api --seeds 20 -n 500
+tools/bindingtester/run.sh --self-test -V 8.0          # python vs python: checks the harness only
+```
+
+Needs docker, git, curl (optionally `FDB_SRC=/path/to/foundationdb`, read only). It starts its own
+disposable FDB container and removes it by ID on exit; the bindingtester wipes the whole database,
+so never aim it at a shared cluster. Logs and `summary.tsv` per seed go to
+`tools/bindingtester/results/` (gitignored). Known expected difference: Python packs
+`+-(2^64-1)` with `1d`/`0b` where we use `1c`/`0c`; by default the harness rewrites those two
+values in the `tuple` test (`--int-edge keep` shows the 2 resulting differences). On 7.4 the
+cluster is configured with `tenant_mode=optional_experimental` (the 7.4 bindingtester clears the
+tenant map). Details: `tools/bindingtester/README.md`.
+
 ## Architecture Overview
 
 Pure-Rust native FoundationDB client that speaks the wire protocol directly (no `libfdb_c`),
