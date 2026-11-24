@@ -114,7 +114,10 @@
 //! [`reset`](Transaction::reset); not from [`on_error`](Transaction::on_error)): once it
 //! has passed, every operation, including one in progress and `on_error`, fails with
 //! `transaction_timed_out` (1031) until the transaction is reset. Setting the option applies
-//! to the operations in progress too (at once if the deadline has already passed).
+//! to the operations in progress too (at once if the deadline has already passed). As with
+//! C++'s timer, a deadline that has passed has killed the transaction even if nothing ran
+//! then: changing or removing the timeout afterwards does not bring it back, and a later
+//! [`cancel`](Transaction::cancel) leaves the error `transaction_timed_out`.
 //! [`cancel`](Transaction::cancel) does the same with `transaction_cancelled` (1025), and a
 //! [`reset`](Transaction::reset) (or `on_error`) makes the operations in progress fail with
 //! `transaction_cancelled`. The future of [`get_versionstamp`](Transaction::get_versionstamp)
@@ -476,15 +479,24 @@ impl State {
 
     /// Fails if the transaction is dead, or its timeout has passed (which kills it).
     fn check_alive(&mut self, now: Instant) -> Result<(), Error> {
-        if let Some(e) = &self.dead {
-            return Err(e.clone());
+        self.fire_timebomb(now);
+        match &self.dead {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
-        if self.deadline().is_some_and(|deadline| deadline <= now) {
-            let e = Error::new(TRANSACTION_TIMED_OUT);
-            self.kill(e.clone());
-            return Err(e);
+    }
+
+    /// `timebomb` (`ReadYourWrites.actor.cpp`): C++ arms a timer that sets `resetPromise`
+    /// to `transaction_timed_out` at the deadline, whatever the transaction is doing. Here
+    /// the deadline is looked at whenever the transaction is ([`Transaction::state`], and
+    /// every wait of an operation in progress): one that has passed kills the transaction
+    /// then, before anything else happens to it, as if the timer had fired at the deadline.
+    /// So a later change of the timeout (`set_option(Timeout(0))` included), a `cancel` or
+    /// a `used_during_commit` does not replace the timeout.
+    fn fire_timebomb(&mut self, now: Instant) {
+        if self.dead.is_none() && self.deadline().is_some_and(|deadline| deadline <= now) {
+            self.kill(Error::new(TRANSACTION_TIMED_OUT));
         }
-        Ok(())
     }
 
     /// Makes every operation fail with `error` (the first such error stays) until a full
@@ -597,7 +609,7 @@ impl<R: Runtime> Clone for Transaction<R> {
 
 impl<R: Runtime> fmt::Debug for Transaction<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state();
+        let state = lock(&self.inner.state);
         f.debug_struct("Transaction")
             .field("read_version", &state.read_version)
             .field("retries", &state.retries)
@@ -786,8 +798,12 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
+    /// The transaction's state, killed first if its deadline has passed
+    /// ([`State::fire_timebomb`]).
     fn state(&self) -> MutexGuard<'_, State> {
-        lock(&self.inner.state)
+        let mut state = lock(&self.inner.state);
+        state.fire_timebomb(self.rt().now());
+        state
     }
 
     fn rt(&self) -> &R {
@@ -1350,10 +1366,11 @@ impl<R: Runtime> Transaction<R> {
     }
 
     /// A mutation (`set`, `clear`, `clear_range` or `atomic_op`): `f` on the state (its
-    /// buffer), unless the transaction is committing (`used_during_commit`) or dead, or the
-    /// handle is stale; its error is deferred. On success, the state (still locked) and what
-    /// `f` returned: the write's watches are triggered then (`triggerWatches` comes after the
-    /// write's checks).
+    /// buffer), unless the transaction is committing (`used_during_commit`) or the handle is
+    /// stale; its error is deferred. On success, the state (still locked) and what `f`
+    /// returned: the write's watches are triggered then (`triggerWatches` comes after the
+    /// write's checks), unless the transaction is dead (cancelled or timed out: the write
+    /// is made, as in C++, but its watches have failed already).
     ///
     /// The `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option is used up first thing, as the
     /// read-your-writes layer's `getAndResetWriteConflictDisabled` does (whatever the write
@@ -1380,9 +1397,6 @@ impl<R: Runtime> Transaction<R> {
             state.defer(Self::stale());
             return None;
         }
-        if state.dead.is_some() {
-            return None;
-        }
         if let Err(e) = state.check_not_committing() {
             state.defer(e);
             return None;
@@ -1391,6 +1405,12 @@ impl<R: Runtime> Transaction<R> {
         let result = f(&mut state, !skip_conflict);
         state.buffer.set_skip_write_conflict(false);
         match result {
+            // C++'s writes do not look at `resetPromise`: on a cancelled or timed-out
+            // transaction a write is still checked, its error deferred (which the next
+            // operation returns before the cancellation), and applied (only
+            // `approximate_size` sees it). It triggers no watch: the transaction's watches
+            // have failed with its error already.
+            Ok(_) if state.dead.is_some() => None,
             Ok(t) => Some((state, t)),
             Err(e) => {
                 state.defer(e);
@@ -1420,12 +1440,30 @@ impl<R: Runtime> Transaction<R> {
     /// been sent, that error [`is_maybe_committed`](Error::is_maybe_committed).
     pub async fn commit(&self) -> Result<CommitResult, Error> {
         let sent = Arc::new(AtomicBool::new(false));
-        let epoch = self.state().epoch;
-        let result = match self.guarded(epoch, self.commit_inner(&sent, epoch)).await {
-            Ok(result) => result,
-            // Interrupted (cancelled, timed out, reset) once the request may have left.
-            Err(e) if sent.load(Ordering::SeqCst) => Err(e.into_maybe_committed()),
-            Err(e) => Err(e),
+        let (epoch, deferred) = {
+            let mut state = self.state();
+            // `ThreadSafeTransaction::commit` checks the deferred error first
+            // (`checkDeferredError`), before the transaction's cancellation or timeout,
+            // as every other operation does here.
+            let deferred = match self.is_stale(&state) {
+                true => None,
+                false => state.deferred.clone(),
+            };
+            if let Some(e) = &deferred {
+                // C++ leaves the `getVersionstamp` futures pending until the reset; they
+                // get the deferred error here, as the commit never will.
+                state.resolve_versionstamp(Err(e.clone()));
+            }
+            (state.epoch, deferred)
+        };
+        let result = match deferred {
+            Some(e) => Err(e),
+            None => match self.guarded(epoch, self.commit_inner(&sent, epoch)).await {
+                Ok(result) => result,
+                // Interrupted (cancelled, timed out, reset) once the request may have left.
+                Err(e) if sent.load(Ordering::SeqCst) => Err(e.into_maybe_committed()),
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = &result {
             // `commitAndWatch`: the watches fail with the commit's error.
@@ -1681,6 +1719,13 @@ impl<R: Runtime> Transaction<R> {
     pub async fn on_error(&self, error: Error) -> Result<(), Error> {
         let maybe_committed = error.is_maybe_committed();
         self.on_error_inner(error).await.map_err(|e| {
+            // `RYWImpl::onError` (7.4:1531, 8.0:1532): `if (e.code() ==
+            // error_code_broken_promise) throw transaction_cancelled();`.
+            let e = if e.code() == BROKEN_PROMISE {
+                Error::new(TRANSACTION_CANCELLED)
+            } else {
+                e
+            };
             if maybe_committed {
                 e.into_maybe_committed()
             } else {
@@ -1702,7 +1747,7 @@ impl<R: Runtime> Transaction<R> {
             let retry = if limit_hit {
                 Err(error.clone())
             } else {
-                error.on_error()
+                error.on_error_for(self.inner.db.inner.monitor.schema_version())
             };
             let knobs = &self.inner.db.inner.knobs;
             let delay = match retry {
@@ -1750,7 +1795,8 @@ impl<R: Runtime> Transaction<R> {
         state.apply_option(&option)?;
         if let TransactionOption::Timeout(_) = option {
             // `resetTimeout`: the operations in progress see the new deadline (and fail at
-            // once if it has passed).
+            // once if it has passed). A deadline that passed before this call has killed
+            // the transaction already (`state()`), and no new timeout brings it back.
             if state.check_alive(self.rt().now()).is_ok() {
                 state.interrupt(|| Interrupt::Deadline);
             }

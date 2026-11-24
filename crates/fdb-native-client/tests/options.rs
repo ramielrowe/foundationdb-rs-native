@@ -166,7 +166,10 @@ fn option_codes_and_persistence_are_those_of_fdb_options() {
         assert_eq!(option.is_persistent(), persistent, "{option:?}");
     }
     let database: Vec<(DatabaseOption, i32, Option<TransactionOption>)> = vec![
+        (DatabaseOption::LocationCacheSize(1), 10, None),
         (DatabaseOption::MaxWatches(1), 20, None),
+        (DatabaseOption::MachineId(Some(b"m".to_vec())), 21, None),
+        (DatabaseOption::DatacenterId(None), 22, None),
         (DatabaseOption::SnapshotRywEnable, 26, None),
         (DatabaseOption::SnapshotRywDisable, 27, None),
         (
@@ -657,6 +660,7 @@ async fn database_options_validate_their_values() {
         DatabaseOption::MaxWatches(1_000_001),
         DatabaseOption::TransactionLoggingMaxFieldLength(0),
         DatabaseOption::TransactionLoggingMaxFieldLength(-2),
+        DatabaseOption::LocationCacheSize(i32::MAX as usize + 1),
     ] {
         assert_eq!(
             env.db.set_option(option.clone()).unwrap_err().code(),
@@ -681,11 +685,52 @@ async fn database_options_validate_their_values() {
         DatabaseOption::TransactionIncludePortInAddress,
         DatabaseOption::TransactionBypassUnreadable,
         DatabaseOption::TransactionUsedDuringCommitProtectionDisable,
+        DatabaseOption::LocationCacheSize(0),
+        DatabaseOption::LocationCacheSize(i32::MAX as usize),
+        DatabaseOption::MachineId(None),
+        DatabaseOption::DatacenterId(None),
     ] {
         env.db
             .set_option(option.clone())
             .unwrap_or_else(|e| panic!("{option:?}: {e}"));
     }
+}
+
+/// `LOCATION_CACHE_SIZE`, `MACHINE_ID` and `DATACENTER_ID` (the Python tester's
+/// `test_db_options`) reach the read path.
+#[tokio::test(start_paused = true)]
+async fn location_cache_size_machine_id_and_datacenter_id() {
+    let env = env(SchemaVersion::V8_0).await;
+    let reader = env.db.reader();
+    assert_eq!(reader.location_cache_size(), 600_000);
+    env.db
+        .set_option(DatabaseOption::LocationCacheSize(100_001))
+        .unwrap();
+    assert_eq!(reader.location_cache_size(), 100_001);
+    env.db
+        .set_option(DatabaseOption::LocationCacheSize(0))
+        .unwrap();
+    assert_eq!(reader.location_cache_size(), 1);
+
+    assert_eq!(reader.client_dc_id(), None);
+    env.db
+        .set_option(DatabaseOption::DatacenterId(Some(b"dc_id".to_vec())))
+        .unwrap();
+    env.db
+        .set_option(DatabaseOption::MachineId(Some(b"machine_id".to_vec())))
+        .unwrap();
+    assert_eq!(reader.client_dc_id().as_deref(), Some(&b"dc_id"[..]));
+    assert_eq!(reader.client_zone_id().as_deref(), Some(&b"machine_id"[..]));
+    env.db
+        .set_option(DatabaseOption::DatacenterId(None))
+        .unwrap();
+    assert_eq!(reader.client_dc_id(), None);
+    assert_eq!(
+        reader.client_zone_id().as_deref(),
+        Some(&b"machine_id"[..]),
+        "each option sets its own part of the locality"
+    );
+    assert_eq!(reader.cached_locations(), 0);
 }
 
 #[tokio::test(start_paused = true)]

@@ -402,6 +402,29 @@ async fn on_error_backs_off_as_cpp_does() {
     );
 }
 
+/// `on_error` retries what the cluster's release retries: 7.4 retries
+/// `blob_granule_request_failed` (1079) and `proxy_tag_throttled` (1223), 8.0 removed them
+/// (the bindingtester's `api` test, seed 1114 at 2000 operations on 8.0: ON_ERROR with
+/// 1079).
+#[tokio::test(start_paused = true)]
+async fn on_error_retries_what_the_release_of_the_cluster_retries() {
+    for schema in SCHEMAS {
+        let env = env(schema).await;
+        for code in [
+            codes::BLOB_GRANULE_REQUEST_FAILED,
+            codes::PROXY_TAG_THROTTLED,
+        ] {
+            let tx = env.db.create_transaction();
+            let result = tx.on_error(Error::new(code)).await;
+            if schema == SchemaVersion::V8_0 {
+                assert_eq!(result.unwrap_err().code(), code);
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_retry_limit_and_errors_that_are_not_retried_cancel_the_transaction() {
     let env = env(SchemaVersion::V7_4).await;
@@ -439,6 +462,26 @@ async fn the_retry_limit_and_errors_that_are_not_retried_cancel_the_transaction(
     tx.set(b"k", b"v");
     assert_eq!(
         tx.commit().await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    // `broken_promise` is returned as `transaction_cancelled` (`RYWImpl::onError`; the
+    // bindingtester's `api` test, seed 1068 at 2000 operations, ON_ERROR with 1100), also
+    // when the retry limit is hit.
+    tx.reset();
+    assert_eq!(
+        tx.on_error(Error::new(codes::BROKEN_PROMISE))
+            .await
+            .unwrap_err()
+            .code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    tx.reset();
+    tx.set_option(TransactionOption::RetryLimit(0)).unwrap();
+    assert_eq!(
+        tx.on_error(Error::new(codes::BROKEN_PROMISE))
+            .await
+            .unwrap_err()
+            .code(),
         codes::TRANSACTION_CANCELLED
     );
     // A plain `connection_failed` is not retried; a commit that was not delivered is.
@@ -865,6 +908,55 @@ async fn a_timeout_set_during_an_operation_interrupts_it() {
     assert!(before.elapsed() < Duration::from_millis(2));
 }
 
+/// A deadline that passed while nothing ran has killed the transaction (C++'s `timebomb`
+/// fires on its own): unsetting or lengthening the timeout afterwards does not bring it
+/// back, and a `cancel` does not replace the error (the bindingtester's `test_timeouts`
+/// case 10).
+#[tokio::test(start_paused = true)]
+async fn a_timeout_that_fired_while_idle_cannot_be_unset() {
+    let env = env(SchemaVersion::V7_4).await;
+    for change in [
+        Some(Duration::ZERO),
+        Some(Duration::from_secs(1000)),
+        None, // cancel
+    ] {
+        let tx = env.db.create_transaction();
+        tx.set(b"foo", b"bar");
+        tx.set_option(TransactionOption::Timeout(Duration::from_millis(100)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        match change {
+            Some(timeout) => tx.set_option(TransactionOption::Timeout(timeout)).unwrap(),
+            None => tx.cancel(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The fake proxy never answers: a commit that is sent does not end.
+        let e = tokio::time::timeout(Duration::from_secs(10), tx.commit())
+            .await
+            .expect("the commit fails at once, without a request")
+            .unwrap_err();
+        assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT, "{change:?}");
+        assert!(!e.is_maybe_committed());
+        assert_eq!(
+            tx.get_read_version().await.unwrap_err().code(),
+            codes::TRANSACTION_TIMED_OUT
+        );
+        // A reset starts over.
+        tx.reset();
+        assert_eq!(tx.commit().await.unwrap().committed_version(), -1);
+    }
+
+    // Unset before the deadline, the timeout is gone (case 9).
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(100)))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.set_option(TransactionOption::Timeout(Duration::ZERO))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(tx.commit().await.unwrap().committed_version(), -1);
+}
+
 /// (f4) Shutting the database down ends the operations in progress; a commit that was
 /// sent may have committed.
 #[tokio::test(start_paused = true)]
@@ -1132,6 +1224,63 @@ async fn the_deferred_error_comes_before_the_cancellation() {
     assert_eq!(
         tx.get_read_version().await.unwrap_err().code(),
         codes::KEY_TOO_LARGE
+    );
+    // The commit too (`ThreadSafeTransaction::commit` checks the deferred error first): the
+    // bindingtester's `api` test, seed 1004 at 2000 operations on 8.0, sets an invalid read
+    // version (`version_invalid`, deferred), cancels, and commits.
+    assert_eq!(tx.commit().await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    let tx = env.db.create_transaction();
+    tx.set_read_version(-1);
+    tx.cancel();
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    assert_eq!(
+        tx.get_versionstamp().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    // A write after the cancellation is still checked (C++'s writes do not look at
+    // `resetPromise`), and its error is deferred: the bindingtester's `api` test, seed 1059
+    // at 2000 operations on 8.0 (CANCEL, SET of a value too large, GET).
+    let tx = env.db.create_transaction();
+    tx.cancel();
+    tx.set(b"k", &[0; 200_000]);
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::VALUE_TOO_LARGE
+    );
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VALUE_TOO_LARGE
+    );
+    // And applied: only the approximate size sees it.
+    let tx = env.db.create_transaction();
+    tx.cancel();
+    let before = tx.approximate_size().unwrap();
+    tx.set(b"k", b"v");
+    tx.clear_range(b"a", b"b");
+    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+    assert!(tx.approximate_size().unwrap() > before);
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    tx.reset();
+    assert_eq!(tx.approximate_size().unwrap(), 0);
+    // A timeout that has passed does not hide it either.
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(10)))
+        .unwrap();
+    tx.set_read_version(0);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::VERSION_INVALID
     );
 }
 

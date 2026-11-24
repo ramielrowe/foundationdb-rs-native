@@ -144,6 +144,18 @@ pub(crate) struct LocationCache {
     servers: HashMap<Uid, Weak<ServerInfo>>,
     /// The size of `servers` after its last pruning of dead entries.
     servers_after_prune: usize,
+    /// The client's locality (`DatabaseContext::clientLocality`): its `dcid` (which
+    /// replicas are near) and its `zoneid` (`MACHINE_ID`; only used for `SAME_MACHINE`,
+    /// which the default knobs never use), kept here so that a change and the
+    /// [`clear`](Self::clear) it causes are one step.
+    locality: ClientLocality,
+}
+
+/// The client's `LocalityData` as far as the read path uses it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClientLocality {
+    pub(crate) dc_id: Option<Vec<u8>>,
+    pub(crate) zone_id: Option<Vec<u8>>,
 }
 
 impl LocationCache {
@@ -158,12 +170,45 @@ impl LocationCache {
             capacity: capacity.max(1),
             servers: HashMap::new(),
             servers_after_prune: 0,
+            locality: ClientLocality::default(),
         }
     }
 
     /// How many ranges have a location.
     pub(crate) fn len(&self) -> usize {
         self.cached
+    }
+
+    /// The bound: inserts evict while this many ranges have a location.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// `DatabaseContext::setOption(LOCATION_CACHE_SIZE)`: a new bound, applied by the next
+    /// inserts (as C++, nothing is evicted at once).
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+
+    /// `server_interf.clear(); locationCache.insert(allKeys, Reference<LocationInfo>())`
+    /// (`DatabaseContext::setOption(MACHINE_ID / DATACENTER_ID)`): forgets every location
+    /// and server entry, so that the next ones are made with the new locality.
+    pub(crate) fn clear(&mut self) {
+        let locality = std::mem::take(&mut self.locality);
+        *self = LocationCache::new(self.capacity);
+        self.locality = locality;
+    }
+
+    /// The client's locality.
+    pub(crate) fn locality(&self) -> &ClientLocality {
+        &self.locality
+    }
+
+    /// `DatabaseContext::setOption(MACHINE_ID / DATACENTER_ID)`: a new client locality,
+    /// and the cache [cleared](Self::clear) (as C++ does even if nothing changed).
+    pub(crate) fn set_locality(&mut self, locality: ClientLocality) {
+        self.locality = locality;
+        self.clear();
     }
 
     /// How many ranges the map has, known or not.
@@ -617,5 +662,59 @@ mod tests {
         assert_eq!(cache.len(), 10);
         assert!(cache.ranges() <= 2 * 10 + 1);
         assert!(cache.pool.len() <= 2 * cache.len() + 64);
+    }
+
+    #[tokio::test]
+    async fn the_bound_changes_at_runtime_and_clear_forgets_everything() {
+        use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
+        use fdb_native_transport::runtime::TokioRuntime;
+
+        let mut rng = Rng::new(Some(9));
+        let mut cache = LocationCache::new(10);
+        let insert = |cache: &mut LocationCache, rng: &mut Rng, i: u32| {
+            let (b, e) = (i.to_be_bytes(), (i + 1).to_be_bytes());
+            cache.insert(&range(&b, &e), location(u64::from(i)), rng);
+        };
+        for i in 0..10 {
+            insert(&mut cache, &mut rng, i);
+        }
+        // A larger bound lets the cache grow.
+        cache.set_capacity(20);
+        for i in 10..30 {
+            insert(&mut cache, &mut rng, i);
+        }
+        assert_eq!(cache.len(), 20);
+        // A smaller one evicts from the next inserts on (at most 100 per insert).
+        cache.set_capacity(5);
+        assert_eq!(cache.len(), 20, "nothing is evicted at once");
+        insert(&mut cache, &mut rng, 30);
+        assert_eq!(cache.len(), 5);
+        assert!(cache.get(&30u32.to_be_bytes()).is_some());
+        // 0 caches one range at a time.
+        cache.set_capacity(0);
+        assert_eq!(cache.capacity(), 1);
+        insert(&mut cache, &mut rng, 31);
+        assert_eq!(cache.len(), 1);
+
+        let peers = PeerManager::new(
+            TokioRuntime::new(),
+            PeerManagerConfig::default(),
+            DiscardEvents,
+        );
+        let info = cache.server_info(&storage_server(1, 1, b"dc"), None, |e| {
+            (
+                e.addresses.address,
+                peers.peer(&e.addresses.address).reference(),
+            )
+        });
+        assert_eq!(cache.server_entries(), 1);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.ranges(), 1);
+        assert_eq!(cache.server_entries(), 0);
+        assert!(cache.pool.is_empty());
+        assert_eq!(cache.capacity(), 1, "the bound stays");
+        drop(info);
+        peers.shutdown().await;
     }
 }

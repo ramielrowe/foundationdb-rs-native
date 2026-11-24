@@ -590,7 +590,26 @@ impl<R: Runtime> Database<R> {
     /// ```
     pub fn set_option(&self, option: DatabaseOption) -> Result<(), Error> {
         match option {
+            DatabaseOption::LocationCacheSize(size) => {
+                // `extractIntOption(value, 0, std::numeric_limits<int>::max())`.
+                if size > i32::MAX as usize {
+                    return Err(Error::with_message(
+                        crate::error::codes::INVALID_OPTION_VALUE,
+                        "the location cache size is at most i32::MAX",
+                    ));
+                }
+                self.inner.reader.set_location_cache_size(size);
+                return Ok(());
+            }
             DatabaseOption::MaxWatches(max) => return self.set_max_watches(max),
+            DatabaseOption::MachineId(id) => {
+                self.inner.reader.set_client_zone_id(id);
+                return Ok(());
+            }
+            DatabaseOption::DatacenterId(id) => {
+                self.inner.reader.set_client_dc_id(id);
+                return Ok(());
+            }
             DatabaseOption::SnapshotRywEnable => {
                 self.inner.snapshot_ryw.fetch_add(1, Ordering::SeqCst);
                 return Ok(());

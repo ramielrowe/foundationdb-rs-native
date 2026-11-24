@@ -3,9 +3,7 @@
 //! database and transaction options, watches, cancellation, retry limits, timeouts, the
 //! error predicates, the size limit and the approximate size.
 //!
-//! Left out: case (10) of `test_timeouts` (see there), the database options
-//! `LOCATION_CACHE_SIZE`, `DATACENTER_ID` and `MACHINE_ID` (not in the client yet, beads
-//! `blr.3`), `test_locality` (`get_addresses_for_key` and the shard boundaries),
+//! Left out: `test_locality` (`get_addresses_for_key` and the shard boundaries),
 //! `test_get_client_status`, the tenant tests, the Python-specific tests of
 //! `@fdb.transactional`, and release-8.0's `test_range_split_points` (it passes a split
 //! point limit, which the client's `get_range_split_points` does not take) and
@@ -121,9 +119,12 @@ pub(crate) async fn run(db: &Database) -> Result<(), String> {
     Ok(())
 }
 
-/// `test_db_options`, less `LOCATION_CACHE_SIZE`, `DATACENTER_ID` and `MACHINE_ID` (blr.3).
+/// `test_db_options`.
 fn db_options(db: &Database) -> Result<(), Error> {
+    db.set_option(DatabaseOption::LocationCacheSize(100_001))?;
     db.set_option(DatabaseOption::MaxWatches(100_001))?;
+    db.set_option(DatabaseOption::DatacenterId(Some(b"dc_id".to_vec())))?;
+    db.set_option(DatabaseOption::MachineId(Some(b"machine_id".to_vec())))?;
     db.set_option(DatabaseOption::SnapshotRywEnable)?;
     db.set_option(DatabaseOption::SnapshotRywDisable)?;
     db.set_option(DatabaseOption::TransactionLoggingMaxFieldLength(1000))?;
@@ -667,10 +668,15 @@ async fn timeouts(db: &Database) -> Result<(), String> {
     })
     .await?;
 
-    // (10) "Unsetting a timeout after it has fired doesn't help" is left out: the client
-    // checks the deadline when an operation looks at it, and `set_option(Timeout(0))` after a
-    // deadline that passed while nothing ran lifts it, where C++'s timer has already killed
-    // the transaction (a client divergence to fix in `Transaction::set_option`).
+    // (10) Unsetting a timeout after it has fired doesn't help.
+    retry_with_timeout(db, "timeouts (10)", DEFAULT_TIMEOUT, |tr| async move {
+        set_foo(&tr);
+        timeout(&tr, 100)?;
+        sleep(ms(1000)).await;
+        timeout(&tr, 0)?;
+        commit_times_out(&tr, "Timeout didn't fire.").await
+    })
+    .await?;
 
     // (11) An error thrown in commit does not reset time from which timeout is measured.
     retry_with_timeout(db, "timeouts (11)", DEFAULT_TIMEOUT, |tr| async move {

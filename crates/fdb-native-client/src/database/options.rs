@@ -3,7 +3,10 @@
 //!
 //! | Option | Code | Status |
 //! |---|---|---|
+//! | [`LocationCacheSize`](DatabaseOption::LocationCacheSize) | 10 | supported (the bound of the location cache, from the next insert on) |
 //! | [`MaxWatches`](DatabaseOption::MaxWatches) | 20 | supported |
+//! | [`MachineId`](DatabaseOption::MachineId) | 21 | stored (the client's zone id; C++ uses it only with a knob that is off by default); forgets the cached locations |
+//! | [`DatacenterId`](DatabaseOption::DatacenterId) | 22 | supported (replicas in this data center are preferred); forgets the cached locations |
 //! | [`SnapshotRywEnable`](DatabaseOption::SnapshotRywEnable) / [`Disable`](DatabaseOption::SnapshotRywDisable) | 26 / 27 | supported (a counter, as C++'s `snapshotRywEnabled`) |
 //! | [`TransactionLoggingMaxFieldLength`](DatabaseOption::TransactionLoggingMaxFieldLength) | 405 | default for `TRANSACTION_LOGGING_MAX_FIELD_LENGTH` (validated; no-op) |
 //! | [`TransactionTimeout`](DatabaseOption::TransactionTimeout) | 500 | default for `TIMEOUT` |
@@ -16,10 +19,7 @@
 //! | [`TransactionUsedDuringCommitProtectionDisable`](DatabaseOption::TransactionUsedDuringCommitProtectionDisable) | 701 | default for `USED_DURING_COMMIT_PROTECTION_DISABLE` |
 //! | [`TransactionReportConflictingKeys`](DatabaseOption::TransactionReportConflictingKeys) | 702 | default for `REPORT_CONFLICTING_KEYS` |
 //!
-//! Not offered: `LOCATION_CACHE_SIZE` (the cache is [`ReadConfig`](crate::read::ReadConfig)'s,
-//! fixed when the database is opened), `MACHINE_ID` and `DATACENTER_ID` (the locality that
-//! prefers a same-datacenter replica; there is none yet), `USE_CONFIG_DATABASE` (800, 7.4
-//! only: the configuration database is a server-side tool's), `TEST_CAUSAL_READ_RISKY` (a
+//! Not offered: `USE_CONFIG_DATABASE` (800, 7.4 only: the configuration database is a server-side tool's), `TEST_CAUSAL_READ_RISKY` (a
 //! simulation aid) and `TRANSACTION_AUTOMATIC_IDEMPOTENCY` (no idempotency ids yet).
 //!
 //! # Transaction defaults
@@ -49,10 +49,35 @@ use crate::transaction::TransactionOption;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DatabaseOption {
+    /// `LOCATION_CACHE_SIZE` (10): the most shards whose location is cached (C++'s default
+    /// is 100 000 in `fdb.options`, but `LOCATION_CACHE_EVICTION_SIZE`, 600 000, in
+    /// `DatabaseContext`; here [`ReadConfig::location_cache_size`], 600 000). 0 to
+    /// `i32::MAX` (`invalid_option_value` otherwise; 0 is taken as 1). As in C++, a smaller
+    /// bound evicts when the next locations are cached, not at once.
+    ///
+    /// [`ReadConfig::location_cache_size`]: crate::read::ReadConfig::location_cache_size
+    LocationCacheSize(usize),
     /// `MAX_WATCHES` (20): the most watches that may be outstanding at once (default 10 000);
     /// 0 to 1 000 000 (`invalid_option_value` otherwise). Watches already outstanding stay,
     /// whatever the new cap.
     MaxWatches(usize),
+    /// `MACHINE_ID` (21): the machine id given to the `fdbserver` processes on this client's
+    /// machine (C++ stores it as the client locality's `zoneid`); `None` clears it. C++
+    /// prefers replicas on the same machine only with the knob
+    /// `LOAD_BALANCE_ZONE_ID_LOCALITY_ENABLED`, off by default and not offered here, so the
+    /// id is stored ([`Reader::client_zone_id`]) and changes no choice. As in C++, the
+    /// cached key locations are forgotten.
+    ///
+    /// [`Reader::client_zone_id`]: crate::read::Reader::client_zone_id
+    MachineId(Option<Vec<u8>>),
+    /// `DATACENTER_ID` (22): the data center id given to the `fdbserver` processes of this
+    /// client's data center (the client locality's `dcid`); `None` clears it. Reads prefer
+    /// the replicas whose `dcid` is this one (`loadBalanceDistance`'s `SAME_DC`; the
+    /// initial value is [`ReadConfig::client_dc_id`]). As in C++, the cached key locations
+    /// are forgotten, so that every replica's distance is computed again.
+    ///
+    /// [`ReadConfig::client_dc_id`]: crate::read::ReadConfig::client_dc_id
+    DatacenterId(Option<Vec<u8>>),
     /// `SNAPSHOT_RYW_ENABLE` (26): snapshot reads see the transactions' writes (the default).
     /// As in C++ (`DatabaseContext::snapshotRywEnabled`), this and
     /// [`SnapshotRywDisable`](Self::SnapshotRywDisable) count up and down from 1: snapshot
@@ -98,7 +123,10 @@ impl DatabaseOption {
     /// The option's code in `fdb.options` (`FDBDatabaseOption`).
     pub const fn code(&self) -> i32 {
         match self {
+            DatabaseOption::LocationCacheSize(_) => 10,
             DatabaseOption::MaxWatches(_) => 20,
+            DatabaseOption::MachineId(_) => 21,
+            DatabaseOption::DatacenterId(_) => 22,
             DatabaseOption::SnapshotRywEnable => 26,
             DatabaseOption::SnapshotRywDisable => 27,
             DatabaseOption::TransactionLoggingMaxFieldLength(_) => 405,
@@ -118,7 +146,10 @@ impl DatabaseOption {
     /// `None` for the options that are not transaction defaults.
     pub fn default_for(&self) -> Option<TransactionOption> {
         Some(match self {
-            DatabaseOption::MaxWatches(_)
+            DatabaseOption::LocationCacheSize(_)
+            | DatabaseOption::MaxWatches(_)
+            | DatabaseOption::MachineId(_)
+            | DatabaseOption::DatacenterId(_)
             | DatabaseOption::SnapshotRywEnable
             | DatabaseOption::SnapshotRywDisable => return None,
             DatabaseOption::TransactionLoggingMaxFieldLength(n) => {
