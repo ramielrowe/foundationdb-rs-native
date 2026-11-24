@@ -93,7 +93,7 @@
 //!   watchers fire; if it is older (the metadata was updated to a newer version meanwhile)
 //!   it goes around again (the "ABA" case); on `future_version` it goes around again, on
 //!   another error the watchers fail with it.
-//! * **`watchValue`** is [`Reader::watch_value`](crate::Reader::watch_value).
+//! * **`watchValue`** is [`Reader::watch_value`](crate::read::Reader::watch_value).
 //!
 //! ## Differences
 //!

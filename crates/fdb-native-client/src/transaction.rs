@@ -6,8 +6,8 @@
 //! * **Reads see the transaction's own writes** (read-your-writes, the default of every FDB
 //!   binding). [`get`](Transaction::get), [`get_key`](Transaction::get_key) and
 //!   [`get_range`](Transaction::get_range) (and its streams,
-//!   [`get_ranges`](Transaction::get_ranges) and [`range_stream`](Transaction::range_stream))
-//!   read the database at the transaction's read version with the transaction's
+//!   [`get_ranges`](Transaction::get_ranges) and
+//!   [`get_ranges_keyvalues`](Transaction::get_ranges_keyvalues)) read the database at the transaction's read version with the transaction's
 //!   [`set`](Transaction::set)s, [`clear`](Transaction::clear)s and atomic operations
 //!   applied, and remember what they read (a snapshot cache), so that reading the same keys
 //!   again does not ask the cluster again. Key selectors resolve through the writes too.
@@ -187,11 +187,13 @@ use crate::ryw::read::{BoxFuture, RywRead, RywSource};
 use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap, WriteMapIter};
 use crate::watch::PendingWatches;
 
+mod mutation;
 pub mod options;
 mod range;
 mod watch;
 mod write;
 
+pub use mutation::MutationType;
 pub use options::TransactionOption;
 use options::{Flags, Persistent};
 pub use range::{KeyValueStream, RangeResult, RangeStream};
@@ -206,7 +208,7 @@ const SYSTEM_KEYS_BEGIN: &[u8] = b"\xff";
 const SYSTEM_KEYS_END: &[u8] = b"\xff\xff";
 
 /// What a successful [`Transaction::commit`] did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CommitResult {
     version: i64,
     versionstamp: Option<[u8; 10]>,
@@ -243,6 +245,30 @@ macro_rules! transaction_struct {
         ///
         /// A handle: clones share the transaction (as the closure of [`Database::run`]
         /// gets one). Every method takes `&self`; reads may run concurrently.
+        ///
+        /// ```no_run
+        /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+        /// use fdb_native_client::{KeySelector, RangeOptions};
+        ///
+        /// let tx = db.create_transaction();
+        /// // Two reads at once; each adds a read conflict range.
+        /// let (a, b) = (tx.get(b"a"), tx.get(b"b"));
+        /// let (a, b) = (a.await?, b.await?);
+        /// // Reads see the transaction's writes.
+        /// tx.set(b"c", b"3");
+        /// let range = tx
+        ///     .get_range(
+        ///         &KeySelector::first_greater_or_equal(b"a".to_vec()),
+        ///         &KeySelector::first_greater_or_equal(b"d".to_vec()),
+        ///         &RangeOptions::default(),
+        ///     )
+        ///     .await?;
+        /// assert!(range.kvs.iter().any(|kv| kv.key == b"c"));
+        /// tx.commit().await?;
+        /// # let _ = (a, b);
+        /// # Ok(())
+        /// # }
+        /// ```
         pub struct Transaction<R: Runtime $(= $default)?> {
             inner: Arc<Inner<R>>,
             /// For a handle of a [`Database::run`] attempt: the epoch of that attempt.
@@ -975,6 +1001,7 @@ impl<R: Runtime> Transaction<R> {
 
     /// A view of the transaction whose reads are snapshot reads: they add no read conflict
     /// range.
+    #[must_use]
     pub fn snapshot(&self) -> Snapshot<'_, R> {
         Snapshot { tx: self }
     }
@@ -1482,7 +1509,7 @@ impl<R: Runtime> Transaction<R> {
                 Ok(outcome) => {
                     let result = CommitResult::from(outcome);
                     if current {
-                        state.commit = CommitStage::Committed(result.clone());
+                        state.commit = CommitStage::Committed(result);
                         // C++: the stamp, or `no_commit_version` for a transaction with
                         // nothing to write.
                         state.resolve_versionstamp(
@@ -1581,7 +1608,7 @@ impl<R: Runtime> Transaction<R> {
     /// transaction.
     pub fn get_versionstamp(
         &self,
-    ) -> impl Future<Output = Result<[u8; 10], Error>> + Send + 'static {
+    ) -> impl Future<Output = Result<[u8; 10], Error>> + Send + use<R> {
         enum Pending<R: Runtime> {
             Done(Result<[u8; 10], Error>),
             Wait {
@@ -1636,7 +1663,7 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
-    /// `onError(error)`: if `error` is one C++'s `onError` retries ([`Error::on_error`])
+    /// `onError(error)`: if `error` is one C++'s `onError` retries ([`Error::transaction_retry`])
     /// and the retry limit is not reached, resets the transaction for another attempt and
     /// waits the backoff, then `Ok`; otherwise returns the error (`error` itself, or the
     /// transaction's timeout or cancellation), and the transaction is cancelled until

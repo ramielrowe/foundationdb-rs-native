@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use fdb_native_client::cluster::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 use fdb_native_client::read::{ReadConfig, Reader};
-use fdb_native_client::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 use fdb_native_testkit::FdbContainer;
 use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
 use fdb_native_transport::runtime::TokioRuntime;

@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdb_native_client::atomic;
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::read::KEY_SPACE_END;
-use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOptions, Error, MutationType, Watch, WatchConfig,
-};
+use fdb_native_client::watch::WatchConfig;
+use fdb_native_client::{Database, DatabaseOptions, Error, MutationType, Watch};
 use fdb_native_schema::domain::{
     Commit, CommitId, GetKeyServerLocations, GetReadVersion, GetValue, GetValueReply, KeyRange,
     KeyServerLocations, Mutation, MutationType as Mt, ReadVersion, StorageServer, WatchValue,
@@ -446,6 +446,21 @@ async fn a_watch_starts_at_commit_and_fires_when_the_value_changes() {
     }
 }
 
+/// `watch` starts when it is called (C++'s watch future): a watch whose future is awaited
+/// only after the commit was registered by that commit.
+#[tokio::test(start_paused = true)]
+async fn a_watch_starts_when_called_and_may_be_awaited_after_the_commit() {
+    let env = standard(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let watch = tx.watch(b"k");
+    tx.commit().await.unwrap();
+    let mut watch = within("the watch", watch).await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    assert!(pending(&mut watch).await);
+    env.set_value(b"k", Some(b"v"));
+    resolved("the watch", &mut watch).await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_watch_of_a_retry_loop_returns_pending_and_fires() {
     let env = standard(SchemaVersion::V8_0).await;
@@ -504,7 +519,7 @@ async fn a_pending_atomic_operation_applies_to_the_value_at_the_read_version() {
         let env = standard(schema).await;
         env.set_value(b"n", Some(&5u64.to_le_bytes()));
         let tx = env.db.create_transaction();
-        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
         let mut watch = tx.watch(b"n").await.unwrap();
         // The key was read at the read version (a dependent write: RYW reads the database).
         let read_version = tx.get_read_version().await.unwrap();
@@ -543,18 +558,18 @@ async fn atomic_operations_fold_into_the_value_the_transaction_wrote() {
     let tx = env.db.create_transaction();
     // A set, then atomic operations: known without a read.
     tx.set(b"a", &5u16.to_le_bytes());
-    tx.atomic_op(b"a", &3u16.to_le_bytes(), MutationType::ADD_VALUE);
-    tx.atomic_op(b"a", &4u16.to_le_bytes(), MutationType::MAX);
+    tx.atomic_op(b"a", &3u16.to_le_bytes(), MutationType::Add);
+    tx.atomic_op(b"a", &4u16.to_le_bytes(), MutationType::Max);
     // A clear, then an operation: from no value (`MinV2` of nothing is the operand).
     tx.clear(b"b");
-    tx.atomic_op(b"b", b"\x09", MutationType::MIN);
+    tx.atomic_op(b"b", b"\x09", MutationType::Min);
     // A clear, then a compare-and-clear of nothing: still nothing.
     tx.clear(b"c");
-    tx.atomic_op(b"c", b"x", MutationType::COMPARE_AND_CLEAR);
+    tx.atomic_op(b"c", b"x", MutationType::CompareAndClear);
     // Dependent operations, in order, on the database's value.
     env.set_value(b"d", Some(b"\x01\x02"));
-    tx.atomic_op(b"d", b"\xff\x00", MutationType::ADD_VALUE);
-    tx.atomic_op(b"d", b"q", MutationType::APPEND_IF_FITS);
+    tx.atomic_op(b"d", b"\xff\x00", MutationType::Add);
+    tx.atomic_op(b"d", b"q", MutationType::AppendIfFits);
     let mut watches = Vec::new();
     for key in [b"a", b"b", b"c", b"d"] {
         watches.push(tx.watch(key).await.unwrap());
@@ -593,8 +608,8 @@ async fn atomic_operations_fold_into_the_value_the_transaction_wrote() {
 async fn a_later_write_fires_a_watch_of_a_key_with_a_pending_atomic_operation() {
     let env = standard(SchemaVersion::V7_4).await;
     let tx = env.db.create_transaction();
-    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
-    tx.atomic_op(b"m", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+    tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
+    tx.atomic_op(b"m", &1u64.to_le_bytes(), MutationType::Add);
     let mut by_set = tx.watch(b"n").await.unwrap();
     let mut by_clear = tx.watch(b"m").await.unwrap();
     // The value the operation gives (the key is not set: 1): nothing changes.
@@ -619,7 +634,7 @@ async fn concurrent_increments_fire_each_others_watches() {
         let env = standard(schema).await;
         let (t1, t2) = (env.db.create_transaction(), env.db.create_transaction());
         for tx in [&t1, &t2] {
-            tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+            tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
         }
         let mut w1 = t1.watch(b"n").await.unwrap();
         let mut w2 = t2.watch(b"n").await.unwrap();
@@ -660,7 +675,7 @@ async fn writes_after_the_watch_that_change_the_value_fire_it_at_once() {
     tx.set(b"a", b"2");
     tx.set(b"b", b"1"); // the value it has: nothing changed
     tx.clear_range(b"c", b"d"); // clearing what is not there changes nothing
-    tx.atomic_op(b"d", &[1], MutationType::ADD_VALUE); // its result is not known
+    tx.atomic_op(b"d", &[1], MutationType::Add); // its result is not known
     assert!(ready(&mut by_set).await.unwrap().is_ok());
     assert!(ready(&mut by_atomic).await.unwrap().is_ok());
     assert!(ready(&mut same).await.is_none());
@@ -1101,6 +1116,27 @@ async fn watch_checks_its_key_and_the_transaction() {
     );
     assert_eq!(env.db.outstanding_watches(), 0);
 
+    // `\xff/metadataVersion` may be watched without the system key options, as C++ allows
+    // (`ReadYourWritesTransaction::watch`, 7.4:2451); a key next to it may not.
+    let tx = env.db.create_transaction();
+    assert_eq!(
+        tx.watch(b"\xff/metadataVersion\x00")
+            .await
+            .unwrap_err()
+            .code(),
+        codes::KEY_OUTSIDE_LEGAL_RANGE
+    );
+    let mut watch = tx.watch(b"\xff/metadataVersion").await.unwrap();
+    tx.commit().await.unwrap();
+    until("the watch request", || env.request_count() == 1).await;
+    let (request, _, _) = env.requests().remove(0);
+    assert_eq!(request.key, b"\xff/metadataVersion");
+    assert!(pending(&mut watch).await);
+    env.set_value(b"\xff/metadataVersion", Some(&[1; 10]));
+    resolved("the metadata version watch", &mut watch)
+        .await
+        .unwrap();
+
     // After the commit started, a watch is `used_during_commit`.
     let tx = env.db.create_transaction();
     tx.commit().await.unwrap();
@@ -1201,7 +1237,7 @@ async fn a_write_that_fails_its_checks_triggers_no_watch() {
     let tx = env.db.create_transaction();
     let mut watch = tx.watch(b"k").await.unwrap();
     tx.set(b"k", &vec![b'v'; 100_001]); // value_too_large
-    tx.atomic_op(b"k", b"x", MutationType::SET_VALUE); // invalid_mutation_type
+    tx.atomic_op(&[b'k'; 10_001], b"x", MutationType::Add); // key_too_large
     let mut stamp = b"k".to_vec();
     stamp.extend_from_slice(&5i32.to_le_bytes());
     tx.set_versionstamped_value(b"k", &stamp); // client_invalid_operation
@@ -1376,7 +1412,7 @@ async fn a_watch_reads_through_the_transactions_cache() {
         assert_eq!(env.reads.lock().unwrap().len(), 1, "the cache answers");
         // A dependent write over a cached value: no read either.
         assert!(tx.get(b"n").await.unwrap().is_some());
-        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::Add);
         let mut by_n = tx.watch(b"n").await.unwrap();
         assert_eq!(env.reads.lock().unwrap().len(), 2);
         tx.set(b"other", b"x");

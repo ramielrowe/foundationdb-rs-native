@@ -9,11 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fdb_native_client::Error;
+use fdb_native_client::cluster::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 use fdb_native_client::commit::{CommitBuffer, CommitOutcome};
-use fdb_native_client::{
-    ClusterMonitor, ClusterMonitorConfig, CommitOptions, Committer, CommitterConfig,
-    ConnectionRecord,
-};
+use fdb_native_client::commit::{CommitOptions, Committer, CommitterConfig};
 use fdb_native_schema::domain::{GetReadVersion, INVALID_VERSION, MutationType};
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_testkit::FdbContainer;

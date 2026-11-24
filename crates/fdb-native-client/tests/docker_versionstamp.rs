@@ -161,7 +161,7 @@ async fn docker_versionstamped_keys_and_values_carry_the_stamp_of_the_commit() {
     tx.set_versionstamped_value(b"vs/value", &with_versionstamp_offset(value, 4));
     // A plain write and an atomic operation in the same transaction.
     tx.set(b"vs/plain", b"plain");
-    tx.atomic_op(b"vs/counter", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+    tx.atomic_op(b"vs/counter", &1u64.to_le_bytes(), MutationType::Add);
     let result = within("commit", tx.commit()).await.expect("commit");
     let stamp = result.versionstamp().expect("a versionstamp");
     assert_eq!(&stamp[..8], &result.committed_version().to_be_bytes());

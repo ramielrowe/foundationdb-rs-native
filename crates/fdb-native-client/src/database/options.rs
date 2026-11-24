@@ -5,22 +5,22 @@
 //! |---|---|---|
 //! | [`MaxWatches`](DatabaseOption::MaxWatches) | 20 | supported |
 //! | [`SnapshotRywEnable`](DatabaseOption::SnapshotRywEnable) / [`Disable`](DatabaseOption::SnapshotRywDisable) | 26 / 27 | supported (a counter, as C++'s `snapshotRywEnabled`) |
+//! | [`TransactionLoggingMaxFieldLength`](DatabaseOption::TransactionLoggingMaxFieldLength) | 405 | default for `TRANSACTION_LOGGING_MAX_FIELD_LENGTH` (validated; no-op) |
 //! | [`TransactionTimeout`](DatabaseOption::TransactionTimeout) | 500 | default for `TIMEOUT` |
 //! | [`TransactionRetryLimit`](DatabaseOption::TransactionRetryLimit) | 501 | default for `RETRY_LIMIT` |
 //! | [`TransactionMaxRetryDelay`](DatabaseOption::TransactionMaxRetryDelay) | 502 | default for `MAX_RETRY_DELAY` |
 //! | [`TransactionSizeLimit`](DatabaseOption::TransactionSizeLimit) | 503 | default for `SIZE_LIMIT` |
 //! | [`TransactionCausalReadRisky`](DatabaseOption::TransactionCausalReadRisky) | 504 | default for `CAUSAL_READ_RISKY` |
 //! | [`TransactionIncludePortInAddress`](DatabaseOption::TransactionIncludePortInAddress) | 505 | default for `INCLUDE_PORT_IN_ADDRESS` (no-op) |
-//! | [`TransactionBypassUnreadable`](DatabaseOption::TransactionBypassUnreadable) | 700 | default for `BYPASS_UNREADABLE` (no-op) |
+//! | [`TransactionBypassUnreadable`](DatabaseOption::TransactionBypassUnreadable) | 700 | default for `BYPASS_UNREADABLE` |
 //! | [`TransactionUsedDuringCommitProtectionDisable`](DatabaseOption::TransactionUsedDuringCommitProtectionDisable) | 701 | default for `USED_DURING_COMMIT_PROTECTION_DISABLE` |
 //! | [`TransactionReportConflictingKeys`](DatabaseOption::TransactionReportConflictingKeys) | 702 | default for `REPORT_CONFLICTING_KEYS` |
 //!
 //! Not offered: `LOCATION_CACHE_SIZE` (the cache is [`ReadConfig`](crate::read::ReadConfig)'s,
 //! fixed when the database is opened), `MACHINE_ID` and `DATACENTER_ID` (the locality that
-//! prefers a same-datacenter replica; there is none yet), `TRANSACTION_LOGGING_MAX_FIELD_LENGTH`
-//! (405: there is no transaction logging), `USE_CONFIG_DATABASE` (800, 7.4 only: the
-//! configuration database is a server-side tool's), `TEST_CAUSAL_READ_RISKY` (a simulation
-//! aid) and `TRANSACTION_AUTOMATIC_IDEMPOTENCY` (no idempotency ids yet).
+//! prefers a same-datacenter replica; there is none yet), `USE_CONFIG_DATABASE` (800, 7.4
+//! only: the configuration database is a server-side tool's), `TEST_CAUSAL_READ_RISKY` (a
+//! simulation aid) and `TRANSACTION_AUTOMATIC_IDEMPOTENCY` (no idempotency ids yet).
 //!
 //! # Transaction defaults
 //!
@@ -63,6 +63,10 @@ pub enum DatabaseOption {
     /// `SNAPSHOT_RYW_DISABLE` (27): snapshot reads do not see the transactions' writes (see
     /// [`SnapshotRywEnable`](Self::SnapshotRywEnable)).
     SnapshotRywDisable,
+    /// `TRANSACTION_LOGGING_MAX_FIELD_LENGTH` (405): the default
+    /// [`TransactionLoggingMaxFieldLength`](TransactionOption::TransactionLoggingMaxFieldLength)
+    /// (validated as it is; there is no transaction logging, so it does nothing).
+    TransactionLoggingMaxFieldLength(i32),
     /// `TRANSACTION_TIMEOUT` (500): the default [`Timeout`](TransactionOption::Timeout).
     TransactionTimeout(Duration),
     /// `TRANSACTION_RETRY_LIMIT` (501): the default
@@ -80,7 +84,7 @@ pub enum DatabaseOption {
     /// [`IncludePortInAddress`](TransactionOption::IncludePortInAddress) (a no-op).
     TransactionIncludePortInAddress,
     /// `TRANSACTION_BYPASS_UNREADABLE` (700): every transaction is
-    /// [`BypassUnreadable`](TransactionOption::BypassUnreadable) (a no-op for now).
+    /// [`BypassUnreadable`](TransactionOption::BypassUnreadable).
     TransactionBypassUnreadable,
     /// `TRANSACTION_USED_DURING_COMMIT_PROTECTION_DISABLE` (701): every transaction is
     /// [`UsedDuringCommitProtectionDisable`](TransactionOption::UsedDuringCommitProtectionDisable).
@@ -97,6 +101,7 @@ impl DatabaseOption {
             DatabaseOption::MaxWatches(_) => 20,
             DatabaseOption::SnapshotRywEnable => 26,
             DatabaseOption::SnapshotRywDisable => 27,
+            DatabaseOption::TransactionLoggingMaxFieldLength(_) => 405,
             DatabaseOption::TransactionTimeout(_) => 500,
             DatabaseOption::TransactionRetryLimit(_) => 501,
             DatabaseOption::TransactionMaxRetryDelay(_) => 502,
@@ -116,6 +121,9 @@ impl DatabaseOption {
             DatabaseOption::MaxWatches(_)
             | DatabaseOption::SnapshotRywEnable
             | DatabaseOption::SnapshotRywDisable => return None,
+            DatabaseOption::TransactionLoggingMaxFieldLength(n) => {
+                TransactionOption::TransactionLoggingMaxFieldLength(*n)
+            }
             DatabaseOption::TransactionTimeout(d) => TransactionOption::Timeout(*d),
             DatabaseOption::TransactionRetryLimit(n) => TransactionOption::RetryLimit(*n),
             DatabaseOption::TransactionMaxRetryDelay(d) => TransactionOption::MaxRetryDelay(*d),

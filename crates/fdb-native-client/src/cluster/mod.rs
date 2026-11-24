@@ -9,7 +9,7 @@
 //! client should use with all their endpoints derived for that version.
 //!
 //! ```no_run
-//! use fdb_native_client::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
+//! use fdb_native_client::cluster::{ClusterMonitor, ClusterMonitorConfig, ConnectionRecord};
 //! use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig};
 //! use fdb_native_transport::runtime::TokioRuntime;
 //!

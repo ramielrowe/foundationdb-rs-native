@@ -1,6 +1,6 @@
-//! Atomic operations: what each [`MutationType`] does to a key's value, a port of
-//! `fdbclient/include/fdbclient/Atomic.h` (identical on `release-7.4` and `release-8.0` but
-//! for style).
+//! Atomic operations: what each [`MutationType`](crate::MutationType) does to a key's
+//! value, a port of `fdbclient/include/fdbclient/Atomic.h` (identical on `release-7.4` and
+//! `release-8.0` but for style).
 //!
 //! These are the functions the storage server applies to the value a key has when an atomic
 //! mutation reaches it (`convertAtomicOp`, `storageserver.actor.cpp` 7.4:7826-7881), and the
@@ -247,6 +247,11 @@ pub fn compare_and_clear(existing: Option<&[u8]>, operand: &[u8]) -> Option<Vec<
 /// (`WriteMap::coalesceUnder`). `SetValue` gives `operand`. `value_size_limit` is for
 /// [`append_if_fits`] ([`VALUE_SIZE_LIMIT`] by default).
 ///
+/// `op` is a mutation type as sent to the cluster: the client's
+/// [`MutationType`](crate::MutationType) (whose `BitAnd` and `Min` are sent as `AndV2` and
+/// `MinV2`), or the wire type itself (`fdb_native_schema::domain::MutationType`, which also
+/// has the version 1 `And` and `Min` and `SetValue`).
+///
 /// `invalid_mutation_type` (2018) for `ClearRange` (a range, not a value), the versionstamp
 /// operations (their result depends on the commit) and types that are not mutations.
 ///
@@ -257,18 +262,18 @@ pub fn compare_and_clear(existing: Option<&[u8]>, operand: &[u8]) -> Option<Vec<
 /// let one = 1u64.to_le_bytes();
 /// let mut value = None;
 /// for _ in 0..3 {
-///     value = apply(MutationType::ADD_VALUE, value.as_deref(), &one, VALUE_SIZE_LIMIT)?;
+///     value = apply(MutationType::Add, value.as_deref(), &one, VALUE_SIZE_LIMIT)?;
 /// }
 /// assert_eq!(value, Some(3u64.to_le_bytes().to_vec()));
 /// # Ok::<(), fdb_native_client::Error>(())
 /// ```
 pub fn apply(
-    op: MutationType,
+    op: impl Into<MutationType>,
     existing: Option<&[u8]>,
     operand: &[u8],
     value_size_limit: usize,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let value = match op {
+    let value = match op.into() {
         MutationType::SET_VALUE => operand.to_vec(),
         MutationType::ADD_VALUE => add(existing, operand),
         MutationType::AND => and(existing, operand),

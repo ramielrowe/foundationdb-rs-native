@@ -3,6 +3,7 @@
 //! `write.rs`, after each write's checks). The watch machinery is [`crate::watch`]; see its
 //! documentation for what C++ does.
 
+use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -10,9 +11,12 @@ use std::sync::atomic::AtomicBool;
 use fdb_native_transport::runtime::Runtime;
 use futures_channel::oneshot;
 
-use super::{CommitStage, ReadGuard, ReadStart, RywView, SYSTEM_KEYS_END, Transaction, TxSource};
+use super::{
+    CommitStage, ReadFuture, ReadGuard, ReadStart, RywView, SYSTEM_KEYS_END, Transaction, TxSource,
+};
 use crate::error::Error;
 use crate::error::codes::*;
+use crate::read::METADATA_VERSION_KEY;
 use crate::read::util::{Either, race};
 use crate::ryw;
 use crate::watch::{PendingId, Watch};
@@ -54,13 +58,30 @@ impl<R: Runtime> Transaction<R> {
     /// This is the behaviour of C++'s read-your-writes layer (see the [module
     /// documentation](super)).
     ///
+    /// As a read, the watch **starts when `watch` is called**: its checks, its registration
+    /// with the transaction and its read happen whether or not the future is awaited before
+    /// the commit (C++'s `watch` future). The future resolves to the [`Watch`] once the value
+    /// is known; it may be awaited after the commit:
+    ///
+    /// ```no_run
+    /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
+    /// let tx = db.create_transaction();
+    /// let watch = tx.watch(b"config"); // registered now
+    /// tx.commit().await?; // starts the watch
+    /// let watch = watch.await?;
+    /// watch.await?; // "config" changed
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// `watches_disabled` (1034) with
     /// [`ReadYourWritesDisable`](super::TransactionOption::ReadYourWritesDisable).
     /// `too_many_watches` (1032): the database has [`max_outstanding_watches`] outstanding
     /// watches. `key_outside_legal_range` (2004) for a key from `\xff` on (unless the
-    /// `ReadSystemKeys` or `AccessSystemKeys` option is set) or from `\xff\xff` on,
+    /// `ReadSystemKeys` or `AccessSystemKeys` option is set; `\xff/metadataVersion` may
+    /// always be watched, as C++ allows) or from `\xff\xff` on,
     /// `key_too_large` (2102), `accessed_unreadable` (1036) for a key whose value a pending
     /// versionstamped operation of the transaction makes unknown (unless
     /// [`BypassUnreadable`](super::TransactionOption::BypassUnreadable)), the errors of
@@ -68,53 +89,62 @@ impl<R: Runtime> Transaction<R> {
     /// ([maybe committed](Error::is_maybe_committed) once the commit may have been sent; the
     /// commit itself goes on).
     ///
-    /// [`max_outstanding_watches`]: crate::WatchConfig::max_outstanding_watches
-    pub async fn watch(&self, key: &[u8]) -> Result<Watch, Error> {
-        let (read, guard) = {
-            let mut state = self.state();
-            self.check_handle(&state)?;
-            if let Some(e) = state.deferred.clone() {
-                return Err(e);
+    /// [`max_outstanding_watches`]: crate::watch::WatchConfig::max_outstanding_watches
+    pub fn watch(&self, key: &[u8]) -> impl Future<Output = Result<Watch, Error>> + Send + use<R> {
+        match self.begin_watch(key) {
+            Ok((read, guard)) => {
+                let tx = self.clone();
+                ReadFuture::Task(self.spawn_read(async move {
+                    let result = tx.watch_read(read, &guard).await;
+                    drop(guard);
+                    result
+                }))
             }
-            state.check_alive(self.rt().now())?;
-            if let Some(e) = state.used_during_commit() {
-                return Err(e);
-            }
-            let start = ReadStart {
-                epoch: state.epoch,
-                use_provisional_proxies: state.flags.use_provisional_proxies,
-                max_read_key: state.flags.max_read_key(),
-            };
-            // `ReadYourWritesTransaction::watch` (7.4:2440-2459, 8.0:2356-2375).
-            let Some(view) = Self::ryw_view(&state, false) else {
-                return Err(Error::new(WATCHES_DISABLED));
-            };
-            if key >= SYSTEM_KEYS_END || key >= start.max_read_key {
-                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
-            }
-            if key.len() > state.buffer.limits().max_write_key_size(key) {
-                return Err(Error::new(KEY_TOO_LARGE));
-            }
-            // `RYWImpl::watch`: `watchMap[key].push_back(watch)`, then the read, counted in
-            // `ryw->reading` until the watch is registered (or failed).
-            let (id, fired) = state.watches.register(key, start.use_provisional_proxies);
-            let guard = self.start_read(&mut state);
-            let read = WatchRead {
-                key: key.to_vec(),
-                id,
-                fired,
-                start,
-                view,
-            };
-            (read, guard)
+            Err(e) => ReadFuture::ready(Err(e)),
+        }
+    }
+
+    /// The checks of `ReadYourWritesTransaction::watch` and the registration of the watch
+    /// with the transaction, made when [`watch`](Self::watch) is called.
+    fn begin_watch(&self, key: &[u8]) -> Result<(WatchRead, ReadGuard<R>), Error> {
+        let mut state = self.state();
+        self.check_handle(&state)?;
+        if let Some(e) = state.deferred.clone() {
+            return Err(e);
+        }
+        state.check_alive(self.rt().now())?;
+        if let Some(e) = state.used_during_commit() {
+            return Err(e);
+        }
+        let start = ReadStart {
+            epoch: state.epoch,
+            use_provisional_proxies: state.flags.use_provisional_proxies,
+            max_read_key: state.flags.max_read_key(),
         };
-        let tx = self.clone();
-        self.spawn_read(async move {
-            let result = tx.watch_read(read, &guard).await;
-            drop(guard);
-            result
-        })
-        .await
+        // `ReadYourWritesTransaction::watch` (7.4:2440-2459, 8.0:2356-2375).
+        let Some(view) = Self::ryw_view(&state, false) else {
+            return Err(Error::new(WATCHES_DISABLED));
+        };
+        // `\xff/metadataVersion` may be watched without the system key options, as it may
+        // be read.
+        if key >= SYSTEM_KEYS_END || (key >= start.max_read_key && key != METADATA_VERSION_KEY) {
+            return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
+        }
+        if key.len() > state.buffer.limits().max_write_key_size(key) {
+            return Err(Error::new(KEY_TOO_LARGE));
+        }
+        // `RYWImpl::watch`: `watchMap[key].push_back(watch)`, then the read, counted in
+        // `ryw->reading` until the watch is registered (or failed).
+        let (id, fired) = state.watches.register(key, start.use_provisional_proxies);
+        let guard = self.start_read(&mut state);
+        let read = WatchRead {
+            key: key.to_vec(),
+            id,
+            fired,
+            start,
+            view,
+        };
+        Ok((read, guard))
     }
 
     /// `RYWImpl::watch` (7.4:1284-1335, 8.0:1278-1327) from the read on: the value read

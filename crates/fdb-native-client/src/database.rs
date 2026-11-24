@@ -55,6 +55,27 @@ pub mod options;
 pub use options::DatabaseOption;
 
 /// How a [`Database`] is built. [`DatabaseOptions::default`] has C++'s knobs everywhere.
+///
+/// The struct is `#[non_exhaustive]`: start from the default and change fields.
+///
+/// ```no_run
+/// # #[cfg(feature = "tls")]
+/// # fn example() -> Result<(), fdb_native_client::Error> {
+/// use fdb_native_client::runtime::TokioRuntime;
+/// use fdb_native_client::{Database, DatabaseOptions, TlsConfig};
+///
+/// let mut options = DatabaseOptions::default();
+/// options.tls = Some(
+///     TlsConfig::new()
+///         .ca_path("/etc/foundationdb/ca.pem")
+///         .cert_path("/etc/foundationdb/cert.pem")
+///         .key_path("/etc/foundationdb/key.pem"),
+/// );
+/// let db = Database::open_with(TokioRuntime::new(), None, options)?;
+/// # let _ = db;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct DatabaseOptions {
@@ -247,6 +268,25 @@ macro_rules! database_struct {
         /// cluster monitor and connection tasks): with tokio (the `tokio` feature),
         /// `Database::open` or `Database::from_connection_string`; over any [`Runtime`],
         /// [`Database::open_with`] or [`Database::from_record`].
+        ///
+        /// ```no_run
+        /// use fdb_native_client::{Database, DatabaseOption};
+        /// use std::path::Path;
+        /// use std::time::Duration;
+        ///
+        /// # async fn example() -> Result<(), fdb_native_client::Error> {
+        /// let db = Database::open(Some(Path::new("/etc/foundationdb/fdb.cluster")))?;
+        /// // Or, without a file: Database::from_connection_string("test:abcd@127.0.0.1:4500")
+        /// db.set_option(DatabaseOption::TransactionTimeout(Duration::from_secs(10)))?;
+        /// db.run(|tx, _| async move {
+        ///     tx.set(b"k", b"v");
+        ///     Ok(())
+        /// })
+        /// .await?;
+        /// db.shutdown().await;
+        /// # Ok(())
+        /// # }
+        /// ```
         pub struct Database<R: Runtime $(= $default)?> {
             pub(crate) inner: Arc<DbInner<R>>,
         }
@@ -401,7 +441,9 @@ impl<R: Runtime> Database<R> {
         })
     }
 
-    /// A new transaction (`createTransaction`), with default options.
+    /// A new transaction (`createTransaction`), with the database's [default
+    /// options](Database::set_option).
+    #[must_use]
     pub fn create_transaction(&self) -> Transaction<R> {
         Transaction::new(self.clone())
     }

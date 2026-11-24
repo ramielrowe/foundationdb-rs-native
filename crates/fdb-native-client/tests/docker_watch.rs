@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fdb_native_client::error::codes;
-use fdb_native_client::{Database, DatabaseOptions, MutationType, Watch, WatchConfig};
+use fdb_native_client::watch::WatchConfig;
+use fdb_native_client::{Database, DatabaseOptions, MutationType, Watch};
 use fdb_native_testkit::FdbContainer;
 use fdb_native_transport::runtime::TokioRuntime;
 
@@ -104,6 +105,29 @@ async fn fires(what: &str, watch: &mut Watch) {
         .unwrap_or_else(|e| panic!("{what}: {e}"));
 }
 
+/// `\xff/metadataVersion` may be watched without the system key options (as C++ allows),
+/// and a transaction that bumps it (the versionstamped value `metadataVersionRequiredValue`)
+/// fires the watch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_watch_of_the_metadata_version_fires_when_it_is_bumped() {
+    const KEY: &[u8] = b"\xff/metadataVersion";
+    let c = Cluster::start().await;
+    let mut watch = c.watch(KEY).await;
+    stays_pending(&mut watch).await;
+    within(
+        "bump",
+        c.db.run(|tx, _| async move {
+            tx.atomic_op(KEY, &[0; 14], MutationType::SetVersionstampedValue);
+            Ok(())
+        }),
+    )
+    .await
+    .expect("bump");
+    fires("the metadata version bump", &mut watch).await;
+    c.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker"]
 async fn docker_watch_fires_when_fdbcli_changes_the_value() {
@@ -172,7 +196,7 @@ async fn docker_watch_fires_when_fdbcli_changes_the_value() {
     let mut watch = within(
         "atomic and watch",
         c.db.run(|tx, _| async move {
-            tx.atomic_op(b"watch/n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+            tx.atomic_op(b"watch/n", &1u64.to_le_bytes(), MutationType::Add);
             tx.watch(b"watch/n").await
         }),
     )
@@ -335,7 +359,7 @@ async fn docker_watch_concurrent_increments() {
         let (t1, t2) = (c.db.create_transaction(), c.db.create_transaction());
         let mut watches = Vec::new();
         for tx in [&t1, &t2] {
-            tx.atomic_op(key, &one, MutationType::ADD_VALUE);
+            tx.atomic_op(key, &one, MutationType::Add);
             watches.push(within("watch", tx.watch(key)).await.unwrap());
         }
         let (r1, r2) = within("the commits", async {
@@ -380,7 +404,7 @@ async fn docker_watch_concurrent_increments() {
                 let mut again = within(
                     "the retry",
                     c.db.run(move |tx, _| async move {
-                        tx.atomic_op(key, &one, MutationType::ADD_VALUE);
+                        tx.atomic_op(key, &one, MutationType::Add);
                         tx.watch(key).await
                     }),
                 )

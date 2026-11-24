@@ -10,10 +10,10 @@ mod support;
 
 use std::time::Duration;
 
+use fdb_native_client::cluster::ConnectionRecord;
 use fdb_native_client::error::codes;
 use fdb_native_client::{
-    ConnectionRecord, Database, DatabaseOption, DatabaseOptions, Error, MutationType, Transaction,
-    TransactionOption,
+    Database, DatabaseOption, DatabaseOptions, Error, MutationType, Transaction, TransactionOption,
 };
 use fdb_native_schema::SchemaVersion;
 use fdb_native_schema::domain::{Commit, CommitId, GetReadVersion, KeyRange};
@@ -169,6 +169,11 @@ fn option_codes_and_persistence_are_those_of_fdb_options() {
         (DatabaseOption::MaxWatches(1), 20, None),
         (DatabaseOption::SnapshotRywEnable, 26, None),
         (DatabaseOption::SnapshotRywDisable, 27, None),
+        (
+            DatabaseOption::TransactionLoggingMaxFieldLength(-1),
+            405,
+            Some(TransactionLoggingMaxFieldLength(-1)),
+        ),
         (
             DatabaseOption::TransactionTimeout(Duration::from_secs(1)),
             500,
@@ -650,6 +655,8 @@ async fn database_options_validate_their_values() {
         DatabaseOption::TransactionTimeout(Duration::from_secs(1 << 40)),
         DatabaseOption::TransactionMaxRetryDelay(Duration::from_secs(1 << 40)),
         DatabaseOption::MaxWatches(1_000_001),
+        DatabaseOption::TransactionLoggingMaxFieldLength(0),
+        DatabaseOption::TransactionLoggingMaxFieldLength(-2),
     ] {
         assert_eq!(
             env.db.set_option(option.clone()).unwrap_err().code(),
@@ -692,7 +699,7 @@ async fn the_next_write_adds_no_write_conflict_range() {
             ("clear_range", |tx| tx.clear_range(b"a", b"b"), b"a"),
             (
                 "atomic_op",
-                |tx| tx.atomic_op(b"a", &1u64.to_le_bytes(), MutationType::ADD_VALUE),
+                |tx| tx.atomic_op(b"a", &1u64.to_le_bytes(), MutationType::Add),
                 b"a",
             ),
         ];
@@ -733,7 +740,7 @@ async fn the_next_write_adds_no_write_conflict_range() {
         let tx = env.db.create_transaction();
         tx.set_read_version(5);
         opt(&tx, TransactionOption::NextWriteNoWriteConflictRange);
-        tx.add_write_conflict_range(b"w", b"x");
+        tx.add_write_conflict_range(b"w", b"x").unwrap();
         tx.set(b"a", b"1");
         tx.set(b"b", b"2");
         let commit = commit_request(&mut env, &tx).await;
@@ -1217,7 +1224,7 @@ async fn metadata_version_writes() {
             codes::CLIENT_INVALID_OPERATION
         );
         let tx = env.db.create_transaction();
-        tx.atomic_op(METADATA_VERSION, &[0; 14], MutationType::ADD_VALUE);
+        tx.atomic_op(METADATA_VERSION, &[0; 14], MutationType::Add);
         assert_eq!(
             tx.get_read_version().await.unwrap_err().code(),
             codes::CLIENT_INVALID_OPERATION
@@ -1226,7 +1233,7 @@ async fn metadata_version_writes() {
         tx.atomic_op(
             METADATA_VERSION,
             &[0; 13],
-            MutationType::SET_VERSIONSTAMPED_VALUE,
+            MutationType::SetVersionstampedValue,
         );
         assert_eq!(
             tx.get_read_version().await.unwrap_err().code(),
@@ -1238,7 +1245,7 @@ async fn metadata_version_writes() {
         tx.atomic_op(
             METADATA_VERSION,
             &[0; 14],
-            MutationType::SET_VERSIONSTAMPED_VALUE,
+            MutationType::SetVersionstampedValue,
         );
         assert_eq!(
             tx.get(METADATA_VERSION).await.unwrap_err().code(),
@@ -1248,7 +1255,7 @@ async fn metadata_version_writes() {
         assert_eq!(commit.mutations.len(), 1);
         assert_eq!(
             commit.mutations[0].kind,
-            MutationType::SET_VERSIONSTAMPED_VALUE
+            fdb_native_schema::domain::MutationType::SET_VERSIONSTAMPED_VALUE
         );
         assert_eq!(commit.mutations[0].param1, METADATA_VERSION);
     }
