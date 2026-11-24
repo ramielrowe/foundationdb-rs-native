@@ -79,6 +79,8 @@ fn seed_sweep() {
         failed.len()
     );
     eprintln!("sim sweep: faults struck {faults:?}");
+    let shared = reports.iter().filter(|r| r.databases > 1).count();
+    eprintln!("sim sweep: {shared} seeds with two databases sharing the connections");
     let mut errors = std::collections::BTreeMap::new();
     let (mut committed, mut not, mut maybe, mut transfers, mut reads, mut backoffs) =
         (0, 0, 0, 0, 0, 0);

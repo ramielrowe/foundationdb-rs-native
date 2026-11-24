@@ -1,10 +1,11 @@
 //! [`Database`]: a connection to a cluster, the transactions on it, and the retry loop.
 //!
-//! A database owns everything a client needs to talk to one cluster, built from a cluster
+//! A database has everything a client needs to talk to one cluster, built from a cluster
 //! file or a connection string:
 //!
 //! * the [`PeerManager`] (one connection per server address, with TLS when the cluster uses
-//!   it, see [TLS](#tls));
+//!   it, see [TLS](#tls)), shared with the other databases of the process that can use the
+//!   same connections (see [Sharing connections](#sharing-connections));
 //! * the [`ClusterMonitor`] (the coordinators' long poll for the proxies);
 //! * the [`Reader`] (read versions, locations, values) and the [`Committer`].
 //!
@@ -20,11 +21,55 @@
 //! config directory (see `fdb_native_transport::tls::TlsConfig::load`). Without the feature,
 //! opening a cluster with `:tls` coordinators fails with `tls_error` (2107).
 //!
+//! # Sharing connections
+//!
+//! As in C++, where every database of a process uses the process's one `FlowTransport`
+//! (`TransportData::getOrOpenPeer`: one connection per address), the databases opened in one
+//! process share their connections and failure monitor when they can: a database opened
+//! while another one that is still open has
+//!
+//! * the same runtime ([`Runtime::same_runtime`]: the same tokio runtime, the smol executor,
+//!   the same node of a simulation; a runtime type that does not say never shares),
+//! * the same [`DatabaseOptions::peers`] (connection knobs), and
+//! * the same TLS material (none, or the same certificate, key, CA, password and
+//!   verify-peers rules as loaded when it is opened; see [TLS](#tls)),
+//!
+//! uses that one's connections: two databases of one cluster have one connection to each
+//! server, pinged once, and one failure monitor (and two of different clusters, which share
+//! no address, one connection manager). Everything else stays per database, also as in C++
+//! (each `DatabaseContext` has its own): the coordinators' long poll, the proxies, the
+//! location cache and its peer evictor, the read version batchers, the watches, the options.
+//!
+//! The sharing is counted: the connections close when the last database using them is shut
+//! down or dropped, and a database opened after that makes new ones. Opening a database once
+//! and cloning the handle is still the cheapest way (one long poll, one location cache);
+//! sharing is for programs whose components each open their own. Set
+//! [`DatabaseOptions::share_connections`] to `false` for connections of the database's own.
+//! [`Database::peers`] gives the database's user of the connections
+//! ([`PeerManager::shares_connections_with`], [`PeerManager::users`]).
+//!
+//! The registry that finds a database's connections is process-wide but holds only weak
+//! references: it keeps nothing alive, and never hands out connections that are shut down.
+//! What it compares (the knobs, the TLS material with its key and password) is kept by the
+//! connections themselves and goes with them.
+//!
+//! **Limits are per connection, so the databases that share one share them**: the command
+//! queue of an address (`PeerManagerConfig::command_queue_len`), its output buffer and its
+//! cap on requests in flight (`RegistryConfig::max_pending`, in the transport's `rpc`
+//! module). One busy database can make another's requests wait for room, or fail them with
+//! a not-sent error (`connection_failed`, 1026), which is retryable and certainly not
+//! delivered, as one busy database alone already could. Give a database that must not be
+//! affected connections of its own (`share_connections = false`) or other knobs.
+//!
 //! # Shutdown
 //!
-//! [`Database::shutdown`] stops the cluster monitor and closes every connection, waiting for
-//! both; transactions then fail with `operation_cancelled` (1101). Dropping the last handle
-//! of a database (and of its transactions, which hold one) stops them too, without waiting.
+//! [`Database::shutdown`] stops the cluster monitor and the database's tasks, and ends its
+//! use of the connections, waiting for them; transactions then fail with
+//! `operation_cancelled` (1101). The connections themselves are closed (and waited for) when
+//! no other database shares them; otherwise they stay open for the others, and only this
+//! database's requests in progress end (a request still queued as not sent, one already sent
+//! as cancelled; see `fdb_native_transport::peer`, "Sharing"). Dropping the last handle of a
+//! database (and of its transactions, which hold one) does the same, without waiting.
 
 #[cfg(feature = "tls")]
 use fdb_native_transport::tls::TlsConfig;
@@ -34,7 +79,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use fdb_native_transport::peer::{DiscardEvents, PeerManager, StreamWrapper};
+use fdb_native_transport::peer::{PeerManager, StreamWrapper};
 use fdb_native_transport::runtime::Runtime;
 #[cfg(feature = "tokio")]
 use fdb_native_transport::runtime::TokioRuntime;
@@ -50,6 +95,7 @@ use crate::read::{ReadConfig, Reader};
 use crate::transaction::{Transaction, TransactionOption};
 use crate::watch::{ABSOLUTE_MAX_WATCHES, WatchConfig, WatchContext};
 
+mod connections;
 pub mod options;
 
 pub use fdb_native_transport::peer::PeerManagerConfig;
@@ -83,10 +129,11 @@ pub use options::DatabaseOption;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct DatabaseOptions {
-    /// The connections.
+    /// The connections. Databases share connections only if these are equal (see [Sharing
+    /// connections](self#sharing-connections)).
     pub peers: PeerManagerConfig,
     /// The coordinator long poll.
     pub monitor: ClusterMonitorConfig,
@@ -104,7 +151,33 @@ pub struct DatabaseOptions {
     /// documentation](self#tls).
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
+    /// Whether the database shares its connections with the other databases of the process
+    /// that can (default `true`; see [Sharing connections](self#sharing-connections)).
+    /// `false` gives it connections of its own, never shared.
+    pub share_connections: bool,
 }
+
+impl Default for DatabaseOptions {
+    fn default() -> DatabaseOptions {
+        DatabaseOptions {
+            peers: PeerManagerConfig::default(),
+            monitor: ClusterMonitorConfig::default(),
+            read: ReadConfig::default(),
+            commit: CommitterConfig::default(),
+            watch: WatchConfig::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
+            share_connections: true,
+        }
+    }
+}
+
+/// The TLS material a database connects with, after loading: `None` without TLS. Databases
+/// share connections only if theirs are equal.
+#[cfg(feature = "tls")]
+pub(crate) type TlsMaterial = Option<fdb_native_transport::tls::LoadedTlsConfig>;
+#[cfg(not(feature = "tls"))]
+pub(crate) type TlsMaterial = Option<std::convert::Infallible>;
 
 /// Whether the previous attempts of a [`Database::run`] closure may have committed: the
 /// closure runs again after `commit_unknown_result`, and must then be idempotent (or check
@@ -125,6 +198,11 @@ impl From<MaybeCommitted> for bool {
 pub struct ClientTls {
     #[cfg(feature = "tls")]
     wrapper: Option<fdb_native_transport::tls::peer::TlsStreamWrapper>,
+    /// What the wrapper was made from, when the client made it: the connections of
+    /// databases with equal material are shared (see [Sharing
+    /// connections](self#sharing-connections)). It lives (and its key and password are
+    /// zeroed) with the connections, not in the registry.
+    material: TlsMaterial,
 }
 
 impl ClientTls {
@@ -138,6 +216,7 @@ impl ClientTls {
     pub fn new(wrapper: fdb_native_transport::tls::peer::TlsStreamWrapper) -> ClientTls {
         ClientTls {
             wrapper: Some(wrapper),
+            material: None,
         }
     }
 
@@ -153,27 +232,23 @@ impl ClientTls {
         }
     }
 
-    /// What a database of `connection_string` with `options` connects with (see the [module
-    /// documentation](self#tls)).
-    fn for_cluster(
+    /// The TLS material a database of `connection_string` with `options` connects with (see
+    /// the [module documentation](self#tls)): loaded from the files or the environment.
+    fn material(
         connection_string: &ClusterConnectionString,
         options: &DatabaseOptions,
-    ) -> Result<ClientTls, Error> {
+    ) -> Result<TlsMaterial, Error> {
         let wants_tls = connection_string.coordinators().iter().any(|c| c.tls());
         #[cfg(feature = "tls")]
         {
-            use fdb_native_transport::tls::TlsConnector;
-            use fdb_native_transport::tls::peer::TlsStreamWrapper;
             if !wants_tls && options.tls.is_none() {
-                return Ok(ClientTls::none());
+                return Ok(None);
             }
             let config = options.tls.clone().unwrap_or_default();
             let loaded = config
                 .load()
                 .map_err(|e| Error::with_source(TLS_ERROR, e))?;
-            let connector =
-                TlsConnector::new(&loaded).map_err(|e| Error::with_source(TLS_ERROR, e))?;
-            Ok(ClientTls::new(TlsStreamWrapper::new(connector)))
+            Ok(Some(loaded))
         }
         #[cfg(not(feature = "tls"))]
         {
@@ -185,7 +260,30 @@ impl ClientTls {
                      fdb-native-client",
                 ));
             }
-            Ok(ClientTls::none())
+            Ok(None)
+        }
+    }
+
+    /// The wrapper for `material`.
+    fn from_material(material: &TlsMaterial) -> Result<ClientTls, Error> {
+        #[cfg(feature = "tls")]
+        {
+            use fdb_native_transport::tls::TlsConnector;
+            use fdb_native_transport::tls::peer::TlsStreamWrapper;
+            let Some(loaded) = material else {
+                return Ok(ClientTls::none());
+            };
+            let connector =
+                TlsConnector::new(loaded).map_err(|e| Error::with_source(TLS_ERROR, e))?;
+            Ok(ClientTls {
+                wrapper: Some(TlsStreamWrapper::new(connector)),
+                material: material.clone(),
+            })
+        }
+        #[cfg(not(feature = "tls"))]
+        match *material {
+            None => Ok(ClientTls::none()),
+            Some(never) => match never {},
         }
     }
 }
@@ -410,9 +508,13 @@ impl<R: Runtime> Database<R> {
         record: ConnectionRecord,
         options: DatabaseOptions,
     ) -> Result<Database<R>, Error> {
-        let tls = ClientTls::for_cluster(record.connection_string(), &options)?;
-        let uses_tls = tls.is_enabled();
-        let peers = PeerManager::with_stream_wrapper(rt.clone(), options.peers, tls, DiscardEvents);
+        let material = ClientTls::material(record.connection_string(), &options)?;
+        let uses_tls = material.is_some();
+        let peers = if options.share_connections {
+            connections::shared(&rt, &options.peers, &material)?
+        } else {
+            connections::own(&rt, &options.peers, &material)?
+        };
         let monitor = Arc::new(ClusterMonitor::start(
             rt.clone(),
             peers.clone(),
@@ -565,14 +667,17 @@ impl<R: Runtime> Database<R> {
     }
 
     /// The connections (the transport's `PeerManager`; lower tier, see
-    /// [`cluster_monitor`](Self::cluster_monitor)).
+    /// [`cluster_monitor`](Self::cluster_monitor)): this database's user of them, which other
+    /// databases may share (see [Sharing connections](self#sharing-connections)).
     pub fn peers(&self) -> &PeerManager<R, ClientTls> {
         &self.inner.peers
     }
 
-    /// Stops the cluster monitor and closes every connection, and waits for both. Every
-    /// handle of the database (and its transactions) then fails with `operation_cancelled`
-    /// (1101). Idempotent.
+    /// Stops the cluster monitor and ends the database's use of the connections, and waits
+    /// for both: the connections are closed (and waited for) unless other databases share them
+    /// (see [Sharing connections](self#sharing-connections)), and its requests in progress end
+    /// either way. Every handle of the database (and its transactions) then fails with
+    /// `operation_cancelled` (1101). Idempotent.
     ///
     /// None of the database's tasks outlives the call, also while handles of it (or of its
     /// transactions) are still held: the read version batchers and the watches stop at once

@@ -152,6 +152,11 @@ impl<R: Runtime> Runtime for MemRuntime<R> {
 
     const TIMER_RESOLUTION: Duration = R::TIMER_RESOLUTION;
 
+    /// The same runtime and the same in-memory network: databases on one share connections.
+    fn same_runtime(&self, other: &Self) -> bool {
+        self.inner.same_runtime(&other.inner) && Arc::ptr_eq(&self.net, &other.net)
+    }
+
     fn now(&self) -> Instant {
         self.inner.now()
     }

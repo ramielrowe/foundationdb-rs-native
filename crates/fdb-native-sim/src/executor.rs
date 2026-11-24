@@ -314,6 +314,11 @@ impl fmt::Debug for Sim {
 }
 
 impl Sim {
+    /// Whether `other` is a handle to this very simulation.
+    pub fn same_sim(&self, other: &Sim) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// A simulation of `seed`, printing its trace at `level`, with the network's default
     /// fault settings ([`NetConfig::default`](crate::NetConfig)).
     pub fn new(seed: u64, level: TraceLevel) -> Sim {

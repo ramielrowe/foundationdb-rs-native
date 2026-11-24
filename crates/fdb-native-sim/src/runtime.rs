@@ -78,6 +78,11 @@ impl<const E: bool, const P: bool> Runtime for SimRuntime<E, P> {
     /// Virtual timers fire exactly at their deadline.
     const TIMER_RESOLUTION: Duration = Duration::ZERO;
 
+    /// The same node of the same simulation.
+    fn same_runtime(&self, other: &Self) -> bool {
+        self.sim.same_sim(&other.sim) && self.node == other.node
+    }
+
     fn now(&self) -> Instant {
         self.sim.now()
     }
