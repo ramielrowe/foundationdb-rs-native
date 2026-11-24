@@ -169,6 +169,7 @@ pub use committer::{CommitOutcome, Committer, versionstamp};
 pub(crate) use limits::normalize_range;
 pub use limits::{CommitLimits, KEY_RANGE_REF_SIZE, MUTATION_REF_SIZE, expected_size};
 pub use options::{CommitOptions, CommitterConfig};
+pub(crate) use prepare::check_write;
 pub use versionstamp::{VERSIONSTAMP_LEN, with_versionstamp_offset};
 
 #[cfg(test)]

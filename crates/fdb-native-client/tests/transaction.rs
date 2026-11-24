@@ -101,7 +101,9 @@ async fn a_write_only_commit_reads_a_causal_read_risky_version_and_commits() {
         let (commit, _) = call.commit();
         assert_eq!(commit.read_snapshot, 100);
         let kinds: Vec<_> = commit.mutations.iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, vec![Mt::SET_VALUE, Mt::CLEAR_RANGE, Mt::ADD_VALUE]);
+        // From the write map, as C++'s `writeRangeToNativeTransaction` sends them: the
+        // cleared ranges first, then each key's operations in key order.
+        assert_eq!(kinds, vec![Mt::CLEAR_RANGE, Mt::SET_VALUE, Mt::ADD_VALUE]);
         // A blind write: the self-conflicting key is a read and a write conflict range.
         assert_eq!(commit.read_conflict_ranges.len(), 1);
         assert_eq!(commit.flags, 0);

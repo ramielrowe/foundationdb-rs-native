@@ -29,7 +29,7 @@ use fdb_native_client::{
 use fdb_native_schema::domain::{
     ClientDbInfo, Commit, CommitId, CommitProxy, GetKey, GetKeyReply, GetKeyServerLocations,
     GetKeyValues, GetKeyValuesReply, GetReadVersion, GetValue, GetValueReply, GrvProxy, KeyRange,
-    KeyServerLocations, MutationType, ReadVersion, StorageServer, TenantMode,
+    KeyServerLocations, Mutation, MutationType, ReadVersion, StorageServer, TenantMode,
 };
 use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_schema::{Request, SchemaVersion};
@@ -1885,6 +1885,780 @@ async fn read_conflict_ranges_match_cpp_for_a_corpus() {
                 }
             }
             assert_eq!(commit_reads(&env, &tx).await, expected, "{schema:?} {name}");
+        }
+    }
+}
+
+// ---- what the commit sends -------------------------------------------------------------------
+
+/// One step of a commit corpus case.
+#[derive(Clone, Debug)]
+enum W {
+    Set(&'static [u8], &'static [u8]),
+    Clear(&'static [u8]),
+    ClearRange(&'static [u8], &'static [u8]),
+    Atomic(&'static [u8], MutationType, &'static [u8]),
+    /// `set_versionstamped_key` of the key (with its offset appended).
+    Svk(Vec<u8>, &'static [u8]),
+    /// `set_versionstamped_value` of the value (with its offset appended).
+    Svv(&'static [u8], Vec<u8>),
+    /// The `NextWriteNoWriteConflictRange` option.
+    NoConflict,
+    WriteConflict(&'static [u8], &'static [u8]),
+    ReadConflict(&'static [u8], &'static [u8]),
+    Get(&'static [u8]),
+    /// The `ReadYourWritesDisable` option (first).
+    RywDisable,
+}
+
+/// `prefix`, a 10-byte placeholder (`0xff`), `suffix`, and the 4-byte offset.
+fn stamp_key(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut k = prefix.to_vec();
+    k.extend([0xff; 10]);
+    k.extend_from_slice(suffix);
+    k.extend((prefix.len() as i32).to_le_bytes());
+    k
+}
+
+/// `key` with the placeholder after `prefix_len` bytes filled with the versionstamp of
+/// `version` (`transformVersionstampKey`), the offset kept.
+fn stamped(key: &[u8], prefix_len: usize, version: i64) -> Vec<u8> {
+    let mut k = key.to_vec();
+    k[prefix_len..prefix_len + 8].copy_from_slice(&version.to_be_bytes());
+    k[prefix_len + 8..prefix_len + 10].fill(0);
+    k
+}
+
+fn m(kind: MutationType, k: &[u8], v: &[u8]) -> Mutation {
+    Mutation::new(kind, k, v).unwrap()
+}
+
+/// A commit corpus case: its steps, the mutations sent (in order), the write and the read
+/// conflict ranges sent (sorted, without the self-conflicting key).
+type CommitCase = (
+    &'static str,
+    Vec<W>,
+    Vec<Mutation>,
+    Vec<KeyRange>,
+    Vec<KeyRange>,
+);
+
+/// What C++'s read-your-writes layer sends for each case, worked out by hand from
+/// `ReadYourWritesTransaction::set` / `clear` / `atomicOp` / `addWriteConflictRange`
+/// (`ReadYourWrites.actor.cpp` 7.4:2219-2500), `WriteMap::mutate` / `clear` / `coalesce`
+/// (`WriteMap.cpp`), `writeRangeToNativeTransaction` (7.4:1997-2072) and
+/// `RYWImpl::commit` (7.4:1392-1399): the clears first, then each key's operations bottom to
+/// top in key order, the write conflict ranges as the maximal runs of the map, the read
+/// conflict ranges coalesced. The transaction reads at version 1000, so a versionstamped key
+/// is written to the map (and sent) with the stamp of version 1001 in its placeholder.
+fn commit_corpus() -> Vec<CommitCase> {
+    use W::*;
+    let set = |k: &[u8], v: &[u8]| m(MutationType::SET_VALUE, k, v);
+    let clear = |b: &[u8], e: &[u8]| m(MutationType::CLEAR_RANGE, b, e);
+    let svk = stamp_key(b"s", b"/x");
+    let svk_sent = stamped(&svk, 1, READ_VERSION + 1);
+    let mut svv = b"val:".to_vec();
+    svv.extend([0xff; 10]);
+    svv.extend(4i32.to_le_bytes());
+    vec![
+        (
+            "sets in key order, the last one of a key",
+            vec![Set(b"b", b"1"), Set(b"a", b"1"), Set(b"b", b"2")],
+            vec![set(b"a", b"1"), set(b"b", b"2")],
+            ranges(&[(b"a", b"a\x00"), (b"b", b"b\x00")]),
+            vec![],
+        ),
+        (
+            "a clear, then a set in it",
+            vec![ClearRange(b"a", b"m"), Set(b"c", b"v")],
+            vec![clear(b"a", b"c"), clear(b"c\x00", b"m"), set(b"c", b"v")],
+            ranges(&[(b"a", b"m")]),
+            vec![],
+        ),
+        (
+            "a set, then a clear over it",
+            vec![Set(b"c", b"v"), ClearRange(b"a", b"m")],
+            vec![clear(b"a", b"m")],
+            ranges(&[(b"a", b"m")]),
+            vec![],
+        ),
+        (
+            "single clears coalesce",
+            vec![Clear(b"c"), Clear(b"c\x00"), Clear(b"e")],
+            vec![clear(b"c", b"c\x00\x00"), clear(b"e", b"e\x00")],
+            ranges(&[(b"c", b"c\x00\x00"), (b"e", b"e\x00")]),
+            vec![],
+        ),
+        (
+            "atomic operations coalesce, or stack",
+            vec![
+                Atomic(b"n", ADD, &[1]),
+                Atomic(b"n", ADD, &[2]),
+                Atomic(b"n", MutationType::XOR, &[7]),
+                Atomic(b"p", MutationType::MIN, b"z"),
+                Atomic(b"p", MutationType::AND, b"y"),
+            ],
+            vec![
+                m(ADD, b"n", &[3]),
+                m(MutationType::XOR, b"n", &[7]),
+                m(MutationType::MIN_V2, b"p", b"z"),
+                m(MutationType::AND_V2, b"p", b"y"),
+            ],
+            ranges(&[(b"n", b"n\x00"), (b"p", b"p\x00")]),
+            vec![],
+        ),
+        (
+            "atomic operations fold into a set or a clear",
+            vec![
+                Set(b"n", &[5]),
+                Atomic(b"n", ADD, &[1]),
+                Clear(b"o"),
+                Atomic(b"o", MutationType::APPEND_IF_FITS, b"z"),
+                Set(b"q", b"x"),
+                Atomic(b"q", MutationType::COMPARE_AND_CLEAR, b"x"),
+            ],
+            vec![set(b"n", &[6]), set(b"o", b"z"), clear(b"q", b"q\x00")],
+            ranges(&[(b"n", b"n\x00"), (b"o", b"o\x00"), (b"q", b"q\x00")]),
+            vec![],
+        ),
+        (
+            "writes without a write conflict range",
+            vec![
+                NoConflict,
+                Set(b"a", b"v"),
+                Set(b"b", b"v"),
+                NoConflict,
+                ClearRange(b"c", b"e"),
+                NoConflict,
+                Atomic(b"f", ADD, &[1]),
+            ],
+            vec![
+                clear(b"c", b"e"),
+                set(b"a", b"v"),
+                set(b"b", b"v"),
+                m(ADD, b"f", &[1]),
+            ],
+            ranges(&[(b"b", b"b\x00")]),
+            vec![],
+        ),
+        (
+            "a write conflict range alone, and merged with writes",
+            vec![
+                WriteConflict(b"p", b"r"),
+                Set(b"r", b"v"),
+                WriteConflict(b"t", b"u"),
+            ],
+            vec![set(b"r", b"v")],
+            ranges(&[(b"p", b"r\x00"), (b"t", b"u")]),
+            vec![],
+        ),
+        (
+            "a read before a write of the key",
+            vec![Get(b"a"), Set(b"a", b"v"), Get(b"f")],
+            vec![set(b"a", b"v")],
+            ranges(&[(b"a", b"a\x00")]),
+            ranges(&[(b"a", b"a\x00"), (b"f", b"f\x00")]),
+        ),
+        (
+            "a versionstamped key sends the writes in its range first",
+            vec![
+                Set(b"s\x01", b"1"),
+                Set(b"t", b"2"),
+                Svk(svk.clone(), b"payload"),
+                Set(b"s\x02", b"3"),
+            ],
+            vec![
+                set(b"s\x01", b"1"),
+                m(MutationType::SET_VERSIONSTAMPED_KEY, &svk_sent, b"payload"),
+                set(b"s\x02", b"3"),
+                set(b"t", b"2"),
+            ],
+            ranges(&[
+                (b"s\x01", b"s\x01\x00"),
+                (b"s\x02", b"s\x02\x00"),
+                (b"t", b"t\x00"),
+            ]),
+            vec![],
+        ),
+        (
+            "a clear over a versionstamped key drops it",
+            vec![Svk(svk.clone(), b"payload"), ClearRange(b"s", b"s\xff")],
+            vec![clear(b"s", b"s\xff")],
+            ranges(&[(b"s", b"s\xff")]),
+            vec![],
+        ),
+        (
+            "a versionstamped value, then a set of its key",
+            vec![Svv(b"k", svv.clone()), Set(b"k", b"after")],
+            vec![
+                m(MutationType::SET_VERSIONSTAMPED_VALUE, b"k", &svv),
+                set(b"k", b"after"),
+            ],
+            ranges(&[(b"k", b"k\x00")]),
+            vec![],
+        ),
+        // The native transaction: every write as it was made.
+        (
+            "read-your-writes disabled",
+            vec![
+                RywDisable,
+                Set(b"b", b"1"),
+                Set(b"a", b"1"),
+                Set(b"b", b"2"),
+                ClearRange(b"a", b"c"),
+                Get(b"f"),
+            ],
+            vec![
+                set(b"b", b"1"),
+                set(b"a", b"1"),
+                set(b"b", b"2"),
+                clear(b"a", b"c"),
+            ],
+            ranges(&[
+                (b"a", b"a\x00"),
+                (b"a", b"c"),
+                (b"b", b"b\x00"),
+                (b"b", b"b\x00"),
+            ]),
+            ranges(&[(b"f", b"f\x00")]),
+        ),
+    ]
+}
+
+/// Runs a commit corpus case's steps on `tx`.
+async fn run_steps(tx: &Transaction<MemRuntime>, steps: &[W]) {
+    for step in steps {
+        match step {
+            W::Set(k, v) => tx.set(k, v),
+            W::Clear(k) => tx.clear(k),
+            W::ClearRange(b, e) => tx.clear_range(b, e),
+            W::Atomic(k, op, v) => tx.atomic_op(k, v, *op),
+            W::Svk(k, v) => tx.set_versionstamped_key(k, v),
+            W::Svv(k, v) => tx.set_versionstamped_value(k, v),
+            W::NoConflict => tx
+                .set_option(TransactionOption::NextWriteNoWriteConflictRange)
+                .unwrap(),
+            W::WriteConflict(b, e) => tx.add_write_conflict_range(b, e),
+            W::ReadConflict(b, e) => tx.add_read_conflict_range(b, e),
+            W::Get(k) => {
+                get(tx, k).await;
+            }
+            W::RywDisable => tx
+                .set_option(TransactionOption::ReadYourWritesDisable)
+                .unwrap(),
+        }
+    }
+}
+
+fn sorted_without_sc(list: &[KeyRange]) -> Vec<KeyRange> {
+    let mut list: Vec<KeyRange> = list
+        .iter()
+        .filter(|r| !r.begin.starts_with(b"\xff/SC/"))
+        .cloned()
+        .collect();
+    list.sort_by(|a, b| (&a.begin, &a.end).cmp(&(&b.begin, &b.end)));
+    list
+}
+
+#[tokio::test(start_paused = true)]
+async fn commits_send_what_cpp_sends_for_a_corpus() {
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 1).await;
+        env.set(&KEYS);
+        for (name, steps, mutations, writes, reads) in commit_corpus() {
+            let tx = env.transaction();
+            run_steps(&tx, &steps).await;
+            let n = env.commit_count();
+            within("commit", tx.commit())
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let commit = env.commits.lock().unwrap()[n].clone();
+            assert_eq!(commit.mutations, mutations, "{schema:?} {name}: mutations");
+            assert_eq!(
+                sorted_without_sc(&commit.write_conflict_ranges),
+                writes,
+                "{schema:?} {name}: write conflict ranges"
+            );
+            assert_eq!(
+                sorted_without_sc(&commit.read_conflict_ranges),
+                reads,
+                "{schema:?} {name}: read conflict ranges"
+            );
+        }
+    }
+}
+
+/// The database after the commit proxy applied `mutations` with the versionstamp of
+/// `version` (batch index 0): what a storage server ends up with.
+fn apply_commit(db: &mut BTreeMap<Vec<u8>, Vec<u8>>, mutations: &[Mutation], version: i64) {
+    let place = |bytes: &[u8]| {
+        let (body, offset) = bytes.split_at(bytes.len() - 4);
+        let pos = i32::from_le_bytes(offset.try_into().unwrap()) as usize;
+        let mut out = body.to_vec();
+        out[pos..pos + 8].copy_from_slice(&version.to_be_bytes());
+        out[pos + 8..pos + 10].fill(0);
+        out
+    };
+    for mu in mutations {
+        match mu.kind {
+            MutationType::SET_VALUE => {
+                db.insert(mu.param1.clone(), mu.param2.clone());
+            }
+            MutationType::CLEAR_RANGE => {
+                let doomed: Vec<Vec<u8>> = db
+                    .range(mu.param1.clone()..mu.param2.clone())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in doomed {
+                    db.remove(&k);
+                }
+            }
+            MutationType::SET_VERSIONSTAMPED_KEY => {
+                db.insert(place(&mu.param1), mu.param2.clone());
+            }
+            MutationType::SET_VERSIONSTAMPED_VALUE => {
+                db.insert(mu.param1.clone(), place(&mu.param2));
+            }
+            op => {
+                let new = fdb_native_client::atomic::apply(
+                    op,
+                    db.get(&mu.param1).map(Vec::as_slice),
+                    &mu.param2,
+                    fdb_native_client::atomic::VALUE_SIZE_LIMIT,
+                )
+                .unwrap();
+                match new {
+                    Some(v) => db.insert(mu.param1.clone(), v),
+                    None => db.remove(&mu.param1),
+                };
+            }
+        }
+    }
+}
+
+/// Every atomic operation a transaction can make (`Min` and `And` become `MinV2` and
+/// `AndV2`).
+const ALL_OPS: [MutationType; 12] = [
+    MutationType::ADD_VALUE,
+    MutationType::AND,
+    MutationType::AND_V2,
+    MutationType::OR,
+    MutationType::XOR,
+    MutationType::MAX,
+    MutationType::MIN,
+    MutationType::MIN_V2,
+    MutationType::BYTE_MIN,
+    MutationType::BYTE_MAX,
+    MutationType::APPEND_IF_FITS,
+    MutationType::COMPARE_AND_CLEAR,
+];
+
+/// Random write sequences (sets, clears, ranges, every atomic operation, versionstamped
+/// values, writes without a conflict range), committed: the database the commit proxy makes
+/// of the mutations sent (the coalesced ones of the write map) is the database with each
+/// write applied in order, and the write conflict ranges cover exactly the keys written
+/// with one. Every fifth round with read-your-writes disabled.
+#[tokio::test(start_paused = true)]
+async fn random_writes_commit_to_the_model() {
+    let mut g = Gen(0x0123_4567_89ab_cdef);
+    // The fake commit proxy commits at 2000.
+    let commit_version = 2000i64;
+    for round in 0..60 {
+        let schema = SCHEMAS[round % 2];
+        let env = Env::new(schema, 1).await;
+        for _ in 0..g.below(10) {
+            let (k, v) = (g.key(), g.value());
+            env.set_value(&k, &v);
+        }
+        let disabled = round % 5 == 4;
+        let tx = env.transaction();
+        if disabled {
+            tx.set_option(TransactionOption::ReadYourWritesDisable)
+                .unwrap();
+        }
+        let mut model = env.snapshot();
+        // What was written with a write conflict range.
+        let mut conflicts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..(1 + g.below(30)) {
+            let no_conflict = g.below(6) == 0;
+            if no_conflict {
+                tx.set_option(TransactionOption::NextWriteNoWriteConflictRange)
+                    .unwrap();
+            }
+            let written: Option<(Vec<u8>, Vec<u8>)> = match g.below(7) {
+                0 | 1 => {
+                    let (k, v) = (g.key(), g.value());
+                    tx.set(&k, &v);
+                    model.insert(k.clone(), v);
+                    Some((k.clone(), key_after(&k)))
+                }
+                2 => {
+                    let k = g.key();
+                    tx.clear(&k);
+                    model.remove(&k);
+                    Some((k.clone(), key_after(&k)))
+                }
+                3 => {
+                    let (mut a, mut b) = (g.key(), g.key());
+                    if a > b {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    tx.clear_range(&a, &b);
+                    let doomed: Vec<Vec<u8>> = model
+                        .range(a.clone()..b.clone())
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for k in doomed {
+                        model.remove(&k);
+                    }
+                    (a < b).then_some((a, b))
+                }
+                4 | 5 => {
+                    let (k, v) = (g.key(), g.value());
+                    let op = ALL_OPS[g.below(ALL_OPS.len() as u64) as usize];
+                    tx.atomic_op(&k, &v, op);
+                    let op = match op {
+                        MutationType::MIN => MutationType::MIN_V2,
+                        MutationType::AND => MutationType::AND_V2,
+                        other => other,
+                    };
+                    let new = fdb_native_client::atomic::apply(
+                        op,
+                        model.get(&k).map(Vec::as_slice),
+                        &v,
+                        fdb_native_client::atomic::VALUE_SIZE_LIMIT,
+                    )
+                    .unwrap();
+                    match new {
+                        Some(new) => model.insert(k.clone(), new),
+                        None => model.remove(&k),
+                    };
+                    Some((k.clone(), key_after(&k)))
+                }
+                _ => {
+                    let k = g.key();
+                    let mut v = g.value();
+                    let pos = v.len();
+                    v.extend([0xff; 10]);
+                    v.extend((pos as i32).to_le_bytes());
+                    tx.set_versionstamped_value(&k, &v);
+                    let mut stamped_value = v[..v.len() - 4].to_vec();
+                    stamped_value[pos..pos + 8].copy_from_slice(&commit_version.to_be_bytes());
+                    stamped_value[pos + 8..].fill(0);
+                    model.insert(k.clone(), stamped_value);
+                    Some((k.clone(), key_after(&k)))
+                }
+            };
+            if let (false, Some(range)) = (no_conflict, written) {
+                conflicts.push(range);
+            }
+        }
+        let n = env.commit_count();
+        within("commit", tx.commit())
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        let commit = env.commits.lock().unwrap()[n].clone();
+        let mut db = env.snapshot();
+        apply_commit(&mut db, &commit.mutations, commit_version);
+        assert_eq!(db, model, "round {round} disabled {disabled}: {commit:?}");
+        // The write conflict ranges cover the keys written with one, and no other (probed
+        // on every key the generator makes and on the bounds).
+        let sent = sorted_without_sc(&commit.write_conflict_ranges);
+        fn within_any<'a>(mut list: impl Iterator<Item = (&'a [u8], &'a [u8])>, k: &[u8]) -> bool {
+            list.any(|(b, e)| b <= k && k < e)
+        }
+        let mut probes: Vec<Vec<u8>> = (0..16u8)
+            .flat_map(|c| {
+                (0..4).map(move |z| {
+                    let mut k = vec![b'a' + c];
+                    k.extend(std::iter::repeat_n(0, z));
+                    k
+                })
+            })
+            .collect();
+        probes.extend(sent.iter().flat_map(|r| [r.begin.clone(), r.end.clone()]));
+        probes.extend(conflicts.iter().flat_map(|(b, e)| [b.clone(), e.clone()]));
+        for k in probes {
+            let covered = within_any(
+                sent.iter().map(|r| (r.begin.as_slice(), r.end.as_slice())),
+                &k,
+            );
+            let wanted = within_any(
+                conflicts.iter().map(|(b, e)| (b.as_slice(), e.as_slice())),
+                &k,
+            );
+            assert_eq!(
+                covered, wanted,
+                "round {round} disabled {disabled}: {k:?} in {sent:?}"
+            );
+        }
+        if !disabled {
+            // From the write map: disjoint, ordered, not touching.
+            for w in sent.windows(2) {
+                assert!(w[0].end < w[1].begin, "round {round}: {sent:?}");
+            }
+        }
+    }
+}
+
+// ---- the approximate size ----------------------------------------------------------------------
+
+/// `prefix` + `key`.
+fn under(prefix: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut k = prefix.to_vec();
+    k.extend_from_slice(key);
+    k
+}
+
+/// `getApproximateSize()` after each case's steps (keys under the prefix `cNN/` of the case's
+/// index, over the database `a f k n q x` under it), as `libfdb_c` 7.4.10 reported it for the
+/// same steps against a 7.4.10 server (a dev-only run through its C API): what C++'s
+/// read-your-writes layer adds to `approximateSize` for each write, conflict range and read.
+/// The committed database of each case was compared too, and the same.
+#[tokio::test(start_paused = true)]
+async fn approximate_size_is_what_libfdb_c_reports() {
+    use W::*;
+    let add = MutationType::ADD_VALUE;
+    let mut svv = b"val:".to_vec();
+    svv.extend([0xff; 10]);
+    svv.extend(4i32.to_le_bytes());
+    let cases: Vec<(Vec<W>, u64)> = vec![
+        (vec![Set(b"b", b"1"), Set(b"a", b"1"), Set(b"b", b"2")], 255),
+        (vec![ClearRange(b"a", b"m"), Set(b"c", b"v")], 173),
+        (vec![Set(b"c", b"v"), ClearRange(b"a", b"m")], 173),
+        (vec![Clear(b"c"), Clear(b"c\x00"), Clear(b"e")], 214),
+        (
+            vec![
+                Atomic(b"n", add, &[1]),
+                Atomic(b"n", add, &[2]),
+                Atomic(b"n", MutationType::XOR, &[7]),
+                Atomic(b"p", MutationType::MIN, b"z"),
+                Atomic(b"p", MutationType::AND, b"y"),
+            ],
+            425,
+        ),
+        (
+            vec![
+                Set(b"n", &[5]),
+                Atomic(b"n", add, &[1]),
+                Clear(b"o"),
+                Atomic(b"o", MutationType::APPEND_IF_FITS, b"z"),
+                Set(b"q", b"x"),
+                Atomic(b"q", MutationType::COMPARE_AND_CLEAR, b"x"),
+            ],
+            495,
+        ),
+        (
+            vec![
+                NoConflict,
+                Set(b"a", b"v"),
+                Set(b"b", b"v"),
+                NoConflict,
+                ClearRange(b"c", b"e"),
+                NoConflict,
+                Atomic(b"f", add, &[1]),
+                NoConflict,
+                Clear(b"k"),
+            ],
+            274,
+        ),
+        (
+            vec![
+                WriteConflict(b"p", b"r"),
+                Set(b"r", b"v"),
+                WriteConflict(b"t", b"u"),
+            ],
+            153,
+        ),
+        (
+            vec![
+                Get(b"a"),
+                Set(b"a", b"v"),
+                Get(b"f"),
+                ReadConflict(b"g", b"j"),
+                Clear(b"h"),
+                ReadConflict(b"g", b"j"),
+                Atomic(b"x", add, &[1]),
+                Get(b"x"),
+            ],
+            447,
+        ),
+        (
+            vec![
+                Set(b"s\x01", b"1"),
+                Set(b"t", b"2"),
+                Svk(Vec::new(), b"payload"),
+                Set(b"s\x02", b"3"),
+            ],
+            333,
+        ),
+        (vec![Svv(b"k", svv.clone()), Set(b"k", b"after")], 191),
+        (
+            vec![Svk(Vec::new(), b"payload"), ClearRange(b"s", b"s\xff")],
+            162,
+        ),
+    ];
+    let env = Env::new(SchemaVersion::V7_4, 1).await;
+    for (i, (steps, size)) in cases.into_iter().enumerate() {
+        let prefix = format!("c{i:02}/").into_bytes();
+        for k in KEYS {
+            env.set_value(&under(&prefix, k), b"v");
+        }
+        let tx = env.transaction();
+        for step in steps {
+            match step {
+                Set(k, v) => tx.set(&under(&prefix, k), v),
+                Clear(k) => tx.clear(&under(&prefix, k)),
+                ClearRange(b, e) => tx.clear_range(&under(&prefix, b), &under(&prefix, e)),
+                Atomic(k, op, v) => tx.atomic_op(&under(&prefix, k), v, op),
+                // `cNN/s`, the placeholder, `/x`, the offset.
+                Svk(_, v) => tx.set_versionstamped_key(&stamp_key(&under(&prefix, b"s"), b"/x"), v),
+                Svv(k, v) => tx.set_versionstamped_value(&under(&prefix, k), &v),
+                NoConflict => tx
+                    .set_option(TransactionOption::NextWriteNoWriteConflictRange)
+                    .unwrap(),
+                WriteConflict(b, e) => {
+                    tx.add_write_conflict_range(&under(&prefix, b), &under(&prefix, e))
+                }
+                ReadConflict(b, e) => {
+                    tx.add_read_conflict_range(&under(&prefix, b), &under(&prefix, e))
+                }
+                Get(k) => {
+                    get(&tx, &under(&prefix, k)).await;
+                }
+                RywDisable => unreachable!(),
+            }
+        }
+        assert_eq!(tx.approximate_size().unwrap(), size, "case {i}");
+        // `on_error` and `reset` start it over; a deferred error is returned instead.
+        tx.on_error(fdb_native_client::Error::new(codes::NOT_COMMITTED))
+            .await
+            .unwrap();
+        assert_eq!(tx.approximate_size().unwrap(), 0);
+        tx.set(b"\xffno", b"v");
+        assert_eq!(
+            tx.approximate_size().unwrap_err().code(),
+            codes::KEY_OUTSIDE_LEGAL_RANGE
+        );
+        tx.reset();
+        assert_eq!(tx.approximate_size().unwrap(), 0);
+    }
+}
+
+// ---- reset, on_error, used during commit -----------------------------------------------------
+
+/// `resetRyow` (`ReadYourWrites.actor.cpp` 7.4:2702-2731, 8.0:2616-2645): `on_error` and
+/// `reset` forget the write map, the cache, the read conflict ranges and the approximate
+/// size; the next attempt reads the database again and commits only its own writes. A write
+/// after the commit started does not reach the commit: it is `used_during_commit`.
+#[tokio::test(start_paused = true)]
+async fn on_error_and_reset_forget_the_read_your_writes_state() {
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 1).await;
+        env.set(&KEYS);
+        let tx = env.transaction();
+        tx.set(b"a", b"mine");
+        tx.clear_range(b"f", b"z");
+        assert_eq!(get(&tx, b"a").await, Some(b"mine".to_vec()));
+        assert_eq!(get(&tx, b"k").await, None);
+        tx.on_error(fdb_native_client::Error::new(codes::NOT_COMMITTED))
+            .await
+            .unwrap();
+        tx.set_read_version(READ_VERSION);
+        let requests = env.requests();
+        assert_eq!(get(&tx, b"a").await, Some(b"v".to_vec()));
+        assert_eq!(get(&tx, b"k").await, Some(b"v".to_vec()));
+        assert_eq!(env.requests(), requests + 2, "the cache was forgotten too");
+        tx.set(b"b", b"second");
+        let n = env.commit_count();
+        within("commit", tx.commit()).await.unwrap();
+        let commit = env.commits.lock().unwrap()[n].clone();
+        assert_eq!(
+            commit.mutations,
+            vec![Mutation::new(MutationType::SET_VALUE, "b", "second").unwrap()]
+        );
+        assert_eq!(
+            sorted_without_sc(&commit.read_conflict_ranges),
+            ranges(&[(b"a", b"a\x00"), (b"k", b"k\x00")])
+        );
+        // Committed: a write now is `used_during_commit` (maybe committed: the commit
+        // succeeded), and is not in any commit.
+        tx.set(b"c", b"late");
+        let e = tx.commit().await.unwrap_err();
+        assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+        assert!(e.is_maybe_committed());
+
+        let tx = env.transaction();
+        tx.set(b"a", b"mine");
+        tx.reset();
+        tx.set_read_version(READ_VERSION);
+        assert_eq!(get(&tx, b"a").await, Some(b"v".to_vec()));
+        assert_eq!(
+            within("commit", tx.commit())
+                .await
+                .unwrap()
+                .committed_version(),
+            -1,
+            "nothing to write"
+        );
+    }
+}
+
+/// A write while the commit waits for a read in progress (`ryw->reading`) poisons the
+/// transaction: the commit fails with `used_during_commit`, and nothing is sent.
+#[tokio::test(start_paused = true)]
+async fn a_write_while_the_commit_waits_for_a_read_fails_the_commit() {
+    let env = Env::new(SchemaVersion::V8_0, 1).await;
+    env.set(&KEYS);
+    env.delay(Duration::from_secs(1));
+    let tx = env.transaction();
+    tx.set(b"a", b"mine");
+    let read = tx.get(b"k");
+    let commit = tokio::spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.set(b"b", b"during");
+    let e = within("commit", commit).await.unwrap().unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(!e.is_maybe_committed(), "{e:?}");
+    assert_eq!(env.commit_count(), 0);
+    // The read was interrupted by the transaction's death.
+    assert_eq!(
+        within("read", read).await.unwrap_err().code(),
+        codes::USED_DURING_COMMIT
+    );
+}
+
+/// `transaction_too_large` (2101) applies to what the commit sends (`commitMutations`'
+/// `getSize()` over the native transaction): with read-your-writes, the write map's coalesced
+/// writes, so a key written over and over counts once; with read-your-writes disabled, every
+/// write as it was made. The approximate size counts every call in both.
+#[tokio::test(start_paused = true)]
+async fn the_size_limit_applies_to_what_the_commit_sends() {
+    let env = Env::new(SchemaVersion::V8_0, 1).await;
+    let value = vec![7u8; 90_000];
+    for disabled in [false, true] {
+        let tx = env.transaction();
+        if disabled {
+            tx.set_option(TransactionOption::ReadYourWritesDisable)
+                .unwrap();
+        }
+        // 120 sets of 90 kB: 10.8 MB of calls, over the default 10 MB limit.
+        for _ in 0..120 {
+            tx.set(b"big", &value);
+        }
+        assert!(tx.approximate_size().unwrap() > 10_000_000);
+        let n = env.commit_count();
+        let result = within("commit", tx.commit()).await;
+        if disabled {
+            assert_eq!(result.unwrap_err().code(), codes::TRANSACTION_TOO_LARGE);
+            assert_eq!(env.commit_count(), n, "nothing sent");
+        } else {
+            result.unwrap();
+            let commit = env.commits.lock().unwrap()[n].clone();
+            assert_eq!(commit.mutations.len(), 1);
         }
     }
 }

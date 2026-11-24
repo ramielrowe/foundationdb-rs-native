@@ -3,7 +3,6 @@
 //! values computed by applying them one by one), and a property test.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use fdb_native_schema::domain::MutationType as M;
 use proptest::prelude::*;
