@@ -303,14 +303,60 @@
 //!
 //! # Shutdown
 //!
-//! [`PeerManager::shutdown`] asks every peer to finish: queued commands are refused (never
-//! sent), requests that were sent complete with [`RequestError::Cancelled`], what is already
-//! queued for writing gets [`shutdown_timeout`](PeerManagerConfig::shutdown_timeout) to be
-//! written, the socket is closed, [`PeerEvent::Closed`] (clean) is reported, the address's
-//! waiters on the [`FailureMonitor`] are woken (`notifyDisconnect`) if it had a connection, and
-//! the task ends.
-//! The call returns when all tasks have. Dropping the last [`PeerManager`] clone shuts every
-//! peer down the same way (without waiting): a manager that is gone leaves no task behind.
+//! [`PeerManager::shutdown`] (of the last [user](#sharing)) asks every peer to finish: queued
+//! commands are refused (never sent), requests that were sent complete with
+//! [`RequestError::Cancelled`], what is already queued for writing gets
+//! [`shutdown_timeout`](PeerManagerConfig::shutdown_timeout) to be written, the socket is
+//! closed, [`PeerEvent::Closed`] (clean) is reported, the address's waiters on the
+//! [`FailureMonitor`] are woken (`notifyDisconnect`) if it had a connection, and the task ends.
+//! The call returns when all tasks have. Dropping the last [`PeerManager`] clone of the last
+//! user shuts every peer down the same way (without waiting): a manager that is gone leaves no
+//! task behind.
+//!
+//! # Sharing
+//!
+//! C++ has one `FlowTransport` per process, shared by all its databases: one connection per
+//! address (`TransportData::getOrOpenPeer`, 7.4:1795-1809, 8.0:1931), one failure monitor.
+//! Here one manager's peers can have several **users**: [`PeerManager::share`] (or
+//! [`WeakPeerManager::share`], for a registry that should not keep the connections alive)
+//! makes a manager over the same peers, failure monitor, configuration, stream wrapper and
+//! event sink. A manager and its clones are
+//! one user; every user sees the same peers, references and failure state, as C++'s databases
+//! do.
+//!
+//! Each user shuts down on its own, by [`shutdown`](PeerManager::shutdown) or by dropping its
+//! last clone, and that only ends what the user asked for:
+//!
+//! * its handles' commands fail from then on, as after a shutdown, and those in progress end
+//!   at once: each peer's task is told, and refuses the user's commands still queued
+//!   ([`RequestError::NotSent`]: decided under the queue's lock, they were certainly not
+//!   sent) and fails its requests in flight with [`RequestError::Cancelled`] (they may have
+//!   been sent; their reply tokens are forgotten, and the connection goes on for the other
+//!   users). A command the task takes after it was told is refused unsent too (one it took
+//!   before is in flight, and cancelled). Nothing of this is on a request's path: a command
+//!   carries its user's id, and the reply is awaited without looking at shared state;
+//! * its [`connect`](PeerHandle::connect)s fail with [`PeerError::Shutdown`], its
+//!   [`close_connection`](PeerHandle::close_connection)s do nothing, and its
+//!   [`reference`](PeerHandle::reference)s do not count (those taken before stay until
+//!   dropped);
+//! * [`peer`](PeerManager::peer) gives handles that fail, and starts no peer.
+//!
+//! The peers shut down (as above) with the last user. [`PeerManager::users`] counts the users
+//! left and [`PeerManager::shares_connections_with`] tells whether two managers share.
+//!
+//! Peers are shared across clusters too (they share no addresses), and so is the guess of the
+//! version a new connection announces first (the one last negotiated with any address, else the
+//! first supported). With clusters of different versions in a process that guess flips between
+//! them, and a wrong one costs a reconnect. A user that names its cluster
+//! ([`PeerManager::set_cluster_key`]) has the peers it makes guess from the version last
+//! negotiated with that cluster's addresses first.
+//!
+//! The limits of a peer are the connection's, so the users share them: the command queue
+//! ([`command_queue_len`](PeerManagerConfig::command_queue_len)), the output buffer and the
+//! reply registry's cap on requests in flight
+//! ([`RegistryConfig::max_pending`](crate::rpc::RegistryConfig::max_pending),
+//! [`RequestError::TooManyPending`]). A user that fills them makes the others' commands wait
+//! for room or fail as not sent (retryable), as one busy user already did.
 //!
 //! Citations `7.4:N` are lines of `fdbrpc/FlowTransport.actor.cpp` on `release-7.4` and `8.0:N`
 //! of `fdbrpc/FlowTransport.cpp` on `release-8.0`, unless another file is named.
@@ -340,6 +386,7 @@ mod queue;
 mod stream;
 mod task;
 mod tls_throttle;
+mod user;
 mod waiters;
 mod watch;
 
@@ -358,6 +405,7 @@ pub use stream::{MaybeTls, NoTls, StreamWrapper};
 use address::PeerKey;
 use queue::{Cmd, CommandQueue, Rejected};
 use task::PeerTask;
+use user::User;
 use watch::Watch;
 
 #[cfg(doc)]
@@ -418,6 +466,9 @@ pub(crate) enum Ctrl {
     Unregister(Uid),
     /// The request with this id was dropped after the task took it.
     Cancel(u64),
+    /// The user with this id was shut down (and others remain): its queued commands are
+    /// refused, its requests in flight cancelled.
+    UserClosed(u64),
     CloseConnection,
     /// The last [`PeerHandle`] was dropped.
     Released,
@@ -431,6 +482,9 @@ pub(crate) struct PeerShared {
     pub(crate) status: Watch<PeerStatus>,
     pub(crate) queue: CommandQueue,
     pub(crate) ctrl: mpsc::UnboundedSender<Ctrl>,
+    /// The cluster the user that made the peer said it is of, if it did
+    /// ([`PeerManager::set_cluster_key`]): the key of the version guess its connections make.
+    pub(crate) cluster: Option<Arc<str>>,
     /// C++'s `peerReferences`: -1 until the first reference, then the count.
     references: AtomicIsize,
     /// How many [`PeerHandle`]s exist (the manager's map holds none).
@@ -559,6 +613,9 @@ impl Drop for Guard<'_> {
 pub struct PeerHandle {
     shared: Arc<PeerShared>,
     failures: FailureMonitor,
+    /// The user of the manager that gave it out: its commands end when that user is shut
+    /// down.
+    user: Arc<User>,
 }
 
 impl fmt::Debug for PeerHandle {
@@ -572,7 +629,11 @@ impl fmt::Debug for PeerHandle {
 
 impl Clone for PeerHandle {
     fn clone(&self) -> PeerHandle {
-        PeerHandle::new(self.shared.clone(), self.failures.clone())
+        PeerHandle::new(
+            self.shared.clone(),
+            self.failures.clone(),
+            self.user.clone(),
+        )
     }
 }
 
@@ -586,9 +647,13 @@ impl Drop for PeerHandle {
 }
 
 impl PeerHandle {
-    fn new(shared: Arc<PeerShared>, failures: FailureMonitor) -> PeerHandle {
+    fn new(shared: Arc<PeerShared>, failures: FailureMonitor, user: Arc<User>) -> PeerHandle {
         shared.handles.fetch_add(1, Ordering::SeqCst);
-        PeerHandle { shared, failures }
+        PeerHandle {
+            shared,
+            failures,
+            user,
+        }
     }
 
     /// The stable id of the peer, as events carry it.
@@ -641,30 +706,43 @@ impl PeerHandle {
     /// connection that is closed locally while it handshakes does not end the wait: the
     /// connect is retried.
     pub async fn connect(&self) -> Result<ProtocolVersion, PeerError> {
+        if self.user.is_closed() {
+            return Err(PeerError::Shutdown);
+        }
         let failures_before = self.shared.status.read(|s| s.failures);
         if self.shared.ctrl.unbounded_send(Ctrl::Connect).is_err() {
             return Err(PeerError::Shutdown);
         }
-        self.shared
-            .status
-            .wait_for(|s| {
-                if s.phase == PeerPhase::Connected {
-                    return s.version.map(Ok);
-                }
-                if s.phase == PeerPhase::Shutdown {
-                    return Some(Err(PeerError::Shutdown));
-                }
-                if s.failures != failures_before {
-                    return Some(Err(s.last_error.clone().unwrap_or(PeerError::Shutdown)));
-                }
-                None
-            })
+        let connected = self.shared.status.wait_for(|s| {
+            if s.phase == PeerPhase::Connected {
+                return s.version.map(Ok);
+            }
+            if s.phase == PeerPhase::Shutdown {
+                return Some(Err(PeerError::Shutdown));
+            }
+            if s.failures != failures_before {
+                return Some(Err(s.last_error.clone().unwrap_or(PeerError::Shutdown)));
+            }
+            None
+        });
+        self.user
+            .unless_closed(connected)
             .await
+            .unwrap_or(Err(PeerError::Shutdown))
     }
 
     /// Queues a command and waits for the task's answer. Dropping the future takes the
     /// command back if the task has not.
-    async fn call<T>(&self, make: impl FnOnce(u64, oneshot::Sender<T>) -> Cmd) -> Called<T> {
+    ///
+    /// When the handle's user is [shut down](PeerManager::shutdown), the command is not
+    /// queued, a wait for room in the queue ends at once (nothing was queued), and the peer's
+    /// task answers what is queued or in flight ([`Ctrl::UserClosed`]). The user is checked
+    /// only with an atomic load here: the reply is awaited as is, with no shared state on the
+    /// way (a request's cost does not depend on sharing).
+    async fn call<T>(&self, make: impl FnOnce(u64, u64, oneshot::Sender<T>) -> Cmd) -> Called<T> {
+        if self.user.is_closed() {
+            return Called::NeverQueued;
+        }
         let (tx, rx) = oneshot::channel();
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let mut guard = Guard {
@@ -673,10 +751,16 @@ impl PeerHandle {
             queued: false,
             done: false,
         };
-        match self.shared.queue.push(make(id, tx)).await {
-            Ok(()) => {}
-            Err(Rejected::Closed) => return Called::NeverQueued,
-            Err(Rejected::Refused(error)) => return Called::Refused(error),
+        // A push abandoned while it waits for room has queued nothing (and one that finds
+        // room at once never looks at the shutdown signal).
+        match self
+            .user
+            .unless_closed(self.shared.queue.push(make(id, self.user.id(), tx)))
+            .await
+        {
+            None | Some(Err(Rejected::Closed)) => return Called::NeverQueued,
+            Some(Ok(())) => {}
+            Some(Err(Rejected::Refused(error))) => return Called::Refused(error),
         }
         guard.queued = true;
         let answer = rx.await;
@@ -720,8 +804,9 @@ impl PeerHandle {
             });
         }
         let called = self
-            .call(|id, reply| Cmd::Request {
+            .call(|id, user, reply| Cmd::Request {
                 id,
+                user,
                 endpoint,
                 encode: Box::new(encode),
                 reply,
@@ -775,8 +860,9 @@ impl PeerHandle {
         F: FnOnce(ProtocolVersion, &mut Vec<u8>) -> Result<(), EncodeError> + Send + 'static,
     {
         let called = self
-            .call(|id, ack| Cmd::Send {
+            .call(|id, user, ack| Cmd::Send {
                 id,
+                user,
                 token,
                 encode: Box::new(encode),
                 ack,
@@ -797,7 +883,14 @@ impl PeerHandle {
     /// rules. If the future is dropped after the registration was applied (the caller never
     /// saw the answer), the registration is undone.
     pub async fn register(&self, token: Uid) -> Result<Generation, SendError> {
-        let called = self.call(|id, ack| Cmd::Register { id, token, ack }).await;
+        let called = self
+            .call(|id, user, ack| Cmd::Register {
+                id,
+                user,
+                token,
+                ack,
+            })
+            .await;
         match called {
             Called::Answer(result) => result,
             Called::NeverQueued | Called::Lost => Err(SendError::Shutdown),
@@ -823,17 +916,28 @@ impl PeerHandle {
     /// dropped. A referenced peer keeps its connection and is probed after a failure; when the
     /// last reference is released, an idle connection is closed and the peer may be
     /// [removed](self#references-and-removal). Never waits.
+    ///
+    /// A handle whose user is [shut down](PeerManager::shutdown) gives a reference that does
+    /// not count: the connections other users share are not kept for it.
     pub fn reference(&self) -> PeerRef {
-        self.shared.add_reference();
+        let counted = !self.user.is_closed();
+        if counted {
+            self.shared.add_reference();
+        }
         PeerRef {
             handle: self.clone(),
+            counted,
         }
     }
 
     /// Closes the current connection, if any, as a clean local close (no failure is
     /// recorded). Requests that were sent complete as maybe delivered; commands still waiting
-    /// reconnect. Never waits.
+    /// reconnect. Never waits. Does nothing once the handle's user is
+    /// [shut down](PeerManager::shutdown).
     pub fn close_connection(&self) {
+        if self.user.is_closed() {
+            return;
+        }
         let _ = self.shared.ctrl.unbounded_send(Ctrl::CloseConnection);
     }
 }
@@ -843,6 +947,8 @@ impl PeerHandle {
 #[derive(Debug)]
 pub struct PeerRef {
     handle: PeerHandle,
+    /// Whether it counts (see [`PeerHandle::reference`]).
+    counted: bool,
 }
 
 impl PeerRef {
@@ -860,7 +966,9 @@ impl Clone for PeerRef {
 
 impl Drop for PeerRef {
     fn drop(&mut self) {
-        self.handle.shared.remove_reference();
+        if self.counted {
+            self.handle.shared.remove_reference();
+        }
     }
 }
 
@@ -875,11 +983,15 @@ pub(crate) struct Shared<R: Runtime, W> {
     pub(crate) tls_throttle: tls_throttle::TlsThrottle,
     /// The version of the cluster, as last negotiated with any address.
     pub(crate) cluster_version: Mutex<Option<ProtocolVersion>>,
+    /// The version last negotiated with an address of each cluster that users named
+    /// ([`PeerManager::set_cluster_key`]).
+    cluster_versions: Mutex<HashMap<Arc<str>, ProtocolVersion>>,
     pub(crate) seed: u64,
     peers: Mutex<Peers<R>>,
     next_peer: AtomicU64,
-    /// How many [`PeerManager`] values (clones) exist.
-    managers: AtomicUsize,
+    /// How many users ([`PeerManager::share`]) are neither shut down nor dropped. The
+    /// connections shut down when it reaches 0, and it never leaves 0 again.
+    users: AtomicUsize,
 }
 
 struct Entry<R: Runtime> {
@@ -909,11 +1021,32 @@ impl<R: Runtime, W> Shared<R, W> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn set_cluster_version(&self, version: ProtocolVersion) {
+    /// Records the version negotiated with an address of `cluster` (the key of the peer's
+    /// user, if it named one).
+    pub(crate) fn set_cluster_version(&self, cluster: Option<&Arc<str>>, version: ProtocolVersion) {
         *self
             .cluster_version
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(version);
+        if let Some(cluster) = cluster {
+            self.cluster_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(cluster.clone(), version);
+        }
+    }
+
+    /// The version to announce first to a new address of `cluster`: the one last negotiated
+    /// with that cluster, else the manager's.
+    pub(crate) fn guess_version(&self, cluster: Option<&Arc<str>>) -> Option<ProtocolVersion> {
+        let own = cluster.and_then(|cluster| {
+            self.cluster_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(cluster)
+                .copied()
+        });
+        own.or_else(|| self.cluster_version())
     }
 
     fn lock_peers(&self) -> std::sync::MutexGuard<'_, Peers<R>> {
@@ -969,41 +1102,35 @@ impl<R: Runtime, W> Shared<R, W> {
 /// Cheap to clone (a shared handle). Create it, and call [`peer`](PeerManager::peer), inside
 /// the executor (tasks are spawned). `W` is the [`StreamWrapper`] for TLS; the default,
 /// [`NoTls`], supports plain addresses only.
+///
+/// A manager and its clones are one **user** of the connections; [`share`](Self::share) makes
+/// another user of the same connections, with its own [shutdown](self#sharing).
 pub struct PeerManager<R: Runtime, W = NoTls> {
     inner: Arc<Shared<R, W>>,
+    user: Arc<User>,
 }
 
 impl<R: Runtime, W> Clone for PeerManager<R, W> {
     fn clone(&self) -> Self {
-        self.inner.managers.fetch_add(1, Ordering::SeqCst);
+        self.user.clones.fetch_add(1, Ordering::SeqCst);
         PeerManager {
             inner: self.inner.clone(),
+            user: self.user.clone(),
         }
     }
 }
 
 impl<R: Runtime, W> Drop for PeerManager<R, W> {
-    /// Dropping the last clone shuts the peers down, as [`shutdown`](PeerManager::shutdown)
-    /// does, without waiting for them: nothing could ever use or end them again. Handles that
-    /// outlive the manager fail their commands.
+    /// Dropping the last clone of a user shuts that user down, as
+    /// [`shutdown`](PeerManager::shutdown) does, without waiting: when it was the last user,
+    /// the peers shut down too, as nothing could ever use or end them again. Handles that
+    /// outlive their user fail their commands.
     fn drop(&mut self) {
-        if self.inner.managers.fetch_sub(1, Ordering::SeqCst) == 1 {
+        if self.user.clones.fetch_sub(1, Ordering::SeqCst) == 1 && self.inner.leave(&self.user) {
             // Detach the tasks (they end by themselves), but let go of them outside the lock:
             // a runtime that cancels a task whose handle is dropped runs its destructors
             // (which take the lock) right there.
-            let detached: Vec<R::Task<()>> = {
-                let mut peers = self.inner.lock_peers();
-                peers.shutdown = true;
-                peers
-                    .map
-                    .values_mut()
-                    .filter_map(|entry| {
-                        let _ = entry.shared.ctrl.unbounded_send(Ctrl::Shutdown);
-                        entry.task.take()
-                    })
-                    .collect()
-            };
-            drop(detached);
+            drop(self.inner.stop_peers());
         }
     }
 }
@@ -1013,8 +1140,124 @@ impl<R: Runtime, W> fmt::Debug for PeerManager<R, W> {
         let peers = self.inner.lock_peers();
         f.debug_struct("PeerManager")
             .field("peers", &peers.map.len())
+            .field("users", &self.inner.users.load(Ordering::SeqCst))
+            .field("user_shut_down", &self.user.is_closed())
             .field("shutdown", &peers.shutdown)
             .finish_non_exhaustive()
+    }
+}
+
+impl<R: Runtime, W> Shared<R, W> {
+    /// Shuts `user` down, if it was not. Returns whether it was the last user, whose
+    /// departure shuts the peers down ([`stop_peers`](Self::stop_peers) is then due).
+    ///
+    /// When others remain, every peer's task is told ([`Ctrl::UserClosed`]): it refuses the
+    /// user's queued commands and cancels its requests in flight. A peer made after this
+    /// never gets a command of the user ([`PeerManager::peer`] looks at the flag under the
+    /// map's lock, which this takes after setting it).
+    fn leave(&self, user: &User) -> bool {
+        if !user.close() {
+            return false;
+        }
+        if self.users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            return true;
+        }
+        let peers = self.lock_peers();
+        for entry in peers.map.values() {
+            let _ = entry
+                .shared
+                .ctrl
+                .unbounded_send(Ctrl::UserClosed(user.id()));
+        }
+        false
+    }
+
+    /// Asks every peer to shut down, and hands back their tasks.
+    fn stop_peers(&self) -> Vec<R::Task<()>> {
+        let mut peers = self.lock_peers();
+        peers.shutdown = true;
+        peers
+            .map
+            .values_mut()
+            .filter_map(|entry| {
+                let _ = entry.shared.ctrl.unbounded_send(Ctrl::Shutdown);
+                entry.task.take()
+            })
+            .collect()
+    }
+
+    /// A new user, unless the peers are shut down (every user left).
+    fn join(&self) -> Option<Arc<User>> {
+        self.users
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Arc::new(User::new()))
+    }
+}
+
+/// A weak reference to the connections of a [`PeerManager`] ([`PeerManager::downgrade`]): it
+/// keeps nothing alive, and [`share`](Self::share) makes a new user of them while they are not
+/// shut down. For a registry of managers to share, such as the client's.
+pub struct WeakPeerManager<R: Runtime, W = NoTls> {
+    inner: std::sync::Weak<Shared<R, W>>,
+}
+
+impl<R: Runtime, W> Clone for WeakPeerManager<R, W> {
+    fn clone(&self) -> Self {
+        WeakPeerManager {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<R: Runtime, W> fmt::Debug for WeakPeerManager<R, W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeakPeerManager")
+            .field("alive", &(self.inner.strong_count() > 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Runtime, W> WeakPeerManager<R, W> {
+    /// A new user of the connections ([`PeerManager::share`]), or `None` once they are shut
+    /// down or gone.
+    pub fn share(&self) -> Option<PeerManager<R, W>> {
+        let inner = self.inner.upgrade()?;
+        let user = inner.join()?;
+        Some(PeerManager { inner, user })
+    }
+
+    /// [`share`](Self::share), only for a user on `rt`: `None` unless the connections run on
+    /// that very runtime ([`Runtime::same_runtime`]).
+    pub fn share_on(&self, rt: &R) -> Option<PeerManager<R, W>> {
+        self.share_on_if(rt, |_, _| true)
+    }
+
+    /// [`share_on`](Self::share_on), only if `accept` takes the connections' configuration
+    /// and stream wrapper (it is asked before a user is made, so a refusal costs the
+    /// connections nothing). A registry keeps what it compares in the manager this way, and
+    /// lets go of it with the connections.
+    pub fn share_on_if(
+        &self,
+        rt: &R,
+        accept: impl FnOnce(&PeerManagerConfig, &W) -> bool,
+    ) -> Option<PeerManager<R, W>> {
+        let inner = self.inner.upgrade()?;
+        if !inner.rt.same_runtime(rt) || !accept(&inner.config, &inner.wrapper) {
+            return None;
+        }
+        let user = inner.join()?;
+        Some(PeerManager { inner, user })
+    }
+
+    /// Whether the connections are shut down (every user left) or gone: [`share`](Self::share)
+    /// will never succeed again.
+    pub fn is_shut_down(&self) -> bool {
+        self.inner
+            .upgrade()
+            .is_none_or(|inner| inner.users.load(Ordering::SeqCst) == 0)
     }
 }
 
@@ -1060,15 +1303,59 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
                 failures: FailureMonitor::new(),
                 tls_throttle: Default::default(),
                 cluster_version: Mutex::new(None),
+                cluster_versions: Mutex::new(HashMap::new()),
                 seed,
                 peers: Mutex::new(Peers {
                     map: HashMap::new(),
                     shutdown: false,
                 }),
                 next_peer: AtomicU64::new(1),
-                managers: AtomicUsize::new(1),
+                users: AtomicUsize::new(1),
             }),
+            user: Arc::new(User::new()),
         }
+    }
+
+    /// Another user of these connections: a manager with the same peers, failure monitor,
+    /// configuration and stream wrapper (an address has one connection whichever user asks),
+    /// but its own [shutdown](Self::shutdown). `None` once the connections are shut down
+    /// (every user was shut down or dropped). See [Sharing](self#sharing).
+    pub fn share(&self) -> Option<PeerManager<R, W>> {
+        let user = self.inner.join()?;
+        Some(PeerManager {
+            inner: self.inner.clone(),
+            user,
+        })
+    }
+
+    /// A weak reference to the connections, to [share](WeakPeerManager::share) them later
+    /// without keeping them alive.
+    pub fn downgrade(&self) -> WeakPeerManager<R, W> {
+        WeakPeerManager {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Whether `other` uses the same connections (one is a [`share`](Self::share) of the
+    /// other, or a clone).
+    pub fn shares_connections_with(&self, other: &PeerManager<R, W>) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// How many users of the connections are neither shut down nor dropped (0 once they are
+    /// shut down).
+    pub fn users(&self) -> usize {
+        self.inner.users.load(Ordering::SeqCst)
+    }
+
+    /// The runtime the peers run on.
+    pub fn runtime(&self) -> &R {
+        &self.inner.rt
+    }
+
+    /// The stream wrapper the peers connect with.
+    pub fn stream_wrapper(&self) -> &W {
+        &self.inner.wrapper
     }
 
     /// The failure monitor all peers report to.
@@ -1079,6 +1366,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
     /// The configuration.
     pub fn config(&self) -> &PeerManagerConfig {
         &self.inner.config
+    }
+
+    /// Tells the manager which cluster this user's peers are of (a key such as `description:id`
+    /// of its connection string; only compared for equality). A peer this user creates then
+    /// announces, to a new address, the version last negotiated with that cluster's other
+    /// addresses before it falls back to [`cluster_version`](Self::cluster_version), so that
+    /// databases of clusters of different versions sharing the connections do not mislead each
+    /// other's first announcement (a wrong guess costs one reconnect, never a request). Set
+    /// once, before the user's first [`peer`](Self::peer); later calls do nothing and return
+    /// `false`. See [Sharing](self#sharing).
+    pub fn set_cluster_key(&self, key: &str) -> bool {
+        self.user.set_cluster(key)
     }
 
     /// The protocol version of the cluster as last negotiated with any address, if one has
@@ -1103,12 +1402,18 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
         let shared = &self.inner;
         let mut peers = shared.lock_peers();
         if let Some(entry) = peers.map.get(&key) {
-            return PeerHandle::new(entry.shared.clone(), shared.failures.clone());
+            return PeerHandle::new(
+                entry.shared.clone(),
+                shared.failures.clone(),
+                self.user.clone(),
+            );
         }
+        // A user that is shut down starts nothing: it gets a peer that is not the manager's.
+        let detached = peers.shutdown || self.user.is_closed();
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded();
         let id = PeerId(shared.next_peer.fetch_add(1, Ordering::Relaxed));
         let status = PeerStatus {
-            phase: if peers.shutdown {
+            phase: if detached {
                 PeerPhase::Shutdown
             } else {
                 PeerPhase::Idle
@@ -1127,12 +1432,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
             status: Watch::new(status),
             queue: CommandQueue::new(shared.config.command_queue_len),
             ctrl: ctrl_tx,
+            cluster: self.user.cluster(),
             references: AtomicIsize::new(-1),
             handles: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         });
-        let handle = PeerHandle::new(peer.clone(), shared.failures.clone());
-        if peers.shutdown {
+        let handle = PeerHandle::new(peer.clone(), shared.failures.clone(), self.user.clone());
+        if detached {
             // Nothing runs: close the queue so that every command fails.
             peer.queue.close();
             return handle;
@@ -1170,30 +1476,30 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
         choose_primary_address(addresses, local_tls).address
     }
 
-    /// Shuts every peer down and waits for their tasks to end (see the [module
-    /// documentation](self#shutdown)). Handles stay valid but their commands fail. Idempotent;
-    /// a second concurrent call returns without waiting.
+    /// Shuts this user down (with its clones), and when it is the last user of the
+    /// connections ([`share`](Self::share)), shuts every peer down and waits for their tasks
+    /// to end (see the [module documentation](self#shutdown)). Handles of the user stay valid
+    /// but their commands fail, and those in progress end at once (see
+    /// [Sharing](self#sharing)). Idempotent; a second concurrent call returns without waiting.
     pub async fn shutdown(&self) {
-        let tasks: Vec<R::Task<()>> = {
-            let mut peers = self.inner.lock_peers();
-            peers.shutdown = true;
-            peers
-                .map
-                .values_mut()
-                .filter_map(|entry| {
-                    let _ = entry.shared.ctrl.unbounded_send(Ctrl::Shutdown);
-                    entry.task.take()
-                })
-                .collect()
-        };
+        if !self.inner.leave(&self.user) {
+            return;
+        }
+        let tasks = self.inner.stop_peers();
         for task in tasks {
             // A task that panicked has nothing left to wait for.
             let _ = task.await;
         }
     }
 
-    /// Whether [`shutdown`](Self::shutdown) was called.
+    /// Whether this user is shut down ([`shutdown`](Self::shutdown) was called on it, or
+    /// on a clone).
     pub fn is_shut_down(&self) -> bool {
+        self.user.is_closed()
+    }
+
+    /// Whether the connections are shut down: every user was shut down or dropped.
+    pub fn connections_shut_down(&self) -> bool {
         self.inner.lock_peers().shutdown
     }
 }

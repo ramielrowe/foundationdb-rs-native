@@ -190,6 +190,11 @@ impl Runtime for SmolRuntime {
         Duration::from_millis(1)
     };
 
+    /// The same executor (every [`SmolRuntime::new`] is the process-wide one).
+    fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.executor, &other.executor)
+    }
+
     fn now(&self) -> Instant {
         Instant::from_std(std::time::Instant::now())
     }

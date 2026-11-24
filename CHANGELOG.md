@@ -148,3 +148,18 @@ These aligned behaviour with C++'s read-your-writes layer:
   database or of its transactions are held (they ran until the last one was dropped): the
   waiting requests and every later one fail with `operation_cancelled` (1101). New:
   `read::Reader::shutdown`.
+* **Databases share their connections**, as the databases of a C++ process share its
+  `FlowTransport`: databases opened on the same runtime with the same
+  `DatabaseOptions::peers` and TLS material use one connection per server and one failure
+  monitor (each keeps its own long poll, location cache, batchers and options). The sharing is
+  counted: `Database::shutdown` (or dropping a database) ends that database's requests in
+  progress and closes the connections only when no other database uses them. New:
+  `DatabaseOptions::share_connections` (default `true`), `Runtime::same_runtime` (default
+  `false`: a runtime that does not say never shares; tokio compares runtime ids, smol the
+  executor), `PeerManager::share` / `downgrade` / `users` / `shares_connections_with` /
+  `connections_shut_down` / `runtime` / `stream_wrapper` and `WeakPeerManager` (`share`,
+  `share_on`, `share_on_if`); `PeerManager::shutdown` and `is_shut_down` are now per user (the
+  peers' tasks end a user's commands; a request's path is unchanged). `PeerManagerConfig` is
+  `PartialEq`. The databases that share connections share their per-connection limits
+  (command queue, requests in flight). `read::Reader::shutdown` lets go of the reader's server
+  references (the location cache is emptied, and a location fetched after is not kept).

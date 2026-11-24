@@ -488,6 +488,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -707,6 +708,10 @@ pub(crate) struct Shared<R: Runtime, W> {
     metadata_versions: Mutex<MetadataVersionCache>,
     /// The peer evictor's task, started with the first cached location.
     evictor: Mutex<Evictor<R>>,
+    /// [`Reader::shutdown`] was called: the reader references no server any more (a
+    /// location or proxy list that arrives after is used, not kept). Read under the lock of
+    /// what it guards, after which `shutdown` empties it.
+    released: AtomicBool,
 }
 
 /// The peer evictor's task, and whether the reader was [shut down](Reader::shutdown) (it is
@@ -828,6 +833,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             metadata_versions: Mutex::new(MetadataVersionCache::new(
                 config.metadata_version_cache_size,
             )),
+            released: AtomicBool::new(false),
             evictor: Mutex::new(Evictor {
                 task: None,
                 stopped: false,
@@ -858,8 +864,26 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// fail with it once the peer manager is shut down or the cluster monitor closed (see the
     /// [module documentation](self)). [`Database::shutdown`](crate::Database::shutdown)
     /// calls this. Idempotent.
+    ///
+    /// It also lets go of the reader's [references](fdb_native_transport::peer::PeerRef) to
+    /// servers: the location cache is emptied and the proxies are no longer referenced, so
+    /// connections that other databases share are not kept (or probed) for this one.
     pub fn shutdown(&self) {
         self.inner.stop(true);
+        // Before emptying: a location or proxy list being kept now is either emptied below
+        // or sees the flag (both look under the same locks).
+        self.inner
+            .shared
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let references = lock(&self.inner.shared.state).proxy_references.take();
+        drop(references);
+        let emptied = {
+            let mut cache = lock(&self.inner.shared.locations);
+            let capacity = cache.capacity();
+            std::mem::replace(&mut *cache, LocationCache::new(capacity))
+        };
+        drop(emptied);
     }
 
     /// A read version for a default transaction (`getReadVersion`): batched with the other
@@ -1224,6 +1248,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     /// Keeps references to the peers of `info`'s proxies (replacing those of an older info).
     fn hold_proxy_references(&self, info: &ClusterInfo) {
         let mut state = lock(&self.state);
+        if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if matches!(&state.proxy_references, Some((seq, _)) if *seq == info.sequence) {
             return;
         }
@@ -1446,6 +1473,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             .collect();
         let mut rng = lock(&self.rng);
         let location = Arc::new(Location::new(infos, &mut rng));
+        if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+            // The reader was shut down while the location was fetched (a reply that landed
+            // during `Database::shutdown`): this read uses it, the cache does not keep it, so
+            // its servers are not referenced for the reader's handles that remain.
+            cache.clear();
+            drop(rng);
+            drop(cache);
+            return location;
+        }
         cache.insert(range, location.clone(), &mut rng);
         drop(rng);
         drop(cache);

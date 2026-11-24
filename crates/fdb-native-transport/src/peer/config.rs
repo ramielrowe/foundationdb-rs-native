@@ -11,7 +11,7 @@ use crate::framing::DEFAULT_PACKET_LIMIT;
 /// How a [`PeerManager`](super::PeerManager) connects, reconnects and judges its peers. Build
 /// one with [`PeerManagerConfig::default`] and adjust the public fields. The defaults are
 /// FDB's (see the [module documentation](super#reconnecting) for the knobs).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct PeerManagerConfig {
     /// The protocol versions this client can speak, most preferred first (it must not be

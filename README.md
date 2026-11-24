@@ -163,6 +163,13 @@ A database spawns its background tasks when it is opened (the coordinators' long
 connection task per server), so open it inside the runtime. Reads run as tasks of their own.
 `db.shutdown().await` stops everything; dropping the last handle does too.
 
+**Several databases.** As in C++, the databases a process opens share their connections (one
+per server, one failure monitor) when they run on the same runtime with the same connection
+knobs (`DatabaseOptions::peers`) and TLS material; each keeps its own coordinator long poll,
+location cache and options. Shutting one down (or dropping it) closes the connections only if
+no other database uses them. Cloning one `Database` handle is still the cheapest way to share a
+cluster; `DatabaseOptions::share_connections = false` gives a database connections of its own.
+
 ## Feature flags
 
 `fdb-native-client`:

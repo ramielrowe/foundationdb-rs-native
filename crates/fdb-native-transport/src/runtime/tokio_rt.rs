@@ -98,6 +98,12 @@ impl Runtime for TokioRuntime {
     /// 2.07 ms (measured on Linux, tokio 1.54, current-thread and multi-thread runtimes alike).
     const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 
+    /// The same tokio runtime ([`Handle::id`], unique among the runtimes alive, and a handle
+    /// keeps its runtime's id from being reused).
+    fn same_runtime(&self, other: &Self) -> bool {
+        self.handle.id() == other.handle.id()
+    }
+
     fn now(&self) -> Instant {
         // Only a current-thread runtime's clock can be paused (`tokio::time::pause` and
         // `start_paused` refuse the others), so on any other `tokio::time::Instant::now` is

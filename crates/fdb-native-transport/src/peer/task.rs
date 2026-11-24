@@ -1,6 +1,7 @@
 //! The task of one peer: connects, runs the [`Connection`] and its [`ReplyRegistry`],
 //! reconnects.
 
+use std::collections::HashSet;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
@@ -238,6 +239,8 @@ enum RunEnd {
 /// A request that was sent and awaits its reply.
 struct Waiter {
     reply: oneshot::Sender<Result<Reply, RequestError>>,
+    /// The id of the user that sent it (see `Ctrl::UserClosed`).
+    user: u64,
     /// Its reply token in the registry, to cancel it.
     token: Uid,
     /// The version of the connection it went out on, which its reply arrives on.
@@ -330,6 +333,10 @@ pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     shutdown: bool,
     /// The peer was removed from its manager.
     retired: bool,
+    /// The users shut down while others remain (`Ctrl::UserClosed`): a command of theirs
+    /// that is taken after is refused unsent. One id per database shut down, for the peer's
+    /// life.
+    closed_users: HashSet<u64>,
     /// [`finish`](PeerTask::finish) completed: the peer ended in order. If the task is dropped
     /// without it (a panic, or a runtime that drops its tasks), [`Drop`] cleans up.
     finished: bool,
@@ -373,6 +380,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             first_failure: None,
             shutdown: false,
             retired: false,
+            closed_users: HashSet::new(),
             finished: false,
         }
     }
@@ -474,12 +482,24 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         }
     }
 
+    /// Refuses the queued commands of the user `user`, which was shut down: never sent.
+    fn refuse_user(&mut self, user: u64) {
+        self.closed_users.insert(user);
+        for cmd in self.peer.queue.take_user(user) {
+            if !cmd.is_cancelled() {
+                cmd.refuse(Refusal::Shutdown);
+            }
+        }
+    }
+
     // ---- waiting without a connection ----------------------------------------------------
 
     fn apply_ctrl(&mut self, ctrl: Ctrl) {
         match ctrl {
             Ctrl::Connect => self.demand = true,
             Ctrl::Shutdown => self.shutdown = true,
+            // Without a connection nothing is in flight.
+            Ctrl::UserClosed(user) => self.refuse_user(user),
             // Nothing to do without a connection (a request that is gone from the queue was
             // never applied; the rest look at the state again).
             Ctrl::RefsChanged
@@ -609,12 +629,13 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
     fn first_version(&self) -> ProtocolVersion {
         let known = self.peer.status.read(|s| s.known_version);
         known
-            .or_else(|| self.shared.cluster_version())
+            .or_else(|| self.shared.guess_version(self.peer.cluster.as_ref()))
             .unwrap_or(self.shared.config.supported_versions[0])
     }
 
     fn learn_version(&self, version: ProtocolVersion) {
-        self.shared.set_cluster_version(version);
+        self.shared
+            .set_cluster_version(self.peer.cluster.as_ref(), version);
         self.update(|s| {
             let changed = s.known_version != Some(version);
             s.known_version = Some(version);
@@ -761,7 +782,8 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         self.demand = false;
         // The version we speak is the supported one the peer's is compatible with.
         let negotiated = self.shared.supported(version).unwrap_or(announced);
-        self.shared.set_cluster_version(negotiated);
+        self.shared
+            .set_cluster_version(self.peer.cluster.as_ref(), negotiated);
         self.shared
             .failures
             .set_address_failed(&self.peer.address, false, now);
@@ -895,6 +917,23 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                     run.conn.unregister(token);
                 }
             }
+            Ctrl::UserClosed(user) => {
+                self.refuse_user(user);
+                // Its requests in flight: the reply tokens are forgotten (a late reply is
+                // dropped) and the callers told it may have been delivered.
+                let ids: Vec<u64> = self
+                    .waiters
+                    .iter()
+                    .filter(|(_, waiter)| waiter.user == user)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in ids {
+                    if let Some(waiter) = self.waiters.remove(&id) {
+                        self.registry.cancel(&mut run.conn, waiter.token);
+                        let _ = waiter.reply.send(Err(RequestError::Cancelled));
+                    }
+                }
+            }
             Ctrl::CloseConnection => run.conn.close(),
             Ctrl::Shutdown => self.shutdown = true,
         }
@@ -902,11 +941,20 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
 
     /// Applies one command to the established connection.
     fn apply<S>(&mut self, run: &mut Run<'_, R, S>, cmd: Cmd) {
+        // A command of a user shut down after it was queued (and after the task was told):
+        // never sent.
+        if !self.closed_users.is_empty() && self.closed_users.contains(&cmd.user()) {
+            if !cmd.is_cancelled() {
+                cmd.refuse(Refusal::Shutdown);
+            }
+            return;
+        }
         // Established: the version is negotiated.
         let version = run.negotiated.unwrap_or(run.announce);
         match cmd {
             Cmd::Request {
                 id,
+                user,
                 endpoint,
                 encode,
                 reply,
@@ -948,6 +996,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                             id,
                             Waiter {
                                 reply,
+                                user,
                                 token,
                                 version,
                             },
@@ -985,7 +1034,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
                 };
                 let _ = ack.send(result);
             }
-            Cmd::Register { id, token, ack } => {
+            Cmd::Register { id, token, ack, .. } => {
                 if ack.is_canceled() {
                     return;
                 }

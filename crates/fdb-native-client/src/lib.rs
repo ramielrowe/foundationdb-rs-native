@@ -143,6 +143,17 @@
 //!   every method takes `&self`, so reads can run concurrently on one transaction (as with
 //!   `fdb_c`'s futures). [`Database::run`] hands its closure a handle of the attempt, which
 //!   goes stale when the attempt is over (see the [`transaction`] module).
+//! * **Databases share connections without a handle to pass around.** C++ has one
+//!   `FlowTransport` per process, which every database uses. Here the databases of a process
+//!   find each other's connections in a registry, by runtime ([`runtime::Runtime::same_runtime`]),
+//!   connection knobs and TLS material, so `Database::open` stays one call and a program
+//!   whose parts each open the cluster still has one connection per server (see
+//!   [Sharing connections](database#sharing-connections)). An explicit "network" value to
+//!   share by hand was not added: it would only reach the programs that already pass one
+//!   `Database` around. The registry holds weak references only (it keeps nothing alive, and
+//!   a database opened after the last one went makes new connections), never shares across
+//!   runtimes, knobs or TLS settings, and each database's shutdown ends only its own
+//!   requests; `DatabaseOptions::share_connections` opts out.
 //! * **Reads start when they are called.** `get`, `get_key`, `get_range` and `watch` return
 //!   `Send` futures that do not borrow the transaction or the arguments, and the read runs
 //!   as a task of its own, as a C++ read actor does: dropping the future does not cancel the

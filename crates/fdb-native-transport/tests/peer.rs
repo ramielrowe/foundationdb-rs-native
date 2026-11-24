@@ -432,6 +432,64 @@ async fn an_incompatible_cluster_is_reconnected_with_its_version() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn clusters_sharing_a_manager_guess_the_first_announcement_per_cluster() {
+    let net = Net::new();
+    let a1 = listen_one(&net, sock(4500), Script::new(V74));
+    let a2 = listen_one(&net, sock(4501), Script::new(V74));
+    let b1 = listen_one(&net, sock(4600), Script::new(V80));
+    let b2 = listen_one(&net, sock(4601), Script::new(V80));
+    let (mgr_a, _events) = manager(&net, config());
+    let mgr_b = mgr_a.share().unwrap();
+    assert!(mgr_a.set_cluster_key("a:1"));
+    assert!(!mgr_a.set_cluster_key("other:2"), "set once");
+    assert!(mgr_b.set_cluster_key("b:2"));
+
+    assert_eq!(mgr_a.peer(&a1.address).connect().await, Ok(V74));
+    assert_eq!(mgr_b.peer(&b1.address).connect().await, Ok(V80));
+    // Each cluster's first connection guessed the manager's version at the time.
+    assert_eq!(a1.announced(), vec![Some(V74)]);
+    assert_eq!(b1.announced(), vec![Some(V74), Some(V80)]);
+    // The manager-wide version is the last one negotiated (8.0), but a new address of cluster
+    // A announces A's own version, and so does one of B: no reconnect for either.
+    assert_eq!(mgr_a.cluster_version(), Some(V80));
+    assert_eq!(mgr_a.peer(&a2.address).connect().await, Ok(V74));
+    assert_eq!(a2.announced(), vec![Some(V74)]);
+    assert_eq!(mgr_b.peer(&b2.address).connect().await, Ok(V80));
+    assert_eq!(b2.announced(), vec![Some(V80)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wrong_first_guess_costs_a_reconnect_and_no_request() {
+    let net = Net::new();
+    let a1 = listen_one(&net, sock(4500), Script::echo(V74));
+    let b1 = listen_one(&net, sock(4600), Script::echo(V80));
+    let b2 = listen_one(&net, sock(4601), Script::echo(V80));
+    let (mgr_a, _events) = manager(&net, config());
+    let mgr_b = mgr_a.share().unwrap();
+    // B names no cluster, so a new address of it guesses the manager's version: the last
+    // negotiated, A's.
+    mgr_a.set_cluster_key("a:1");
+    assert_eq!(mgr_b.peer(&b1.address).connect().await, Ok(V80));
+    assert_eq!(mgr_a.peer(&a1.address).connect().await, Ok(V74));
+    assert_eq!(mgr_a.cluster_version(), Some(V74));
+    let reply = mgr_b
+        .peer(&b2.address)
+        .request_as::<EchoReply, _>(token(7), echo_encode(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        reply,
+        EchoReply {
+            value: 5 + ECHO_ADDS
+        }
+    );
+    // The wrong guess (7.4) cost one reconnect; the request was sent once, on the right one.
+    assert_eq!(b2.announced(), vec![Some(V74), Some(V80)]);
+    assert_eq!(b2.echo_values(0), Vec::<u64>::new());
+    assert_eq!(b2.echo_values(1), vec![5]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_preferred_version_is_the_first_supported_one() {
     let net = Net::new();
     let server = listen_one(&net, sock(4500), Script::new(V74));
