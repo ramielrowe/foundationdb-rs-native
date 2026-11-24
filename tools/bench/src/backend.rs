@@ -68,6 +68,29 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// A transaction that watches `key` and commits (the watch starts at commit). Returns
     /// the future that resolves when the key changes.
     fn watch(&self, key: &[u8]) -> impl Future<Output = Result<WatchFuture, BoxErr>> + Send;
+
+    /// One transaction: set `key` = `value`, commit; returns the committed version.
+    fn set_commit_version(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> impl Future<Output = Result<i64, BoxErr>> + Send;
+
+    /// A fresh transaction: its read version, then `get(key)`.
+    fn rv_get(
+        &self,
+        key: &[u8],
+    ) -> impl Future<Output = Result<(i64, Option<Vec<u8>>), BoxErr>> + Send;
+
+    /// A fresh transaction with its read version set to `rv`: `get(key)`.
+    fn get_at(
+        &self,
+        key: &[u8],
+        rv: i64,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, BoxErr>> + Send;
+
+    /// A fresh transaction: its read version only.
+    fn grv(&self) -> impl Future<Output = Result<i64, BoxErr>> + Send;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -164,6 +187,31 @@ impl Backend for Native {
         tx.commit().await.map_err(es)?;
         Ok(Box::pin(async move { w.await.map_err(es) }))
     }
+
+    async fn set_commit_version(&self, key: &[u8], value: &[u8]) -> Result<i64, BoxErr> {
+        let tx = self.db.create_transaction();
+        tx.set(key, value);
+        tx.commit().await.map_err(es)?;
+        Ok(tx.committed_version())
+    }
+
+    async fn rv_get(&self, key: &[u8]) -> Result<(i64, Option<Vec<u8>>), BoxErr> {
+        let tx = self.db.create_transaction();
+        let rv = tx.get_read_version().await.map_err(es)?;
+        let v = tx.get(key).await.map_err(es)?;
+        Ok((rv, v.map(|v| v.to_vec())))
+    }
+
+    async fn get_at(&self, key: &[u8], rv: i64) -> Result<Option<Vec<u8>>, BoxErr> {
+        let tx = self.db.create_transaction();
+        tx.set_read_version(rv);
+        Ok(tx.get(key).await.map_err(es)?.map(|v| v.to_vec()))
+    }
+
+    async fn grv(&self) -> Result<i64, BoxErr> {
+        let tx = self.db.create_transaction();
+        tx.get_read_version().await.map_err(es)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -171,27 +219,41 @@ impl Backend for Native {
 
 #[derive(Clone)]
 pub struct CClient {
-    db: Arc<foundationdb::Database>,
+    dbs: Arc<Vec<foundationdb::Database>>,
+    next: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CClient {
-    /// `foundationdb::boot()` must have run (its guard is held by the caller).
-    pub fn open(cluster_file: &Path) -> Result<CClient, BoxErr> {
-        let db =
-            foundationdb::Database::new(Some(cluster_file.to_str().ok_or("path")?)).map_err(es)?;
-        Ok(CClient { db: Arc::new(db) })
+    /// `foundationdb::boot()` must have run (its guard is held by the caller). Opens `dbs`
+    /// database handles; every operation takes the next one, round robin. With the network
+    /// running `ClientThreadsPerVersion(N)` the handles are spread over the N client threads,
+    /// so `dbs` should be N to use them all.
+    pub fn open(cluster_file: &Path, dbs: usize) -> Result<CClient, BoxErr> {
+        let path = cluster_file.to_str().ok_or("path")?;
+        let dbs = (0..dbs.max(1))
+            .map(|_| foundationdb::Database::new(Some(path)).map_err(es))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CClient {
+            dbs: Arc::new(dbs),
+            next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    fn db(&self) -> &foundationdb::Database {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &self.dbs[i % self.dbs.len()]
     }
 }
 
 impl Backend for CClient {
     async fn get(&self, key: &[u8]) -> Result<bool, BoxErr> {
-        let tx = self.db.create_trx().map_err(es)?;
+        let tx = self.db().create_trx().map_err(es)?;
         let v = tx.get(key, false).await.map_err(es)?;
         Ok(v.is_some())
     }
 
     async fn get_seq(&self, keys: &[Vec<u8>]) -> Result<Vec<u32>, BoxErr> {
-        let tx = self.db.create_trx().map_err(es)?;
+        let tx = self.db().create_trx().map_err(es)?;
         let mut lat = Vec::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
             let t = Instant::now();
@@ -204,7 +266,7 @@ impl Backend for CClient {
     }
 
     async fn set_commit(&self, key: &[u8], value: &[u8]) -> Result<(), BoxErr> {
-        self.db
+        self.db()
             .run(|tx, _| async move {
                 tx.set(key, value);
                 Ok(())
@@ -214,7 +276,7 @@ impl Backend for CClient {
     }
 
     async fn run_ops(&self, ops: &[Op]) -> Result<(), BoxErr> {
-        self.db
+        self.db()
             .run(|tx, _| async move {
                 for op in ops {
                     match op {
@@ -233,7 +295,7 @@ impl Backend for CClient {
     async fn scan(&self, begin: &[u8], end: &[u8], mode: Mode) -> Result<(u64, u64), BoxErr> {
         use foundationdb::RangeOption;
         use foundationdb::options::StreamingMode;
-        let tx = self.db.create_trx().map_err(es)?;
+        let tx = self.db().create_trx().map_err(es)?;
         let mut opt = RangeOption::from((begin, end));
         opt.mode = match mode {
             Mode::WantAll => StreamingMode::WantAll,
@@ -250,9 +312,34 @@ impl Backend for CClient {
     }
 
     async fn watch(&self, key: &[u8]) -> Result<WatchFuture, BoxErr> {
-        let tx = self.db.create_trx().map_err(es)?;
+        let tx = self.db().create_trx().map_err(es)?;
         let w = tx.watch(key);
         tx.commit().await.map_err(es)?;
         Ok(Box::pin(async move { w.await.map_err(es) }))
+    }
+
+    async fn set_commit_version(&self, key: &[u8], value: &[u8]) -> Result<i64, BoxErr> {
+        let tx = self.db().create_trx().map_err(es)?;
+        tx.set(key, value);
+        let c = tx.commit().await.map_err(es)?;
+        c.committed_version().map_err(es)
+    }
+
+    async fn rv_get(&self, key: &[u8]) -> Result<(i64, Option<Vec<u8>>), BoxErr> {
+        let tx = self.db().create_trx().map_err(es)?;
+        let rv = tx.get_read_version().await.map_err(es)?;
+        let v = tx.get(key, false).await.map_err(es)?;
+        Ok((rv, v.map(|v| v.to_vec())))
+    }
+
+    async fn get_at(&self, key: &[u8], rv: i64) -> Result<Option<Vec<u8>>, BoxErr> {
+        let tx = self.db().create_trx().map_err(es)?;
+        tx.set_read_version(rv);
+        Ok(tx.get(key, false).await.map_err(es)?.map(|v| v.to_vec()))
+    }
+
+    async fn grv(&self) -> Result<i64, BoxErr> {
+        let tx = self.db().create_trx().map_err(es)?;
+        tx.get_read_version().await.map_err(es)
     }
 }

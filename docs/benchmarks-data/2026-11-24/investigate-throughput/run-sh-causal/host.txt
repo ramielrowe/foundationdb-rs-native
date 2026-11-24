@@ -1,0 +1,15 @@
+date: 2026-11-24T14:01:06Z
+git: ac57c8784ac93db1b07124b06432847b7504e5c7
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+fdbcli: FoundationDB CLI 7.4 (v7.4.10)
+kernel: Linux 7.0.0-38-generic
+loadavg: 3.22 2.87 3.19 3/1822 1934373
+CPU(s):                                  32
+Model name:                              AMD Ryzen 9 9950X3D2 16-Core Processor
+Thread(s) per core:                      2
+Core(s) per socket:                      16
+Socket(s):                               1
+CPU(s) scaling MHz:                      75%
+CPU max MHz:                             5665.0801
+               total        used        free      shared  buff/cache   available
+Mem:              59           9          28           3          24          49

@@ -1,5 +1,7 @@
 //! The workloads. Each one emits one JSON value per (variant, concurrency) as it finishes.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -11,15 +13,22 @@ use crate::harness::{self, Iter, Measurement, Stats, closed_loop, key, value};
 /// Keys per point-access keyspace (`bench/get/`, `bench/set/`, `bench/mix/`).
 pub const KEYSPACE: u64 = 100_000;
 
+/// The default suite of `fdb-bench run`.
 pub const WORKLOADS: &[&str] = &["get", "get_seq", "set", "scan", "mixed", "many_tx", "watch"];
+
+/// Workloads `run` does only when asked (`--workloads`): `grv_only` isolates the read version
+/// path, `causal` is a correctness check whose cell fails on a violation.
+pub const OPT_IN_WORKLOADS: &[&str] = &["grv_only", "causal"];
 
 #[derive(Clone, Copy)]
 pub struct Opts {
     pub warmup: Duration,
     pub dur: Duration,
-    /// The concurrencies of `get`, `get_seq`, `set` and `mixed` (`--concs`; default
-    /// [`CONCS`]).
+    /// The concurrencies of `get`, `get_seq`, `set`, `mixed`, `grv_only` and `causal` (`--concs`;
+    /// default [`CONCS`]).
     pub concs: &'static [usize],
+    /// `causal` only (`--causal-negative`): run the negative control, which must find violations.
+    pub causal_negative: bool,
 }
 
 pub async fn run<B: Backend>(
@@ -37,6 +46,8 @@ pub async fn run<B: Backend>(
         "mixed" => mixed(&b, o, emit).await,
         "many_tx" => many_tx(&b, o, emit).await,
         "watch" => watch(&b, emit).await?,
+        "causal" => causal(&b, o, emit).await?,
+        "grv_only" => grv_only(&b, o, emit).await,
         other => return Err(format!("unknown workload {other}")),
     }
     Ok(())
@@ -227,6 +238,7 @@ fn stats(mut v: Vec<u32>) -> Stats {
         ops: v.len() as u64,
         iters: v.len() as u64,
         errors: 0,
+        all_iters: 0,
         samples: v,
     }
 }
@@ -356,4 +368,222 @@ async fn watch<B: Backend>(b: &B, emit: &mut dyn FnMut(Value)) -> Result<(), Str
         total,
     );
     Ok(())
+}
+
+/// `grv_only`: a fresh transaction per iteration that only gets its read version, the part of
+/// `get` that is the proxy's and the client's batching, without a storage read.
+async fn grv_only<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
+    for &conc in o.concs {
+        let b = b.clone();
+        let m = closed_loop(conc, o.warmup, o.dur, move |_ctx| {
+            let b = b.clone();
+            async move {
+                b.grv().await?;
+                Ok(Iter::ops(1))
+            }
+        })
+        .await;
+        emit_m(emit, &m, "grv_only", "fresh_tx", conc);
+    }
+}
+
+/// Writers and readers of the causal check (each a task of the runtime).
+const CAUSAL_WRITERS: usize = 16;
+const CAUSAL_READERS: usize = 16;
+
+/// The counters of one `causal` run.
+#[derive(Default)]
+struct CausalCounts {
+    background_gets: AtomicU64,
+    same_task_checks: AtomicU64,
+    cross_task_checks: AtomicU64,
+    violations: AtomicU64,
+    rv_backwards: AtomicU64,
+    errors: AtomicU64,
+}
+
+impl CausalCounts {
+    /// Counts a violation and prints the first few.
+    fn violation(&self, what: std::fmt::Arguments) {
+        if self.violations.fetch_add(1, SeqCst) < 20 {
+            eprintln!("VIOLATION {what}");
+        }
+    }
+}
+
+fn decode_counter(v: &Option<Vec<u8>>) -> u64 {
+    v.as_ref()
+        .filter(|v| v.len() >= 8)
+        .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap()))
+        .unwrap_or(0)
+}
+
+/// `causal`: whether a transaction started after a commit was acknowledged always reads it.
+///
+/// For each concurrency (`--concs`: the background load) `conc` tasks run fresh-transaction
+/// gets, so that read version batches are always in flight, while 16 writers commit
+/// `bench/causal/<w>` = i, one transaction each. Once a commit is acknowledged the writer
+/// publishes `(i, committed version)`. The checks are:
+///
+/// * the same writer starts a new transaction: its read version is at least the committed
+///   version and it reads i;
+/// * 16 readers, on any worker thread, take a writer's last published `(i, cv)` and start a
+///   new transaction: its read version is at least `cv` and it reads at least i. This is the
+///   check a read version shared with transactions that started before the commit was
+///   acknowledged would fail;
+/// * the read versions of one task never go backwards.
+///
+/// `--causal-negative` is the negative control: the readers take a read version *before*
+/// looking at what was acknowledged, as a transaction that joined an already sent read version
+/// request would, and must then be found out (the cell fails if no violation is reported).
+/// Otherwise the cell fails on any violation, any backwards read version, or no check at all.
+async fn causal<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) -> Result<(), String> {
+    let negative = o.causal_negative;
+    let mut failures = Vec::new();
+    for &background in o.concs {
+        let c = Arc::new(CausalCounts::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let published: Arc<Vec<Mutex<(u64, i64)>>> =
+            Arc::new((0..CAUSAL_WRITERS).map(|_| Mutex::new((0, 0))).collect());
+        for w in 0..CAUSAL_WRITERS {
+            b.set_commit_version(&key("causal", w as u64), &0u64.to_be_bytes())
+                .await?;
+        }
+        let mut handles = Vec::new();
+        for t in 0..background {
+            let (b, c, stop) = (b.clone(), c.clone(), stop.clone());
+            handles.push(tokio::spawn(async move {
+                let mut rng = harness::Rng::new(t as u64 + 1);
+                while !stop.load(SeqCst) {
+                    match b.get(&key("get", rng.below(KEYSPACE))).await {
+                        Ok(_) => c.background_gets.fetch_add(1, SeqCst),
+                        Err(_) => c.errors.fetch_add(1, SeqCst),
+                    };
+                }
+            }));
+        }
+        for w in 0..CAUSAL_WRITERS {
+            let (b, c, stop, published) = (b.clone(), c.clone(), stop.clone(), published.clone());
+            handles.push(tokio::spawn(async move {
+                let k = key("causal", w as u64);
+                let (mut last_rv, mut i) = (0i64, 0u64);
+                while !stop.load(SeqCst) {
+                    i += 1;
+                    let cv = match b.set_commit_version(&k, &i.to_be_bytes()).await {
+                        Ok(cv) => cv,
+                        Err(e) => {
+                            // Unknown result: the key may or may not be i. Skip ahead.
+                            eprintln!("writer {w}: commit: {e}");
+                            c.errors.fetch_add(1, SeqCst);
+                            i += 1_000_000;
+                            continue;
+                        }
+                    };
+                    *published[w].lock().unwrap() = (i, cv);
+                    match b.rv_get(&k).await {
+                        Ok((rv, v)) => {
+                            c.same_task_checks.fetch_add(1, SeqCst);
+                            let got = decode_counter(&v);
+                            if rv < cv || got != i {
+                                c.violation(format_args!(
+                                    "same task, writer {w}: committed i={i} at cv={cv}; \
+                                     a new transaction has rv={rv} and read {got}"
+                                ));
+                            }
+                            if rv < last_rv {
+                                c.rv_backwards.fetch_add(1, SeqCst);
+                                eprintln!("read version backwards, writer {w}: {rv} < {last_rv}");
+                            }
+                            last_rv = rv;
+                        }
+                        Err(_) => {
+                            c.errors.fetch_add(1, SeqCst);
+                        }
+                    }
+                }
+            }));
+        }
+        for r in 0..CAUSAL_READERS {
+            let (b, c, stop, published) = (b.clone(), c.clone(), stop.clone(), published.clone());
+            handles.push(tokio::spawn(async move {
+                let mut rng = harness::Rng::new(1000 + r as u64);
+                let mut last_rv = 0i64;
+                while !stop.load(SeqCst) {
+                    let w = rng.below(CAUSAL_WRITERS as u64) as usize;
+                    let k = key("causal", w as u64);
+                    let early = if negative { Some(b.grv().await) } else { None };
+                    let (i, cv) = *published[w].lock().unwrap();
+                    if i == 0 {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    let res = match early {
+                        Some(Ok(rv)) => b.get_at(&k, rv).await.map(|v| (rv, v)),
+                        Some(Err(e)) => Err(e),
+                        None => b.rv_get(&k).await,
+                    };
+                    match res {
+                        Ok((rv, v)) => {
+                            c.cross_task_checks.fetch_add(1, SeqCst);
+                            let got = decode_counter(&v);
+                            if rv < cv || got < i {
+                                c.violation(format_args!(
+                                    "cross task, reader {r}: writer {w} acknowledged i={i} at \
+                                     cv={cv}; a new transaction has rv={rv} and read {got}"
+                                ));
+                            }
+                            // The negative control's read versions are older than the last.
+                            if rv < last_rv && !negative {
+                                c.rv_backwards.fetch_add(1, SeqCst);
+                                eprintln!("read version backwards, reader {r}: {rv} < {last_rv}");
+                            }
+                            last_rv = rv;
+                        }
+                        Err(_) => {
+                            c.errors.fetch_add(1, SeqCst);
+                        }
+                    }
+                }
+            }));
+        }
+        let start = Instant::now();
+        tokio::time::sleep(o.warmup + o.dur).await;
+        stop.store(true, SeqCst);
+        for h in handles {
+            let _ = h.await;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let n = |a: &AtomicU64| a.load(SeqCst);
+        let checks = n(&c.same_task_checks) + n(&c.cross_task_checks);
+        emit(serde_json::json!({
+            "workload": "causal",
+            "variant": if negative { "negative_control" } else { "checks" },
+            "conc": background,
+            "secs": secs,
+            "background_gets": n(&c.background_gets),
+            "background_gets_per_s": n(&c.background_gets) as f64 / secs,
+            "same_task_checks": n(&c.same_task_checks),
+            "cross_task_checks": n(&c.cross_task_checks),
+            "violations": n(&c.violations),
+            "rv_backwards": n(&c.rv_backwards),
+            "errors": n(&c.errors),
+            "negative_control": negative,
+        }));
+        if negative && n(&c.violations) == 0 {
+            failures.push(format!(
+                "concurrency {background}: the negative control found no violation (the checker is blind)"
+            ));
+        } else if !negative && (n(&c.violations) > 0 || n(&c.rv_backwards) > 0 || checks == 0) {
+            failures.push(format!(
+                "concurrency {background}: {} violations, {} backwards read versions, {checks} checks",
+                n(&c.violations),
+                n(&c.rv_backwards),
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
