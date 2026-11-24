@@ -505,8 +505,10 @@ pub struct KeyServerLocations {
 // ---------------------------------------------------------------------------------------
 // Storage server: GetValueRequest -> GetValueReply.
 
-/// `ReadOptions`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `ReadOptions` (`FDBTypes.h` 7.4:1739-1759, 8.0:1661-1681): how a storage server should
+/// serve a read. [`Default`] is `ReadOptions()`: [`NORMAL`](Self::NORMAL), `cacheResult`
+/// true, the rest absent or false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadOptions {
     /// `type`, a `ReadType` (`EAGER` = 0, `FETCH`, `LOW`, `NORMAL`, `HIGH`). An `int32_t` enum
     /// on 7.4 and a `uint32_t` one on 8.0; the bits are kept.
@@ -522,8 +524,31 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    /// `ReadType::NORMAL`, the type of a default-constructed `ReadOptions()`.
+    /// `ReadType::EAGER`: a storage server's own eager reads (clears of ranges).
+    pub const EAGER: u32 = 0;
+    /// `ReadType::FETCH`: a storage server fetching a shard it is moving in.
+    pub const FETCH: u32 = 1;
+    /// `ReadType::LOW`: the transaction option `READ_PRIORITY_LOW`.
+    pub const LOW: u32 = 2;
+    /// `ReadType::NORMAL`, the type of a default-constructed `ReadOptions()` (and of
+    /// `READ_PRIORITY_NORMAL`).
     pub const NORMAL: u32 = 3;
+    /// `ReadType::HIGH`: the transaction option `READ_PRIORITY_HIGH`.
+    pub const HIGH: u32 = 4;
+}
+
+impl Default for ReadOptions {
+    /// `ReadOptions()`: `ReadType::NORMAL`, `CacheResult::True`, no debug id, no consistency
+    /// check version, not lock aware.
+    fn default() -> Self {
+        ReadOptions {
+            read_type: ReadOptions::NORMAL,
+            cache_result: true,
+            debug_id: None,
+            consistency_check_start_version: None,
+            lock_aware: false,
+        }
+    }
 }
 
 /// `GetValueRequest`, sent to a storage server's `getValue`.

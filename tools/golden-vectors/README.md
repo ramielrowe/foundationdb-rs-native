@@ -924,21 +924,24 @@ the schema by the server's protocol version. Everything else covered (the replie
 
 ### Message vector catalog
 
-The same 42 vectors exist for both releases; the values differ only in fields that exist on
+The same 45 vectors exist for both releases; the values differ only in fields that exist on
 one branch. Group `storage`:
 
 | vector | `cpp_type` | covers |
 | --- | --- | --- |
 | `get_value_request` | `GetValueRequest` | every field set; `tag_set` with two tags; `ReadOptions` with every field; `version_vector` with 1-byte deltas; 7.4: `TenantInfo` with a token |
 | `get_value_request_minimal` | `GetValueRequest` | optionals absent, default `SpanContext` (and `TenantInfo` on 7.4); `version_vector` with 2-byte deltas |
+| `get_value_request_read_options` | `GetValueRequest` | as fdb-native-client sends it with a read option set: `ReadOptions()` present (`NORMAL`, cacheResult true, debugID and consistencyCheckStartVersion absent, lockAware false), tags absent, empty `version_vector` |
 | `get_value_reply` | `GetValueReply` | bare reply: penalty, error (absent), value, cached |
 | `get_value_reply_envelope` | `ErrorOr<EnsureTable<GetValueReply>>` | success envelope |
 | `get_value_reply_absent_value` | `ErrorOr<EnsureTable<GetValueReply>>` | value absent, `LoadBalancedReply::error` present (1037) |
 | `get_value_reply_error` | `ErrorOr<EnsureTable<GetValueReply>>` | error envelope (1009 `future_version`) |
 | `get_key_values_request` | `GetKeyValuesRequest` | `KeySelectorRef` begin and end; `version_vector` with a negative locality, a tag id over 255 and 8-byte deltas; 8.0: `taskID` |
+| `get_key_values_request_read_options` | `GetKeyValuesRequest` | as fdb-native-client sends it with `READ_PRIORITY_LOW` and `READ_SERVER_SIDE_CACHE_DISABLE`: `ReadOptions` type `LOW`, cacheResult false; 8.0: `taskID` `DefaultEndpoint` |
 | `get_key_values_reply`, `get_key_values_reply_envelope` | `GetKeyValuesReply`, `ErrorOr<...>` | pre-serialized KV vector with three rows (one empty value) |
 | `get_key_values_reply_empty` | `ErrorOr<EnsureTable<GetKeyValuesReply>>` | zero rows (a 4-byte blob) |
 | `get_key_request` | `GetKeyRequest` | empty `version_vector` |
+| `get_key_request_read_options` | `GetKeyRequest` | as fdb-native-client sends it with `READ_PRIORITY_HIGH` and `LOCK_AWARE`: `ReadOptions` type `HIGH`, cacheResult true, lockAware true |
 | `get_key_reply`, `get_key_reply_envelope` | `GetKeyReply`, `ErrorOr<...>` | `KeySelector` (`Standalone<KeySelectorRef>`) |
 | `watch_value_request` | `WatchValueRequest` | value and debugID present |
 | `watch_value_reply`, `watch_value_reply_envelope` | `WatchValueReply`, `ErrorOr<...>` | |

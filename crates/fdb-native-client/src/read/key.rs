@@ -10,7 +10,7 @@ use fdb_native_transport::runtime::Runtime;
 use fdb_native_wire::VersionVector;
 
 use super::location::{KEY_SPACE_END, Location};
-use super::{ReadSnapshot, Reader, Shared, lock};
+use super::{ReadParams, ReadSnapshot, Reader, Shared, lock};
 use crate::error::Error;
 use crate::error::codes::*;
 
@@ -37,13 +37,15 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         self.get_key_with(selector, version, false).await
     }
 
-    /// [`get_key`](Self::get_key), locating keys with provisional commit proxies too if
-    /// `use_provisional_proxies` (the transaction option `USE_PROVISIONAL_PROXIES`).
+    /// [`get_key`](Self::get_key) with `params` (as [`Reader::get_with`]): keys are located
+    /// with provisional commit proxies too if
+    /// [`use_provisional_proxies`](ReadParams::use_provisional_proxies), and every
+    /// `GetKeyRequest` carries [`read_options`](ReadParams::read_options).
     pub async fn get_key_with(
         &self,
         selector: &KeySelector,
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<Vec<u8>, Error> {
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
@@ -51,13 +53,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if selector.key.as_slice() > KEY_SPACE_END {
             return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
-        get_key(
-            &self.inner.shared,
-            selector,
-            version,
-            use_provisional_proxies,
-        )
-        .await
+        get_key(&self.inner.shared, selector, version, params.into()).await
     }
 }
 
@@ -67,7 +63,7 @@ pub(crate) async fn get_key<R: Runtime, W: StreamWrapper<R::Stream>>(
     shared: &Shared<R, W>,
     selector: &KeySelector,
     version: i64,
-    use_provisional_proxies: bool,
+    params: ReadParams,
 ) -> Result<Vec<u8>, Error> {
     {
         let mut k = selector.clone();
@@ -95,7 +91,7 @@ pub(crate) async fn get_key<R: Runtime, W: StreamWrapper<R::Stream>>(
                 .key_location_for(
                     &k.key,
                     version,
-                    use_provisional_proxies,
+                    params.use_provisional_proxies,
                     backward,
                     STORAGE_SERVER_STREAMS.get_key,
                 )
@@ -106,7 +102,7 @@ pub(crate) async fn get_key<R: Runtime, W: StreamWrapper<R::Stream>>(
                 version,
                 tags: None,
                 span_context: Default::default(),
-                options: None,
+                options: params.read_options,
                 ss_latest_commit_versions: VersionVector::default(),
             };
             match shared.load_balance(&location, request).await {
@@ -141,7 +137,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
     /// The key `selector` resolves to at the snapshot's version ([`Reader::get_key_with`]).
     pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
         self.reader
-            .get_key_with(selector, self.version, self.use_provisional_proxies)
+            .get_key_with(selector, self.version, self.params)
             .await
     }
 }

@@ -16,7 +16,7 @@ use fdb_native_wire::{KeyValue, KeyValueRef, KeyValueVector, VersionVector};
 use super::balance::{LoadBalanced, LoadBalancedReply};
 use super::key::is_backward;
 use super::location::{KEY_SPACE_END, Location};
-use super::{ReadSnapshot, Reader, Shared, lock};
+use super::{ReadParams, ReadSnapshot, Reader, Shared, lock};
 use crate::error::Error;
 use crate::error::codes::*;
 
@@ -689,14 +689,22 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     ) -> Result<RangeRead, Error> {
         options.validate()?;
         let limits = options.limits(self.schema().await?)?;
-        self.get_range_with_limits(begin, end, limits, options.reverse, version, false)
-            .await
+        self.get_range_with_limits(
+            begin,
+            end,
+            limits,
+            options.reverse,
+            version,
+            ReadParams::new(),
+        )
+        .await
     }
 
     /// `Transaction::getRange(begin, end, limits, Snapshot::True, reverse)` (NativeAPI's
     /// `getRangeInternal` and `getRange`): the rows between the selectors at `version`,
-    /// across as many shards as it takes, within `limits`. Locates keys with provisional
-    /// commit proxies too if `use_provisional_proxies`.
+    /// across as many shards as it takes, within `limits`, read with `params` (as
+    /// [`Reader::get_with`]: provisional commit proxies, and the `ReadOptions` of every
+    /// `GetKeyValuesRequest` and `GetKeyRequest`).
     ///
     /// * A row limit of 0, or an inverted range (`begin`'s offset at least `end`'s and its
     ///   key at least `end`'s, `orEqual`s removed), returns nothing.
@@ -711,7 +719,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         limits: RangeLimits,
         reverse: bool,
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<RangeRead, Error> {
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
@@ -722,7 +730,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
             Limits::new(limits),
             reverse,
             version,
-            use_provisional_proxies,
+            params.into(),
         )
         .await
     }
@@ -738,7 +746,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         limits: Limits,
         reverse: bool,
         version: i64,
-        use_provisional_proxies: bool,
+        params: ReadParams,
     ) -> Result<RangeRead, Error> {
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
@@ -757,14 +765,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if begin.offset >= end.offset && begin.key >= end.key {
             return Ok(RangeRead::default());
         }
-        Box::pin(self.inner.shared.get_range(
-            begin,
-            end,
-            limits,
-            reverse,
-            version,
-            use_provisional_proxies,
-        ))
+        Box::pin(
+            self.inner
+                .shared
+                .get_range(begin, end, limits, reverse, version, params),
+        )
         .await
     }
 }
@@ -786,7 +791,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
                 limits,
                 options.reverse,
                 self.version,
-                self.use_provisional_proxies,
+                self.params,
             )
             .await
     }
@@ -803,7 +808,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         mut limits: Limits,
         reverse: bool,
         version: i64,
-        use_provisional: bool,
+        params: ReadParams,
     ) -> Result<RangeRead, Error> {
         let original_begin = begin.clone();
         let original_end = end.clone();
@@ -844,7 +849,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 .key_location_for(
                     &location_key,
                     version,
-                    use_provisional,
+                    params.use_provisional_proxies,
                     backward,
                     GetKeyValues::STREAM,
                 )
@@ -876,7 +881,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                 limit_bytes,
                 tags: None,
                 span_context: Default::default(),
-                options: None,
+                options: params.read_options,
                 ss_latest_commit_versions: VersionVector::default(),
                 task_id: Some(DEFAULT_ENDPOINT_TASK),
             };
@@ -896,7 +901,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                             original_limits,
                             reverse,
                             version,
-                            use_provisional,
+                            params,
                         ))
                         .await;
                     }
@@ -933,7 +938,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                         original_limits,
                         reverse,
                         version,
-                        use_provisional,
+                        params,
                     ))
                     .await;
                 }
@@ -964,7 +969,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         selector: &KeySelector,
         version: i64,
-        use_provisional: bool,
+        params: ReadParams,
     ) -> Result<Vec<u8>, Error> {
         if is_first_greater_or_equal(selector) {
             return Ok(selector.key.clone());
@@ -972,7 +977,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         if is_first_greater_than(selector) {
             return Ok(key_after(&selector.key));
         }
-        self.get_key(selector, version, use_provisional).await
+        self.get_key(selector, version, params).await
     }
 
     /// `getRangeFallback` (NativeAPI 7.4:4761-4837, 8.0:2572-2647): resolve both selectors,
@@ -984,11 +989,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         limits: Limits,
         reverse: bool,
         version: i64,
-        use_provisional: bool,
+        params: ReadParams,
     ) -> Result<RangeRead, Error> {
         let (b, e) = try_join(
-            self.resolve_key(begin, version, use_provisional),
-            self.resolve_key(end, version, use_provisional),
+            self.resolve_key(begin, version, params),
+            self.resolve_key(end, version, params),
         )
         .await?;
         if b >= e {
@@ -996,8 +1001,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         }
         let keys = KeyRange { begin: b, end: e };
         let mut r =
-            Box::pin(self.get_exact_range(keys.clone(), limits, reverse, version, use_provisional))
-                .await?;
+            Box::pin(self.get_exact_range(keys.clone(), limits, reverse, version, params)).await?;
         // `b` is the beginning of the database: the read went there, or the key `""` exists
         // and is in the conflict range anyway.
         if keys.begin.is_empty() && (!reverse || !r.more) {
@@ -1020,7 +1024,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         mut limits: Limits,
         reverse: bool,
         version: i64,
-        use_provisional: bool,
+        params: ReadParams,
     ) -> Result<RangeRead, Error> {
         let mut output = RangeRead::default();
         loop {
@@ -1031,7 +1035,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     GET_RANGE_SHARD_LIMIT,
                     reverse,
                     version,
-                    use_provisional,
+                    params.use_provisional_proxies,
                     GetKeyValues::STREAM,
                 )
                 .await?;
@@ -1048,7 +1052,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     limit_bytes,
                     tags: None,
                     span_context: Default::default(),
-                    options: None,
+                    options: params.read_options,
                     ss_latest_commit_versions: VersionVector::default(),
                     task_id: None,
                 };
@@ -1232,15 +1236,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         &self,
         selector: &KeySelector,
         version: i64,
-        use_provisional: bool,
+        params: ReadParams,
     ) -> Result<Vec<u8>, Error> {
-        Box::pin(super::key::get_key(
-            self,
-            selector,
-            version,
-            use_provisional,
-        ))
-        .await
+        Box::pin(super::key::get_key(self, selector, version, params)).await
     }
 }
 

@@ -166,8 +166,8 @@
 //! ## Values
 //!
 //! * **`getValue`** (7.4:3891-4035, 8.0:1687-1820): locate the key, then `loadBalance` a
-//!   `GetValueRequest(key, version)` (no tags, no read options, no version vector) over its
-//!   replicas. `wrong_shard_server` (1001) and `all_alternatives_failed` (1006) invalidate the
+//!   `GetValueRequest(key, version)` (no tags, no version vector; the transaction's
+//!   [read options](#read-options)) over its replicas. `wrong_shard_server` (1001) and `all_alternatives_failed` (1006) invalidate the
 //!   key's cached location, wait `WRONG_SHARD_SERVER_DELAY` (10 ms;
 //!   [`ReadConfig::wrong_shard_server_delay`]) and start again; any other error is returned:
 //!   `future_version` (1009) and `transaction_too_old` (1007) go to the transaction, which
@@ -257,7 +257,7 @@
 //!   backward). A server's shards span `["", \xff\xff)`, so walking off the database's end
 //!   reaches `\xff\xff` (and the start `""`), which the loop above turns into the answer: an
 //!   offset beyond the database is clamped, as C++ returns `allKeys.end` / `allKeys.begin`.
-//! * **Not ported:** the trace events, tags, read options, the version vector and
+//! * **Not ported:** the trace events, tags, the version vector and
 //!   `connectionFileChanged`, as for values. The endpoint-failure refresh of a reverse
 //!   lookup invalidates the cached range containing the key (not the one before it), as C++
 //!   does (`getKeyLocation`, 7.4:3381, 8.0:1365).
@@ -312,7 +312,7 @@
 //! * **Read conflict ranges** (`getRangeFinished`, 7.4:4849-4895, 8.0:2650-2702) are the
 //!   transaction's ([`Transaction::get_range`](crate::Transaction::get_range)).
 //! * **Not ported:** mapped ranges (`getMappedRange`), `getRangeStream`, the tenant prefix,
-//!   the version vector, tags, read options, BUGGIFY's random truncation, and trace events.
+//!   the version vector, tags, BUGGIFY's random truncation, and trace events.
 //!   Not in C++: a forward read whose begin resolves at the end of the key space returns
 //!   what it has (C++ would look up the shard of `\xff\xff`), and a reverse one whose end
 //!   does reads up to `\xff\xff`. A reply with `more` but no rows, or with more rows than
@@ -370,6 +370,50 @@
 //!   goes beyond it), and a `chunk_size` below 1 is `client_invalid_operation` (a storage
 //!   server's walk of its byte sample may never end for a negative one). The parts' sum saturates.
 //!
+//! ## Read options
+//!
+//! A storage read request has an `Optional<ReadOptions> options` (`StorageServerInterface.h`:
+//! `GetValueRequest`, `GetKeyRequest`, `GetKeyValuesRequest`, and `GetMappedKeyValuesRequest`,
+//! which this client does not send; `WatchValueRequest` has none): `type` (`ReadType`),
+//! `cacheResult`, `debugID`, `consistencyCheckStartVersion` and `lockAware` (`FDBTypes.h`
+//! 7.4:1730-1759, 8.0:1652-1681; `type` is an `int32_t` enum on 7.4 and a `uint32_t` one on
+//! 8.0, with the same values).
+//!
+//! * **When it is sent.** C++ keeps it in `trState->readOptions`, absent until a transaction
+//!   option makes it present: `READ_PRIORITY_LOW/NORMAL/HIGH` set `type`
+//!   (`ReadType::LOW`/`NORMAL`/`HIGH`), `READ_SERVER_SIDE_CACHE_ENABLE/DISABLE` set
+//!   `cacheResult`, each on `readOptions.withDefault(ReadOptions())` (NativeAPI 7.4:7561-7579,
+//!   8.0:5254-5272), and `LOCK_AWARE` / `READ_LOCK_AWARE` set `lockAware` (7.4:7420-7438,
+//!   8.0:5124-5142). So a transaction that set any of them sends `ReadOptions()` with those
+//!   changes, even when they are the defaults (`READ_PRIORITY_NORMAL` alone sends
+//!   `{NORMAL, cacheResult true}`), and a transaction that set none sends none. A reset (and
+//!   `on_error`) forgets them: they live in the `TransactionState` that `resetImpl` replaces
+//!   (7.4:6491-6499, 8.0:4235-4243), and the options are not persistent. The database's
+//!   `LOCK_AWARE` default does not set them (`TransactionOptions::reset` copies only
+//!   `lockAware`).
+//! * **Where.** `getValue` (7.4:3915-3959, 8.0:1706-1755), `getKey` (7.4:4041-4088,
+//!   8.0:1832-1887), `getExactRange` (7.4:4603, 8.0:2407) and `getRange` (7.4:4959,
+//!   8.0:2764) copy it into every request, and so do the reads of `getRangeFallback`
+//!   (`getKey` and `getExactRange`). Here: [`ReadParams::read_options`], which
+//!   [`Reader::get_with`], [`Reader::get_key_with`] and [`Reader::get_range_with_limits`]
+//!   take, and the transaction fills from its options when a read is called.
+//! * **`debugID`** is never sent: C++ sets it only for a transaction being traced
+//!   (`SERVER_REQUEST_TRACING`, `debugTransaction`), which this client accepts without
+//!   effect. `consistencyCheckStartVersion` is for the consistency checker.
+//! * **What a storage server does with it** (`fdbserver/storageserver.actor.cpp` 7.4,
+//!   `fdbserver/storageserver/storageserver.cpp` 8.0): it takes its read lock
+//!   (`getReadLock`, 7.4:1660-1664, 8.0:1415-1419) at the rank of the type
+//!   (`STORAGESERVER_READTYPE_PRIORITY_MAP` into `STORAGESERVER_READ_PRIORITIES`, a
+//!   `PriorityMultiLock` whose higher ranks get more of the concurrent reads; a type outside
+//!   the ranks is clamped), so a low priority scan yields to normal reads; `cacheResult`
+//!   false asks the storage engine not to keep the pages it read; `lockAware` matters only
+//!   for tenant locks.
+//!
+//! The messages, as this client builds them, are checked against each release's C++ reader
+//! (`tools/golden-vectors` fixtures `get_value_request_read_options`,
+//! `get_key_request_read_options` and `get_key_values_request_read_options`, and the
+//! `cpp_crosscheck` test of `fdb-native-schema`).
+//!
 //! ## Deliberate differences
 //!
 //! * **Lagging requests** are tasks on the runtime ([`Runtime::spawn`]), one per request, where
@@ -422,6 +466,7 @@ mod watch_lb;
 
 #[doc(hidden)]
 pub use balance::{EndpointStats, LoadBalanceStats};
+pub use fdb_native_schema::domain::ReadOptions;
 pub use grv::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
 pub(crate) use range::{
@@ -487,6 +532,51 @@ impl Default for ReadConfig {
             client_dc_id: None,
             seed: None,
         }
+    }
+}
+
+/// What a storage read carries from its transaction besides the read version: whether keys
+/// are located with provisional commit proxies too (`trState->useProvisionalProxies`, the
+/// transaction option `USE_PROVISIONAL_PROXIES`), and the `ReadOptions` the storage servers
+/// get (`trState->readOptions`, see the [module documentation](self#read-options)).
+///
+/// The default is neither. A `bool` converts to the first alone, so
+/// `reader.get_with(key, version, true)` still reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadParams {
+    /// Locate keys with provisional commit proxies too.
+    pub use_provisional_proxies: bool,
+    /// The `options` of every `GetValueRequest`, `GetKeyRequest` and `GetKeyValuesRequest`;
+    /// `None` sends none (a storage server then reads as for `ReadOptions()`).
+    pub read_options: Option<ReadOptions>,
+}
+
+impl ReadParams {
+    /// Neither provisional proxies nor read options.
+    pub fn new() -> ReadParams {
+        ReadParams::default()
+    }
+
+    /// The same, with `use_provisional_proxies`.
+    #[must_use]
+    pub fn use_provisional_proxies(mut self, on: bool) -> ReadParams {
+        self.use_provisional_proxies = on;
+        self
+    }
+
+    /// The same, with `read_options`.
+    #[must_use]
+    pub fn read_options(mut self, read_options: Option<ReadOptions>) -> ReadParams {
+        self.read_options = read_options;
+        self
+    }
+}
+
+impl From<bool> for ReadParams {
+    /// `use_provisional_proxies` alone.
+    fn from(use_provisional_proxies: bool) -> ReadParams {
+        ReadParams::new().use_provisional_proxies(use_provisional_proxies)
     }
 }
 
@@ -721,18 +811,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         self.metadata_version_with(version, false).await
     }
 
-    /// [`metadata_version`](Self::metadata_version), locating the key with provisional
-    /// commit proxies too if `use_provisional_proxies` when it has to be read.
+    /// [`metadata_version`](Self::metadata_version), read with `params` when it has to be
+    /// read ([`get_with`](Self::get_with)).
     pub async fn metadata_version_with(
         &self,
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<Option<Vec<u8>>, Error> {
         if let Some(cached) = self.cached_metadata_version(version) {
             return Ok(cached);
         }
-        self.get_with(METADATA_VERSION_KEY, version, use_provisional_proxies)
-            .await
+        self.get_with(METADATA_VERSION_KEY, version, params).await
     }
 
     /// The value of `\xff/metadataVersion` at `version` if the reader knows it without asking:
@@ -766,7 +855,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         Ok(ReadSnapshot {
             reader: self.clone(),
             version,
-            use_provisional_proxies: options.use_provisional_proxies,
+            params: ReadParams::from(options.use_provisional_proxies),
         })
     }
 
@@ -775,7 +864,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         ReadSnapshot {
             reader: self.clone(),
             version,
-            use_provisional_proxies: false,
+            params: ReadParams::new(),
         }
     }
 
@@ -789,14 +878,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         self.get_with(key, version, false).await
     }
 
-    /// [`get`](Self::get), locating the key with provisional commit proxies too if
-    /// `use_provisional_proxies` (the transaction option `USE_PROVISIONAL_PROXIES`).
+    /// [`get`](Self::get) with `params`: the key is located with provisional commit proxies
+    /// too if [`use_provisional_proxies`](ReadParams::use_provisional_proxies) (the
+    /// transaction option `USE_PROVISIONAL_PROXIES`), and the request carries
+    /// [`read_options`](ReadParams::read_options). A `bool` is `use_provisional_proxies`.
     pub async fn get_with(
         &self,
         key: &[u8],
         version: i64,
-        use_provisional_proxies: bool,
+        params: impl Into<ReadParams>,
     ) -> Result<Option<Vec<u8>>, Error> {
+        let params = params.into();
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
@@ -810,7 +902,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         let mut _previous: Option<Arc<Location>> = None;
         loop {
             let (_, location) = shared
-                .key_location(key, version, use_provisional_proxies)
+                .key_location(key, version, params.use_provisional_proxies)
                 .await?;
             _previous = Some(location.clone());
             let request = GetValue {
@@ -818,7 +910,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                 version,
                 tags: None,
                 span_context: Default::default(),
-                options: None,
+                options: params.read_options,
                 ss_latest_commit_versions: VersionVector::default(),
             };
             match shared.load_balance_get_value(&location, request).await {
@@ -940,7 +1032,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
 pub struct ReadSnapshot<R: Runtime, W = NoTls> {
     reader: Reader<R, W>,
     version: i64,
-    use_provisional_proxies: bool,
+    params: ReadParams,
 }
 
 impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
@@ -948,7 +1040,7 @@ impl<R: Runtime, W> Clone for ReadSnapshot<R, W> {
         ReadSnapshot {
             reader: self.reader.clone(),
             version: self.version,
-            use_provisional_proxies: self.use_provisional_proxies,
+            params: self.params,
         }
     }
 }
@@ -972,11 +1064,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> ReadSnapshot<R, W> {
         &self.reader
     }
 
+    /// What the snapshot's reads carry ([`ReadParams`]).
+    pub fn params(&self) -> ReadParams {
+        self.params
+    }
+
+    /// The same snapshot, whose reads send `read_options` to the storage servers.
+    #[must_use]
+    pub fn with_read_options(mut self, read_options: Option<ReadOptions>) -> Self {
+        self.params.read_options = read_options;
+        self
+    }
+
     /// The value of `key` at the snapshot's version ([`Reader::get_with`]).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.reader
-            .get_with(key, self.version, self.use_provisional_proxies)
-            .await
+        self.reader.get_with(key, self.version, self.params).await
     }
 }
 

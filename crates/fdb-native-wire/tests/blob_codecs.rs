@@ -356,13 +356,14 @@ fn message_fixtures_decode_and_reencode_blobs() {
     }
     // Per release: 3 KV vectors (each with two Rust types); version vectors in
     // get_key_request, get_key_values_request, get_read_version_reply and its envelope,
-    // get_value_request and its minimal form; tag sets in get_key_request,
-    // get_key_values_request, get_value_request (two fields: present and absent),
-    // watch_value_request and the two commit requests; idempotency ids in the two commit
+    // get_value_request and its minimal form, and the three *_read_options requests; tag
+    // sets (present or absent) in get_key_request, get_key_values_request, get_value_request
+    // and its minimal form, the three *_read_options requests, watch_value_request and the
+    // two commit requests; idempotency ids in the two commit
     // requests (borrowed and owned).
     assert_eq!(covered["kv"].len(), 2 * 3 * 2, "{:?}", covered["kv"]);
-    assert_eq!(covered["vv"].len(), 2 * 6, "{:?}", covered["vv"]);
-    assert_eq!(covered["tags"].len(), 2 * 7, "{:?}", covered["tags"]);
+    assert_eq!(covered["vv"].len(), 2 * 9, "{:?}", covered["vv"]);
+    assert_eq!(covered["tags"].len(), 2 * 10, "{:?}", covered["tags"]);
     assert_eq!(
         covered["idempotency"].len(),
         2 * 2 * 2,

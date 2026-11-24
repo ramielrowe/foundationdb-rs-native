@@ -58,7 +58,7 @@ server files).
 | Connections | Several `Database` handles on one cluster share no connections | Gap: b35.7 |
 | Location cache | Size, eviction, endpoint-failure refresh | OK |
 | Location cache | Peer evictor for dead servers (8.0 default on) | Gap: b35.6 |
-| Reads | `READ_PRIORITY_*` / `READ_SERVER_SIDE_CACHE_*` sent to storage | Gap: b35.8 |
+| Reads | `READ_PRIORITY_*` / `READ_SERVER_SIDE_CACHE_*` sent to storage | **Fixed** (b35.8) |
 | Errors | `process_behind`, `future_version`, `database_locked`, ... | OK |
 | Errors | `cluster_version_changed` | N/A (never produced) |
 | Protocol | Version announcement, incompatible servers | OK |
@@ -163,7 +163,7 @@ nothing from it: untagged requests are throttled only by ratekeeper's priority r
 
 | Item | C++ | This client | Status |
 | --- | --- | --- | --- |
-| Read options | `READ_PRIORITY_LOW/NORMAL/HIGH` and `READ_SERVER_SIDE_CACHE_ENABLE/DISABLE` set `trState->readOptions` (NativeAPI 7.4:7560-7580), sent with every `getValue`, `getKey`, `getRange` and watch; a storage server takes its read lock at the type's rank (`getReadLock`, `fdbserver/storageserver.actor.cpp` 7.4:1660-1664). | Accepted, but requests carry no `ReadOptions`, so a scan marked low priority competes with foreground reads at normal priority, and a cache-disable hint is lost. | Gap: b35.8 |
+| Read options | `READ_PRIORITY_LOW/NORMAL/HIGH` and `READ_SERVER_SIDE_CACHE_ENABLE/DISABLE` set `type` and `cacheResult` of `trState->readOptions.withDefault(ReadOptions())` (NativeAPI 7.4:7561-7579, 8.0:5254-5272), and `LOCK_AWARE` / `READ_LOCK_AWARE` its `lockAware` (7.4:7420-7438, 8.0:5124-5142); it is absent until one of them is set, and a reset drops it. `getValue` (7.4:3915-3959, 8.0:1706-1755), `getKey` (7.4:4041-4088, 8.0:1832-1887), `getRange` (7.4:4959, 8.0:2764) and `getExactRange` (7.4:4603, 8.0:2407) put it in every request (`WatchValueRequest` has no options: a watch sends only the debug id). A storage server takes its read lock at the type's rank (`getReadLock`, `fdbserver/storageserver.actor.cpp` 7.4:1660-1664, `fdbserver/storageserver/storageserver.cpp` 8.0:1415-1419). | **Was missing**: the options were accepted but every request went out with `options` absent, so a scan marked low priority competed with foreground reads at normal priority, and a cache-disable hint was lost. Now the same: `ReadParams::read_options` (`read/mod.rs`, "Read options"), filled from the transaction's options when a read is called, sent on `GetValueRequest`, `GetKeyRequest` and `GetKeyValuesRequest` on both releases; no `debugID` (`SERVER_REQUEST_TRACING` is a no-op here). Wire safety: golden vectors `get_value_request_read_options`, `get_key_request_read_options`, `get_key_values_request_read_options` written by each release's C++, and `cpp_crosscheck_release_readers_decode_client_read_options` (every type, cache and lock-aware combination, decoded by the 7.4 and 8.0 readers). Tests: `tests/read_options.rs` (fake cluster: which options each request carries), `tests/docker_read_options.rs` (7.4.10 and 8.0.1: reads with each option). | **Fixed** |
 
 ## Errors
 
@@ -218,10 +218,11 @@ message is part of being well behaved. Status: **Deferred**.
   one outstanding request; GRV batching and `transactionCount` accounting; the
   resource-constrained backoff against throttled GRV and commit proxies. The model cluster now
   counts `open_database_requests`, `grv_requests`, `grv_transactions` and `location_requests`.
+* **Read options** (b35.8, `fdb-native-client` `read` and `transaction`): see the Reads
+  row. `ReadParams` carries them through the read path; `ReadSnapshot::with_read_options`
+  for readers.
 
 ## Open beads
 
 * `foundationdb-rs-native-b35.6`: location cache peer evictor (8.0's default).
 * `foundationdb-rs-native-b35.7`: share connections between `Database` handles on one cluster.
-* `foundationdb-rs-native-b35.8`: send `ReadOptions` (read priority, server-side cache) to
-  storage servers.

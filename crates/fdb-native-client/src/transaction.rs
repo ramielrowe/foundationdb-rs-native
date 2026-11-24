@@ -190,7 +190,9 @@ use crate::database::Database;
 use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
 use crate::read::util::{Either, never, race};
-use crate::read::{Limits, METADATA_VERSION_KEY, RangeRead, ReadVersionOptions, key_after};
+use crate::read::{
+    Limits, METADATA_VERSION_KEY, RangeRead, ReadOptions, ReadParams, ReadVersionOptions, key_after,
+};
 use crate::ryw::read::{BoxFuture, RywRead, RywSource};
 use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap, WriteMapIter};
 use crate::watch::PendingWatches;
@@ -646,7 +648,18 @@ impl<R: Runtime> Drop for FetchGuard<R> {
 struct ReadStart {
     epoch: u64,
     use_provisional_proxies: bool,
+    /// `trState->readOptions` when the read was called (C++'s reads copy it as they start).
+    read_options: Option<ReadOptions>,
     max_read_key: &'static [u8],
+}
+
+impl ReadStart {
+    /// What the read's storage requests carry.
+    fn params(&self) -> ReadParams {
+        ReadParams::new()
+            .use_provisional_proxies(self.use_provisional_proxies)
+            .read_options(self.read_options)
+    }
 }
 
 /// What a read-your-writes read sees of the transaction's writes ([`Transaction::ryw_view`]).
@@ -672,7 +685,7 @@ impl RywView {
 struct TxSource<'t, R: Runtime> {
     tx: &'t Transaction<R>,
     epoch: u64,
-    use_provisional_proxies: bool,
+    params: ReadParams,
 }
 
 impl<'t, R: Runtime> TxSource<'t, R> {
@@ -680,7 +693,7 @@ impl<'t, R: Runtime> TxSource<'t, R> {
         TxSource {
             tx,
             epoch: start.epoch,
-            use_provisional_proxies: start.use_provisional_proxies,
+            params: start.params(),
         }
     }
 }
@@ -697,7 +710,7 @@ impl<R: Runtime> RywSource for TxSource<'_, R> {
     fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
         Box::pin(async move {
             self.tx
-                .native_get_value(&key, self.epoch, self.use_provisional_proxies)
+                .native_get_value(&key, self.epoch, self.params)
                 .await
         })
     }
@@ -717,14 +730,7 @@ impl<R: Runtime> RywSource for TxSource<'_, R> {
                     .db
                     .inner
                     .reader
-                    .get_range_with_raw_limits(
-                        &begin,
-                        &end,
-                        limits,
-                        reverse,
-                        version,
-                        self.use_provisional_proxies,
-                    )
+                    .get_range_with_raw_limits(&begin, &end, limits, reverse, version, self.params)
                     .await
             })
             .await?
@@ -1040,6 +1046,7 @@ impl<R: Runtime> Transaction<R> {
         Ok(ReadStart {
             epoch: state.epoch,
             use_provisional_proxies: state.flags.use_provisional_proxies,
+            read_options: state.flags.read_options,
             max_read_key: state.flags.max_read_key(),
         })
     }
@@ -1092,10 +1099,7 @@ impl<R: Runtime> Transaction<R> {
         let key = key.to_vec();
         ReadFuture::Task(self.spawn_read(async move {
             let result = match view {
-                None => {
-                    tx.native_get_value(&key, start.epoch, start.use_provisional_proxies)
-                        .await
-                }
+                None => tx.native_get_value(&key, start.epoch, start.params()).await,
                 Some(view) => {
                     let source = TxSource::new(&tx, &start);
                     let read = view.read(&source, start.max_read_key);
@@ -1121,20 +1125,18 @@ impl<R: Runtime> Transaction<R> {
         &self,
         key: &[u8],
         epoch: u64,
-        use_provisional_proxies: bool,
+        params: ReadParams,
     ) -> Result<Option<Vec<u8>>, Error> {
         self.guarded(epoch, async {
             let version = self.read_version(false).await?;
             if key == METADATA_VERSION_KEY {
-                return self
-                    .metadata_version(version, epoch, use_provisional_proxies)
-                    .await;
+                return self.metadata_version(version, epoch, params).await;
             }
             self.inner
                 .db
                 .inner
                 .reader
-                .get_with(key, version, use_provisional_proxies)
+                .get_with(key, version, params)
                 .await
         })
         .await?
@@ -1149,7 +1151,7 @@ impl<R: Runtime> Transaction<R> {
         &self,
         version: i64,
         epoch: u64,
-        use_provisional_proxies: bool,
+        params: ReadParams,
     ) -> Result<Option<Vec<u8>>, Error> {
         {
             let state = self.state();
@@ -1164,7 +1166,7 @@ impl<R: Runtime> Transaction<R> {
             .db
             .inner
             .reader
-            .metadata_version_with(version, use_provisional_proxies)
+            .metadata_version_with(version, params)
             .await
     }
 
@@ -1216,13 +1218,8 @@ impl<R: Runtime> Transaction<R> {
             let result = match view {
                 None => {
                     let conflict = (!snapshot).then_some(&guard);
-                    tx.native_get_key(
-                        &selector,
-                        conflict,
-                        start.epoch,
-                        start.use_provisional_proxies,
-                    )
-                    .await
+                    tx.native_get_key(&selector, conflict, start.epoch, start.params())
+                        .await
                     // `readThrough`: results in keys the transaction may not read are
                     // clamped.
                     .map(|key| {
@@ -1267,7 +1264,7 @@ impl<R: Runtime> Transaction<R> {
         selector: &KeySelector,
         guard: Option<&ReadGuard<R>>,
         epoch: u64,
-        use_provisional_proxies: bool,
+        params: ReadParams,
     ) -> Result<Vec<u8>, Error> {
         let key = self
             .guarded(epoch, async {
@@ -1276,7 +1273,7 @@ impl<R: Runtime> Transaction<R> {
                     .db
                     .inner
                     .reader
-                    .get_key_with(selector, version, use_provisional_proxies)
+                    .get_key_with(selector, version, params)
                     .await
             })
             .await??;
