@@ -370,8 +370,11 @@ mod watch_lb;
 pub use balance::{EndpointStats, LoadBalanceStats};
 pub use grv::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
+pub(crate) use range::{
+    Limits, REPLY_BYTE_LIMIT, is_first_greater_or_equal, key_after, read_conflict_range,
+    remove_or_equal,
+};
 pub use range::{RangeLimits, RangeOptions, RangeRead, StreamingMode};
-pub(crate) use range::{key_after, read_conflict_range, remove_or_equal};
 pub use watch_lb::WatchTimings;
 
 use grv::{Batcher, BatcherKey, MetadataVersionCache};
@@ -652,10 +655,21 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// answered without a storage server whenever the transaction's read version is one the
     /// proxies reported it for.
     pub async fn metadata_version(&self, version: i64) -> Result<Option<Vec<u8>>, Error> {
+        self.metadata_version_with(version, false).await
+    }
+
+    /// [`metadata_version`](Self::metadata_version), locating the key with provisional
+    /// commit proxies too if `use_provisional_proxies` when it has to be read.
+    pub async fn metadata_version_with(
+        &self,
+        version: i64,
+        use_provisional_proxies: bool,
+    ) -> Result<Option<Vec<u8>>, Error> {
         if let Some(cached) = self.cached_metadata_version(version) {
             return Ok(cached);
         }
-        self.get(METADATA_VERSION_KEY, version).await
+        self.get_with(METADATA_VERSION_KEY, version, use_provisional_proxies)
+            .await
     }
 
     /// The value of `\xff/metadataVersion` at `version` if the reader knows it without asking:

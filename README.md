@@ -48,8 +48,10 @@ async fn main() -> Result<(), Error> {
   rules), `reset`, `cancel`, and options (`timeout`, `retry_limit`, `max_retry_delay`,
   `size_limit`, `causal_write_risky`, `lock_aware`, `use_provisional_proxies`,
   `report_conflicting_keys`, system-key access).
-* **Reads do not see the transaction's own writes yet** (no read-your-writes layer); conflict
-  ranges are tracked as in C++, so read-modify-write transactions are serializable.
+* **Reads see the transaction's own writes** (C++'s read-your-writes layer, with its cache,
+  its read conflict range rules, snapshot reads and the `ReadYourWritesDisable` /
+  `SnapshotRywDisable` options); conflict ranges are tracked as in C++, so read-modify-write
+  transactions are serializable.
 * One error type, `fdb_native_client::Error`: FDB's code with `is_retryable`,
   `is_maybe_committed` and `is_retryable_not_committed`. As with every FDB binding, a
   transaction retried after `commit_unknown_result` may already have committed: make retried

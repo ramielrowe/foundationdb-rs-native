@@ -93,9 +93,10 @@
 //!
 //! ## Differences
 //!
-//! * **No read-your-writes layer yet.** `Transaction::get` does not see the transaction's own
-//!   writes, but `watch` does what `ReadYourWritesTransaction::watch` does (above), from the
-//!   commit buffer's mutations in place of the write map.
+//! * **The watch's own writes come from the commit buffer.** `watch` does what
+//!   `ReadYourWritesTransaction::watch` does (above), but works out the key's value from the
+//!   commit buffer's mutations in place of the write map, and reads the database directly
+//!   rather than through the read-your-writes read (the move to the write map is ygr.4).
 //! * **A watch started after the commit started** fails with `used_during_commit` (maybe
 //!   committed once the commit may have been sent) **without failing the commit**; C++'s
 //!   `checkUsedDuringCommit` also makes the commit fail with it.

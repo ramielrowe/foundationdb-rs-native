@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 14ae7115492fd249ea6752e640da6d1bdafe57a7cc27e3b39230fa83192a9873 # shrinks to db = {}, boundaries = [], ops = [Read(Range { begin: KeySelector { key: [97], or_equal: false, offset: 0 }, end: KeySelector { key: [97], or_equal: false, offset: 1 }, rows: None, bytes: None, reverse: false })]
+cc 6913dcfba169c58dbefb23af64cd3160d6941f7fd9a15cff10d2cd6a0e158bd9 # shrinks to db = {[97]: [], [99]: []}, boundaries = [[98]], ops = [Read(Range { begin: KeySelector { key: [98], or_equal: true, offset: 0 }, end: KeySelector { key: [99, 0], or_equal: false, offset: 0 }, rows: None, bytes: None, reverse: false })]
+cc 05b59ee00086c2650c63448e74c4cb25aa67492fbca543fd4b48359fbb240b80 # shrinks to db = {[97]: []}, boundaries = [], ops = [Write(Atomic([97, 0], MutationType(20), [])), Read(Range { begin: KeySelector { key: [97, 0, 0], or_equal: false, offset: 0 }, end: KeySelector { key: [97], or_equal: true, offset: 1 }, rows: None, bytes: None, reverse: false })]

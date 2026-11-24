@@ -507,8 +507,13 @@ impl Env {
             .unwrap_or_else(|e| panic!("{sel:?}: {e}"))
     }
 
+    /// A transaction at the fake cluster's read version, **with read-your-writes disabled**:
+    /// these tests check the reads C++'s `readThrough` passes to NativeAPI (their requests and
+    /// NativeAPI's read conflict ranges); `ryw.rs` tests the read-your-writes reads.
     fn transaction(&self) -> Transaction<MemRuntime> {
         let tx = self.db.create_transaction();
+        tx.set_option(TransactionOption::ReadYourWritesDisable)
+            .expect("before any read or write");
         tx.set_read_version(READ_VERSION);
         tx
     }
@@ -963,6 +968,8 @@ async fn transaction_get_key_follows_the_transaction_rules() {
     assert_eq!(e.code(), codes::USED_DURING_COMMIT);
     // Without a read version set, the first read asks for one.
     let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::ReadYourWritesDisable)
+        .unwrap();
     assert_eq!(tx.get_key(&fgt(b"a")).await.unwrap(), b"f");
     assert_eq!(tx.get_read_version().await.unwrap(), READ_VERSION);
 }

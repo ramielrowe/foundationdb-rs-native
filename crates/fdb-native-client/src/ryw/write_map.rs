@@ -529,7 +529,7 @@ impl WriteMap {
 
         match it.end_key().cmp(&end_key) {
             Ordering::Equal => {
-                it.advance();
+                let _ = it.advance();
             }
             Ordering::Less => it.skip(end),
             Ordering::Greater => {}
@@ -582,7 +582,7 @@ impl WriteMap {
 
         match it.end_key().cmp(&end_key) {
             Ordering::Equal => {
-                it.advance();
+                let _ = it.advance();
             }
             Ordering::Less => it.skip(end),
             Ordering::Greater => {}
@@ -653,7 +653,7 @@ impl WriteMap {
         }
 
         while it.end_key() < end_key {
-            it.advance();
+            let _ = it.advance();
             let entry = it.entry();
             if it.key_at_begin() && !entry.all_conflict() {
                 let mut e = entry.clone();
@@ -669,7 +669,7 @@ impl WriteMap {
             let is_cleared = entry.following_keys_cleared;
             let is_unreadable = entry.is_unreadable;
             let following_unreadable = entry.following_keys_unreadable;
-            it.advance();
+            let _ = it.advance();
             if !it.key_at_begin() || it.begin_key() != end_key {
                 insertions.push((
                     Arc::from(end),
@@ -713,7 +713,7 @@ impl WriteMap {
         }
 
         while it.end_key() < end_key {
-            it.advance();
+            let _ = it.advance();
             if last_conflicted != it.is_conflict_range() {
                 conflict_ranges.push(it.begin_key().to_vec());
                 last_conflicted = it.is_conflict_range();
@@ -721,7 +721,7 @@ impl WriteMap {
         }
 
         if it.end_key() == end_key {
-            it.advance();
+            let _ = it.advance();
         }
 
         debug_assert!(it.begin_key() <= end_key && end_key < it.end_key());
@@ -885,7 +885,7 @@ impl fmt::Debug for WriteMap {
         let mut it = self.iter();
         while it.begin_key() < ExtKey::from(ALL_KEYS_END) {
             list.entry(&it);
-            it.advance();
+            let _ = it.advance();
         }
         list.finish()
     }
@@ -909,7 +909,9 @@ pub(crate) enum WriteSegmentType {
 ///
 /// It is always at a segment: [`WriteMap::iter`] starts at the first, `["", ...)`. The
 /// segments of the key space end at `\xff\xff`; one more, `[\xff\xff, \xff\xff\x00)`, is the
-/// last (loops stop when [`begin_key`](Self::begin_key) reaches `\xff\xff`). It holds a
+/// last (loops stop when [`begin_key`](Self::begin_key) reaches `\xff\xff`), and
+/// [`advance`](Self::advance) from it reaches the terminal position at `\xff\xff\x00`, as
+/// C++'s `++` reaches the `afterAllKeys` entry. It holds a
 /// snapshot: later writes to the map do not change what it sees. The method names follow
 /// the snapshot cache's iterator ([`SnapshotCacheIter`](crate::ryw::SnapshotCacheIter)),
 /// which the read path walks together with this one.
@@ -1049,14 +1051,22 @@ impl WriteMapIter {
         }
     }
 
-    /// `operator++`: moves to the next segment. Returns `false`, without moving, at the last
-    /// one, `[\xff\xff, \xff\xff\x00)`.
+    /// `operator++`: moves to the next segment. From the last one, `[\xff\xff, \xff\xff\x00)`,
+    /// it moves (as C++ does) onto the `\xff\xff\x00` sentinel entry, a terminal position whose
+    /// [`begin_key`](Self::begin_key) is `\xff\xff\x00` (what ends a loop over a range up to
+    /// `keyAfter(\xff\xff)`), and returns `false`; from there it stays put, returning `false`.
+    #[must_use]
     pub(crate) fn advance(&mut self) -> bool {
         if !self.offset && !equals_key_after(&self.begin, &self.end) {
             self.offset = true;
             return true;
         }
         let Some(next) = self.entry_after(&self.end) else {
+            if self.begin != self.end {
+                // The sentinel: `end` is `\xff\xff\x00`, which has no entry after it.
+                self.begin = Arc::clone(&self.end);
+                self.offset = true;
+            }
             return false;
         };
         self.begin = std::mem::replace(&mut self.end, next);
@@ -1066,6 +1076,7 @@ impl WriteMapIter {
 
     /// `operator--`: moves to the previous segment. Returns `false`, without moving, at the
     /// first one.
+    #[must_use]
     pub(crate) fn retreat(&mut self) -> bool {
         if self.offset && !self.entry().stack.is_empty() {
             self.offset = false;

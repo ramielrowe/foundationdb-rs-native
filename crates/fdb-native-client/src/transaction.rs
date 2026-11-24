@@ -1,23 +1,38 @@
 //! [`Transaction`]: reads at one read version, buffered writes, and a commit; with C++'s
 //! `onError` retry semantics, its options, timeouts and cancellation.
 //!
-//! This is the minimal transaction of the vertical slice, the C++ `Transaction` behind a
-//! `ReadYourWritesTransaction` **with read-your-writes disabled**:
+//! This is C++'s `ReadYourWritesTransaction` over its `Transaction`:
 //!
-//! * **Reads do not see the transaction's own writes (yet).** [`get`](Transaction::get),
-//!   [`get_key`](Transaction::get_key) and [`get_range`](Transaction::get_range) (and its
-//!   streams, [`get_ranges`](Transaction::get_ranges) and
-//!   [`range_stream`](Transaction::range_stream)) read the database at the transaction's read
-//!   version, whatever the transaction has
-//!   [`set`](Transaction::set) or [`clear`](Transaction::clear)ed. The read-your-writes layer
-//!   (M5) will make reads see the transaction's own writes **by default**, as every FDB
-//!   binding does, with an option to disable it; code should not rely on today's behaviour.
-//! * **Conflict ranges are tracked as C++ tracks them.** Each (non-snapshot) read adds the
-//!   key it read as a read conflict range; each write adds its key or range as a write
-//!   conflict range; the commit sends them, so a transaction whose reads were changed by
-//!   another transaction that committed after its read version fails with `not_committed`
-//!   (1020), and [`Database::run`] retries it.
-//! * **The read version** is requested lazily, by the first read (or
+//! * **Reads see the transaction's own writes** (read-your-writes, the default of every FDB
+//!   binding). [`get`](Transaction::get), [`get_key`](Transaction::get_key) and
+//!   [`get_range`](Transaction::get_range) (and its streams,
+//!   [`get_ranges`](Transaction::get_ranges) and [`range_stream`](Transaction::range_stream))
+//!   read the database at the transaction's read version with the transaction's
+//!   [`set`](Transaction::set)s, [`clear`](Transaction::clear)s and atomic operations
+//!   applied, and remember what they read (a snapshot cache), so that reading the same keys
+//!   again does not ask the cluster again. Key selectors resolve through the writes too.
+//!   Keys that a versionstamped operation of the transaction may write are unreadable until
+//!   the commit: reading them fails with `accessed_unreadable` (1036). The code is a port of
+//!   `ReadYourWrites.actor.cpp` (`RYWImpl`, `RYWIterator`, `WriteMap`, `SnapshotCache`). A
+//!   read sees the writes made **before
+//!   it was called** (the future it returns has taken its view already, as C++'s read
+//!   actors do).
+//! * **Read conflict ranges are C++'s** (`RYWImpl::addConflictRange`): a serializable read
+//!   conflicts on the keys whose database value it depended on, not on the keys the
+//!   transaction had set or cleared before it (which it read from its own writes); a
+//!   snapshot read ([`snapshot`](Transaction::snapshot)) adds none. The commit sends their
+//!   union, coalesced, as C++'s `readConflicts` map does. Each write adds its key or range
+//!   as a write conflict range; so a transaction whose reads were changed by another
+//!   transaction that committed after its read version fails with `not_committed` (1020),
+//!   and [`Database::run`] retries it.
+//! * **Options.** [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable) turns
+//!   all this off (before the first read or write): reads go to the database as C++'s
+//!   `readThrough` does, with the read conflict ranges of C++'s `Transaction`.
+//!   [`SnapshotRywDisable`](TransactionOption::SnapshotRywDisable) makes snapshot reads
+//!   ignore the transaction's writes (they still use and fill the cache).
+//!   [`BypassUnreadable`](TransactionOption::BypassUnreadable) lets `get` read unreadable
+//!   keys.
+//! * **The read version** is requested lazily, by the first read that needs the cluster (or
 //!   [`get_read_version`](Transaction::get_read_version)), once for the transaction: the
 //!   request runs as its own task on the runtime and every read waiting for it gets its
 //!   answer, whichever of them is still being polled. [`set_read_version`](Transaction::set_read_version)
@@ -26,22 +41,23 @@
 //! * **Errors of writes are deferred.** `set`, `clear`, ... return nothing; an error they
 //!   meet (`key_too_large`, `key_outside_legal_range`, ...) is kept and returned by the next
 //!   read or the commit, as `fdb_c`'s deferred error.
-//! * **A commit waits for the reads in progress.** As C++'s read-your-writes layer (even with
-//!   read-your-writes disabled) counts every read in `reading` and makes the commit wait for
-//!   them (`ReadYourWrites.actor.cpp` 7.4:1359-1360, 8.0:1340-1341), the commit waits for
-//!   the `get_key`, `get_range` (and range stream batches) and `watch` reads that started
-//!   before it, whether they succeed or fail, before it takes the conflict ranges: their
-//!   ranges depend on what they read and are added when they end (a read that fails adds
-//!   none). A `get` adds its range when it starts, so the commit does not need to wait for
-//!   it, and does not. **Each of these reads runs as a task of its own**, as a C++ read
-//!   actor runs to its end: a read future that is dropped, or kept but no longer polled
-//!   (the loser of a `select`), does not hold a commit up; its read still ends and adds its
-//!   range. A read started after the commit fails with `used_during_commit`. The conflict
-//!   ranges of `get_key` and `get_range` are C++'s `extraConflictRanges`: they do not count
-//!   toward the transaction's size (the `SizeLimit` option and `transaction_too_large`).
+//! * **A commit waits for the reads in progress.** As C++'s read-your-writes layer counts
+//!   every read in `reading` and makes the commit wait for them (`ReadYourWrites.actor.cpp`
+//!   7.4:1359-1360, 8.0:1340-1341), the commit waits for the reads (`get`, `get_key`,
+//!   `get_range`, range stream batches, snapshot or not) and `watch` reads called before it,
+//!   whether they succeed or fail, before it takes the conflict ranges: a read adds its
+//!   range when it ends (a read that fails adds none). **Each read runs as a task of its
+//!   own, started when it is called**, as a C++ read actor runs to its end: a read future
+//!   that is dropped, or kept but never polled (the loser of a `select`), does not hold a
+//!   commit up; its read still ends and adds its range. A read called after the commit
+//!   started fails with `used_during_commit`. With read-your-writes disabled, a `get` adds
+//!   its range when it is called and the ranges of `get_key` and `get_range` are C++'s
+//!   `extraConflictRanges`, which do not count toward the transaction's size (the
+//!   `SizeLimit` option and `transaction_too_large`); with read-your-writes, every read
+//!   conflict range counts, as C++'s commit adds them with `addReadConflictRange`.
 //!
-//! * **Watches** ([`watch`](Transaction::watch)) have the read-your-writes layer's semantics
-//!   already: the watch works out the key's value with the transaction's own writes
+//! * **Watches** ([`watch`](Transaction::watch)) have the read-your-writes layer's semantics:
+//!   the watch works out the key's value with the transaction's own writes
 //!   (atomic operations included, with a read conflict range when the database's value
 //!   counts), starts when the transaction commits (a read-only one too) and fails if it does
 //!   not; the transaction's later writes trigger it; see [`crate::watch`].
@@ -119,19 +135,28 @@
 //! remembers of recent read versions and commits ([`Reader::metadata_version`](crate::read::Reader::metadata_version)). A commit
 //! tells the database the metadata version at its commit version (`tryCommit`,
 //! 7.4:6990-6996), so that a transaction that reads at that version knows it.
-//! Writing the key (`SetVersionstampedValue` of the special value) is not ported yet.
+//!
+//! The key is written only as C++'s read-your-writes layer allows (7.4:2226-2230, 2300):
+//! [`atomic_op`](Transaction::atomic_op) with `SetVersionstampedValue` and the 14-byte
+//! value `metadataVersionRequiredValue` (all zeros), with or without the system key
+//! options; any other atomic operation on it, and a [`set`](Transaction::set) of it, is a
+//! (deferred) `client_invalid_operation` (2000). Once written, the key is unreadable in the
+//! transaction (`accessed_unreadable`), as any versionstamped value.
 //!
 //! # Not ported yet
 //!
-//! Read-your-writes, mapped range reads (`getMappedRange`), `getRangeStream` (the
-//! storage servers' streaming reads), snapshot read-your-writes options, the special key
-//! space (`\xff\xff`), transaction tags, idempotency ids, tenants, the read options sent to
-//! storage servers (read priority, server side cache) and the `\xff/metadataVersion` write.
+//! Mapped range reads (`getMappedRange`), `getRangeStream` (the storage servers' streaming
+//! reads), the special key space (`\xff\xff`), transaction tags, idempotency ids, tenants
+//! and the read options sent to storage servers (read priority, server side cache). The
+//! commit still sends the writes as they were made (C++ sends them from its write map,
+//! coalesced: the same effect).
 
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fdb_native_schema::domain::{INVALID_VERSION, KeyRange, KeySelector, MutationType};
@@ -141,12 +166,14 @@ use fdb_native_transport::runtime::{Instant, Runtime};
 use futures_channel::oneshot;
 
 use crate::atomic;
-use crate::commit::{CommitBuffer, CommitLimits, CommitOptions, CommitOutcome};
+use crate::commit::{CommitBuffer, CommitLimits, CommitOptions, CommitOutcome, normalize_range};
 use crate::database::Database;
 use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
 use crate::read::util::{Either, never, race};
-use crate::read::{METADATA_VERSION_KEY, ReadVersionOptions, key_after};
+use crate::read::{Limits, METADATA_VERSION_KEY, RangeRead, ReadVersionOptions, key_after};
+use crate::ryw::read::{BoxFuture, RywRead, RywSource};
+use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap, WriteMapIter};
 use crate::watch::{PendingWatches, StampedKey, Written};
 
 pub mod options;
@@ -156,6 +183,10 @@ mod watch;
 pub use options::TransactionOption;
 use options::{Flags, Persistent};
 pub use range::{KeyValueStream, RangeResult, RangeStream};
+
+/// `metadataVersionRequiredValue`: the only operand of a write of `\xff/metadataVersion`
+/// (a `SetVersionstampedValue` whose stamp goes at offset 0).
+const METADATA_VERSION_REQUIRED_VALUE: &[u8] = &[0; 14];
 
 /// The first key a transaction may not read or write without the system-key options.
 const SYSTEM_KEYS_BEGIN: &[u8] = b"\xff";
@@ -266,8 +297,9 @@ struct State {
     /// transaction was created or fully reset: applied then, and again (the non-persistent
     /// ones) after every [`on_error`](Transaction::on_error).
     defaults: Arc<Vec<TransactionOption>>,
-    /// A read was started since the last reset (the read-your-writes cache is not empty).
-    read_issued: bool,
+    /// The read-your-writes layer: the writes, the cache of what was read, the read
+    /// conflict ranges.
+    ryw: RywState,
     retries: u32,
     backoff: Duration,
     /// What the timeout counts from.
@@ -282,14 +314,26 @@ struct State {
     versionstamp_waiters: Vec<oneshot::Sender<Result<[u8; 10], Error>>>,
     /// The watches to start when the transaction commits ([`Transaction::watch`]).
     watches: PendingWatches,
-    /// The non-snapshot reads in progress (the read-your-writes layer's `reading`).
+    /// The reads in progress (the read-your-writes layer's `reading`).
     reading: Reading,
     /// The `SetVersionstampedKey`s of the buffer, for what [`Transaction::watch`] may read.
     stamped_keys: Vec<StampedKey>,
 }
 
+/// The read-your-writes layer's state (`ReadYourWritesTransaction`'s `writes`, `cache` and
+/// `readConflicts`).
+#[derive(Debug, Default)]
+struct RywState {
+    /// The writes (mirrored from the commit buffer's; the commit still sends the buffer).
+    writes: WriteMap,
+    /// What reads found out of the database at the read version.
+    cache: SnapshotCache,
+    /// The read conflict ranges of the reads (and of `add_read_conflict_range`).
+    read_conflicts: ReadConflicts,
+}
+
 /// The read-your-writes layer's `reading` (`ReadYourWrites.actor.cpp` 7.4:1707, 8.0:1694):
-/// the non-snapshot reads in progress, which the commit waits for before it takes the
+/// the reads in progress, which the commit waits for before it takes the
 /// conflict ranges (7.4:1359-1360, 8.0:1340-1341), so that a read that started before the
 /// commit is in it whenever it ends.
 #[derive(Debug, Default)]
@@ -313,7 +357,7 @@ impl Reading {
     }
 }
 
-/// A non-snapshot read in progress, counted in [`Reading`] until it is dropped: when it
+/// A read in progress, counted in [`Reading`] until it is dropped: when it
 /// ended, after adding its conflict range ([`Transaction::add_read_conflict`]), or failed or
 /// was abandoned (it adds nothing then).
 struct ReadGuard<R: Runtime> {
@@ -342,14 +386,17 @@ impl State {
             metadata: None,
             buffer: CommitBuffer::new(limits),
             deferred: None,
-            flags: Flags::new(CommitOptions::default().size_limit),
+            flags: Flags::new(
+                CommitOptions::default().size_limit,
+                db.inner.snapshot_ryw.load(Ordering::SeqCst),
+            ),
             persistent: Persistent {
                 timeout: None,
                 retry_limit: None,
                 max_retry_delay: knobs.max_backoff,
             },
             defaults: db.inner.transaction_defaults(),
-            read_issued: false,
+            ryw: RywState::default(),
             retries: 0,
             backoff: knobs.initial_backoff,
             created: db.inner.rt.now(),
@@ -409,7 +456,7 @@ impl State {
     }
 
     /// `resetRyow` and `Transaction::reset` as `onError` does them.
-    fn reset_for_retry(&mut self, limits: CommitLimits) {
+    fn reset_for_retry(&mut self, limits: CommitLimits, snapshot_ryw: i32) {
         self.epoch += 1;
         self.interrupt(|| Interrupt::Abort(Error::new(TRANSACTION_CANCELLED)));
         self.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
@@ -418,8 +465,8 @@ impl State {
         self.metadata = None;
         self.buffer = CommitBuffer::new(limits);
         self.deferred = None;
-        self.flags = Flags::new(CommitOptions::default().size_limit);
-        self.read_issued = false;
+        self.flags = Flags::new(CommitOptions::default().size_limit, snapshot_ryw);
+        self.ryw = RywState::default();
         self.commit = CommitStage::Idle;
         self.reading = Reading::default();
         self.stamped_keys.clear();
@@ -435,6 +482,15 @@ impl State {
     /// The first deferred error stays.
     fn defer(&mut self, error: Error) {
         self.deferred.get_or_insert(error);
+    }
+
+    /// A write's change to the write map, with read-your-writes (C++ writes to the native
+    /// transaction instead when it is disabled).
+    fn mirror(&mut self, f: impl FnOnce(&mut WriteMap) -> Result<(), Error>) -> Result<(), Error> {
+        if self.flags.read_your_writes_disabled {
+            return Ok(());
+        }
+        f(&mut self.ryw.writes)
     }
 
     /// `checkUsedDuringCommit`: an operation after the commit started poisons the
@@ -533,6 +589,143 @@ impl<R: Runtime> Drop for FetchGuard<R> {
             if state.epoch == self.epoch && matches!(state.read_version, ReadVersion::Fetching(_)) {
                 state.read_version = ReadVersion::Unset;
             }
+        }
+    }
+}
+
+/// What a read takes from the transaction when it is called.
+#[derive(Clone, Copy, Debug)]
+struct ReadStart {
+    epoch: u64,
+    use_provisional_proxies: bool,
+    max_read_key: &'static [u8],
+}
+
+/// What a read-your-writes read sees of the transaction's writes ([`Transaction::ryw_view`]).
+struct RywView {
+    writes: WriteMapIter,
+    bypass_unreadable: bool,
+}
+
+impl RywView {
+    fn read<'s, S>(&self, source: &'s S, max_read_key: &'static [u8]) -> RywRead<'s, S> {
+        RywRead {
+            source,
+            writes: self.writes.clone(),
+            max_read_key,
+            bypass_unreadable: self.bypass_unreadable,
+        }
+    }
+}
+
+/// The cache and the snapshot reads of a transaction, for a read-your-writes read
+/// ([`RywSource`]): each storage read is a NativeAPI read at the read version, interrupted by
+/// the transaction's reset, cancellation and timeout ([`Transaction::guarded`]).
+struct TxSource<'t, R: Runtime> {
+    tx: &'t Transaction<R>,
+    epoch: u64,
+    use_provisional_proxies: bool,
+}
+
+impl<'t, R: Runtime> TxSource<'t, R> {
+    fn new(tx: &'t Transaction<R>, start: &ReadStart) -> TxSource<'t, R> {
+        TxSource {
+            tx,
+            epoch: start.epoch,
+            use_provisional_proxies: start.use_provisional_proxies,
+        }
+    }
+}
+
+impl<R: Runtime> RywSource for TxSource<'_, R> {
+    fn with_cache<T>(&self, f: impl FnOnce(&mut SnapshotCache) -> T) -> Result<T, Error> {
+        let mut state = self.tx.state();
+        if state.epoch != self.epoch {
+            return Err(Error::new(TRANSACTION_CANCELLED));
+        }
+        Ok(f(&mut state.ryw.cache))
+    }
+
+    fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
+        Box::pin(async move {
+            self.tx
+                .native_get_value(&key, self.epoch, self.use_provisional_proxies)
+                .await
+        })
+    }
+
+    fn read_range(
+        &self,
+        begin: KeySelector,
+        end: KeySelector,
+        limits: Limits,
+        reverse: bool,
+    ) -> BoxFuture<'_, Result<RangeRead, Error>> {
+        Box::pin(async move {
+            let tx = self.tx;
+            tx.guarded(self.epoch, async {
+                let version = tx.read_version(false).await?;
+                tx.inner
+                    .db
+                    .inner
+                    .reader
+                    .get_range_with_raw_limits(
+                        &begin,
+                        &end,
+                        limits,
+                        reverse,
+                        version,
+                        self.use_provisional_proxies,
+                    )
+                    .await
+            })
+            .await?
+        })
+    }
+}
+
+/// The answer of a read task ([`Transaction::spawn_read`]): `transaction_cancelled` if the
+/// task ended without one.
+struct ReadTask<T>(oneshot::Receiver<Result<T, Error>>);
+
+impl<T> Future for ReadTask<T> {
+    type Output = Result<T, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|r| r.unwrap_or_else(|oneshot::Canceled| Err(Error::new(TRANSACTION_CANCELLED))))
+    }
+}
+
+/// The future of a read: its answer, known when it was called (an error of its checks), or
+/// its task's.
+enum ReadFuture<T> {
+    Ready(Option<Result<T, Error>>),
+    Task(ReadTask<T>),
+}
+
+impl<T> ReadFuture<T> {
+    fn ready(result: Result<T, Error>) -> ReadFuture<T> {
+        ReadFuture::Ready(Some(result))
+    }
+}
+
+// Nothing is pinned through a `ReadFuture`: a ready answer is moved out, a task's receiver
+// is `Unpin`.
+impl<T> Unpin for ReadFuture<T> {}
+
+impl<T> Future for ReadFuture<T> {
+    type Output = Result<T, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut *self {
+            ReadFuture::Ready(result) => Poll::Ready(
+                result
+                    .take()
+                    .expect("a read future polled after it completed"),
+            ),
+            ReadFuture::Task(task) => Pin::new(task).poll(cx),
         }
     }
 }
@@ -750,14 +943,30 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
-    /// `get(key)`: the value of `key` at the transaction's read version, `None` if it is not
-    /// set. Adds `key` as a read conflict range. **Does not see the transaction's own writes
-    /// yet** (see the [module documentation](self)).
+    /// `get(key)`: the value of `key` as the transaction sees it, `None` if it is not set:
+    /// the database's value at the read version with the transaction's writes before this
+    /// call applied (see the [module documentation](self)).
     ///
-    /// `key_outside_legal_range` (2004) for a key from `\xff` on (unless the
-    /// `ReadSystemKeys` or `AccessSystemKeys` option is set) or from `\xff\xff` on.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.get_with(key, false).await
+    /// The read starts when `get` is called (the future may be dropped or polled later: the
+    /// read and its conflict range happen anyway), and sees the writes made before the call,
+    /// not those made while it waits.
+    ///
+    /// * **Read conflict range** (`RYWImpl::addConflictRange`): `[key, key\x00)` unless the
+    ///   transaction had set or cleared the key (an atomic operation on a key it had not
+    ///   written depends on the database's value: the range is added). With
+    ///   [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable), always, as soon
+    ///   as `get` is called.
+    /// * **Errors.** `key_outside_legal_range` (2004) for a key from `\xff` on (unless the
+    ///   `ReadSystemKeys` or `AccessSystemKeys` option is set; `\xff/metadataVersion` is
+    ///   always allowed) or from `\xff\xff` on; `accessed_unreadable` (1036) for a key a
+    ///   versionstamped operation of the transaction may write or whose value it stamps
+    ///   (unless [`BypassUnreadable`](TransactionOption::BypassUnreadable)). A key longer than
+    ///   any key can be is `None`, with no conflict range.
+    pub fn get(
+        &self,
+        key: &[u8],
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send + use<R> {
+        self.get_with(key, false)
     }
 
     /// A view of the transaction whose reads are snapshot reads: they add no read conflict
@@ -766,43 +975,107 @@ impl<R: Runtime> Transaction<R> {
         Snapshot { tx: self }
     }
 
-    async fn get_with(&self, key: &[u8], snapshot: bool) -> Result<Option<Vec<u8>>, Error> {
-        let (too_long, use_provisional_proxies, epoch, _guard) = {
-            let mut state = self.state();
-            self.check_handle(&state)?;
-            // `fdb_c` reports the deferred error first.
-            if let Some(e) = state.deferred.clone() {
-                return Err(e);
-            }
-            state.check_alive(self.rt().now())?;
-            state.check_not_committing()?;
-            // `\xff/metadataVersion` may be read without any system key option.
-            if key >= state.flags.max_read_key() && key != METADATA_VERSION_KEY {
-                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
-            }
-            state.read_issued = true;
-            if !snapshot {
-                let end = key_after(key);
-                // The key is below `\xff\xff`, so the range is not inverted.
-                state.buffer.add_read_conflict_range(key, &end)?;
-            }
-            let limits = *state.buffer.limits();
-            let guard = (!snapshot).then(|| self.start_read(&mut state));
-            (
-                key.len() > limits.max_range_key_size(key),
-                state.flags.use_provisional_proxies,
-                state.epoch,
-                guard,
-            )
-        };
-        if too_long {
-            // No key in the database is longer than the limit (C++ does not ask either).
-            return Ok(None);
+    /// The checks every read makes when it is called, in `fdb_c`'s order (the deferred
+    /// error first), then what the read needs.
+    fn begin_read(&self, state: &mut State) -> Result<ReadStart, Error> {
+        self.check_handle(state)?;
+        if let Some(e) = state.deferred.clone() {
+            return Err(e);
         }
+        state.check_alive(self.rt().now())?;
+        state.check_not_committing()?;
+        Ok(ReadStart {
+            epoch: state.epoch,
+            use_provisional_proxies: state.flags.use_provisional_proxies,
+            max_read_key: state.flags.max_read_key(),
+        })
+    }
+
+    /// The view of a read-your-writes read called now (`readWithConflictRange`): `None` with
+    /// read-your-writes disabled (`readThrough`); the cache alone for a snapshot read when
+    /// snapshot reads do not see the writes (`readWithConflictRangeSnapshot`); else the
+    /// writes as they are now (`readWithConflictRangeRYW`).
+    fn ryw_view(state: &State, snapshot: bool) -> Option<RywView> {
+        if state.flags.read_your_writes_disabled {
+            return None;
+        }
+        let writes = if snapshot && state.flags.snapshot_ryw <= 0 {
+            WriteMap::new().iter()
+        } else {
+            state.ryw.writes.iter()
+        };
+        Some(RywView {
+            writes,
+            bypass_unreadable: state.flags.bypass_unreadable,
+        })
+    }
+
+    fn get_with(&self, key: &[u8], snapshot: bool) -> ReadFuture<Option<Vec<u8>>> {
+        let (start, view, guard) = {
+            let mut state = self.state();
+            let start = match self.begin_read(&mut state) {
+                Ok(start) => start,
+                Err(e) => return ReadFuture::ready(Err(e)),
+            };
+            // `\xff/metadataVersion` may be read without any system key option.
+            if key >= start.max_read_key && key != METADATA_VERSION_KEY {
+                return ReadFuture::ready(Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE)));
+            }
+            if key.len() > state.buffer.limits().max_range_key_size(key) {
+                // No key in the database is longer than the limit (C++ does not ask either).
+                return ReadFuture::ready(Ok(None));
+            }
+            let view = Self::ryw_view(&state, snapshot);
+            if view.is_none() && !snapshot {
+                // NativeAPI's `get` adds the range when it is called. The key is below
+                // `\xff\xff`, so the range is not inverted.
+                if let Err(e) = state.buffer.add_read_conflict_range(key, &key_after(key)) {
+                    return ReadFuture::ready(Err(e));
+                }
+            }
+            (start, view, self.start_read(&mut state))
+        };
+        let tx = self.clone();
+        let key = key.to_vec();
+        ReadFuture::Task(self.spawn_read(async move {
+            let result = match view {
+                None => {
+                    tx.native_get_value(&key, start.epoch, start.use_provisional_proxies)
+                        .await
+                }
+                Some(view) => {
+                    let source = TxSource::new(&tx, &start);
+                    let read = view.read(&source, start.max_read_key);
+                    match ryw::read::get(&read, &key).await {
+                        Ok(value) if !snapshot => tx
+                            .add_ryw_conflict(&guard, |c| {
+                                ryw::read::add_get_conflict(c, &key, &read.writes);
+                                Ok(())
+                            })
+                            .map(|()| value),
+                        other => other,
+                    }
+                }
+            };
+            drop(guard);
+            result
+        }))
+    }
+
+    /// NativeAPI's `Transaction::get(key, Snapshot::True)`: the database's value at the
+    /// read version.
+    async fn native_get_value(
+        &self,
+        key: &[u8],
+        epoch: u64,
+        use_provisional_proxies: bool,
+    ) -> Result<Option<Vec<u8>>, Error> {
         self.guarded(epoch, async {
             let version = self.read_version(false).await?;
             if key == METADATA_VERSION_KEY {
-                return self.metadata_version(version, epoch).await;
+                return self
+                    .metadata_version(version, epoch, use_provisional_proxies)
+                    .await;
             }
             self.inner
                 .db
@@ -819,7 +1092,12 @@ impl<R: Runtime> Transaction<R> {
     /// one; else what the database remembers of the read version
     /// ([`Reader::metadata_version`](crate::read::Reader::metadata_version)), which reads the
     /// key from a storage server if it does not know.
-    async fn metadata_version(&self, version: i64, epoch: u64) -> Result<Option<Vec<u8>>, Error> {
+    async fn metadata_version(
+        &self,
+        version: i64,
+        epoch: u64,
+        use_provisional_proxies: bool,
+    ) -> Result<Option<Vec<u8>>, Error> {
         {
             let state = self.state();
             if state.epoch != epoch {
@@ -829,80 +1107,95 @@ impl<R: Runtime> Transaction<R> {
                 return Ok(metadata.clone());
             }
         }
-        self.inner.db.inner.reader.metadata_version(version).await
+        self.inner
+            .db
+            .inner
+            .reader
+            .metadata_version_with(version, use_provisional_proxies)
+            .await
     }
 
-    /// `getKey(selector)`: the key `selector` resolves to at the transaction's read version
-    /// ([`Reader::get_key`](crate::read::Reader::get_key)), as `fdb_c` returns it with
-    /// read-your-writes disabled. **Does not see the transaction's own writes yet** (see the
-    /// [module documentation](self)).
+    /// `getKey(selector)`: the key `selector` resolves to as the transaction sees it (its
+    /// writes before this call included: a key it set counts, a key it cleared does not).
+    /// The read starts when `get_key` is called, as [`get`](Self::get)'s.
     ///
     /// * **Bounds.** A selector that resolves before the first key gives the empty key; one
     ///   that resolves past the last key the transaction may read gives that bound: `\xff`, or
-    ///   `\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option
-    ///   (`ReadYourWritesTransaction`'s `readThrough` clamps to `getMaxReadKey()`).
+    ///   `\xff\xff` with the `ReadSystemKeys` or `AccessSystemKeys` option.
     /// * **Errors.** `key_outside_legal_range` (2004) for a selector key after that bound
-    ///   (the bound itself is allowed); then as [`get`](Self::get). A selector key longer
-    ///   than any key can be is shortened first, as `KeySelectorRef::setKey` does (to one
-    ///   byte over the limit of `getMaxKeySize`).
-    /// * **Read conflict range** (`getKeyAndConflictRange`, NativeAPI 7.4:6077-6092,
-    ///   8.0:3817-3835), from the selector's key `k` and the (unclamped) result `r`: for an
-    ///   offset of 0 or less, `[r, k)` (`[r, keyAfter(k))` if `or_equal`); otherwise
-    ///   `[k, keyAfter(r))` (`[keyAfter(k), keyAfter(r))` if `or_equal`), where `keyAfter(k)`
-    ///   is `k\x00` and `keyAfter(\xff\xff)` is `\xff\xff`; none if that range is empty or
-    ///   the read fails. It is added when the result arrives; a commit started meanwhile
-    ///   waits for the read (see the [module documentation](self)). As C++'s
-    ///   `extraConflictRanges` (7.4:7166-7172, 8.0:4863-4867), it does not count toward the
-    ///   transaction's size.
-    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
-        self.get_key_with(selector, false).await
+    ///   (the bound itself is allowed); `accessed_unreadable` (1036) if the resolution meets
+    ///   keys a versionstamped operation of the transaction made unreadable; then as
+    ///   [`get`](Self::get). A selector key longer than any key can be is shortened first, as
+    ///   `KeySelectorRef::setKey` does (to one byte over the limit of `getMaxKeySize`).
+    /// * **Read conflict range** (`RYWImpl::addConflictRange(GetKeyReq)`), from the
+    ///   selector's key `k` and the result `r`: for an offset of 0 or less, `[r, k)`
+    ///   (`[r, keyAfter(k))` if `or_equal`); otherwise `[k, keyAfter(r))`
+    ///   (`[keyAfter(k), keyAfter(r))` if `or_equal`), where `keyAfter(k)` is `k\x00` and
+    ///   `keyAfter(\xff\xff)` is `\xff\xff`; less the keys the transaction had set or
+    ///   cleared; added when the read ends. With
+    ///   [`ReadYourWritesDisable`](TransactionOption::ReadYourWritesDisable), NativeAPI's
+    ///   (`getKeyAndConflictRange`, 7.4:6077-6092, 8.0:3817-3835): the same from the
+    ///   unclamped result, all of it, not counted in the transaction's size
+    ///   (`extraConflictRanges`).
+    pub fn get_key(
+        &self,
+        selector: &KeySelector,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + use<R> {
+        self.get_key_with(selector, false)
     }
 
-    async fn get_key_with(&self, selector: &KeySelector, snapshot: bool) -> Result<Vec<u8>, Error> {
-        let (selector, max_read_key, use_provisional_proxies, epoch, guard) = {
+    fn get_key_with(&self, selector: &KeySelector, snapshot: bool) -> ReadFuture<Vec<u8>> {
+        let (start, selector, view, guard) = {
             let mut state = self.state();
-            self.check_handle(&state)?;
-            if let Some(e) = state.deferred.clone() {
-                return Err(e);
-            }
-            state.check_alive(self.rt().now())?;
-            state.check_not_committing()?;
-            let max_read_key = state.flags.max_read_key();
+            let start = match self.begin_read(&mut state) {
+                Ok(start) => start,
+                Err(e) => return ReadFuture::ready(Err(e)),
+            };
             let selector = self.set_key(&state, selector);
-            if selector.key.as_slice() > max_read_key {
-                return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
+            if selector.key.as_slice() > start.max_read_key {
+                return ReadFuture::ready(Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE)));
             }
-            state.read_issued = true;
-            (
-                selector,
-                max_read_key,
-                state.flags.use_provisional_proxies,
-                state.epoch,
-                (!snapshot).then(|| self.start_read(&mut state)),
-            )
+            let view = Self::ryw_view(&state, snapshot);
+            (start, selector, view, self.start_read(&mut state))
         };
-        let key = match guard {
-            None => {
-                self.native_get_key(&selector, None, epoch, use_provisional_proxies)
-                    .await?
-            }
-            Some(guard) => {
-                let tx = self.clone();
-                self.spawn_read(async move {
-                    let key = tx
-                        .native_get_key(&selector, Some(&guard), epoch, use_provisional_proxies)
-                        .await;
-                    drop(guard);
-                    key
-                })
-                .await?
-            }
-        };
-        // `readThrough`: results in keys the transaction may not read are clamped.
-        if key.as_slice() > max_read_key {
-            return Ok(max_read_key.to_vec());
-        }
-        Ok(key)
+        let tx = self.clone();
+        ReadFuture::Task(self.spawn_read(async move {
+            let result = match view {
+                None => {
+                    let conflict = (!snapshot).then_some(&guard);
+                    tx.native_get_key(
+                        &selector,
+                        conflict,
+                        start.epoch,
+                        start.use_provisional_proxies,
+                    )
+                    .await
+                    // `readThrough`: results in keys the transaction may not read are
+                    // clamped.
+                    .map(|key| {
+                        if key.as_slice() > start.max_read_key {
+                            start.max_read_key.to_vec()
+                        } else {
+                            key
+                        }
+                    })
+                }
+                Some(view) => {
+                    let source = TxSource::new(&tx, &start);
+                    let read = view.read(&source, start.max_read_key);
+                    match ryw::read::get_key(&read, selector.clone()).await {
+                        Ok(key) if !snapshot => tx
+                            .add_ryw_conflict(&guard, |c| {
+                                ryw::read::add_get_key_conflict(c, &selector, &key, &read.writes)
+                            })
+                            .map(|()| key),
+                        other => other,
+                    }
+                }
+            };
+            drop(guard);
+            result
+        }))
     }
 
     /// `KeySelectorRef::setKey`: a copy of `selector` whose key is at most one byte longer
@@ -956,27 +1249,43 @@ impl<R: Runtime> Transaction<R> {
         Ok(key)
     }
 
-    /// Runs `read`, the part of a non-snapshot read that waits for the cluster and adds the
-    /// read conflict range, holding its [`ReadGuard`], as a task of its own: as a C++ read
-    /// actor, it ends (and lets a waiting commit go on) whether or not the future that
-    /// started it is still polled or kept. The result goes to the future this returns.
+    /// Runs `read`, a read that waits for the cluster and adds its read conflict range,
+    /// holding its [`ReadGuard`], as a task of its own, started now: as a C++ read actor, it
+    /// ends (and lets a waiting commit go on) whether or not the future that started it is
+    /// still polled or kept. The result goes to the [`ReadTask`] this returns.
     fn spawn_read<T: Send + 'static>(
         &self,
         read: impl Future<Output = Result<T, Error>> + Send + 'static,
-    ) -> impl Future<Output = Result<T, Error>> + Send + 'static {
+    ) -> ReadTask<T> {
         let (tx, rx) = oneshot::channel();
         // Detached: it ends with the read (which the transaction's reset, cancellation or
         // timeout interrupts).
         drop(self.rt().spawn(async move {
             let _ = tx.send(read.await);
         }));
-        async move {
-            rx.await
-                .unwrap_or_else(|oneshot::Canceled| Err(Error::new(TRANSACTION_CANCELLED)))
-        }
+        ReadTask(rx)
     }
 
-    /// Counts a non-snapshot read in progress (`reading.add`) until the guard is dropped.
+    /// Adds the read conflict ranges of a read-your-writes read that `guard` counts (`f`
+    /// adds them to the transaction's `readConflicts`). Fails as
+    /// [`add_read_conflict`](Self::add_read_conflict) does.
+    fn add_ryw_conflict(
+        &self,
+        guard: &ReadGuard<R>,
+        f: impl FnOnce(&mut ReadConflicts) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut state = self.state();
+        if state.epoch != guard.epoch {
+            return Err(Error::new(TRANSACTION_CANCELLED));
+        }
+        if state.reading.closed {
+            state.check_not_committing()?;
+            return Err(Error::new(USED_DURING_COMMIT));
+        }
+        f(&mut state.ryw.read_conflicts)
+    }
+
+    /// Counts a read in progress (`reading.add`) until the guard is dropped.
     fn start_read(&self, state: &mut State) -> ReadGuard<R> {
         state.reading.count += 1;
         ReadGuard {
@@ -1012,9 +1321,12 @@ impl<R: Runtime> Transaction<R> {
     /// The `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option is used up first thing, as the
     /// read-your-writes layer's `getAndResetWriteConflictDisabled` does (whatever the write
     /// does next): `f` adds no write conflict range then.
+    ///
+    /// `f` gets whether the write adds its write conflict range (`addWriteConflict`), for
+    /// the write map.
     fn write_then<T>(
         &self,
-        f: impl FnOnce(&mut State) -> Result<T, Error>,
+        f: impl FnOnce(&mut State, bool) -> Result<T, Error>,
     ) -> Option<(MutexGuard<'_, State>, T)> {
         self.write_inner(true, f)
     }
@@ -1022,7 +1334,7 @@ impl<R: Runtime> Transaction<R> {
     fn write_inner<T>(
         &self,
         mutation: bool,
-        f: impl FnOnce(&mut State) -> Result<T, Error>,
+        f: impl FnOnce(&mut State, bool) -> Result<T, Error>,
     ) -> Option<(MutexGuard<'_, State>, T)> {
         let mut state = self.state();
         let skip_conflict =
@@ -1039,7 +1351,7 @@ impl<R: Runtime> Transaction<R> {
             return None;
         }
         state.buffer.set_skip_write_conflict(skip_conflict);
-        let result = f(&mut state);
+        let result = f(&mut state, !skip_conflict);
         state.buffer.set_skip_write_conflict(false);
         match result {
             Ok(t) => Some((state, t)),
@@ -1053,19 +1365,28 @@ impl<R: Runtime> Transaction<R> {
     /// [`write_inner`](Self::write_inner) for a conflict range: no watch, and the option
     /// that skips the next write's conflict range is not used up.
     fn write(&self, f: impl FnOnce(&mut State) -> Result<(), Error>) {
-        drop(self.write_inner(false, f));
+        drop(self.write_inner(false, |state, _| f(state)));
     }
 
-    /// `set(key, value)`: writes `value` to `key` when the transaction commits. Errors are
-    /// deferred: `key_too_large` (2102, a key over 10 000 bytes), `value_too_large` (2103,
-    /// a value over 100 000 bytes), `key_outside_legal_range` (2004, a key from `\xff` on
-    /// without the `AccessSystemKeys` option).
+    /// `set(key, value)`: writes `value` to `key` when the transaction commits; the
+    /// transaction's reads see it from now on. Errors are deferred: `key_too_large` (2102, a
+    /// key over 10 000 bytes), `value_too_large` (2103, a value over 100 000 bytes),
+    /// `key_outside_legal_range` (2004, a key from `\xff` on without the `AccessSystemKeys`
+    /// option), `client_invalid_operation` (2000) for `\xff/metadataVersion` (see the
+    /// [module documentation](self)).
     pub fn set(&self, key: &[u8], value: &[u8]) {
-        let written = self.write_then(|state| {
+        let written = self.write_then(|state, add_conflict| {
+            if key == METADATA_VERSION_KEY {
+                return Err(Error::with_message(
+                    CLIENT_INVALID_OPERATION,
+                    "\\xff/metadataVersion can only be written with SetVersionstampedValue",
+                ));
+            }
             if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            state.buffer.set(key, value)
+            state.buffer.set(key, value)?;
+            state.mirror(|writes| writes.mutate(key, MutationType::SET_VALUE, value, add_conflict))
         });
         if let Some((mut state, ())) = written {
             state
@@ -1076,12 +1397,19 @@ impl<R: Runtime> Transaction<R> {
 
     /// `clear(key)`: removes `key` when the transaction commits.
     pub fn clear(&self, key: &[u8]) {
-        let written = self.write_then(|state| {
+        let written = self.write_then(|state, add_conflict| {
             if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
             state.buffer.clear(key);
-            Ok(())
+            // A key longer than any key can be is not written (`getMaxClearKeySize`).
+            if key.len() > state.buffer.limits().max_range_key_size(key) {
+                return Ok(());
+            }
+            state.mirror(|writes| {
+                writes.clear(key, &key_after(key), add_conflict);
+                Ok(())
+            })
         });
         if let Some((mut state, ())) = written {
             state.watches.trigger(key, None, Written::Value(None));
@@ -1092,12 +1420,21 @@ impl<R: Runtime> Transaction<R> {
     /// commits. Deferred errors: `inverted_range` (2005) if `begin > end`,
     /// `key_outside_legal_range` if either is past `\xff` (without `AccessSystemKeys`).
     pub fn clear_range(&self, begin: &[u8], end: &[u8]) {
-        let written = self.write_then(|state| {
+        let written = self.write_then(|state, add_conflict| {
             let max = state.flags.max_write_key();
             if begin > max || end > max {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            state.buffer.clear_range(begin, end)
+            state.buffer.clear_range(begin, end)?;
+            // Shortened as C++ does (`getMaxClearKeySize`); nothing if it is empty then.
+            let range = KeyRange::new(begin, end).map_err(|_| Error::new(INVERTED_RANGE))?;
+            let Some(range) = normalize_range(&range, state.buffer.limits())? else {
+                return Ok(());
+            };
+            state.mirror(|writes| {
+                writes.clear(&range.begin, &range.end, add_conflict);
+                Ok(())
+            })
         });
         if let Some((mut state, ())) = written {
             state
@@ -1114,12 +1451,31 @@ impl<R: Runtime> Transaction<R> {
     /// `value_too_large`, `key_outside_legal_range`, and for the versionstamp operations
     /// `client_invalid_operation` (2000) if the 4-byte offset is invalid.
     pub fn atomic_op(&self, key: &[u8], operand: &[u8], op: MutationType) {
-        let written = self.write_then(|state| {
-            if key >= state.flags.max_write_key() {
+        let written = self.write_then(|state, add_conflict| {
+            if key == METADATA_VERSION_KEY {
+                // `ReadYourWritesTransaction::atomicOp` (7.4:2226-2230): only the versionstamp
+                // of the metadata version, with or without the system key options.
+                if op != MutationType::SET_VERSIONSTAMPED_VALUE
+                    || operand != METADATA_VERSION_REQUIRED_VALUE
+                {
+                    return Err(Error::with_message(
+                        CLIENT_INVALID_OPERATION,
+                        "\\xff/metadataVersion can only be written with SetVersionstampedValue \
+                         of the 14-byte required value",
+                    ));
+                }
+            } else if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
             state.buffer.atomic_op(key, operand, op)?;
+            // `apiVersionAtLeast(510)`: `Min` and `And` are `MinV2` and `AndV2`.
+            let kind = match op {
+                MutationType::MIN => MutationType::MIN_V2,
+                MutationType::AND => MutationType::AND_V2,
+                other => other,
+            };
             if op != MutationType::SET_VERSIONSTAMPED_KEY {
+                state.mirror(|writes| writes.mutate(key, kind, operand, add_conflict))?;
                 return Ok(None);
             }
             // `getVersionstampKeyRange` and `transformVersionstampKey` with the read version
@@ -1139,7 +1495,14 @@ impl<R: Runtime> Transaction<R> {
                 key: stamped.clone(),
             });
             // C++ throws `inverted_range` here (for a range past the readable keys).
-            range?;
+            let range = range?;
+            // The keys the stamped key may take become unreadable (their earlier writes are
+            // already in the buffer: `writeRangeToNativeTransaction`), then the operation is
+            // written at the key with the placeholder stamped, without a conflict range.
+            state.mirror(|writes| {
+                writes.add_unmodified_and_unreadable_range(&range.begin, &range.end);
+                writes.mutate(&stamped, kind, operand, false)
+            })?;
             Ok(Some(stamped))
         });
         if let Some((mut state, stamped)) = written {
@@ -1166,12 +1529,11 @@ impl<R: Runtime> Transaction<R> {
     /// **No write conflict range is added** for the key: the key is not known before the
     /// commit (C++ adds none either: `Transaction::atomicOp` skips it for
     /// `SetVersionstampedKey`). A transaction that writes nothing else is still sent, with
-    /// the self-conflicting key, as any blind write. Reads of the transaction do not see the
-    /// key (nothing is read-your-writes yet); a [`watch`](Self::watch) of a key in the range
-    /// the key may take (see [`atomic::versionstamp_key_range`]) fails with
-    /// `accessed_unreadable` (1036) until a clear covers it, and a watch of the key with the
-    /// placeholder stamped (`transformVersionstampKey`) is triggered, as C++'s
-    /// read-your-writes layer does.
+    /// the self-conflicting key, as any blind write. The keys the stamped key may be (see
+    /// [`atomic::versionstamp_key_range`]) are unreadable until the commit: a read or a
+    /// [`watch`](Self::watch) of them fails with `accessed_unreadable` (1036) until a clear
+    /// covers them, and a watch of the key with the placeholder stamped
+    /// (`transformVersionstampKey`) is triggered, as C++'s read-your-writes layer does.
     ///
     /// ```no_run
     /// # async fn example(db: fdb_native_client::Database) -> Result<(), fdb_native_client::Error> {
@@ -1207,13 +1569,35 @@ impl<R: Runtime> Transaction<R> {
 
     /// `addReadConflictRange(begin, end)`: the commit conflicts if another transaction
     /// wrote in `[begin, end)` after the read version, as if the range had been read.
+    ///
+    /// With read-your-writes (`ReadYourWritesTransaction::addReadConflictRange`), the parts
+    /// of the range the transaction has set or cleared are left out, as a read of them would
+    /// be (`updateConflictMap`), and the range joins the reads' ranges. Errors (deferred):
+    /// `key_outside_legal_range` (2004) for a key after `\xff` (`\xff\xff` with the system
+    /// key options; the range of `\xff/metadataVersion` is always allowed), `inverted_range`
+    /// (2005).
     pub fn add_read_conflict_range(&self, begin: &[u8], end: &[u8]) {
         self.write(|state| {
             let max = state.flags.max_read_key();
-            if begin > max || end > max {
+            let metadata_version = begin == METADATA_VERSION_KEY && end == key_after(begin);
+            if (begin > max || end > max) && !metadata_version {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            state.buffer.add_read_conflict_range(begin, end)
+            if state.flags.read_your_writes_disabled {
+                return state.buffer.add_read_conflict_range(begin, end);
+            }
+            let range = KeyRange::new(begin, end).map_err(|_| Error::new(INVERTED_RANGE))?;
+            let Some(range) = normalize_range(&range, state.buffer.limits())? else {
+                return Ok(());
+            };
+            let writes = state.ryw.writes.iter();
+            ryw::read::add_range_conflict(
+                &mut state.ryw.read_conflicts,
+                &range.begin,
+                &range.end,
+                &writes,
+            );
+            Ok(())
         });
     }
 
@@ -1225,7 +1609,15 @@ impl<R: Runtime> Transaction<R> {
             if begin > max || end > max {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            state.buffer.add_write_conflict_range(begin, end)
+            state.buffer.add_write_conflict_range(begin, end)?;
+            let range = KeyRange::new(begin, end).map_err(|_| Error::new(INVERTED_RANGE))?;
+            let Some(range) = normalize_range(&range, state.buffer.limits())? else {
+                return Ok(());
+            };
+            state.mirror(|writes| {
+                writes.add_conflict_range(&range.begin, &range.end);
+                Ok(())
+            })
         });
     }
 
@@ -1287,6 +1679,17 @@ impl<R: Runtime> Transaction<R> {
                 }
                 if state.reading.count == 0 {
                     state.reading.closed = true;
+                    if !state.flags.read_your_writes_disabled {
+                        // `RYWImpl::commit` (7.4:1394-1399, 8.0:1375-1380): the reads' conflict
+                        // ranges, coalesced, as `addReadConflictRange`s of the native
+                        // transaction (counted in its size).
+                        let ranges: Vec<KeyRange> = state.ryw.read_conflicts.ranges().collect();
+                        for range in ranges {
+                            state
+                                .buffer
+                                .add_read_conflict_range(&range.begin, &range.end)?;
+                        }
+                    }
                     let limits = *state.buffer.limits();
                     let buffer = std::mem::replace(&mut state.buffer, CommitBuffer::new(limits));
                     state.stamped_keys.clear();
@@ -1347,18 +1750,16 @@ impl<R: Runtime> Transaction<R> {
         options: CommitOptions,
         sent: &Arc<AtomicBool>,
     ) -> Result<CommitOutcome, Error> {
-        let read_version = if buffer.is_empty() {
-            // Nothing to send: the committer returns without using it.
-            INVALID_VERSION
-        } else {
-            self.read_version(true).await?
+        let committer = &self.inner.db.inner.committer;
+        // `commitMutations`' checks (`transaction_read_only`, the size, ...) come before the
+        // read version request (NativeAPI 7.4:7129-7180, 8.0:4820-4875).
+        let Some(commit) = committer.prepare_buffer(buffer, &options)? else {
+            return Ok(CommitOutcome::NothingToCommit);
         };
+        let read_version = self.read_version(true).await?;
         // The committer sets `sent` once the request may reach a proxy.
-        self.inner
-            .db
-            .inner
-            .committer
-            .commit_buffer_tracked(buffer, read_version, &options, sent)
+        committer
+            .commit_prepared_tracked(commit, read_version, &options, sent)
             .await
     }
 
@@ -1528,7 +1929,10 @@ impl<R: Runtime> Transaction<R> {
                     .future_version_retry_delay
                     .min(state.persistent.max_retry_delay),
             };
-            state.reset_for_retry(self.inner.db.inner.committer.limits());
+            state.reset_for_retry(
+                self.inner.db.inner.committer.limits(),
+                self.inner.db.inner.snapshot_ryw.load(Ordering::SeqCst),
+            );
             (delay, state.epoch)
         };
         let (delay, epoch) = delay;
@@ -1653,13 +2057,21 @@ impl<R: Runtime> fmt::Debug for Snapshot<'_, R> {
 }
 
 impl<R: Runtime> Snapshot<'_, R> {
-    /// [`Transaction::get`] without a read conflict range.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.tx.get_with(key, true).await
+    /// [`Transaction::get`] without a read conflict range (and without the transaction's
+    /// writes if snapshot reads do not see them:
+    /// [`SnapshotRywDisable`](TransactionOption::SnapshotRywDisable)).
+    pub fn get(
+        &self,
+        key: &[u8],
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send + use<R> {
+        self.tx.get_with(key, true)
     }
 
-    /// [`Transaction::get_key`] without a read conflict range.
-    pub async fn get_key(&self, selector: &KeySelector) -> Result<Vec<u8>, Error> {
-        self.tx.get_key_with(selector, true).await
+    /// [`Transaction::get_key`] without a read conflict range (see [`get`](Self::get)).
+    pub fn get_key(
+        &self,
+        selector: &KeySelector,
+    ) -> impl Future<Output = Result<Vec<u8>, Error>> + Send + use<R> {
+        self.tx.get_key_with(selector, true)
     }
 }

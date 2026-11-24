@@ -172,7 +172,7 @@ fn check_walk(wm: &WriteMap, expected: &[Expected<'_>]) {
         }
         assert_eq!(it.is_unmodified_range(), unmodified);
         assert_eq!(it.is_unreadable(), unreadable);
-        it.advance();
+        let _ = it.advance();
     }
     assert!(it.begin_key() >= ExtKey::from(ALL_KEYS_END));
 }
@@ -758,7 +758,7 @@ fn iterators_are_snapshots() {
     let mut walked = Vec::new();
     while it.begin_key() < ExtKey::from(ALL_KEYS_END) {
         walked.push(seg(&it));
-        it.advance();
+        let _ = it.advance();
     }
     assert_eq!(walked, segs_before);
     assert!(wm.iter_at(b"a").is_cleared_range());
@@ -773,7 +773,16 @@ fn navigation_at_the_ends() {
     assert!(it.advance());
     assert_eq!(it.begin_key().to_vec(), ALL_KEYS_END);
     assert_eq!(it.end_key().to_vec(), AFTER_ALL_KEYS);
+    // `++` from the last segment reaches the `\xff\xff\x00` sentinel, a terminal position.
     assert!(!it.advance());
+    assert_eq!(it.begin_key().to_vec(), AFTER_ALL_KEYS);
+    assert!(!it.is_cleared_range() && !it.is_conflict_range() && !it.is_unreadable());
+    assert!(!it.advance());
+    assert_eq!(it.begin_key().to_vec(), AFTER_ALL_KEYS);
+    // `--` from there is the last segment again.
+    assert!(it.retreat());
+    assert_eq!(it.begin_key().to_vec(), ALL_KEYS_END);
+    assert_eq!(it.end_key().to_vec(), AFTER_ALL_KEYS);
     // Past `\xff\xff`: the last segment.
     let it = wm.iter_at(b"\xff\xff\xff");
     assert_eq!(it.begin_key().to_vec(), ALL_KEYS_END);
@@ -1130,4 +1139,24 @@ proptest! {
         prop_assert_eq!(segments(&wm), before);
         prop_assert!(it.begin_key() == ExtKey::from(&b""[..]));
     }
+}
+
+/// A C++ `for (; it.beginKey() < keys.end; ++it)` loop up to `keyAfter(\xff\xff)` ends: `++`
+/// from the last segment reaches `\xff\xff\x00` (review repro).
+#[test]
+fn update_conflict_map_loop_to_after_all_keys() {
+    let wm = WriteMap::new();
+    let end = ExtKey::from(AFTER_ALL_KEYS);
+    let mut it = wm.iter_at(b"\xff\xfe");
+    let mut steps = 0;
+    while it.begin_key() < end {
+        steps += 1;
+        assert!(
+            steps <= 1000,
+            "did not terminate: stuck at {:?}",
+            it.begin_key().to_vec()
+        );
+        let _ = it.advance();
+    }
+    assert_eq!(steps, 2);
 }

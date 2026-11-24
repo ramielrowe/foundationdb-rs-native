@@ -4,7 +4,7 @@
 //! | Option | Code | Status |
 //! |---|---|---|
 //! | [`MaxWatches`](DatabaseOption::MaxWatches) | 20 | supported |
-//! | [`SnapshotRywEnable`](DatabaseOption::SnapshotRywEnable) / [`Disable`](DatabaseOption::SnapshotRywDisable) | 26 / 27 | no-op until read-your-writes exists |
+//! | [`SnapshotRywEnable`](DatabaseOption::SnapshotRywEnable) / [`Disable`](DatabaseOption::SnapshotRywDisable) | 26 / 27 | supported (a counter, as C++'s `snapshotRywEnabled`) |
 //! | [`TransactionTimeout`](DatabaseOption::TransactionTimeout) | 500 | default for `TIMEOUT` |
 //! | [`TransactionRetryLimit`](DatabaseOption::TransactionRetryLimit) | 501 | default for `RETRY_LIMIT` |
 //! | [`TransactionMaxRetryDelay`](DatabaseOption::TransactionMaxRetryDelay) | 502 | default for `MAX_RETRY_DELAY` |
@@ -17,8 +17,10 @@
 //!
 //! Not offered: `LOCATION_CACHE_SIZE` (the cache is [`ReadConfig`](crate::read::ReadConfig)'s,
 //! fixed when the database is opened), `MACHINE_ID` and `DATACENTER_ID` (the locality that
-//! prefers a same-datacenter replica; there is none yet), `TEST_CAUSAL_READ_RISKY` (a
-//! simulation aid) and `TRANSACTION_AUTOMATIC_IDEMPOTENCY` (no idempotency ids yet).
+//! prefers a same-datacenter replica; there is none yet), `TRANSACTION_LOGGING_MAX_FIELD_LENGTH`
+//! (405: there is no transaction logging), `USE_CONFIG_DATABASE` (800, 7.4 only: the
+//! configuration database is a server-side tool's), `TEST_CAUSAL_READ_RISKY` (a simulation
+//! aid) and `TRANSACTION_AUTOMATIC_IDEMPOTENCY` (no idempotency ids yet).
 //!
 //! # Transaction defaults
 //!
@@ -52,10 +54,14 @@ pub enum DatabaseOption {
     /// whatever the new cap.
     MaxWatches(usize),
     /// `SNAPSHOT_RYW_ENABLE` (26): snapshot reads see the transactions' writes (the default).
-    /// No-op until read-your-writes exists.
+    /// As in C++ (`DatabaseContext::snapshotRywEnabled`), this and
+    /// [`SnapshotRywDisable`](Self::SnapshotRywDisable) count up and down from 1: snapshot
+    /// reads see the writes while the count is above 0. A transaction starts (and restarts,
+    /// after a reset or `on_error`) with the count the database has then, and its own
+    /// [`TransactionOption::SnapshotRywEnable`] / `Disable` count from there.
     SnapshotRywEnable,
-    /// `SNAPSHOT_RYW_DISABLE` (27): snapshot reads do not see the transactions' writes. No-op
-    /// until read-your-writes exists.
+    /// `SNAPSHOT_RYW_DISABLE` (27): snapshot reads do not see the transactions' writes (see
+    /// [`SnapshotRywEnable`](Self::SnapshotRywEnable)).
     SnapshotRywDisable,
     /// `TRANSACTION_TIMEOUT` (500): the default [`Timeout`](TransactionOption::Timeout).
     TransactionTimeout(Duration),

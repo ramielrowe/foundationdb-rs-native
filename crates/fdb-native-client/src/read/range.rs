@@ -337,6 +337,29 @@ impl RangeRead {
         out
     }
 
+    /// A result with these rows and flags, for tests of the code that reads one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        rows: Vec<KeyValue>,
+        more: bool,
+        read_to_begin: bool,
+        read_through_end: bool,
+        read_through: Option<Vec<u8>>,
+    ) -> RangeRead {
+        let mut read = RangeRead {
+            more,
+            read_to_begin,
+            read_through_end,
+            read_through,
+            ..RangeRead::default()
+        };
+        read.push(
+            KeyValueVector::from_pairs(rows.iter().map(|kv| KeyValueRef::new(&kv.key, &kv.value)))
+                .expect("rows"),
+        );
+        read
+    }
+
     fn push(&mut self, chunk: KeyValueVector) {
         if !chunk.is_empty() {
             self.len += chunk.len();
@@ -490,16 +513,18 @@ pub(crate) fn read_conflict_range(
     })
 }
 
-/// `GetRangeLimits` as `getRange` counts it down: `-1` is no limit.
+/// `GetRangeLimits` as `getRange` counts it down: `-1` is no limit. The read-your-writes
+/// layer builds its own (with a `minRows` above 1) and reads with
+/// [`Reader::get_range_with_raw_limits`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Limits {
-    rows: i64,
-    min_rows: i64,
-    bytes: i64,
+pub(crate) struct Limits {
+    pub(crate) rows: i64,
+    pub(crate) min_rows: i64,
+    pub(crate) bytes: i64,
 }
 
 impl Limits {
-    fn new(limits: RangeLimits) -> Limits {
+    pub(crate) fn new(limits: RangeLimits) -> Limits {
         // C++'s limits are `int`s: larger ones are as good as none.
         let cap = |n: u32| i64::from(n.min(i32::MAX as u32));
         Limits {
@@ -509,21 +534,29 @@ impl Limits {
         }
     }
 
-    fn has_row_limit(&self) -> bool {
+    pub(crate) fn has_row_limit(&self) -> bool {
         self.rows != -1
     }
 
-    fn has_byte_limit(&self) -> bool {
+    pub(crate) fn has_byte_limit(&self) -> bool {
         self.bytes != -1
     }
 
     /// `isReached`.
-    fn is_reached(&self) -> bool {
+    pub(crate) fn is_reached(&self) -> bool {
         self.rows == 0 || (self.bytes == 0 && self.min_rows == 0)
     }
 
+    /// `isValid`.
+    pub(crate) fn is_valid(&self) -> bool {
+        (self.rows >= 0 || self.rows == -1)
+            && (self.bytes >= 0 || self.bytes == -1)
+            && self.min_rows >= 0
+            && (self.min_rows <= self.rows || self.rows == -1)
+    }
+
     /// `hasSatisfiedMinRows`.
-    fn has_satisfied_min_rows(&self) -> bool {
+    pub(crate) fn has_satisfied_min_rows(&self) -> bool {
         self.has_byte_limit() && self.min_rows == 0
     }
 
@@ -659,12 +692,41 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         if version <= 0 {
             return Err(Error::new(CLIENT_INVALID_OPERATION));
         }
+        self.get_range_with_raw_limits(
+            begin,
+            end,
+            Limits::new(limits),
+            reverse,
+            version,
+            use_provisional_proxies,
+        )
+        .await
+    }
+
+    /// [`get_range_with_limits`](Self::get_range_with_limits) with C++'s `GetRangeLimits`
+    /// as it is (`minRows` included), as the read-your-writes layer asks for its reads
+    /// (`RYWImpl::setRequestLimits`). `range_limits_invalid` (2012) for limits that are not
+    /// `isValid()`.
+    pub(crate) async fn get_range_with_raw_limits(
+        &self,
+        begin: &KeySelector,
+        end: &KeySelector,
+        limits: Limits,
+        reverse: bool,
+        version: i64,
+        use_provisional_proxies: bool,
+    ) -> Result<RangeRead, Error> {
+        if version <= 0 {
+            return Err(Error::new(CLIENT_INVALID_OPERATION));
+        }
         if begin.key.as_slice() > KEY_SPACE_END || end.key.as_slice() > KEY_SPACE_END {
             return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
         }
-        let limits = Limits::new(limits);
         if limits.is_reached() {
             return Ok(RangeRead::default());
+        }
+        if !limits.is_valid() {
+            return Err(Error::new(RANGE_LIMITS_INVALID));
         }
         let begin = remove_or_equal(begin);
         let end = remove_or_equal(end);
