@@ -61,8 +61,9 @@ pub enum MutationType {
 }
 
 impl MutationType {
-    /// Every atomic operation, in code order.
-    pub const ALL: [MutationType; 12] = [
+    /// Every atomic operation, in code order. A slice: the enum is `#[non_exhaustive]`, and
+    /// the list grows with it.
+    pub const ALL: &'static [MutationType] = &[
         MutationType::Add,
         MutationType::BitAnd,
         MutationType::BitOr,
@@ -142,7 +143,10 @@ impl MutationType {
             "AND" => Some(MutationType::BitAnd),
             "OR" => Some(MutationType::BitOr),
             "XOR" => Some(MutationType::BitXor),
-            _ => MutationType::ALL.into_iter().find(|op| op.name() == name),
+            _ => MutationType::ALL
+                .iter()
+                .copied()
+                .find(|op| op.name() == name),
         }
     }
 }
@@ -173,9 +177,40 @@ impl From<MutationType> for WireMutationType {
 mod tests {
     use super::*;
 
+    /// `ALL` lists every variant (`from_name` depends on it): the match is exhaustive in the
+    /// defining crate, so a new variant fails to compile here until it is given an index, and
+    /// the index must then be in `ALL`.
+    #[test]
+    fn all_lists_every_variant() {
+        fn index(op: MutationType) -> usize {
+            match op {
+                MutationType::Add => 0,
+                MutationType::BitAnd => 1,
+                MutationType::BitOr => 2,
+                MutationType::BitXor => 3,
+                MutationType::AppendIfFits => 4,
+                MutationType::Max => 5,
+                MutationType::Min => 6,
+                MutationType::SetVersionstampedKey => 7,
+                MutationType::SetVersionstampedValue => 8,
+                MutationType::ByteMin => 9,
+                MutationType::ByteMax => 10,
+                MutationType::CompareAndClear => 11,
+            }
+        }
+        const VARIANTS: usize = 12;
+        let mut seen = [false; VARIANTS];
+        for &op in MutationType::ALL {
+            assert!(!seen[index(op)], "{op:?} twice");
+            seen[index(op)] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "ALL misses a variant: {seen:?}");
+        assert_eq!(MutationType::ALL.len(), VARIANTS);
+    }
+
     #[test]
     fn codes_and_names_round_trip() {
-        for op in MutationType::ALL {
+        for &op in MutationType::ALL {
             assert_eq!(MutationType::from_code(op.code()), Some(op));
             assert_eq!(MutationType::from_name(op.name()), Some(op));
             assert_eq!(
@@ -191,7 +226,7 @@ mod tests {
 
     #[test]
     fn wire_types_are_the_v2_ones() {
-        for op in MutationType::ALL {
+        for &op in MutationType::ALL {
             let wire = WireMutationType::from(op);
             match op {
                 MutationType::BitAnd => assert_eq!(wire, WireMutationType::AND_V2),

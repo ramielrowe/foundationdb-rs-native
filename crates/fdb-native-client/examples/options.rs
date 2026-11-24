@@ -70,7 +70,8 @@ pub(crate) async fn run(db: &Database) -> Result<(), Error> {
         .unwrap_err();
     assert_eq!(e.code(), codes::NOT_COMMITTED);
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    // `not_committed` is retryable, and certainly did not commit.
+    // No attempt may have committed: the predicates say so (the code alone does not; `run`
+    // returns a 1020 marked maybe committed if an earlier attempt ended in 1021).
     assert!(e.is_retryable() && e.is_retryable_not_committed() && !e.is_maybe_committed());
     println!("gave up after 3 attempts: {e}");
 

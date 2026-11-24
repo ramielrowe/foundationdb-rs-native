@@ -95,9 +95,16 @@
 //! this client keeps it true through `on_error`, a timeout or a cancellation that follows).
 //! [`Database::run`] retries such a transaction as C++'s retry loops do, so its closure must
 //! be idempotent, or check whether an earlier attempt took effect: the [`MaybeCommitted`]
-//! argument tells it when one may have. A `not_committed` (1020) conflict, and the other
-//! [`is_retryable_not_committed`](Error::is_retryable_not_committed) errors, certainly did
-//! not commit.
+//! argument tells it when one may have.
+//!
+//! **Read the guarantee from the predicates, not from the code**: an error for which
+//! [`is_retryable_not_committed`](Error::is_retryable_not_committed) is true did not commit;
+//! one for which [`is_maybe_committed`](Error::is_maybe_committed) is true may have. The
+//! code alone does not say: `run` can return `not_committed` (1020) marked maybe committed,
+//! when an earlier attempt ended in `commit_unknown_result` and the retry limit stopped the
+//! loop after a conflict. A hand-written `commit` / `on_error` loop sees one attempt at a
+//! time: there, a 1020 after an earlier 1021 is a plain 1020, and the caller must remember
+//! that an earlier attempt may have committed.
 //!
 //! # Runtime
 //!
@@ -142,9 +149,13 @@
 //!   `fdb_transaction_add_conflict_range` does (and defer the rest).
 //! * **Typed options and operations.** [`TransactionOption`], [`DatabaseOption`],
 //!   [`MutationType`] and [`StreamingMode`] are `#[non_exhaustive]` enums with their
-//!   `fdb.options` codes ([`TransactionOption::code`], [`MutationType::from_name`], ...);
-//!   an option this client does not implement has no variant rather than being accepted and
-//!   ignored (`Tag` and `AutoThrottleTag` exist and fail with `invalid_option`).
+//!   `fdb.options` codes ([`TransactionOption::code`], [`MutationType::from_name`], ...).
+//!   Options that only matter to features this client does not have are either left out
+//!   (no variant) or accepted as validated no-ops where that is what C++ does in effect
+//!   (`IncludePortInAddress`, `TransactionLoggingMaxFieldLength`, the debug and tracing
+//!   options); an option whose effect would be silently missing fails instead (`Tag` and
+//!   `AutoThrottleTag` are `invalid_option`). The tables in [`transaction::options`] and
+//!   [`database::options`] say which is which.
 //! * **Synchronous getters where C++ is synchronous.**
 //!   [`approximate_size`](Transaction::approximate_size) is C++'s `getApproximateSize()`, a
 //!   counter of the read-your-writes layer: `fdb_c` returns it as a future only because
@@ -167,7 +178,11 @@
 //!   are the client's lower layers (the read and commit paths, the coordinator connection,
 //!   cluster files, the watch machinery, the atomic operations' arithmetic); they are public
 //!   for tools and tests, follow C++'s structure, and may change more freely than the
-//!   application API.
+//!   application API. A few application items reach into them on purpose, and those parts
+//!   follow the lower tier's stability: the knob fields of [`DatabaseOptions`] (all but
+//!   `tls`; [`database::PeerManagerConfig`] is re-exported for the first),
+//!   [`Database::from_record`] and the accessors [`Database::cluster_monitor`],
+//!   [`Database::reader`], [`Database::committer`] and [`Database::peers`].
 //!
 //! # Not supported yet
 //!

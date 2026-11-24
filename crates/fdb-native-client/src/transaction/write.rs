@@ -221,20 +221,22 @@ impl<R: Runtime> Transaction<R> {
             } else if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            // `isAtomicOp`, then the sizes and the offsets.
-            if op == MutationType::SET_VALUE {
-                return Err(Error::with_message(
-                    INVALID_MUTATION_TYPE,
-                    "SetValue is not an atomic operation",
-                ));
-            }
+            // `isAtomicOp` and `apiVersionAtLeast(510)` (`Min` and `And` are `MinV2` and
+            // `AndV2`) hold by construction: the type comes from `AtomicOp` (or is one of
+            // the versionstamp operations), which has no `SetValue` and converts to the V2
+            // types. Then the sizes and the offsets.
+            debug_assert!(
+                ![
+                    MutationType::SET_VALUE,
+                    MutationType::CLEAR_RANGE,
+                    MutationType::MIN,
+                    MutationType::AND,
+                ]
+                .contains(&op),
+                "{op:?} is not an atomic operation this client sends"
+            );
             check_write(op, key, operand, state.buffer.limits())?;
-            // `apiVersionAtLeast(510)`: `Min` and `And` are `MinV2` and `AndV2`.
-            let kind = match op {
-                MutationType::MIN => MutationType::MIN_V2,
-                MutationType::AND => MutationType::AND_V2,
-                other => other,
-            };
+            let kind = op;
             let mut add_conflict = add_conflict;
             let mut k = Cow::Borrowed(key);
             if kind == MutationType::SET_VERSIONSTAMPED_KEY {

@@ -74,6 +74,12 @@ impl<R: Runtime> Transaction<R> {
     /// # }
     /// ```
     ///
+    /// **Dropping the future before its read ends does not cancel the read**: it still ends and
+    /// adds its read conflict range, so the commit can fail with `not_committed` (1020) if
+    /// another transaction changed the key, even though nobody waits for the watch. C++
+    /// cancels the read when the watch's future is destroyed (see the differences in
+    /// [`crate::watch`]).
+    ///
     /// # Errors
     ///
     /// `watches_disabled` (1034) with

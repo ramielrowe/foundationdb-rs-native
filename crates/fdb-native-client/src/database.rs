@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use fdb_native_transport::peer::{DiscardEvents, PeerManager, PeerManagerConfig, StreamWrapper};
+use fdb_native_transport::peer::{DiscardEvents, PeerManager, StreamWrapper};
 use fdb_native_transport::runtime::Runtime;
 #[cfg(feature = "tokio")]
 use fdb_native_transport::runtime::TokioRuntime;
@@ -52,11 +52,18 @@ use crate::watch::{ABSOLUTE_MAX_WATCHES, WatchConfig, WatchContext};
 
 pub mod options;
 
+pub use fdb_native_transport::peer::PeerManagerConfig;
 pub use options::DatabaseOption;
 
 /// How a [`Database`] is built. [`DatabaseOptions::default`] has C++'s knobs everywhere.
 ///
 /// The struct is `#[non_exhaustive]`: start from the default and change fields.
+///
+/// **Stability.** `tls` is part of the application API. The other fields are the knobs of
+/// the client's lower layers ([`PeerManagerConfig`], re-exported here,
+/// [`ClusterMonitorConfig`], [`ReadConfig`], [`CommitterConfig`], [`WatchConfig`]): they
+/// follow those layers' stability (see the crate's [API design
+/// notes](crate#api-design-notes)), and most programs leave them at their defaults.
 ///
 /// ```no_run
 /// # #[cfg(feature = "tls")]
@@ -394,6 +401,10 @@ impl<R: Runtime> Database<R> {
 
     /// The database of `record` (a cluster file, or a connection string in memory), over
     /// `rt`, with `options`. Call it inside the executor.
+    ///
+    /// Lower tier: [`ConnectionRecord`] is the cluster layer's, and follows its stability
+    /// (see the crate's [API design notes](crate#api-design-notes)); [`Database::open_with`]
+    /// and [`Database::from_connection_string_with`] are the application API's.
     pub fn from_record(
         rt: R,
         record: ConnectionRecord,
@@ -523,6 +534,11 @@ impl<R: Runtime> Database<R> {
     }
 
     /// The cluster monitor (the proxies, the connection string, the cluster's version).
+    ///
+    /// This and [`reader`](Self::reader), [`committer`](Self::committer) and
+    /// [`peers`](Self::peers) give access to the client's lower layers, for tools and tests:
+    /// their types follow those layers' stability, not the application API's (see the
+    /// crate's [API design notes](crate#api-design-notes)).
     pub fn cluster_monitor(&self) -> &ClusterMonitor<R> {
         &self.inner.monitor
     }
@@ -537,7 +553,8 @@ impl<R: Runtime> Database<R> {
         &self.inner.committer
     }
 
-    /// The connections.
+    /// The connections (the transport's `PeerManager`; lower tier, see
+    /// [`cluster_monitor`](Self::cluster_monitor)).
     pub fn peers(&self) -> &PeerManager<R, ClientTls> {
         &self.inner.peers
     }

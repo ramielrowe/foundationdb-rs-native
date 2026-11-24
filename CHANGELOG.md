@@ -36,7 +36,9 @@ link `libfdb_c`.
   transaction sees it, started by the commit, the cap on outstanding watches).
 * **Errors**: `Error`, an FDB error code with `is_retryable`, `is_maybe_committed`,
   `is_retryable_not_committed` and `transaction_retry`; maybe-committed is kept through the
-  errors that hide a commit (timeouts, cancellations, `on_error`).
+  errors that hide a commit (timeouts, cancellations, `on_error`, `Database::run`'s final
+  error), so the guarantee is the predicates', not the code's: `run` can return a
+  `not_committed` (1020) that is maybe committed.
 * **TLS** (`tls` feature): `:tls` coordinators, `TlsConfig` and FDB's `FDB_TLS_*` variables,
   FDB's peer verification rules.
 * **Runtime**: runtime-agnostic (`runtime::Runtime`), tokio by default (`tokio` feature).
@@ -62,7 +64,7 @@ and binary codecs, checked against the C++ readers with golden vectors.
 These changed the API that earlier development builds had:
 
 * `MutationType` is an enum of the atomic operations (`MutationType::Add`, `BitAnd`, ...,
-  with `code`, `from_code`, `name` and `from_name`), no longer the wire type
+  with `code`, `from_code`, `name`, `from_name` and the slice `ALL`), no longer the wire type
   (`MutationType::ADD_VALUE`, ...). `BitAnd` and `Min` are sent as `AndV2` and `MinV2`.
   `atomic::apply` takes either.
 * `Transaction::range_stream` (and `Snapshot::range_stream`) is now `get_ranges_keyvalues`,
@@ -79,7 +81,9 @@ These changed the API that earlier development builds had:
   their modules: `cluster::{ClusterMonitor, ConnectionRecord, ...}`,
   `cluster_file::{ClusterConnectionString, ...}`, `commit::{Committer, CommitBuffer, ...}`,
   `read::{Reader, ReadConfig, ...}`, `watch::WatchConfig`, `database::ClientTls`. New:
-  `runtime` (the transport's), `TlsConfig` (with `tls`).
+  `runtime` (the transport's), `TlsConfig` (with `tls`), `database::PeerManagerConfig`. The
+  knob fields of `DatabaseOptions`, `Database::from_record` and the lower-layer accessors
+  (`reader`, `committer`, `peers`, `cluster_monitor`) follow the lower tier's stability.
 * `Error::on_error` is private (use `Error::transaction_retry`, or `Transaction::on_error`).
 * `CommitResult` is `Copy` and `Hash`; `RangeOptions::limit` joins the other builder
   methods; builders, `create_transaction`, `snapshot` and the range streams are

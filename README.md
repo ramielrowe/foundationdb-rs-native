@@ -117,9 +117,10 @@ cargo run -p fdb-native-client --features tls --example tls -- fdb.cluster ca.pe
 FoundationDB transactions are serializable, and a commit is all or nothing. But a client cannot
 always tell whether a commit happened:
 
-* **Not committed.** `not_committed` (1020, a conflict) and the other errors for which
-  `is_retryable_not_committed()` is true (`transaction_too_old`, `future_version`,
-  throttling, ...) mean the transaction did not commit. Retrying is always safe.
+* **Not committed.** An error for which `is_retryable_not_committed()` is true (a
+  `not_committed` (1020) conflict, `transaction_too_old`, `future_version`, throttling, ...)
+  means that attempt did not commit. Retrying it cannot apply that attempt twice, but an
+  earlier attempt of the same retry loop may still have committed (below).
 * **Maybe committed.** `commit_unknown_result` (1021) means the commit may or may not have
   happened (the connection to the proxy failed mid-request, a recovery, ...).
   `is_maybe_committed()` is true for it, and this client keeps it true for an error that
@@ -134,6 +135,12 @@ is idempotent; an atomic `Add`, a versionstamped key or an append is not. The cl
 is not idempotent should then check (for example, write a unique marker key in the same
 transaction and read it first). If `run` gives up after an attempt that may have committed,
 its error is `is_maybe_committed()`, whatever its code.
+
+**Read the guarantee from the predicates, not from the error code.** `run` can return
+`not_committed` (1020) marked maybe committed: an attempt ends in `commit_unknown_result`, the
+next in a conflict, and the retry limit stops the loop. A hand-written `commit` / `on_error`
+loop sees one attempt at a time: there, a 1020 after an earlier 1021 is a plain 1020, and the
+caller must remember that an earlier attempt may have committed.
 
 ## Runtime model
 
