@@ -223,8 +223,10 @@
 //!     8.0:29-53) waits for one to come back for 50 ms, growing to 1 s (and, after minutes,
 //!     30 s) while failures continue, jittered, then fails with `all_alternatives_failed`.
 //!   - The same balancer serves `getKey`, on the replicas' `getKey` endpoints (the failure
-//!     monitor is asked about those); the queue model is kept per server, where C++ keeps it
-//!     per endpoint.
+//!     monitor and the queue model are asked about those: as in C++ (`getAdjustedEndpoint`)
+//!     the queue model is kept per stream endpoint, so a server's `getKeyValues` latency
+//!     does not decide the hedging, penalties or `future_version` backoff of its `getValue`
+//!     and `getKey`).
 //!
 //! ## Key selectors
 //!
@@ -321,8 +323,10 @@
 //!   C++ keeps them in one `actorCollection`; the reader's last handle dropping cancels them.
 //!   The periodic `ModelInterface` update is evaluated lazily, in order, when the model is
 //!   next used, instead of by a timer.
-//! * **The queue model** is per server (by its `getValue` token), where C++ keeps it per
-//!   endpoint, so a server's `getValue`, `getKey` and watch streams share what is learned.
+//! * **The queue model's entries** are dropped when no cached location (or read in
+//!   progress) uses their endpoint any more (C++ keeps them for the life of the model), except
+//!   while a request counted in one is outstanding, which a lagging request can be after its
+//!   shard was evicted.
 //! * **Not modelled:** the GRV cache (`USE_GRV_CACHE`), tag throttling (no tags are sent),
 //!   version vectors, TSS duplicate requests and replica consistency checks
 //!   (`enableReplicaConsistencyCheck`), `connectionFileChanged` (a `switchConnectionRecord`
@@ -362,6 +366,8 @@ mod range;
 pub(crate) mod util;
 mod watch_lb;
 
+#[doc(hidden)]
+pub use balance::{EndpointStats, LoadBalanceStats};
 pub use grv::{METADATA_VERSION_KEY, Priority, ReadVersionOptions};
 pub use location::KEY_SPACE_END;
 pub use range::{RangeLimits, RangeOptions, RangeRead, StreamingMode};
@@ -595,6 +601,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         &self,
         options: ReadVersionOptions,
     ) -> Result<(i64, Option<Vec<u8>>), Error> {
+        options.validate()?;
         let key = options.batcher_key();
         let (tx, rx) = oneshot::channel();
         let mut waiter = Some(tx);
@@ -790,6 +797,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// How many shard locations are cached.
     pub fn cached_locations(&self) -> usize {
         lock(&self.inner.shared.locations).len()
+    }
+
+    /// What the load balancer's queue model and lagging requests hold. For tests.
+    #[doc(hidden)]
+    pub fn load_balance_stats(&self) -> LoadBalanceStats {
+        self.inner.shared.load_balance_stats()
     }
 }
 
@@ -1076,8 +1089,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let bound = 2 * lock(&self.locations).server_entries() + 64;
         let endpoints = lock(&self.state).failed_endpoints.len();
         let model = lock(&self.model).len();
-        // A server has an endpoint failure record per stream (`live_targets`: four).
-        if endpoints <= 4 * bound && model <= bound {
+        // A server has an endpoint failure record per stream (`live_targets`: four), and a
+        // queue model entry per load-balanced stream (`getValue`, `getKey`, `getKeyValues`).
+        if endpoints <= 4 * bound && model <= 3 * bound {
             return;
         }
         let live = lock(&self.locations).live_targets();

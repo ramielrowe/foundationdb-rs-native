@@ -18,7 +18,7 @@ use super::balance::ProxyBalance;
 use super::util::{Either, never, now_secs, race, secs};
 use super::{Shared, lock};
 use crate::error::Error;
-use crate::error::codes::{INTERNAL_ERROR, OPERATION_CANCELLED};
+use crate::error::codes::{INTERNAL_ERROR, INVALID_OPTION_VALUE, OPERATION_CANCELLED};
 
 /// A read version as the batcher hands it to every transaction of a batch.
 pub(crate) type GrvResult = Result<Arc<ReadVersion>, Error>;
@@ -77,6 +77,19 @@ impl ReadVersionOptions {
             flags |= GetReadVersion::FLAG_USE_PROVISIONAL_PROXIES;
         }
         flags
+    }
+
+    /// `invalid_option_value` (2006) if `max_grv_queue_delay_ms` is outside `[0, i32::MAX]`
+    /// (`extractIntOption(value, 0, std::numeric_limits<int32_t>::max())`, NativeAPI
+    /// 8.0:5096-5098), whichever release the cluster runs.
+    pub fn validate(&self) -> Result<(), Error> {
+        match self.max_grv_queue_delay_ms {
+            Some(ms) if !(0..=i64::from(i32::MAX)).contains(&ms) => Err(Error::with_message(
+                INVALID_OPTION_VALUE,
+                "max_grv_queue_delay_ms must be in [0, 2147483647]",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// The batcher these options go through: one per distinct request.
