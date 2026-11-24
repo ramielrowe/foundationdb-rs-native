@@ -101,7 +101,9 @@ These changed the API that earlier development builds had:
   allocations and copies, on the way from the reply through the read-your-writes cache to
   `RangeResult::kvs` and `KeyValueStream`. They deref to `[u8]` and compare with `[u8]`,
   `&[u8]` and `Vec<u8>` (not with a byte array: `kv.key == b"a"[..]`); `to_vec()` copies.
-  A row keeps its whole reply (up to 80 kB) alive: copy the few rows you keep for long.
+  A row keeps its whole reply alive: about 80 kB (`REPLY_BYTE_LIMIT` is soft, so a reply can
+  be that plus the row that crosses it: up to about 190 kB with a 10 kB key and a 100 kB
+  value). Copy the few rows you keep for long.
   `KeyValue::new` takes `impl Into<Bytes>` (`Vec<u8>`, `&'static [u8]`, `String`, `Bytes`).
   New in `fdb-native-wire`: `SharedKeyValueVector` (a `GetKeyValuesReply` blob in a shared
   buffer). `read::RangeRead::into_key_values` no longer copies.

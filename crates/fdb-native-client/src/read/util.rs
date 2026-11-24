@@ -80,7 +80,7 @@ pub(crate) enum Either<A, B> {
 /// A struct rather than an `async fn`: an `async fn` keeps its arguments and the pinned
 /// copies it polls, so each `race` of a large future doubled its size.
 pub(crate) fn race<A: Future, B: Future>(a: A, b: B) -> Race<A, B> {
-    Race { a, b }
+    Race { a, b, done: false }
 }
 
 pin_project_lite::pin_project! {
@@ -91,6 +91,8 @@ pin_project_lite::pin_project! {
         a: A,
         #[pin]
         b: B,
+        // One finished (as an `async fn`, it must not be polled again).
+        done: bool,
     }
 }
 
@@ -99,10 +101,13 @@ impl<A: Future, B: Future> Future for Race<A, B> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        assert!(!*this.done, "`Race` polled after it completed");
         if let Poll::Ready(v) = this.a.poll(cx) {
+            *this.done = true;
             return Poll::Ready(Either::Left(v));
         }
         if let Poll::Ready(v) = this.b.poll(cx) {
+            *this.done = true;
             return Poll::Ready(Either::Right(v));
         }
         Poll::Pending

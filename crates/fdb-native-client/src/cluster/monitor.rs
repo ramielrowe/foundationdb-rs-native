@@ -168,6 +168,11 @@ impl<R: Runtime> ClusterMonitor<R> {
 
     /// Resolves with `f`'s first `Some`, evaluated on the current info and on every new one.
     /// `f` runs under the monitor's lock: keep it short, and do not call the monitor from it.
+    ///
+    /// `f` must depend only on the info it is given (not on a clock, a counter or other
+    /// state of the caller): it is evaluated again only when the monitor publishes an info
+    /// or closes, not on every poll, so a `None` that would turn into a `Some` without a new
+    /// info is never seen.
     pub fn wait_for<'a, T>(
         &'a self,
         mut f: impl FnMut(&Arc<ClusterInfo>) -> Option<T> + Unpin + Send + 'a,

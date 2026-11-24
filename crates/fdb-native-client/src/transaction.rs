@@ -939,6 +939,7 @@ impl<R: Runtime> Transaction<R> {
             tx: self,
             epoch,
             checked: false,
+            done: false,
             race: race(
                 op,
                 interruption(Arc::downgrade(&self.inner), self.rt(), epoch),
@@ -1974,6 +1975,8 @@ pin_project_lite::pin_project! {
         tx: &'a Transaction<R>,
         epoch: u64,
         checked: bool,
+        // It returned its output (as an `async fn`, it must not be polled again).
+        done: bool,
         #[pin]
         race: Race<F, I>,
     }
@@ -1988,16 +1991,20 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        assert!(!*this.done, "`Guarded` polled after it completed");
         if !*this.checked {
             *this.checked = true;
             if let Err(e) = this.tx.guard_check(*this.epoch) {
+                *this.done = true;
                 return Poll::Ready(Err(e));
             }
         }
-        this.race.poll(cx).map(|either| match either {
+        let poll = this.race.poll(cx).map(|either| match either {
             Either::Left(result) => Ok(result),
             Either::Right(e) => Err(e),
-        })
+        });
+        *this.done = poll.is_ready();
+        poll
     }
 }
 

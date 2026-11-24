@@ -93,6 +93,11 @@ impl Shared {
 
     /// Resolves with `f`'s first `Some`, evaluated now and after every change; with
     /// [`MonitorClosed`] once the monitor is closed and `f` gave nothing.
+    ///
+    /// `f` is evaluated again only after a [`modify`](Self::modify) (a [`Wait`] polled with
+    /// nothing changed only refreshes its waker), so it must depend only on what `modify`
+    /// changes: the info, the sequence and `closed` (not `status`, which is changed without
+    /// waking anyone, and nothing outside the state).
     pub(crate) fn wait<T, F>(&self, f: F) -> Wait<'_, F>
     where
         F: FnMut(&State) -> Option<T> + Unpin,

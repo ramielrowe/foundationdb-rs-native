@@ -66,7 +66,9 @@ impl<'de: 'a, 'a> Decode<'de> for KeyValueRef<'a> {
 /// The bytes are [`Bytes`]: reference-counted, and possibly a slice of a larger shared
 /// buffer (the rows a [`SharedKeyValueVector`] gives are slices of one reply, as C++'s rows
 /// point into the reply's arena). Cloning a pair is two reference counts, not a copy. A pair
-/// keeps the whole buffer it is a slice of alive; copy it
+/// keeps the whole buffer it is a slice of alive: for a range read's row, its whole reply,
+/// which is about 80 kB (the client's `REPLY_BYTE_LIMIT`) but soft, so up to that plus the
+/// row that crosses the limit (about 190 kB with a 10 kB key and a 100 kB value). Copy it
 /// ([`Bytes::copy_from_slice`]) to keep a few rows of a large read for long.
 ///
 /// ```
