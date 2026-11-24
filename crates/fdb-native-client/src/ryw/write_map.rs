@@ -31,9 +31,9 @@
 //! C++ keeps the entries in a persistent treap (`PTree`, `VersionedMap.h`) and every
 //! iterator is a snapshot of one version: writes made while an iterator lives do not change
 //! what it sees (the read path relies on this: a read that waits for a storage server keeps
-//! its iterator over the waits). Here the entries are an [`imbl::OrdMap`], a persistent
-//! ordered map (a B-tree whose nodes are shared by reference count): a [`WriteMapIter`] holds
-//! a clone of the map (a reference count), and a write while it lives copies only the nodes on
+//! its iterator over the waits). Here the entries are an [`rpds::RedBlackTreeMapSync`], a
+//! persistent ordered map (a red-black tree whose nodes are shared by reference count): a
+//! [`WriteMapIter`] holds a clone of the map (a reference count), and a write while it lives copies only the nodes on
 //! the path to the entry it changes (O(log n)), not the whole map; with no iterator alive a
 //! write changes the nodes in place. An entry's operation stack is behind an [`Arc`] too, so
 //! copying an entry is cheap. The iterator also keeps copies of the entries of its segment and
@@ -95,7 +95,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use fdb_native_schema::domain::MutationType;
-use imbl::OrdMap;
+use rpds::RedBlackTreeMapSync;
 
 use crate::atomic::{self, VALUE_SIZE_LIMIT};
 use crate::error::Error;
@@ -346,7 +346,7 @@ impl Entry {
 
 /// The entries by key: a persistent map, so cloning it (a [`WriteMapIter`] does) is a reference
 /// count, and a write to a map that is shared copies only the path to the entry it changes.
-type Tree = OrdMap<Arc<[u8]>, Entry>;
+type Tree = RedBlackTreeMapSync<Arc<[u8]>, Entry>;
 
 /// `WriteMap`: a transaction's writes (see the module documentation).
 #[derive(Clone)]
@@ -367,9 +367,9 @@ impl Default for WriteMap {
 impl WriteMap {
     /// An empty write map: one unmodified range over the whole key space.
     pub(crate) fn new() -> WriteMap {
-        let mut tree = Tree::new();
+        let mut tree = Tree::new_sync();
         for key in [&b""[..], ALL_KEYS_END, AFTER_ALL_KEYS] {
-            tree.insert(Arc::from(key), Entry::default());
+            tree.insert_mut(Arc::from(key), Entry::default());
         }
         WriteMap { tree, empty: true }
     }
@@ -403,7 +403,7 @@ impl WriteMap {
         let (begin, end) = (begin.to_vec(), end.to_vec());
         let doomed: Vec<Arc<[u8]>> = self
             .tree
-            .range::<_, [u8]>((Bound::Included(&begin[..]), Bound::Excluded(&end[..])))
+            .range::<[u8], _>((Bound::Included(&begin[..]), Bound::Excluded(&end[..])))
             .map(|(k, _)| Arc::clone(k))
             .collect();
         if doomed.is_empty() {
@@ -411,7 +411,7 @@ impl WriteMap {
         }
         let tree = self.tree_mut();
         for key in doomed {
-            tree.remove(&key);
+            tree.remove_mut(&key);
         }
     }
 
@@ -471,7 +471,7 @@ impl WriteMap {
                 (OperationStack::new(new_op), is_cleared)
             };
             drop(it);
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(key),
                 Entry {
                     stack,
@@ -488,7 +488,7 @@ impl WriteMap {
             // A set of a readable key replaces its operations.
             let begin = Arc::clone(&it.begin);
             drop(it);
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 begin,
                 Entry {
                     stack: OperationStack::new(new_op),
@@ -515,7 +515,7 @@ impl WriteMap {
             entry.stack = stack;
             entry.is_conflict = is_conflict;
             entry.is_unreadable = is_unreadable;
-            self.tree_mut().insert(begin, entry);
+            self.tree_mut().insert_mut(begin, entry);
         }
         Ok(())
     }
@@ -576,10 +576,10 @@ impl WriteMap {
         );
         if insert_begin {
             self.tree_mut()
-                .insert(Arc::from(begin), Entry::range(true, true, false));
+                .insert_mut(Arc::from(begin), Entry::range(true, true, false));
         }
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -628,10 +628,10 @@ impl WriteMap {
         );
         if insert_begin {
             self.tree_mut()
-                .insert(Arc::from(begin), Entry::range(false, false, true));
+                .insert_mut(Arc::from(begin), Entry::range(false, false, true));
         }
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -714,7 +714,7 @@ impl WriteMap {
         }
         let tree = self.tree_mut();
         for (key, entry) in insertions {
-            tree.insert(key, entry);
+            tree.insert_mut(key, entry);
         }
     }
 
@@ -772,14 +772,14 @@ impl WriteMap {
 
         for key in conflict_ranges {
             self.tree_mut()
-                .insert(Arc::from(key), Entry::range(true, conflicted, false));
+                .insert_mut(Arc::from(key), Entry::range(true, conflicted, false));
             conflicted = !conflicted;
         }
 
         debug_assert!(conflicted != last_conflicted);
 
         if insert_end {
-            self.tree_mut().insert(
+            self.tree_mut().insert_mut(
                 Arc::from(end),
                 Entry::range(end_cleared, end_conflict, end_unreadable),
             );
@@ -998,14 +998,14 @@ impl WriteMapIter {
 
     /// The first entry after `key` in `tree`, if there is one: its key and a copy of it.
     fn entry_after(tree: &Tree, key: &[u8]) -> Option<(Arc<[u8]>, Entry)> {
-        tree.range::<_, [u8]>((Bound::Excluded(key), Bound::Unbounded))
+        tree.range::<[u8], _>((Bound::Excluded(key), Bound::Unbounded))
             .next()
             .map(|(k, e)| (Arc::clone(k), e.clone()))
     }
 
     /// The last entry before `key` in `tree`, if there is one: its key and a copy of it.
     fn entry_before(tree: &Tree, key: &[u8]) -> Option<(Arc<[u8]>, Entry)> {
-        tree.range::<_, [u8]>((Bound::Unbounded, Bound::Excluded(key)))
+        tree.range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key)))
             .next_back()
             .map(|(k, e)| (Arc::clone(k), e.clone()))
     }

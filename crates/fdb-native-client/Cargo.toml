@@ -27,7 +27,7 @@ bench-internals = []
 fdb-native-schema.workspace = true
 fdb-native-transport.workspace = true
 fdb-native-wire.workspace = true
-imbl.workspace = true
+rpds.workspace = true
 futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-core = "0.3.34"
 futures-io = "0.3.34"
