@@ -33,6 +33,8 @@ use crate::{SchemaVersion, common, domain, v7_4, v8_0};
 /// | [`GetKey`](domain::GetKey) | a storage server, `getKey` | [`GetKeyReply`](domain::GetKeyReply) (borrows the selector's key) |
 /// | [`GetKeyValues`](domain::GetKeyValues) | a storage server, `getKeyValues` | [`GetKeyValuesReply`](domain::GetKeyValuesReply) (reads the rows in place) |
 /// | [`WatchValue`](domain::WatchValue) | a storage server, `watchValue` | [`WatchValueReply`](domain::WatchValueReply) |
+/// | [`WaitMetrics`](domain::WaitMetrics) | a storage server, `waitMetrics` | [`StorageMetrics`](domain::StorageMetrics) |
+/// | [`SplitRange`](domain::SplitRange) | a storage server, `getRangeSplitPoints` | [`SplitRangeReply`](domain::SplitRangeReply) |
 /// | [`Commit`](domain::Commit) | a commit proxy, `commit` | [`CommitId`](domain::CommitId) |
 ///
 /// ```
@@ -555,5 +557,100 @@ impl Request for domain::Commit {
         bytes: &[u8],
     ) -> Result<ErrorOr<domain::CommitId>, DecodeError> {
         decode_envelope(bytes, |r: common::CommitID| Ok(r.into()))
+    }
+}
+
+impl Request for domain::WaitMetrics {
+    type Reply<'de> = domain::StorageMetrics;
+
+    fn encode_request_into(
+        &self,
+        version: SchemaVersion,
+        reply: Uid,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                encode_into(&v7_4::WaitMetricsRequest::from_domain(self, reply), out)
+            }
+            SchemaVersion::V8_0 => {
+                encode_into(&v8_0::WaitMetricsRequest::from_domain(self, reply), out)
+            }
+        }
+    }
+
+    fn decode_request(version: SchemaVersion, bytes: &[u8]) -> Result<(Self, Uid), DecodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                decode_request(bytes, |r: &v7_4::WaitMetricsRequest| r.reply.token())
+            }
+            SchemaVersion::V8_0 => {
+                decode_request(bytes, |r: &v8_0::WaitMetricsRequest| r.reply.token())
+            }
+        }
+    }
+
+    /// The same on both versions.
+    fn encode_reply(
+        _: SchemaVersion,
+        reply: &ErrorOr<domain::StorageMetrics>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_envelope(reply, common::StorageMetrics::from)
+    }
+
+    /// The same on both versions.
+    fn decode_reply(
+        _: SchemaVersion,
+        bytes: &[u8],
+    ) -> Result<ErrorOr<domain::StorageMetrics>, DecodeError> {
+        decode_envelope(bytes, |r: common::StorageMetrics| Ok(r.into()))
+    }
+}
+
+impl Request for domain::SplitRange {
+    type Reply<'de> = domain::SplitRangeReply;
+
+    /// 8.0's `limit` is not sent to 7.4.
+    fn encode_request_into(
+        &self,
+        version: SchemaVersion,
+        reply: Uid,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                encode_into(&v7_4::SplitRangeRequest::from_domain(self, reply), out)
+            }
+            SchemaVersion::V8_0 => {
+                encode_into(&v8_0::SplitRangeRequest::from_domain(self, reply), out)
+            }
+        }
+    }
+
+    fn decode_request(version: SchemaVersion, bytes: &[u8]) -> Result<(Self, Uid), DecodeError> {
+        match version {
+            SchemaVersion::V7_4 => {
+                decode_request(bytes, |r: &v7_4::SplitRangeRequest| r.reply.token())
+            }
+            SchemaVersion::V8_0 => {
+                decode_request(bytes, |r: &v8_0::SplitRangeRequest| r.reply.token())
+            }
+        }
+    }
+
+    /// The same on both versions.
+    fn encode_reply(
+        _: SchemaVersion,
+        reply: &ErrorOr<domain::SplitRangeReply>,
+    ) -> Result<Vec<u8>, EncodeError> {
+        encode_envelope(reply, common::SplitRangeReply::from)
+    }
+
+    /// The same on both versions.
+    fn decode_reply(
+        _: SchemaVersion,
+        bytes: &[u8],
+    ) -> Result<ErrorOr<domain::SplitRangeReply>, DecodeError> {
+        decode_envelope(bytes, |r: common::SplitRangeReply| Ok(r.into()))
     }
 }

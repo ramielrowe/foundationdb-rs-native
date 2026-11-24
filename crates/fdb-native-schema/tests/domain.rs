@@ -13,8 +13,8 @@ use fdb_native_schema::domain::{
     GetKeyReply, GetKeyServerLocations, GetKeyValues, GetKeyValuesReply, GetReadVersion, GetValue,
     GetValueReply, GrvProxy, Hostname, INVALID_VERSION, InvalidValue, KeyRange, KeySelector,
     KeyServerLocations, LATEST_VERSION, Mutation, MutationType, OpenDatabaseCoord, ReadOptions,
-    ReadVersion, StorageServer, TagThrottleLimits, TenantMode, VersionHistory, WatchValue,
-    WatchValueReply,
+    ReadVersion, SplitRange, SplitRangeReply, StorageMetrics, StorageServer, TagThrottleLimits,
+    TenantMode, VersionHistory, WaitMetrics, WatchValue, WatchValueReply,
 };
 use fdb_native_schema::streams::{GRV_PROXY_STREAMS, STORAGE_SERVER_STREAMS};
 use fdb_native_schema::{
@@ -1448,4 +1448,84 @@ fn key_server_locations_reply_is_read_through_a_view() {
     let encoded = encode(&reply).unwrap();
     let again: v8_0::GetKeyServerLocationsReply = decode(&encoded).unwrap();
     assert_eq!(KeyServerLocations::try_from(again).unwrap(), locations);
+}
+
+/// The storage metrics requests: both round trip on both versions; 8.0's `SplitRangeRequest`
+/// carries `limit`, 7.4's has no such field (it decodes as -1) and a tenant-less `TenantInfo`.
+#[test]
+fn storage_metrics_requests_round_trip() {
+    let wait = WaitMetrics {
+        keys: KeyRange::new(b"a".to_vec(), b"m".to_vec()).unwrap(),
+        min: StorageMetrics {
+            bytes: 1,
+            bytes_written_per_ksecond: 2,
+            ios_per_ksecond: 3,
+            bytes_read_per_ksecond: 4,
+            ops_read_per_ksecond: 5,
+        },
+        max: StorageMetrics {
+            bytes: -1,
+            ..StorageMetrics::default()
+        },
+        version: 77,
+    };
+    let split = SplitRange {
+        keys: KeyRange::single_key(b"k"),
+        chunk_size: 1 << 20,
+        limit: 5,
+    };
+    for v in SchemaVersion::ALL {
+        let bytes = wait.encode_request(v, TOKEN).unwrap();
+        assert_eq!(
+            WaitMetrics::decode_request(v, &bytes).unwrap(),
+            (wait.clone(), TOKEN)
+        );
+        let reply = StorageMetrics {
+            bytes: 12345,
+            ..StorageMetrics::default()
+        };
+        let bytes = WaitMetrics::encode_reply(v, &Ok(reply)).unwrap();
+        assert_eq!(WaitMetrics::decode_reply(v, &bytes).unwrap(), Ok(reply));
+        let bytes = WaitMetrics::encode_reply(v, &Err(FdbError::new(1001))).unwrap();
+        assert_eq!(
+            WaitMetrics::decode_reply(v, &bytes).unwrap(),
+            Err(FdbError::new(1001))
+        );
+
+        let bytes = split.encode_request(v, TOKEN).unwrap();
+        let (decoded, token) = SplitRange::decode_request(v, &bytes).unwrap();
+        assert_eq!(token, TOKEN);
+        let limit = match v {
+            SchemaVersion::V7_4 => -1,
+            SchemaVersion::V8_0 => 5,
+        };
+        assert_eq!(
+            decoded,
+            SplitRange {
+                limit,
+                ..split.clone()
+            }
+        );
+        let reply = SplitRangeReply {
+            split_points: vec![b"b".to_vec(), b"c\x00".to_vec()],
+        };
+        let bytes = SplitRange::encode_reply(v, &Ok(reply.clone())).unwrap();
+        assert_eq!(SplitRange::decode_reply(v, &bytes).unwrap(), Ok(reply));
+    }
+    let bytes = split.encode_request(SchemaVersion::V7_4, TOKEN).unwrap();
+    let wire: v7_4::SplitRangeRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
+    let bytes = wait.encode_request(SchemaVersion::V7_4, TOKEN).unwrap();
+    let wire: v7_4::WaitMetricsRequest = decode(&bytes).unwrap();
+    assert_eq!(wire.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(wire.min_version, 77);
+    // An inverted range is refused, as for every request.
+    let inverted = SplitRange {
+        keys: KeyRange {
+            begin: b"z".to_vec(),
+            end: b"a".to_vec(),
+        },
+        ..split
+    };
+    assert!(inverted.encode_request(SchemaVersion::V8_0, TOKEN).is_err());
 }

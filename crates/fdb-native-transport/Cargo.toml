@@ -14,6 +14,9 @@ workspace = true
 default = ["tokio"]
 # Adapter for the tokio runtime (`runtime::TokioRuntime`).
 tokio = ["dep:tokio"]
+# Adapter for the smol family of crates (`runtime::SmolRuntime`): async-io for sockets and
+# timers, async-executor for tasks, blocking for DNS. No dependency on tokio.
+smol = ["dep:async-io", "dep:async-executor", "dep:blocking", "dep:futures-lite"]
 # TLS client layer (`tls` module): rustls with the `ring` crypto provider, and FDB's
 # `verify_peers` rules (`tls::verify_peers`).
 tls = [
@@ -37,6 +40,10 @@ futures-io = "0.3.34"
 thiserror = "2.0.21"
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 tokio = { version = "1.54.1", optional = true, default-features = false, features = ["net", "time", "rt"] }
+async-io = { version = "2.6.0", optional = true }
+async-executor = { version = "1.14.0", optional = true }
+blocking = { version = "1.7.0", optional = true }
+futures-lite = { version = "2.6.1", optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring"], optional = true }
 futures-rustls = { version = "0.26.0", default-features = false, features = ["tls12"], optional = true }
 rustls-pki-types = { version = "1.16.0", optional = true }

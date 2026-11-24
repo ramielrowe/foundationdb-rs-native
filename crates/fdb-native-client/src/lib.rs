@@ -78,7 +78,10 @@
 //!   [`commit`](Transaction::commit) ([`CommitResult`]),
 //!   [`get_versionstamp`](Transaction::get_versionstamp), [`watch`](Transaction::watch)
 //!   ([`Watch`]), [`on_error`](Transaction::on_error), [`reset`](Transaction::reset),
-//!   [`cancel`](Transaction::cancel), [`approximate_size`](Transaction::approximate_size) and
+//!   [`cancel`](Transaction::cancel), [`approximate_size`](Transaction::approximate_size),
+//!   the storage metrics
+//!   ([`get_estimated_range_size_bytes`](Transaction::get_estimated_range_size_bytes),
+//!   [`get_range_split_points`](Transaction::get_range_split_points)) and
 //!   [`TransactionOption`]s. Reads see the transaction's own writes (read-your-writes, as
 //!   every FoundationDB binding); see [`transaction`] for the semantics, ported from C++.
 //! * [`Error`]: the one error type, an FDB error code with C++'s retry predicates
@@ -112,7 +115,10 @@
 //! [`Runtime`](runtime::Runtime) (TCP, timers, task spawning, DNS). With the default `tokio`
 //! feature, [`Database::open`] and [`Database::from_connection_string`] use the current
 //! tokio runtime (multi-threaded or current-thread); [`Database::open_with`] takes any
-//! runtime. A database spawns its tasks (the coordinator long poll, one connection task per
+//! runtime, for example `SmolRuntime` (the `smol` feature:
+//! `Database::open_with(SmolRuntime::new(), None, DatabaseOptions::default())`, which needs
+//! no tokio and no ambient runtime, or `with_executor` to drive your own; see the `smol`
+//! example). A database spawns its tasks (the coordinator long poll, one connection task per
 //! server) when it is opened, so open it inside the runtime. Every future and handle is
 //! `Send`; [`Database`], [`Transaction`] and [`Error`] are `Send + Sync` and cheap to clone.
 //!
@@ -121,6 +127,9 @@
 //! * `tokio` (default): `Database::open` and friends on tokio, and `TokioRuntime` as the
 //!   default runtime. Without it, use [`Database::open_with`] over any
 //!   [`Runtime`](runtime::Runtime).
+//! * `smol`: `SmolRuntime` (async-io, async-executor), for
+//!   [`Database::open_with`]. Independent of `tokio`: use `default-features = false,
+//!   features = ["smol"]` for a build without tokio.
 //! * `tls`: TLS clusters (`:tls` coordinators), configured as FoundationDB is (the
 //!   `FDB_TLS_*` variables, or `DatabaseOptions::tls` with a `TlsConfig`, re-exported here).
 //!   Without it, opening a cluster with TLS coordinators fails with `tls_error` (2107).
@@ -208,8 +217,8 @@ pub mod transaction;
 pub mod watch;
 
 /// The runtime abstraction the client runs over (`fdb_native_transport::runtime`):
-/// [`Runtime`](runtime::Runtime), and with the `tokio` feature
-/// [`TokioRuntime`](runtime::TokioRuntime).
+/// [`Runtime`](runtime::Runtime), and with the `tokio` or `smol` feature
+/// `TokioRuntime` or `SmolRuntime`.
 pub use fdb_native_transport::runtime;
 
 pub use database::{Database, DatabaseOption, DatabaseOptions, MaybeCommitted};

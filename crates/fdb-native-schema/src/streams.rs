@@ -128,7 +128,7 @@ pub struct StorageServerStreams<T> {
     pub get_key_values: T,
     /// `getShardState`.
     pub get_shard_state: T,
-    /// `waitMetrics`.
+    /// `waitMetrics` (`WaitMetricsRequest`).
     pub wait_metrics: T,
     /// `splitMetrics`.
     pub split_metrics: T,
@@ -144,7 +144,7 @@ pub struct StorageServerStreams<T> {
     pub watch_value: T,
     /// `getReadHotRanges`.
     pub get_read_hot_ranges: T,
-    /// `getRangeSplitPoints`.
+    /// `getRangeSplitPoints` (`SplitRangeRequest`).
     pub get_range_split_points: T,
     /// `getKeyValuesStream`.
     pub get_key_values_stream: T,

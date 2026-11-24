@@ -12,6 +12,11 @@
 //!   (unlimited), by range streams in every streaming mode, with row limits that stop
 //!   inside later shards, and with selectors that need `getKey`; checked against the key
 //!   list and `fdbcli getrange`.
+//! * Storage metrics across shards: the estimated size of the same data (within bounds of
+//!   the real size; the shards' parts add up to the whole exactly, and growing ranges never
+//!   shrink, as the byte sample is a fixed set of keys), and split points (with a chunk
+//!   larger than the data exactly the shard boundaries, as C++ returns them; with small
+//!   chunks sorted, inside the range and with every boundary).
 
 #![cfg(feature = "tokio")]
 
@@ -328,6 +333,145 @@ async fn cluster_get_range_reads_across_shards() {
 
     db.shutdown().await;
     drop(db);
+    tokio::task::spawn_blocking(move || drop(cluster))
+        .await
+        .unwrap();
+}
+
+/// The shard boundaries strictly inside `[begin, end)`, as the commit proxies have them now.
+async fn boundaries(db: &Database, begin: &[u8], end: &[u8]) -> Vec<Vec<u8>> {
+    let reader = db.reader();
+    reader.invalidate_locations(&fdb_native_schema::domain::KeyRange {
+        begin: Vec::new(),
+        end: KEY_SPACE_END.to_vec(),
+    });
+    let mut out = Vec::new();
+    let mut at = begin.to_vec();
+    loop {
+        let location = within("locate", reader.locate(&at)).await.unwrap();
+        if location.range.end.as_slice() >= end {
+            return out;
+        }
+        at = location.range.end.clone();
+        out.push(at.clone());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn cluster_storage_metrics_across_shards() {
+    let cluster = Arc::new(
+        tokio::task::spawn_blocking(|| FdbCluster::builder().small_shards().start())
+            .await
+            .unwrap()
+            .expect("cluster"),
+    );
+    println!("{cluster}");
+    let shards = {
+        let cluster = cluster.clone();
+        tokio::task::spawn_blocking(move || {
+            cluster.write_keys("k", COUNT, 1000)?;
+            cluster.wait_for_partitions(4, WAIT)
+        })
+        .await
+        .unwrap()
+        .expect("keys written and split")
+    };
+    println!("{shards} shards");
+    let total = (COUNT * (1000 + key(0).len())) as i64;
+    let db = Database::open(Some(cluster.cluster_file())).expect("database");
+    let tx = db.create_transaction();
+    let estimate = |b: Vec<u8>, e: Vec<u8>| {
+        let tx = tx.clone();
+        async move {
+            within("estimate", tx.get_estimated_range_size_bytes(&b, &e))
+                .await
+                .unwrap()
+        }
+    };
+
+    // The estimate of the whole, and of every shard's part: the byte sample is a fixed set
+    // of keys (chosen by a hash of each key), so the parts add up to the whole exactly, and
+    // growing ranges never shrink.
+    let whole = estimate(b"k".to_vec(), b"l".to_vec()).await;
+    println!("estimate {whole} for {total} bytes");
+    assert!(
+        (total / 2..=total * 2).contains(&whole),
+        "estimate {whole} for {total} bytes"
+    );
+    let inner = boundaries(&db, b"k", b"l").await;
+    assert!(inner.len() >= 2, "the keys span several shards: {inner:?}");
+    let mut edges = vec![b"k".to_vec()];
+    edges.extend(inner.iter().cloned());
+    edges.push(b"l".to_vec());
+    let mut sum = 0;
+    for w in edges.windows(2) {
+        sum += estimate(w[0].clone(), w[1].clone()).await;
+    }
+    assert_eq!(sum, whole, "the shards' parts add up");
+    let mut previous = 0;
+    for i in (0..=COUNT).step_by(250) {
+        let e = estimate(b"k".to_vec(), key(i)).await;
+        assert!(e >= previous, "[k, {i}): {e} < {previous}");
+        previous = e;
+    }
+
+    // Split points: with a chunk larger than the data, exactly the shard boundaries (C++
+    // always includes them); with a small chunk, more points, all of them sorted and inside.
+    let mut exact = false;
+    for _ in 0..5 {
+        let inner = boundaries(&db, b"k", b"l").await;
+        let points = within("split", tx.get_range_split_points(b"k", b"l", 1 << 40))
+            .await
+            .unwrap();
+        let mut want = vec![b"k".to_vec()];
+        want.extend(inner);
+        want.push(b"l".to_vec());
+        if points == want {
+            exact = true;
+            break;
+        }
+        // Data distribution moved a boundary in between: look again.
+        println!("boundaries changed: {points:?} / {want:?}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(
+        exact,
+        "the split points of a huge chunk are the shard boundaries"
+    );
+    let inner = boundaries(&db, b"k", b"l").await;
+    for chunk in [200_000i64, 1_000_000] {
+        let points = within("split", tx.get_range_split_points(b"k", b"l", chunk))
+            .await
+            .unwrap();
+        println!("chunk {chunk}: {} points", points.len());
+        assert_eq!(points.first().map(Vec::as_slice), Some(&b"k"[..]));
+        assert_eq!(points.last().map(Vec::as_slice), Some(&b"l"[..]));
+        assert!(points.windows(2).all(|w| w[0] < w[1]), "{points:?}");
+        let expected = (whole / chunk) as usize;
+        assert!(
+            points.len() >= expected / 2 && points.len() <= expected + inner.len() + 2,
+            "{} points for {whole} bytes in chunks of {chunk}",
+            points.len()
+        );
+        let missing: Vec<_> = inner.iter().filter(|b| !points.contains(b)).collect();
+        assert!(
+            missing.is_empty(),
+            "boundaries not in the points: {missing:?}"
+        );
+    }
+    // From the middle of one shard to the middle of another.
+    let (b, e) = (key(100), key(2900));
+    let points = within("split", tx.get_range_split_points(&b, &e, 500_000))
+        .await
+        .unwrap();
+    assert_eq!(points.first(), Some(&b));
+    assert_eq!(points.last(), Some(&e));
+    assert!(points.windows(2).all(|w| w[0] < w[1]), "{points:?}");
+    assert!(points.iter().all(|p| *p >= b && *p <= e));
+
+    db.shutdown().await;
+    drop((db, tx));
     tokio::task::spawn_blocking(move || drop(cluster))
         .await
         .unwrap();

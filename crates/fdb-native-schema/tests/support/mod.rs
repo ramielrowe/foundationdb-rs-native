@@ -604,7 +604,7 @@ use v7_4::{
     ClientTagThrottleLimits, ClientTrCommitCostEstimation, ClientVersionRef, CommitID,
     CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyValuesReply, GetValueReply,
     GrvProxyInterface, Hostname, KeySelectorRef, LocalityData, OpenDatabaseCoordRequest,
-    StorageServerInterface, VersionHistory, WatchValueReply,
+    SplitRangeReply, StorageMetrics, StorageServerInterface, VersionHistory, WatchValueReply,
 };
 
 dump_table!("SpanContext" SpanContext { trace_id = "traceID", span_id = "spanID", flags = "m_Flags" });
@@ -647,6 +647,12 @@ dump_table!("GetKeyValuesReply" GetKeyValuesReply<'a> {
     cached = "cached",
 } @arena);
 dump_table!("WatchValueReply" WatchValueReply { version = "version", cached = "cached" });
+dump_table!("StorageMetrics" StorageMetrics {
+    bytes = "bytes", bytes_written_per_ksecond = "bytesWrittenPerKSecond",
+    ios_per_ksecond = "iosPerKSecond", bytes_read_per_ksecond = "bytesReadPerKSecond",
+    ops_read_per_ksecond = "opsReadPerKSecond",
+});
+dump_table!("SplitRangeReply" SplitRangeReply<'a> { split_points = "splitPoints" });
 dump_table!("ClientTrCommitCostEstimation" ClientTrCommitCostEstimation {
     ops_count = "opsCount", write_costs = "writeCosts", clear_idx_costs = "clearIdxCosts",
     expensive_cost_est_count = "expensiveCostEstCount",
@@ -686,9 +692,17 @@ mod release_7_4 {
     use fdb_native_schema::v7_4::{
         ClientDBInfo, CommitTransactionRequest, EncryptKeyProxyInterface, GetKeyRequest,
         GetKeyServerLocationsRequest, GetKeyValuesRequest, GetReadVersionReply,
-        GetReadVersionRequest, GetValueRequest, ReadOptions, TenantInfo, TenantMode,
-        WatchValueRequest, WipedString,
+        GetReadVersionRequest, GetValueRequest, ReadOptions, SplitRangeRequest, TenantInfo,
+        TenantMode, WaitMetricsRequest, WatchValueRequest, WipedString,
     };
+
+    dump_table!("WaitMetricsRequest" WaitMetricsRequest<'a> {
+        keys = "keys", min = "min", max = "max", reply = "reply", tenant_info = "tenantInfo",
+        min_version = "minVersion",
+    } @arena);
+    dump_table!("SplitRangeRequest" SplitRangeRequest<'a> {
+        keys = "keys", chunk_size = "chunkSize", reply = "reply", tenant_info = "tenantInfo",
+    } @arena);
 
     dump_table!("WipedString" WipedString<'a> { ws = "ws" } @arena);
     dump_table!("TenantInfo" TenantInfo<'a> { tenant_id = "tenantId", token = "token" } @arena);
@@ -757,8 +771,17 @@ mod release_8_0 {
     use fdb_native_schema::v8_0::{
         CdcProxyInterface, ClientDBInfo, CommitTransactionRequest, GetKeyRequest,
         GetKeyServerLocationsRequest, GetKeyValuesRequest, GetReadVersionReply,
-        GetReadVersionRequest, GetValueRequest, ReadOptions, WatchValueRequest,
+        GetReadVersionRequest, GetValueRequest, ReadOptions, SplitRangeRequest, WaitMetricsRequest,
+        WatchValueRequest,
     };
+
+    dump_table!("WaitMetricsRequest" WaitMetricsRequest<'a> {
+        keys = "keys", min = "min", max = "max", reply = "reply",
+        legacy_version = "legacyVersion",
+    } @arena);
+    dump_table!("SplitRangeRequest" SplitRangeRequest<'a> {
+        keys = "keys", chunk_size = "chunkSize", reply = "reply", limit = "limit",
+    } @arena);
 
     dump_table!("CDCProxyInterface" CdcProxyInterface<'a> {
         process_id = "processId", consume = "consume",

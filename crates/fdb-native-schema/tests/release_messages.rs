@@ -12,7 +12,7 @@ mod support;
 
 use fdb_native_schema::domain::{
     Commit, GetKey, GetKeyServerLocations, GetKeyValues, GetReadVersion, GetValue,
-    OpenDatabaseCoord, WatchValue,
+    OpenDatabaseCoord, SplitRange, WaitMetrics, WatchValue,
 };
 use fdb_native_schema::{Request, SchemaVersion, v7_4, v8_0};
 use fdb_native_wire::{DecodeError, EnsureTable, ErrorOr, FileIdentified, decode, encode};
@@ -122,9 +122,14 @@ fn dropped_by_the_domain(release: &str, name: &str) -> &'static [&'static str] {
         // The tenant of a 7.4 request (the domain is tenant-less; it writes TenantInfo::NONE).
         ("release-7.4", "get_value_request") => &["/0/tenantInfo/"],
         ("release-7.4", "get_key_server_locations_request") => &["/0/tenant/"],
-        ("release-7.4", "get_key_request" | "get_key_values_request" | "watch_value_request") => {
-            &["/0/tenantInfo/"]
-        }
+        (
+            "release-7.4",
+            "get_key_request"
+            | "get_key_values_request"
+            | "watch_value_request"
+            | "wait_metrics_request"
+            | "split_range_request",
+        ) => &["/0/tenantInfo/"],
         // tenantIds is set by the commit proxy; the 7.4 fixture also has a tenant.
         ("release-7.4", "commit_transaction_request") => {
             &["/0/tenantInfo/", "/0/transaction/tenantIds"]
@@ -353,6 +358,74 @@ fn release_7_4() -> Vec<Outcome> {
             "ErrorOr<EnsureTable<WatchValueReply>>"
         ),
         check_request!(
+            WaitMetricsRequest,
+            WaitMetrics,
+            V,
+            "release-7.4",
+            "wait_metrics_request",
+            "WaitMetricsRequest"
+        ),
+        check_request!(
+            WaitMetricsRequest,
+            WaitMetrics,
+            V,
+            "release-7.4",
+            "wait_metrics_request_estimate",
+            "WaitMetricsRequest"
+        ),
+        check!(
+            StorageMetrics,
+            "release-7.4",
+            "storage_metrics",
+            "StorageMetrics"
+        ),
+        check_reply!(
+            StorageMetrics,
+            WaitMetrics,
+            V,
+            "release-7.4",
+            "storage_metrics_envelope",
+            "ErrorOr<EnsureTable<StorageMetrics>>"
+        ),
+        check_reply!(
+            StorageMetrics,
+            WaitMetrics,
+            V,
+            "release-7.4",
+            "storage_metrics_error",
+            "ErrorOr<EnsureTable<StorageMetrics>>"
+        ),
+        check_request!(
+            SplitRangeRequest,
+            SplitRange,
+            V,
+            "release-7.4",
+            "split_range_request",
+            "SplitRangeRequest"
+        ),
+        check!(
+            SplitRangeReply,
+            "release-7.4",
+            "split_range_reply",
+            "SplitRangeReply"
+        ),
+        check_reply!(
+            SplitRangeReply,
+            SplitRange,
+            V,
+            "release-7.4",
+            "split_range_reply_envelope",
+            "ErrorOr<EnsureTable<SplitRangeReply>>"
+        ),
+        check_reply!(
+            SplitRangeReply,
+            SplitRange,
+            V,
+            "release-7.4",
+            "split_range_reply_empty",
+            "ErrorOr<EnsureTable<SplitRangeReply>>"
+        ),
+        check_request!(
             CommitTransactionRequest,
             Commit,
             V,
@@ -572,6 +645,74 @@ fn release_8_0() -> Vec<Outcome> {
             "release-8.0",
             "watch_value_reply_envelope",
             "ErrorOr<EnsureTable<WatchValueReply>>"
+        ),
+        check_request!(
+            WaitMetricsRequest,
+            WaitMetrics,
+            V,
+            "release-8.0",
+            "wait_metrics_request",
+            "WaitMetricsRequest"
+        ),
+        check_request!(
+            WaitMetricsRequest,
+            WaitMetrics,
+            V,
+            "release-8.0",
+            "wait_metrics_request_estimate",
+            "WaitMetricsRequest"
+        ),
+        check!(
+            StorageMetrics,
+            "release-8.0",
+            "storage_metrics",
+            "StorageMetrics"
+        ),
+        check_reply!(
+            StorageMetrics,
+            WaitMetrics,
+            V,
+            "release-8.0",
+            "storage_metrics_envelope",
+            "ErrorOr<EnsureTable<StorageMetrics>>"
+        ),
+        check_reply!(
+            StorageMetrics,
+            WaitMetrics,
+            V,
+            "release-8.0",
+            "storage_metrics_error",
+            "ErrorOr<EnsureTable<StorageMetrics>>"
+        ),
+        check_request!(
+            SplitRangeRequest,
+            SplitRange,
+            V,
+            "release-8.0",
+            "split_range_request",
+            "SplitRangeRequest"
+        ),
+        check!(
+            SplitRangeReply,
+            "release-8.0",
+            "split_range_reply",
+            "SplitRangeReply"
+        ),
+        check_reply!(
+            SplitRangeReply,
+            SplitRange,
+            V,
+            "release-8.0",
+            "split_range_reply_envelope",
+            "ErrorOr<EnsureTable<SplitRangeReply>>"
+        ),
+        check_reply!(
+            SplitRangeReply,
+            SplitRange,
+            V,
+            "release-8.0",
+            "split_range_reply_empty",
+            "ErrorOr<EnsureTable<SplitRangeReply>>"
         ),
         check_request!(
             CommitTransactionRequest,

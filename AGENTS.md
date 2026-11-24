@@ -134,6 +134,7 @@ cargo fmt --all --check                                        # formatting
 cargo clippy --workspace --all-targets -- -D warnings          # lints (warnings are errors in CI)
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps     # docs
 cargo nextest run --workspace                                  # unit tests
+cargo nextest run --workspace --features fdb-native-transport/smol,fdb-native-client/smol  # unit tests incl. the smol adapter and tests
 cargo nextest run --workspace --run-ignored only --no-tests=pass -E 'not (binary(cpp_crosscheck) | test(cpp_crosscheck))'  # Docker-backed integration tests
 cargo test --doc --workspace                                   # doc tests (nextest skips them)
 cargo build --workspace --examples                             # examples (also checked by --all-targets)
@@ -143,6 +144,19 @@ The TLS code is behind features of two crates: `fdb-native-transport/tls` and
 `fdb-native-client/tls` (the client's `cfg(feature = "tls")` code, the `tls` example and the
 client's TLS docker tests need the client's own feature). CI runs clippy, docs, MSRV checks,
 tests and the docker job with `--features fdb-native-transport/tls,fdb-native-client/tls` too.
+
+The second runtime adapter, smol (`SmolRuntime`: async-io, async-executor, `blocking`), is behind
+`fdb-native-transport/smol` and `fdb-native-client/smol` (a feature of both: the client's `smol`
+example and its smol tests need the client's own). The smol tests (`tests/smol_*.rs`, `smol_fake`,
+`docker_smol`, `smol_docker`) are `cfg(feature = "smol")`, so they run only with
+`--features fdb-native-transport/smol,fdb-native-client/smol` (CI's `test-smol` job; the docker job has
+them on too). The client under test runs on smol there; the fake servers of `smol_fake` and
+`smol_tls` stay on tokio (they share only streams and channels with it), and `MemRuntime<R>` in
+`crates/fdb-native-client/tests/support` takes its time and tasks from `R`. A smol build without
+tokio: `cargo build -p fdb-native-client --no-default-features --features smol --example smol`.
+Its `Runtime` safety constants (`WRITE_ERRORS_TAKE_NOTHING`, `PENDING_TAKES_NOTHING`) are
+justified against async-io's source in `runtime/smol_rt.rs`; a change of async-io's `poll_write`
+needs that re-checked.
 
 `fdb-native-client/examples/` are runnable examples (`cargo run -p fdb-native-client --example
 basic -- CLUSTER_FILE`); `tests/docker_examples.rs` includes each example's `run` with

@@ -1032,6 +1032,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
                     reverse,
                     version,
                     use_provisional,
+                    GetKeyValues::STREAM,
                 )
                 .await?;
             let mut shard = 0;
@@ -1135,22 +1136,24 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
 
     /// `getKeyRangeLocations` (NativeAPI 7.4:3505-3547, 8.0:1493-1534): the locations of at
     /// most `limit` shards of `keys`, from its end if `reverse`, each intersected with
-    /// `keys`: from the cache if it has them all (and none has a replica whose endpoint
-    /// failed on a healthy server, which is then forgotten), else from a commit proxy.
-    async fn key_range_locations(
+    /// `keys`: from the cache if it has them all (and none has a replica whose endpoint of
+    /// the storage stream `stream`, the request's `member`, failed on a healthy server: that
+    /// shard is then forgotten), else from a commit proxy.
+    pub(super) async fn key_range_locations(
         &self,
         keys: &KeyRange,
         limit: i32,
         reverse: bool,
         version: i64,
         use_provisional: bool,
+        stream: u32,
     ) -> Result<Vec<(KeyRange, Arc<Location>)>, Error> {
         if let Some(cached) = self.cached_locations(keys, limit as usize, reverse) {
             let mut found_failed = false;
             for (range, location) in &cached {
                 let mut refresh = false;
                 for server in &location.servers {
-                    let (address, token) = server.target_for(GetKeyValues::STREAM);
+                    let (address, token) = server.target_for(stream);
                     if self.check_only_endpoint_failed(address, token) {
                         refresh = true;
                     }

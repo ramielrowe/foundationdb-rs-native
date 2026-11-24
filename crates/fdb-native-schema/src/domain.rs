@@ -800,6 +800,91 @@ pub struct WatchValueReply {
 }
 
 // ---------------------------------------------------------------------------------------
+// Storage server: WaitMetricsRequest -> StorageMetrics, SplitRangeRequest -> SplitRangeReply.
+
+/// `StorageMetrics`: a storage server's estimates for a key range (`waitMetrics`'s reply,
+/// and the bounds of its request). Only `bytes` is a size; the others are rates per
+/// thousand seconds. Not a `LoadBalancedReply`: it carries no penalty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StorageMetrics {
+    /// `bytes`: the estimated bytes stored (from the server's byte sample).
+    pub bytes: i64,
+    /// `bytesWrittenPerKSecond`.
+    pub bytes_written_per_ksecond: i64,
+    /// `iosPerKSecond`.
+    pub ios_per_ksecond: i64,
+    /// `bytesReadPerKSecond`.
+    pub bytes_read_per_ksecond: i64,
+    /// `opsReadPerKSecond`.
+    pub ops_read_per_ksecond: i64,
+}
+
+/// `WaitMetricsRequest`, sent to a storage server's `waitMetrics`: reply with `keys`'
+/// [`StorageMetrics`] once one of them is below `min` or above `max` (at once if that is
+/// already so; [`WaitMetrics::immediate`] asks for that).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WaitMetrics {
+    /// `keys`: a range within one shard of the server.
+    pub keys: KeyRange,
+    /// `min`.
+    pub min: StorageMetrics,
+    /// `max`.
+    pub max: StorageMetrics,
+    /// 7.4's `minVersion` (for a tenant's request), 8.0's `legacyVersion`: unused without
+    /// tenants. The 7.4 request's `tenantInfo` is written as `TenantInfo()`.
+    pub version: i64,
+}
+
+impl WaitMetrics {
+    /// What `doGetStorageMetrics` (NativeAPI 7.4:8172-8200, 8.0:5964-5991) sends for an
+    /// immediate answer: `min` zero and `max.bytes = -1`, a bound the bytes always exceed.
+    pub fn immediate(keys: KeyRange, version: i64) -> WaitMetrics {
+        WaitMetrics {
+            keys,
+            min: StorageMetrics::default(),
+            max: StorageMetrics {
+                bytes: -1,
+                ..StorageMetrics::default()
+            },
+            version,
+        }
+    }
+}
+
+/// `SplitRangeRequest`, sent to a storage server's `getRangeSplitPoints`: the keys that cut
+/// `keys` into chunks of about `chunk_size` bytes (by the server's byte sample).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitRange {
+    /// `keys`: a range within one shard of the server.
+    pub keys: KeyRange,
+    /// `chunkSize`, in bytes.
+    pub chunk_size: i64,
+    /// 8.0 only: `limit`, the most split points to return (-1, the default, for no limit).
+    /// Not sent to 7.4, whose request has no such field (a 7.4 request decodes with -1).
+    pub limit: i32,
+}
+
+impl Default for SplitRange {
+    /// `SplitRangeRequest()`: `limit = -1` (8.0).
+    fn default() -> Self {
+        SplitRange {
+            keys: KeyRange::default(),
+            chunk_size: 0,
+            limit: -1,
+        }
+    }
+}
+
+/// `SplitRangeReply`: the split points, in increasing order, after the request's begin and
+/// before its end (a 7.4 server may also return the end itself); empty if the range is
+/// smaller than a chunk. Not a `LoadBalancedReply`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitRangeReply {
+    /// `splitPoints`.
+    pub split_points: Vec<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------------------
 // Commit proxy: CommitTransactionRequest -> CommitID.
 
 /// `ClientTrCommitCostEstimation`.

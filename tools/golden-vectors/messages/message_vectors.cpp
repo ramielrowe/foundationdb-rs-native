@@ -389,6 +389,114 @@ void storageVectors() {
 		        replyName("WatchValueReply"),
 		        Reply<WatchValueReply>(r));
 	}
+	{
+		StorageMetrics min;
+		min.bytes = 1;
+		min.bytesWrittenPerKSecond = 2;
+		min.iosPerKSecond = 3;
+		min.bytesReadPerKSecond = 4;
+		min.opsReadPerKSecond = 5;
+		StorageMetrics max;
+		max.bytes = -1;
+		max.bytesWrittenPerKSecond = 6000000000LL;
+		max.iosPerKSecond = 7;
+		max.bytesReadPerKSecond = 8;
+		max.opsReadPerKSecond = StorageMetrics::infinity;
+#ifdef GV_V74
+		WaitMetricsRequest r(tenant(48), 9000000000000LL, KeyRangeRef("metrics/a"_sr, "metrics/z"_sr), min, max);
+#else
+		WaitMetricsRequest r(9000000000000LL, KeyRangeRef("metrics/a"_sr, "metrics/z"_sr), min, max);
+#endif
+		r.reply = replyTo<StorageMetrics>(12);
+		message(g,
+		        "wait_metrics_request",
+		        "StorageServerInterface::waitMetrics request (adjusted endpoint 4). min and max are StorageMetrics "
+		        "tables (bytes, bytesWrittenPerKSecond, iosPerKSecond, bytesReadPerKSecond, opsReadPerKSecond: all "
+		        "i64), every field distinct. 7.4: (keys, min, max, reply, tenantInfo, minVersion, arena); 8.0: "
+		        "(keys, min, max, reply, legacyVersion, arena): tenantInfo removed and minVersion renamed, so "
+		        "legacyVersion (i64) is slot 4 where 7.4 has tenantInfo.",
+		        "WaitMetricsRequest",
+		        r);
+	}
+	{
+		// What getStorageMetrics (doGetStorageMetrics) sends: min all zero, max.bytes -1 (a
+		// reversed bound on bytes, so the server replies at once), latestVersion, no tenant.
+		StorageMetrics min, max;
+		min.bytes = 0;
+		max.bytes = -1;
+#ifdef GV_V74
+		WaitMetricsRequest r(TenantInfo(), latestVersion, KeyRangeRef("metrics/a"_sr, "metrics/z"_sr), min, max);
+#else
+		WaitMetricsRequest r(latestVersion, KeyRangeRef("metrics/a"_sr, "metrics/z"_sr), min, max);
+#endif
+		r.reply = replyTo<StorageMetrics>(13);
+		message(g,
+		        "wait_metrics_request_estimate",
+		        "WaitMetricsRequest as Transaction::getEstimatedRangeSizeBytes sends it (doGetStorageMetrics): min "
+		        "zero, max.bytes = -1 and the rest zero, version latestVersion (-2)" +
+#ifdef GV_V74
+		            std::string(", TenantInfo() (tenantId -1, token absent)") +
+#endif
+		            std::string("."),
+		        "WaitMetricsRequest",
+		        r);
+	}
+	{
+		StorageMetrics m;
+		m.bytes = 123456789012LL;
+		m.bytesWrittenPerKSecond = 1000;
+		m.iosPerKSecond = 20;
+		m.bytesReadPerKSecond = 300000;
+		m.opsReadPerKSecond = 4;
+		message(g, "storage_metrics", "StorageMetrics (the waitMetrics reply) as a bare table.", "StorageMetrics", m);
+		message(g,
+		        "storage_metrics_envelope",
+		        "StorageMetrics as sent (ErrorOr<EnsureTable<StorageMetrics>> tag 2). Not a LoadBalancedReply: no "
+		        "penalty or error fields; a server's error comes as the envelope's error.",
+		        replyName("StorageMetrics"),
+		        Reply<StorageMetrics>(m));
+		message(g,
+		        "storage_metrics_error",
+		        "Error reply envelope: ErrorOr<EnsureTable<StorageMetrics>> tag 1, Error 1001 (wrong_shard_server), "
+		        "as sendErrorWithPenalty sends it for a reply type that is not a LoadBalancedReply.",
+		        replyName("StorageMetrics"),
+		        Reply<StorageMetrics>(Error(1001)));
+	}
+	{
+#ifdef GV_V74
+		SplitRangeRequest r(tenant(49), KeyRangeRef("split/a"_sr, "split/z"_sr), 10000000);
+#else
+		SplitRangeRequest r(KeyRangeRef("split/a"_sr, "split/z"_sr), 10000000, 17);
+#endif
+		r.reply = replyTo<SplitRangeReply>(14);
+		message(g,
+		        "split_range_request",
+		        "StorageServerInterface::getRangeSplitPoints request (adjusted endpoint 12). 7.4: (keys, chunkSize, "
+		        "reply, tenantInfo, arena); 8.0: (keys, chunkSize, reply, limit, arena): tenantInfo removed and limit "
+		        "(i32, the most split points to return, -1 for no limit) added in its slot.",
+		        "SplitRangeRequest",
+		        r);
+	}
+	{
+		SplitRangeReply r;
+		r.splitPoints.push_back_deep(r.splitPoints.arena(), "split/f"_sr);
+		r.splitPoints.push_back_deep(r.splitPoints.arena(), "split/m\x00\xff"_sr);
+		message(g,
+		        "split_range_reply",
+		        "SplitRangeReply as a bare table: splitPoints, a vector of strings.",
+		        "SplitRangeReply",
+		        r);
+		message(g,
+		        "split_range_reply_envelope",
+		        "SplitRangeReply as sent (ErrorOr<EnsureTable<>> tag 2). Not a LoadBalancedReply.",
+		        replyName("SplitRangeReply"),
+		        Reply<SplitRangeReply>(r));
+		message(g,
+		        "split_range_reply_empty",
+		        "SplitRangeReply with no split points (a range smaller than the chunk size).",
+		        replyName("SplitRangeReply"),
+		        Reply<SplitRangeReply>(SplitRangeReply()));
+	}
 }
 
 void proxyVectors() {

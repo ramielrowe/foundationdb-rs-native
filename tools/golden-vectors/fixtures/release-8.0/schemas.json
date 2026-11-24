@@ -111,6 +111,28 @@
         }
       ]
     },
+    "ErrorOr<EnsureTable<SplitRangeReply>>": {
+      "file_identifier": 45367566,
+      "file_identifier_hex": "0x02b4410e",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<SplitRangeReply>>>"
+        }
+      ]
+    },
+    "ErrorOr<EnsureTable<StorageMetrics>>": {
+      "file_identifier": 47176658,
+      "file_identifier_hex": "0x02cfdbd2",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "error_or<ensure_table<table<StorageMetrics>>>"
+        }
+      ]
+    },
     "ErrorOr<EnsureTable<Void>>": {
       "file_identifier": 35564874,
       "file_identifier_hex": "0x021ead4a",
@@ -265,6 +287,39 @@
         }
       ]
     },
+    "SplitRangeReply": {
+      "file_identifier": 11813134,
+      "file_identifier_hex": "0x00b4410e",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<SplitRangeReply>"
+        }
+      ]
+    },
+    "SplitRangeRequest": {
+      "file_identifier": 10725174,
+      "file_identifier_hex": "0x00a3a736",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<SplitRangeRequest>"
+        }
+      ]
+    },
+    "StorageMetrics": {
+      "file_identifier": 13622226,
+      "file_identifier_hex": "0x00cfdbd2",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<StorageMetrics>"
+        }
+      ]
+    },
     "UID": {
       "file_identifier": 15597147,
       "file_identifier_hex": "0x00edfe5b",
@@ -273,6 +328,17 @@
           "field": "0",
           "slot": 0,
           "type": "uid"
+        }
+      ]
+    },
+    "WaitMetricsRequest": {
+      "file_identifier": 1795961,
+      "file_identifier_hex": "0x001b6779",
+      "root": [
+        {
+          "field": "0",
+          "slot": 0,
+          "type": "table<WaitMetricsRequest>"
         }
       ]
     },
@@ -1178,6 +1244,67 @@
         "type": "u8"
       }
     ],
+    "table<SplitRangeReply>": [
+      {
+        "field": "splitPoints",
+        "slot": 0,
+        "type": "vector<bytes>"
+      }
+    ],
+    "table<SplitRangeRequest>": [
+      {
+        "field": "keys",
+        "slot": 0,
+        "type": "table<KeyRangeRef>"
+      },
+      {
+        "field": "chunkSize",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "reply",
+        "slot": 2,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "limit",
+        "slot": 3,
+        "type": "i32"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
+    "table<StorageMetrics>": [
+      {
+        "field": "bytes",
+        "slot": 0,
+        "type": "i64"
+      },
+      {
+        "field": "bytesWrittenPerKSecond",
+        "slot": 1,
+        "type": "i64"
+      },
+      {
+        "field": "iosPerKSecond",
+        "slot": 2,
+        "type": "i64"
+      },
+      {
+        "field": "bytesReadPerKSecond",
+        "slot": 3,
+        "type": "i64"
+      },
+      {
+        "field": "opsReadPerKSecond",
+        "slot": 4,
+        "type": "i64"
+      }
+    ],
     "table<StorageServerInterface>": [
       {
         "field": "uniqueID",
@@ -1218,6 +1345,38 @@
       }
     ],
     "table<Void>": [],
+    "table<WaitMetricsRequest>": [
+      {
+        "field": "keys",
+        "slot": 0,
+        "type": "table<KeyRangeRef>"
+      },
+      {
+        "field": "min",
+        "slot": 1,
+        "type": "table<StorageMetrics>"
+      },
+      {
+        "field": "max",
+        "slot": 2,
+        "type": "table<StorageMetrics>"
+      },
+      {
+        "field": "reply",
+        "slot": 3,
+        "type": "table<reply_promise>"
+      },
+      {
+        "field": "legacyVersion",
+        "slot": 4,
+        "type": "i64"
+      },
+      {
+        "field": "arena",
+        "slot": null,
+        "type": "arena"
+      }
+    ],
     "table<WatchValueReply>": [
       {
         "field": "version",
