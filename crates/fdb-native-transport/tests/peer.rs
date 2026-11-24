@@ -1017,6 +1017,81 @@ async fn a_stuck_or_failing_tls_handshake_is_reported() {
     }
 }
 
+/// `TLS_CLIENT_CONNECTION_THROTTLE_*`, as `SSLConnection::connect` (`flow/Net2.actor.cpp`
+/// 7.4:927-946): from the second failed handshake with an address within 11 s of the first,
+/// connects to it do not dial (they wait the connect timeout and fail) until the window ends.
+#[tokio::test(start_paused = true)]
+async fn repeated_tls_handshake_failures_throttle_dialing_like_a_cpp_client() {
+    let net = Net::new();
+    let mut tls_script = Script::new(V74);
+    tls_script.tls = true;
+    let server = listen_one(&net, sock(4500), tls_script);
+    let wraps = Arc::new(AtomicUsize::new(0));
+    let counter = wraps.clone();
+    let failing = move |_s: MemStream, _p: NetworkAddress| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            Err::<MemStream, _>(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad certificate",
+            ))
+        }
+    };
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::with_stream_wrapper(MemRuntime::new(&net), config(), failing, sink);
+    let peer = mgr.peer(&server.address);
+    let start = tokio::time::Instant::now();
+
+    for n in 1..=2 {
+        let error = peer.connect().await.unwrap_err();
+        assert!(matches!(error, PeerError::Tls { .. }), "{n}: {error:?}");
+        assert_eq!(net.connects(sock(4500)), n);
+        assert_eq!(wraps.load(Ordering::SeqCst), n);
+    }
+    // Throttled: no dial, no handshake, a connect timeout's wait.
+    let before = tokio::time::Instant::now();
+    assert_eq!(peer.connect().await, Err(PeerError::TlsThrottled));
+    assert!(before.elapsed() >= Duration::from_secs(2));
+    assert_eq!(net.connects(sock(4500)), 2);
+    assert_eq!(wraps.load(Ordering::SeqCst), 2);
+    assert!(start.elapsed() < Duration::from_secs(11));
+
+    // The window (11 s from the first failure) ends: dialed again.
+    tokio::time::sleep_until(start + Duration::from_secs(12)).await;
+    let error = peer.connect().await.unwrap_err();
+    assert!(matches!(error, PeerError::Tls { .. }), "{error:?}");
+    assert_eq!(net.connects(sock(4500)), 3);
+
+    // Another address (here: another port of the host) is not throttled.
+    let mut other = Script::new(V74);
+    other.tls = true;
+    let other = listen_one(&net, sock(4501), other);
+    let error = mgr.peer(&other.address).connect().await.unwrap_err();
+    assert!(matches!(error, PeerError::Tls { .. }), "{error:?}");
+    assert_eq!(net.connects(sock(4501)), 1);
+}
+
+/// A handshake that times out does not count towards the throttle (C++'s outer connect
+/// timeout cancels it before it can record anything).
+#[tokio::test(start_paused = true)]
+async fn tls_handshake_timeouts_do_not_throttle() {
+    let net = Net::new();
+    let mut tls_script = Script::new(V74);
+    tls_script.tls = true;
+    let server = listen_one(&net, sock(4500), tls_script);
+    let (sink, _events) = event_channel();
+    let stuck = |_s: MemStream, _p: NetworkAddress| async move {
+        std::future::pending::<io::Result<MemStream>>().await
+    };
+    let mgr = PeerManager::with_stream_wrapper(MemRuntime::new(&net), config(), stuck, sink);
+    let peer = mgr.peer(&server.address);
+    for n in 1..=4 {
+        let error = peer.connect().await.unwrap_err();
+        assert!(matches!(error, PeerError::TlsTimeout { .. }), "{error:?}");
+        assert_eq!(net.connects(sock(4500)), n);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn choose_primary_address_prefers_the_plain_address_like_a_cpp_client() {
     let net = Net::new();

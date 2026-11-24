@@ -367,8 +367,11 @@
 //!   (default 1, which the *second* failure in the window does), later connections from that
 //!   IP are not handshaken at all until the window ends: the server waits
 //!   `CONNECTION_MONITOR_TIMEOUT` and closes the socket (`connection_failed`).
-//! * When fdbserver acts as a client, `TLS_CLIENT_CONNECTION_THROTTLE_TIMEOUT` (default 11) and
-//!   `TLS_CLIENT_CONNECTION_THROTTLE_ATTEMPTS` (default 1) do the same per remote `ip:port`.
+//! * When fdbserver (or a `libfdb_c` client) acts as a client,
+//!   `TLS_CLIENT_CONNECTION_THROTTLE_TIMEOUT` (default 11) and
+//!   `TLS_CLIENT_CONNECTION_THROTTLE_ATTEMPTS` (default 1) do the same per remote `ip:port`
+//!   for the handshakes it starts. The peer manager does too (see
+//!   [the TLS handshake throttle](crate::peer#tls-handshake-throttle)).
 //!
 //! What a client sees: **after a few rejected attempts in quick succession** (a bad client
 //! certificate and a retry loop, say) **the server stops answering TLS handshakes from the

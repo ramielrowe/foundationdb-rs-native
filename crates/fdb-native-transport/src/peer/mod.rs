@@ -263,6 +263,18 @@
 //!
 //! See [`StreamWrapper`]: a hook called for TLS addresses with the connected socket.
 //!
+//! ## TLS handshake throttle
+//!
+//! As a C++ client does (`serverTLSConnectionThrottler` in `flow/Net2.actor.cpp` 7.4:927-946,
+//! `flow/Net2.cpp` 8.0:919-939), the manager counts failed TLS handshakes
+//! ([`PeerError::Tls`]) per address: from the second failure within
+//! [`tls_throttle_timeout`](PeerManagerConfig::tls_throttle_timeout) (11 s) of the first
+//! ([`tls_throttle_attempts`](PeerManagerConfig::tls_throttle_attempts), 1), a connect to that
+//! address does not dial until the window ends: it waits the connect timeout and fails with
+//! [`PeerError::TlsThrottled`] (a failure like any other, for the backoff and the failure
+//! monitor). So a server whose certificate this client refuses is not handshaken with again
+//! and again; handshake timeouts do not count (C++ cancels them first).
+//!
 //! # Panics
 //!
 //! Code that runs on a peer's task is the manager's own, plus three hooks of the application: a
@@ -319,6 +331,7 @@ mod messages;
 mod queue;
 mod stream;
 mod task;
+mod tls_throttle;
 mod waiters;
 mod watch;
 
@@ -850,6 +863,8 @@ pub(crate) struct Shared<R: Runtime, W> {
     pub(crate) wrapper: W,
     pub(crate) sink: Box<dyn PeerEventSink>,
     pub(crate) failures: FailureMonitor,
+    /// Failed TLS handshakes per address ([`tls_throttle`]).
+    pub(crate) tls_throttle: tls_throttle::TlsThrottle,
     /// The version of the cluster, as last negotiated with any address.
     pub(crate) cluster_version: Mutex<Option<ProtocolVersion>>,
     pub(crate) seed: u64,
@@ -1035,6 +1050,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerManager<R, W> {
                 wrapper,
                 sink: Box::new(sink),
                 failures: FailureMonitor::new(),
+                tls_throttle: Default::default(),
                 cluster_version: Mutex::new(None),
                 seed,
                 peers: Mutex::new(Peers {

@@ -46,6 +46,13 @@ pub enum PeerError {
         #[source]
         source: IoError,
     },
+    /// Not dialed: TLS handshakes with the address failed repeatedly in the last
+    /// [`tls_throttle_timeout`](super::PeerManagerConfig::tls_throttle_timeout), so, as a C++
+    /// client does, the attempt waited the connect timeout and gave up without connecting
+    /// (see [`PeerManagerConfig::tls_throttle_attempts`](super::PeerManagerConfig::tls_throttle_attempts)).
+    /// The earlier failures' [`PeerError::Tls`] say why the handshakes failed.
+    #[error("not connecting: TLS handshakes with this address failed repeatedly (throttled)")]
+    TlsThrottled,
     /// The connection ended: see [`ConnectionError`], which also says whether it was clean.
     #[error(transparent)]
     Connection(#[from] ConnectionError),

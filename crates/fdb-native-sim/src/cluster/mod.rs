@@ -174,6 +174,14 @@ pub struct ClusterStats {
     pub recoveries: u64,
     /// Storage reads served.
     pub reads: u64,
+    /// `OpenDatabaseCoordRequest`s the coordinators received (the long poll).
+    pub open_database_requests: u64,
+    /// `GetReadVersionRequest`s the GRV proxies received.
+    pub grv_requests: u64,
+    /// The sum of their `transactionCount`s: the transactions the client said it started.
+    pub grv_transactions: u64,
+    /// `GetKeyServerLocationsRequest`s the commit proxies received.
+    pub location_requests: u64,
 }
 
 /// A process of the cluster, as [`SimCluster::processes`] lists it.
@@ -1048,6 +1056,7 @@ impl SimCluster {
             Err(e) => return self.violation(e),
         };
         let mut state = lock(&self.inner.state);
+        state.stats.open_database_requests += 1;
         state.waiters.retain(|(_, r)| !r.is_closed());
         if request.known_client_info_id != state.info.id {
             let payload = OpenDatabaseCoord::encode_reply(reply.schema(), &Ok(state.info.clone()))
@@ -1065,10 +1074,15 @@ impl SimCluster {
     }
 
     fn on_grv(&self, generation: u64, i: usize, process: usize, incoming: Incoming) {
-        let (_request, reply) = match incoming.decode::<GetReadVersion>() {
+        let (request, reply) = match incoming.decode::<GetReadVersion>() {
             Ok(r) => r,
             Err(e) => return self.violation(e),
         };
+        {
+            let mut state = lock(&self.inner.state);
+            state.stats.grv_requests += 1;
+            state.stats.grv_transactions += u64::from(request.transaction_count);
+        }
         let delay = self.latency(50, 3000);
         let me = self.clone();
         let sim = self.inner.sim.clone();
@@ -1228,6 +1242,7 @@ impl SimCluster {
             Ok(r) => r,
             Err(e) => return self.violation(e),
         };
+        lock(&self.inner.state).stats.location_requests += 1;
         let delay = self.latency(50, 2000);
         let me = self.clone();
         let sim = self.inner.sim.clone();

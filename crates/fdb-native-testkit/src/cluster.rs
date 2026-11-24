@@ -342,7 +342,7 @@ fn parse_cluster_file(contents: &str) -> Option<String> {
 }
 
 /// Parses `status json` output (anything before the first `{` is dropped).
-fn parse_status_output(output: &str) -> Result<serde_json::Value> {
+pub(crate) fn parse_status_output(output: &str) -> Result<serde_json::Value> {
     let start = output
         .find('{')
         .ok_or_else(|| Error::Status(format!("no JSON in output: {:?}", output.trim())))?;
