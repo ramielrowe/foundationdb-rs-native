@@ -45,12 +45,18 @@ impl Incoming {
     }
 
     pub fn reply_grv(&self, version: i64) {
+        self.reply_grv_with(version, false, None);
+    }
+
+    /// A read version reply of a database that is `locked` or not, with the value of
+    /// `\xff/metadataVersion` at the version.
+    pub fn reply_grv_with(&self, version: i64, locked: bool, metadata_version: Option<&[u8]>) {
         let (_, token) = self.grv();
         let rv = ReadVersion {
             process_busy_time: 0,
             version,
-            locked: false,
-            metadata_version: None,
+            locked,
+            metadata_version: metadata_version.map(<[u8]>::to_vec),
             tag_throttle_info: Default::default(),
             mid_shard_size: 0,
             rk_default_throttled: false,

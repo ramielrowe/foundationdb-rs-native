@@ -188,6 +188,8 @@ pub mod codes {
     pub const INVERTED_RANGE: u16 = 2005;
     /// `invalid_option_value` (2006).
     pub const INVALID_OPTION_VALUE: u16 = 2006;
+    /// `invalid_option` (2007).
+    pub const INVALID_OPTION: u16 = 2007;
     /// `read_version_already_set` (2010).
     pub const READ_VERSION_ALREADY_SET: u16 = 2010;
     /// `version_invalid` (2011).

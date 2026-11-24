@@ -66,7 +66,9 @@
 //! * The reset keeps the options C++ keeps (the "persistent" ones of `fdb.options`:
 //!   `timeout`, `retry_limit`, `max_retry_delay`), the retry count, the backoff and the time
 //!   the timeout counts from; it forgets the read version, the writes and conflict ranges,
-//!   the deferred error and the other options (`size_limit` among them).
+//!   the deferred error and the other options (`size_limit` among them), except that the
+//!   [database's defaults](crate::DatabaseOption) are applied again. See
+//!   [`TransactionOption`] for every option.
 //! * **An error that may hide a commit stays so.** If the error given to `on_error`
 //!   [`is_maybe_committed`](Error::is_maybe_committed), whatever `on_error` returns instead
 //!   (a timeout during the backoff, the transaction's cancellation) is too.
@@ -80,7 +82,9 @@
 //! to the operations in progress too (at once if the deadline has already passed).
 //! [`cancel`](Transaction::cancel) does the same with `transaction_cancelled` (1025), and a
 //! [`reset`](Transaction::reset) (or `on_error`) makes the operations in progress fail with
-//! `transaction_cancelled`.
+//! `transaction_cancelled`. The future of [`get_versionstamp`](Transaction::get_versionstamp)
+//! is ended by all of these too, when they happen (the timeout does not wait for an
+//! operation to notice it).
 //!
 //! **A commit that times out or is cancelled while its request may be on its way may still
 //! commit.** C++ reports `transaction_timed_out` / `transaction_cancelled`; here that error
@@ -98,12 +102,31 @@
 //! `reset` do nothing. A handle from [`Database::create_transaction`] (or a clone of it) is
 //! never stale.
 //!
+//! # Options
+//!
+//! [`Transaction::set_option`] takes a [`TransactionOption`]: the timeout, retry and size
+//! limits, the read version priorities and `max_grv_queue_delay`, `lock_aware` and
+//! `read_lock_aware`, the causal options, the system key access options and the rest of
+//! `fdb.options` that make sense for this client (a table says which are supported and
+//! which are accepted as no-ops). [`Database::set_option`] sets the defaults new
+//! transactions start with.
+//!
+//! # `\xff/metadataVersion`
+//!
+//! A [`get`](Transaction::get) of `\xff/metadataVersion` needs no system key option, and is
+//! answered without a storage server when it can be (NativeAPI 7.4:5860-5897): from the GRV
+//! proxy's reply to this transaction's read version request, else from what the database
+//! remembers of recent read versions and commits ([`Reader::metadata_version`](crate::read::Reader::metadata_version)). A commit
+//! tells the database the metadata version at its commit version (`tryCommit`,
+//! 7.4:6990-6996), so that a transaction that reads at that version knows it.
+//! Writing the key (`SetVersionstampedValue` of the special value) is not ported yet.
+//!
 //! # Not ported yet
 //!
 //! Read-your-writes, mapped range reads (`getMappedRange`), `getRangeStream` (the
-//! storage servers' streaming reads), snapshot read-your-writes options, the special key space (`\xff\xff`), transaction
-//! tags, priorities, idempotency ids, tenants, the `metadataVersion` key exception, and
-//! database-wide default transaction options.
+//! storage servers' streaming reads), snapshot read-your-writes options, the special key
+//! space (`\xff\xff`), transaction tags, idempotency ids, tenants, the read options sent to
+//! storage servers (read priority, server side cache) and the `\xff/metadataVersion` write.
 
 use std::fmt;
 use std::future::Future;
@@ -123,62 +146,21 @@ use crate::database::Database;
 use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
 use crate::read::util::{Either, never, race};
-use crate::read::{ReadVersionOptions, key_after};
+use crate::read::{METADATA_VERSION_KEY, ReadVersionOptions, key_after};
 use crate::watch::{PendingWatches, StampedKey, Written};
 
+pub mod options;
 mod range;
 mod watch;
 
+pub use options::TransactionOption;
+use options::{Flags, Persistent};
 pub use range::{KeyValueStream, RangeResult, RangeStream};
 
 /// The first key a transaction may not read or write without the system-key options.
 const SYSTEM_KEYS_BEGIN: &[u8] = b"\xff";
 /// The end of the system keys (and the first key of the special key space).
 const SYSTEM_KEYS_END: &[u8] = b"\xff\xff";
-/// `extractIntOption`'s upper bound for the millisecond options.
-const MAX_MILLIS: u128 = i32::MAX as u128;
-
-/// A transaction option (`FDBTransactionOption`), for [`Transaction::set_option`].
-///
-/// `Timeout`, `RetryLimit` and `MaxRetryDelay` persist across
-/// [`on_error`](Transaction::on_error) (`fdb.options`' "persistent" options); the others
-/// apply until the transaction is reset, by `on_error` or [`reset`](Transaction::reset). A
-/// full reset clears them all.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum TransactionOption {
-    /// `TIMEOUT`: the transaction fails with `transaction_timed_out` once this long has
-    /// passed since it was created or last [reset](Transaction::reset). Zero disables it.
-    /// At most `i32::MAX` milliseconds. Persistent.
-    Timeout(Duration),
-    /// `RETRY_LIMIT`: how many times [`on_error`](Transaction::on_error) may retry; `-1`
-    /// (the default) is unlimited. Persistent.
-    RetryLimit(i32),
-    /// `MAX_RETRY_DELAY`: the largest backoff [`on_error`](Transaction::on_error) waits
-    /// (default 1 s). At most `i32::MAX` milliseconds. Persistent.
-    MaxRetryDelay(Duration),
-    /// `SIZE_LIMIT`: the largest size (`getSize()`) the transaction may commit, 32 bytes to
-    /// `TRANSACTION_SIZE_LIMIT` (10 000 000, the default). Not persistent: `on_error`
-    /// forgets it.
-    SizeLimit(u32),
-    /// `CAUSAL_WRITE_RISKY`: the commit adds no self-conflicting key to a blind write, and
-    /// does not settle an unknown result with a dummy transaction.
-    CausalWriteRisky,
-    /// `CAUSAL_READ_RISKY`: the read version may not reflect every earlier commit.
-    CausalReadRisky,
-    /// `LOCK_AWARE`: the transaction may read and commit while the database is locked.
-    LockAware,
-    /// `USE_PROVISIONAL_PROXIES`: use the proxies of a recovery that has not finished.
-    UseProvisionalProxies,
-    /// `REPORT_CONFLICTING_KEYS`: a conflict says which read conflict ranges conflicted
-    /// ([`Error::conflicting_ranges`]).
-    ReportConflictingKeys,
-    /// `ACCESS_SYSTEM_KEYS`: the transaction may read and write keys from `\xff` to
-    /// `\xff\xff`.
-    AccessSystemKeys,
-    /// `READ_SYSTEM_KEYS`: the transaction may read keys from `\xff` to `\xff\xff`.
-    ReadSystemKeys,
-}
 
 /// What a successful [`Transaction::commit`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,62 +232,6 @@ enum ReadVersion {
     Failed(Error),
 }
 
-/// The options that persist across `on_error` (`persistent="true"` in `fdb.options`).
-#[derive(Clone, Copy, Debug)]
-struct Persistent {
-    timeout: Option<Duration>,
-    retry_limit: Option<u32>,
-    max_retry_delay: Duration,
-}
-
-/// The options a reset clears.
-#[derive(Clone, Copy, Debug)]
-struct Flags {
-    causal_write_risky: bool,
-    causal_read_risky: bool,
-    lock_aware: bool,
-    use_provisional_proxies: bool,
-    report_conflicting_keys: bool,
-    access_system_keys: bool,
-    read_system_keys: bool,
-    size_limit: u64,
-}
-
-impl Default for Flags {
-    fn default() -> Flags {
-        Flags {
-            causal_write_risky: false,
-            causal_read_risky: false,
-            lock_aware: false,
-            use_provisional_proxies: false,
-            report_conflicting_keys: false,
-            access_system_keys: false,
-            read_system_keys: false,
-            size_limit: CommitOptions::default().size_limit,
-        }
-    }
-}
-
-impl Flags {
-    /// `getMaxReadKey()`.
-    fn max_read_key(&self) -> &'static [u8] {
-        if self.access_system_keys || self.read_system_keys {
-            SYSTEM_KEYS_END
-        } else {
-            SYSTEM_KEYS_BEGIN
-        }
-    }
-
-    /// `getMaxWriteKey()`.
-    fn max_write_key(&self) -> &'static [u8] {
-        if self.access_system_keys {
-            SYSTEM_KEYS_END
-        } else {
-            SYSTEM_KEYS_BEGIN
-        }
-    }
-}
-
 #[derive(Debug)]
 enum CommitStage {
     Idle,
@@ -328,10 +254,20 @@ struct State {
     /// epoch finds out is dropped, and the handles of earlier `run` attempts are stale.
     epoch: u64,
     read_version: ReadVersion,
+    /// `\xff/metadataVersion` at the read version, as the GRV reply that gave it reported it
+    /// (`TransactionState::metadataVersion`): set once a read version was requested; not for
+    /// one from [`Transaction::set_read_version`].
+    metadata: Option<Option<Vec<u8>>>,
     buffer: CommitBuffer,
     deferred: Option<Error>,
     flags: Flags,
     persistent: Persistent,
+    /// The database's default options (`DatabaseContext::transactionDefaults`) when the
+    /// transaction was created or fully reset: applied then, and again (the non-persistent
+    /// ones) after every [`on_error`](Transaction::on_error).
+    defaults: Arc<Vec<TransactionOption>>,
+    /// A read was started since the last reset (the read-your-writes cache is not empty).
+    read_issued: bool,
     retries: u32,
     backoff: Duration,
     /// What the timeout counts from.
@@ -399,17 +335,21 @@ impl<R: Runtime> Drop for ReadGuard<R> {
 impl State {
     fn new<R: Runtime>(db: &Database<R>, epoch: u64) -> State {
         let knobs = &db.inner.knobs;
-        State {
+        let limits = db.inner.committer.limits();
+        let mut state = State {
             epoch,
             read_version: ReadVersion::Unset,
-            buffer: CommitBuffer::new(db.inner.committer.limits()),
+            metadata: None,
+            buffer: CommitBuffer::new(limits),
             deferred: None,
-            flags: Flags::default(),
+            flags: Flags::new(CommitOptions::default().size_limit),
             persistent: Persistent {
                 timeout: None,
                 retry_limit: None,
                 max_retry_delay: knobs.max_backoff,
             },
+            defaults: db.inner.transaction_defaults(),
+            read_issued: false,
             retries: 0,
             backoff: knobs.initial_backoff,
             created: db.inner.rt.now(),
@@ -420,7 +360,13 @@ impl State {
             watches: PendingWatches::default(),
             reading: Reading::default(),
             stamped_keys: Vec::new(),
+        };
+        // `ReadYourWritesTransaction`'s constructor: the database's defaults, validated when
+        // they were set.
+        for option in state.defaults.clone().iter() {
+            let _ = state.apply_option(option);
         }
+        state
     }
 
     /// Answers the [`Transaction::get_versionstamp`] futures that wait (the promise of
@@ -469,12 +415,21 @@ impl State {
         self.watches.cancel_all(&Error::new(TRANSACTION_CANCELLED));
         self.resolve_versionstamp(Err(Error::new(TRANSACTION_CANCELLED)));
         self.read_version = ReadVersion::Unset;
+        self.metadata = None;
         self.buffer = CommitBuffer::new(limits);
         self.deferred = None;
-        self.flags = Flags::default();
+        self.flags = Flags::new(CommitOptions::default().size_limit);
+        self.read_issued = false;
         self.commit = CommitStage::Idle;
         self.reading = Reading::default();
         self.stamped_keys.clear();
+        // `applyPersistentOptions`: the persistent options are kept as they are; the
+        // database's defaults come back (they are in C++'s `persistentOptions` too).
+        for option in self.defaults.clone().iter() {
+            if !option.is_persistent() {
+                let _ = self.apply_option(option);
+            }
+        }
     }
 
     /// The first deferred error stays.
@@ -489,7 +444,10 @@ impl State {
         let Some(e) = self.used_during_commit() else {
             return Ok(());
         };
-        self.kill(e.clone());
+        // With `USED_DURING_COMMIT_PROTECTION_DISABLE` only the offending operation fails.
+        if !self.flags.used_during_commit_protection_disable {
+            self.kill(e.clone());
+        }
         Err(e)
     }
 
@@ -510,12 +468,14 @@ impl State {
         })
     }
 
+    /// The read version request's options (`TransactionState::getReadVersion`).
     fn read_version_options(&self, causal_read_risky: bool) -> ReadVersionOptions {
         ReadVersionOptions {
+            priority: self.flags.priority,
             causal_read_risky: causal_read_risky || self.flags.causal_read_risky,
             use_provisional_proxies: self.flags.use_provisional_proxies,
             lock_aware: self.flags.lock_aware,
-            ..ReadVersionOptions::default()
+            max_grv_queue_delay_ms: self.flags.max_grv_queue_delay_ms,
         }
     }
 
@@ -523,10 +483,13 @@ impl State {
         CommitOptions {
             causal_write_risky: self.flags.causal_write_risky,
             lock_aware: self.flags.lock_aware,
-            use_provisional_proxies: self.flags.use_provisional_proxies,
+            first_in_batch: self.flags.first_in_batch,
+            bypass_storage_quota: self.flags.bypass_storage_quota,
             report_conflicting_keys: self.flags.report_conflicting_keys,
+            read_only: self.flags.read_only,
+            commit_on_first_proxy: self.flags.commit_on_first_proxy,
+            use_provisional_proxies: self.flags.use_provisional_proxies,
             size_limit: self.flags.size_limit,
-            ..CommitOptions::default()
         }
     }
 }
@@ -724,7 +687,7 @@ impl<R: Runtime> Transaction<R> {
         };
         // Detached: it ends with the request.
         drop(self.rt().spawn(async move {
-            let result = reader.get_read_version_with(options).await;
+            let fetched = reader.get_read_version_and_metadata(options).await;
             guard.done = true;
             let Some(inner) = guard.inner.upgrade() else {
                 return;
@@ -733,6 +696,14 @@ impl<R: Runtime> Transaction<R> {
             if state.epoch != epoch {
                 return;
             }
+            let result = match fetched {
+                Ok((version, metadata)) => {
+                    // `metadataVersion.send(rep.metadataVersion)`.
+                    state.metadata = Some(metadata);
+                    Ok(version)
+                }
+                Err(e) => Err(e),
+            };
             let next = match &result {
                 Ok(v) => ReadVersion::Set(*v),
                 Err(e) => ReadVersion::Failed(e.clone()),
@@ -796,7 +767,7 @@ impl<R: Runtime> Transaction<R> {
     }
 
     async fn get_with(&self, key: &[u8], snapshot: bool) -> Result<Option<Vec<u8>>, Error> {
-        let (too_long, use_provisional_proxies, epoch) = {
+        let (too_long, use_provisional_proxies, epoch, _guard) = {
             let mut state = self.state();
             self.check_handle(&state)?;
             // `fdb_c` reports the deferred error first.
@@ -805,21 +776,23 @@ impl<R: Runtime> Transaction<R> {
             }
             state.check_alive(self.rt().now())?;
             state.check_not_committing()?;
-            if key >= state.flags.max_read_key() {
+            // `\xff/metadataVersion` may be read without any system key option.
+            if key >= state.flags.max_read_key() && key != METADATA_VERSION_KEY {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
+            state.read_issued = true;
             if !snapshot {
                 let end = key_after(key);
                 // The key is below `\xff\xff`, so the range is not inverted.
                 state.buffer.add_read_conflict_range(key, &end)?;
             }
             let limits = *state.buffer.limits();
-            // Its range is in already: the commit need not wait for it (see the module
-            // documentation), so it is not counted in `reading`.
+            let guard = (!snapshot).then(|| self.start_read(&mut state));
             (
                 key.len() > limits.max_range_key_size(key),
                 state.flags.use_provisional_proxies,
                 state.epoch,
+                guard,
             )
         };
         if too_long {
@@ -828,6 +801,9 @@ impl<R: Runtime> Transaction<R> {
         }
         self.guarded(epoch, async {
             let version = self.read_version(false).await?;
+            if key == METADATA_VERSION_KEY {
+                return self.metadata_version(version, epoch).await;
+            }
             self.inner
                 .db
                 .inner
@@ -836,6 +812,24 @@ impl<R: Runtime> Transaction<R> {
                 .await
         })
         .await?
+    }
+
+    /// `Transaction::get` of `\xff/metadataVersion` (NativeAPI 7.4:5860-5897, 8.0:3647-3677):
+    /// the value the GRV proxy reported with this transaction's read version, if it asked for
+    /// one; else what the database remembers of the read version
+    /// ([`Reader::metadata_version`](crate::read::Reader::metadata_version)), which reads the
+    /// key from a storage server if it does not know.
+    async fn metadata_version(&self, version: i64, epoch: u64) -> Result<Option<Vec<u8>>, Error> {
+        {
+            let state = self.state();
+            if state.epoch != epoch {
+                return Err(Error::new(TRANSACTION_CANCELLED));
+            }
+            if let Some(metadata) = &state.metadata {
+                return Ok(metadata.clone());
+            }
+        }
+        self.inner.db.inner.reader.metadata_version(version).await
     }
 
     /// `getKey(selector)`: the key `selector` resolves to at the transaction's read version
@@ -878,6 +872,7 @@ impl<R: Runtime> Transaction<R> {
             if selector.key.as_slice() > max_read_key {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
+            state.read_issued = true;
             (
                 selector,
                 max_read_key,
@@ -1008,15 +1003,30 @@ impl<R: Runtime> Transaction<R> {
         Ok(())
     }
 
-    /// A write: `f` on the state (its buffer), unless the transaction is committing
-    /// (`used_during_commit`) or dead, or the handle is stale; its error is deferred. On
-    /// success, the state (still locked) and what `f` returned: the write's watches are
-    /// triggered then (`triggerWatches` comes after the write's checks).
+    /// A mutation (`set`, `clear`, `clear_range` or `atomic_op`): `f` on the state (its
+    /// buffer), unless the transaction is committing (`used_during_commit`) or dead, or the
+    /// handle is stale; its error is deferred. On success, the state (still locked) and what
+    /// `f` returned: the write's watches are triggered then (`triggerWatches` comes after the
+    /// write's checks).
+    ///
+    /// The `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option is used up first thing, as the
+    /// read-your-writes layer's `getAndResetWriteConflictDisabled` does (whatever the write
+    /// does next): `f` adds no write conflict range then.
     fn write_then<T>(
         &self,
         f: impl FnOnce(&mut State) -> Result<T, Error>,
     ) -> Option<(MutexGuard<'_, State>, T)> {
+        self.write_inner(true, f)
+    }
+
+    fn write_inner<T>(
+        &self,
+        mutation: bool,
+        f: impl FnOnce(&mut State) -> Result<T, Error>,
+    ) -> Option<(MutexGuard<'_, State>, T)> {
         let mut state = self.state();
+        let skip_conflict =
+            mutation && std::mem::take(&mut state.flags.next_write_no_write_conflict_range);
         if self.is_stale(&state) {
             state.defer(Self::stale());
             return None;
@@ -1028,7 +1038,10 @@ impl<R: Runtime> Transaction<R> {
             state.defer(e);
             return None;
         }
-        match f(&mut state) {
+        state.buffer.set_skip_write_conflict(skip_conflict);
+        let result = f(&mut state);
+        state.buffer.set_skip_write_conflict(false);
+        match result {
             Ok(t) => Some((state, t)),
             Err(e) => {
                 state.defer(e);
@@ -1037,9 +1050,10 @@ impl<R: Runtime> Transaction<R> {
         }
     }
 
-    /// [`write_then`](Self::write_then) for a write that triggers no watch.
+    /// [`write_inner`](Self::write_inner) for a conflict range: no watch, and the option
+    /// that skips the next write's conflict range is not used up.
     fn write(&self, f: impl FnOnce(&mut State) -> Result<(), Error>) {
-        drop(self.write_then(f));
+        drop(self.write_inner(false, f));
     }
 
     /// `set(key, value)`: writes `value` to `key` when the transaction commits. Errors are
@@ -1252,6 +1266,9 @@ impl<R: Runtime> Transaction<R> {
         {
             let mut state = self.state();
             if let Some(e) = state.deferred.clone() {
+                // C++ leaves the `getVersionstamp` futures pending until the reset; they
+                // get the deferred error here, as the commit never will.
+                state.resolve_versionstamp(Err(e.clone()));
                 return Err(e);
             }
             state.check_not_committing()?;
@@ -1283,6 +1300,15 @@ impl<R: Runtime> Transaction<R> {
             let _ = ended.await;
         };
         let outcome = self.send_commit(buffer, options, sent).await;
+        // `tryCommit` (NativeAPI 7.4:6990-6996, 8.0:4672): the database remembers the
+        // metadata version at the commit version, whatever became of the transaction.
+        if let Some(id) = outcome.as_ref().ok().and_then(CommitOutcome::commit_id) {
+            self.inner
+                .db
+                .inner
+                .reader
+                .note_committed_version(id.version, id.metadata_version.clone());
+        }
         let (result, current) = {
             let mut state = self.state();
             let current = state.epoch == epoch;
@@ -1364,47 +1390,84 @@ impl<R: Runtime> Transaction<R> {
     /// registered by this call and resolves when the commit does, so it may be awaited
     /// during, after or instead of the commit's own result.
     ///
+    /// The future's result:
+    ///
     /// * The stamp when the commit succeeds (the same as [`versionstamp`](Self::versionstamp)).
     /// * `no_commit_version` (2021) if the commit has nothing to write (a read-only
     ///   transaction).
-    /// * `transaction_invalid_version` (2020) if the commit fails.
+    /// * `transaction_invalid_version` (2020) if the request was sent and the commit
+    ///   **failed**: a conflict (`not_committed`), `commit_unknown_result`, or any other error
+    ///   of the commit proxy or of reaching it (C++'s `commit` catches them all).
+    /// * The **deferred error** of a write (`key_too_large`, ...) if the commit refuses to
+    ///   start because of it (C++ leaves the future pending until the reset, as the commit
+    ///   fails before it reaches the versionstamp's promise; here it is told). A call made
+    ///   when a deferred error is already there returns it at once.
+    /// * `used_during_commit` (2017) for a second commit (or any use of the transaction)
+    ///   once a commit started: it kills the transaction, so every future that waits
+    ///   gets that error, not 2020; a call made while the commit is in progress is
+    ///   `used_during_commit` too.
     /// * `transaction_cancelled` (1025) if the transaction is reset (or `on_error` retries
-    ///   it) first, and the error of [`cancel`](Self::cancel), of a timeout or of
-    ///   `used_during_commit` if one of them kills it first.
+    ///   it) first, or [`cancel`](Self::cancel)led; `transaction_timed_out` (1031) **when the
+    ///   timeout passes** (the future does not wait for an operation to notice it, as C++'s
+    ///   `resetPromise` does); the error that killed the transaction otherwise. A commit that
+    ///   was sent may still have committed in all these cases (the stamp is then lost).
     ///
     /// Unlike C++ (where a call after the commit started is `used_during_commit`), a call
     /// after the commit **succeeded** returns the stamp at once, and does not disturb the
-    /// transaction; a call while the commit is in progress is `used_during_commit`.
+    /// transaction.
     pub fn get_versionstamp(
         &self,
     ) -> impl Future<Output = Result<[u8; 10], Error>> + Send + 'static {
-        enum Pending {
+        enum Pending<R: Runtime> {
             Done(Result<[u8; 10], Error>),
-            Wait(oneshot::Receiver<Result<[u8; 10], Error>>),
+            Wait {
+                rx: oneshot::Receiver<Result<[u8; 10], Error>>,
+                inner: Weak<Inner<R>>,
+                rt: R,
+                epoch: u64,
+            },
         }
         let pending = {
             let mut state = self.state();
-            if let Err(e) = self.check_handle(&state) {
-                Pending::Done(Err(e))
+            let ready = if let Err(e) = self.check_handle(&state) {
+                Some(Err(e))
             } else if let CommitStage::Committed(result) = &state.commit {
-                Pending::Done(result.versionstamp().ok_or(Error::new(NO_COMMIT_VERSION)))
-            } else if let Some(e) = state.dead.clone() {
-                Pending::Done(Err(e))
-            } else if let Err(e) = state.check_not_committing() {
-                Pending::Done(Err(e))
+                Some(result.versionstamp().ok_or(Error::new(NO_COMMIT_VERSION)))
+            } else if let Some(e) = state.deferred.clone() {
+                Some(Err(e))
+            } else if let Err(e) = state
+                .check_alive(self.rt().now())
+                .and_then(|()| state.check_not_committing())
+            {
+                Some(Err(e))
             } else {
-                let (tx, rx) = oneshot::channel();
-                state.versionstamp_waiters.push(tx);
-                Pending::Wait(rx)
+                None
+            };
+            match ready {
+                Some(result) => Pending::Done(result),
+                None => {
+                    let (tx, rx) = oneshot::channel();
+                    // Waiters whose future was dropped are not kept.
+                    state.versionstamp_waiters.retain(|w| !w.is_canceled());
+                    state.versionstamp_waiters.push(tx);
+                    Pending::Wait {
+                        rx,
+                        inner: Arc::downgrade(&self.inner),
+                        rt: self.rt().clone(),
+                        epoch: state.epoch,
+                    }
+                }
             }
         };
         async move {
             match pending {
                 Pending::Done(result) => result,
-                // The transaction was dropped or reset without an answer.
-                Pending::Wait(rx) => rx
-                    .await
-                    .unwrap_or_else(|oneshot::Canceled| Err(Error::new(TRANSACTION_CANCELLED))),
+                Pending::Wait {
+                    rx,
+                    inner,
+                    rt,
+                    epoch,
+                } => wait_versionstamp(rx, inner, rt, epoch).await,
             }
         }
     }
@@ -1476,61 +1539,21 @@ impl<R: Runtime> Transaction<R> {
         .await?
     }
 
-    /// `setOption(option)`. `invalid_option_value` (2006) for a value out of range (the
-    /// option is then unchanged). See [`TransactionOption`] for which options survive
+    /// `setOption(option)`: validates the option (`invalid_option_value`, 2006, for a value out
+    /// of range, `client_invalid_operation` (2000) for one that is not valid now, `invalid_option`
+    /// (2007) for one this client does not support; the transaction is unchanged then) and
+    /// applies it. See [`TransactionOption`] for what each option does and which survive
     /// [`on_error`](Self::on_error).
     pub fn set_option(&self, option: TransactionOption) -> Result<(), Error> {
-        let invalid = |what: &'static str| Error::with_message(INVALID_OPTION_VALUE, what);
-        let millis = |d: Duration, what| {
-            let ms = d.as_millis();
-            if ms > MAX_MILLIS {
-                Err(invalid(what))
-            } else {
-                Ok(Duration::from_millis(ms as u64))
-            }
-        };
         let mut state = self.state();
         self.check_handle(&state)?;
-        match option {
-            TransactionOption::Timeout(d) => {
-                let d = millis(d, "the timeout is at most i32::MAX milliseconds")?;
-                state.persistent.timeout = (!d.is_zero()).then_some(d);
-                // `resetTimeout`: the operations in progress see the new deadline (and fail
-                // at once if it has passed).
-                if state.check_alive(self.rt().now()).is_ok() {
-                    state.interrupt(|| Interrupt::Deadline);
-                }
+        state.apply_option(&option)?;
+        if let TransactionOption::Timeout(_) = option {
+            // `resetTimeout`: the operations in progress see the new deadline (and fail at
+            // once if it has passed).
+            if state.check_alive(self.rt().now()).is_ok() {
+                state.interrupt(|| Interrupt::Deadline);
             }
-            TransactionOption::RetryLimit(n) => {
-                if n < -1 {
-                    return Err(invalid("the retry limit is -1 or more"));
-                }
-                state.persistent.retry_limit = u32::try_from(n).ok();
-            }
-            TransactionOption::MaxRetryDelay(d) => {
-                state.persistent.max_retry_delay =
-                    millis(d, "the max retry delay is at most i32::MAX milliseconds")?;
-            }
-            TransactionOption::SizeLimit(n) => {
-                let limit = state.buffer.limits().transaction_size_limit;
-                if u64::from(n) < 32 || u64::from(n) > limit {
-                    return Err(invalid(
-                        "the size limit must be from 32 to TRANSACTION_SIZE_LIMIT",
-                    ));
-                }
-                state.flags.size_limit = u64::from(n);
-            }
-            TransactionOption::CausalWriteRisky => state.flags.causal_write_risky = true,
-            TransactionOption::CausalReadRisky => state.flags.causal_read_risky = true,
-            TransactionOption::LockAware => state.flags.lock_aware = true,
-            TransactionOption::UseProvisionalProxies => {
-                state.flags.use_provisional_proxies = true;
-            }
-            TransactionOption::ReportConflictingKeys => {
-                state.flags.report_conflicting_keys = true;
-            }
-            TransactionOption::AccessSystemKeys => state.flags.access_system_keys = true,
-            TransactionOption::ReadSystemKeys => state.flags.read_system_keys = true,
         }
         Ok(())
     }
@@ -1566,6 +1589,55 @@ impl<R: Runtime> Transaction<R> {
     /// created or [reset](Self::reset).
     pub fn retries(&self) -> u32 {
         self.state().retries
+    }
+}
+
+/// What [`Transaction::get_versionstamp`] awaits: the answer the commit (or whatever kills
+/// the transaction) sends, raced against the transaction's timeout, which kills it when it
+/// passes. (`waitOrError(tr.getVersionstamp(), resetPromise.getFuture())` with the
+/// `timebomb` that sets the promise.) The future holds the transaction weakly: if the
+/// transaction is dropped, the answer is `transaction_cancelled`.
+async fn wait_versionstamp<R: Runtime>(
+    mut rx: oneshot::Receiver<Result<[u8; 10], Error>>,
+    inner: Weak<Inner<R>>,
+    rt: R,
+    epoch: u64,
+) -> Result<[u8; 10], Error> {
+    let cancelled = || Err(Error::new(TRANSACTION_CANCELLED));
+    loop {
+        // `None`: the transaction is gone or was reset; the answer is in `rx`.
+        let registered = inner.upgrade().and_then(|inner| {
+            let mut state = lock(&inner.state);
+            if state.epoch != epoch {
+                return None;
+            }
+            let (tx, interrupted) = oneshot::channel();
+            state.interrupts.retain(|s| !s.is_canceled());
+            state.interrupts.push(tx);
+            Some((interrupted, state.deadline()))
+        });
+        let Some((interrupted, deadline)) = registered else {
+            return rx.await.unwrap_or_else(|oneshot::Canceled| cancelled());
+        };
+        let timeout = async {
+            match deadline {
+                Some(deadline) => rt.sleep_until(deadline).await,
+                None => never().await,
+            }
+        };
+        match race(&mut rx, race(interrupted, timeout)).await {
+            Either::Left(result) => return result.unwrap_or_else(|oneshot::Canceled| cancelled()),
+            // A change of the timeout, or its end: the transaction dies (and answers us) if
+            // the deadline has passed.
+            Either::Right(_) => {
+                if let Some(inner) = inner.upgrade() {
+                    let mut state = lock(&inner.state);
+                    if state.epoch == epoch {
+                        let _ = state.check_alive(rt.now());
+                    }
+                }
+            }
+        }
     }
 }
 

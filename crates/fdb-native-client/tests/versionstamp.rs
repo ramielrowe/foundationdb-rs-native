@@ -183,6 +183,15 @@ async fn a_versionstamped_key_alone_is_sent_and_a_read_only_transaction_has_no_c
     let call = env.commit.next().await;
     let (commit, _) = call.commit();
     assert_eq!(commit.mutations.len(), 1);
+    // No write conflict range for the key (it is not known yet): the only one is the
+    // self-conflicting key a blind write gets, which is also a read conflict range.
+    assert_eq!(commit.write_conflict_ranges.len(), 1);
+    assert!(
+        commit.write_conflict_ranges[0]
+            .begin
+            .starts_with(b"\xff/SC/")
+    );
+    assert_eq!(commit.read_conflict_ranges, commit.write_conflict_ranges);
     call.reply_commit(committed(9, 0));
     done(handle).await.unwrap();
     assert_eq!(tx.versionstamp(), Some([0, 0, 0, 0, 0, 0, 0, 9, 0, 0]));
@@ -273,4 +282,162 @@ async fn asking_while_the_commit_is_in_progress_is_used_during_commit() {
     );
     call.reply_commit(committed(9, 0));
     let _ = done(handle).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deferred_error_answers_the_waiting_futures_and_later_calls() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    let early = spawn(tx.get_versionstamp());
+    tx.set_versionstamped_key(&with_stamp(b"k", b""), b"v");
+    tx.set(&[b'k'; 10_001], b"v");
+    // C++ would leave the future pending until the reset; here the commit that refuses to
+    // start answers it with the error that stops it.
+    assert_eq!(tx.commit().await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    assert_eq!(done(early).await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    // And a call made now gets the deferred error at once (it would never be answered).
+    assert_eq!(
+        tx.get_versionstamp().await.unwrap_err().code(),
+        codes::KEY_TOO_LARGE
+    );
+    // A reset clears it all: the next future waits.
+    tx.reset();
+    let waiting = tx.get_versionstamp();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .is_err()
+    );
+    assert!(env.commit.try_next().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_commit_fails_the_futures_with_used_during_commit_not_2020() {
+    let mut env = env(SchemaVersion::V8_0).await;
+    let tx = env.db.create_transaction();
+    tx.set_read_version(5);
+    tx.set_versionstamped_key(&with_stamp(b"k", b""), b"");
+    let early = spawn(tx.get_versionstamp());
+    let first = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let call = env.commit.next().await;
+    let e = tx.commit().await.unwrap_err();
+    assert_eq!(e.code(), codes::USED_DURING_COMMIT);
+    assert!(e.is_maybe_committed());
+    assert_eq!(
+        done(early).await.unwrap_err().code(),
+        codes::USED_DURING_COMMIT
+    );
+    call.reply_commit(committed(9, 0));
+    // The first commit was poisoned too (C++'s `resetPromise`).
+    assert_eq!(
+        done(first).await.unwrap_err().code(),
+        codes::USED_DURING_COMMIT
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_timeout_and_a_cancellation_end_the_future_without_another_operation() {
+    use fdb_native_client::TransactionOption::Timeout;
+    let mut env = env(SchemaVersion::V7_4).await;
+    // The timeout passes while nothing else happens on the transaction.
+    let tx = env.db.create_transaction();
+    tx.set_option(Timeout(Duration::from_secs(5))).unwrap();
+    let stamp = spawn(tx.get_versionstamp());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stamp.is_finished());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        done(stamp).await.unwrap_err().code(),
+        codes::TRANSACTION_TIMED_OUT
+    );
+    // The transaction died with it.
+    assert_eq!(
+        tx.get_read_version().await.unwrap_err().code(),
+        codes::TRANSACTION_TIMED_OUT
+    );
+
+    // A timeout set after the call is the one that counts, also if shorter.
+    let tx = env.db.create_transaction();
+    tx.set_option(Timeout(Duration::from_secs(100))).unwrap();
+    let stamp = spawn(tx.get_versionstamp());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tx.set_option(Timeout(Duration::from_secs(3))).unwrap();
+    assert!(!stamp.is_finished());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        done(stamp).await.unwrap_err().code(),
+        codes::TRANSACTION_TIMED_OUT
+    );
+
+    // The timeout during a commit that was sent: the commit and the future both fail, and the
+    // commit may have committed.
+    let tx = env.db.create_transaction();
+    tx.set_option(Timeout(Duration::from_secs(5))).unwrap();
+    tx.set_read_version(5);
+    tx.set_versionstamped_key(&with_stamp(b"k", b""), b"");
+    let stamp = spawn(tx.get_versionstamp());
+    let handle = spawn({
+        let tx = tx.clone();
+        async move { tx.commit().await }
+    });
+    let _unanswered = env.commit.next().await;
+    let e = done(handle).await.unwrap_err();
+    assert_eq!(e.code(), codes::TRANSACTION_TIMED_OUT);
+    assert!(e.is_maybe_committed());
+    assert_eq!(
+        done(stamp).await.unwrap_err().code(),
+        codes::TRANSACTION_TIMED_OUT
+    );
+
+    // A cancellation.
+    let tx = env.db.create_transaction();
+    let stamp = spawn(tx.get_versionstamp());
+    tx.cancel();
+    assert_eq!(
+        done(stamp).await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+    // A future dropped before the answer is not kept; another one still gets its answer.
+    let tx = env.db.create_transaction();
+    drop(tx.get_versionstamp());
+    let stamp = spawn(tx.get_versionstamp());
+    tx.reset();
+    assert_eq!(
+        done(stamp).await.unwrap_err().code(),
+        codes::TRANSACTION_CANCELLED
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_commit_result_is_transaction_invalid_version_for_the_future() {
+    for schema in SCHEMAS {
+        let mut env = env(schema).await;
+        let tx = env.db.create_transaction();
+        // No dummy transaction to settle the result.
+        tx.set_option(fdb_native_client::TransactionOption::CausalWriteRisky)
+            .unwrap();
+        tx.set_read_version(5);
+        tx.set_versionstamped_key(&with_stamp(b"k", b""), b"");
+        let stamp = spawn(tx.get_versionstamp());
+        let handle = spawn({
+            let tx = tx.clone();
+            async move { tx.commit().await }
+        });
+        env.commit
+            .next()
+            .await
+            .reply_commit(Err(codes::COMMIT_UNKNOWN_RESULT));
+        let e = done(handle).await.unwrap_err();
+        assert_eq!(e.code(), codes::COMMIT_UNKNOWN_RESULT, "{schema:?}");
+        assert!(e.is_maybe_committed());
+        assert_eq!(
+            done(stamp).await.unwrap_err().code(),
+            codes::TRANSACTION_INVALID_VERSION,
+            "{schema:?}"
+        );
+        assert_eq!(tx.versionstamp(), None);
+    }
 }

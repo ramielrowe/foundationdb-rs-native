@@ -110,7 +110,7 @@ pub use cluster_file::{
     ConnectionStringError, Coordinator, ResolvedCoordinator,
 };
 
-pub use database::{ClientTls, Database, DatabaseOptions, MaybeCommitted};
+pub use database::{ClientTls, Database, DatabaseOption, DatabaseOptions, MaybeCommitted};
 pub use error::{Error, TransactionRetry};
 pub use fdb_native_schema::domain::{KeySelector, MutationType};
 pub use fdb_native_wire::KeyValue;

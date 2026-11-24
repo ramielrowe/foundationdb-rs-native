@@ -51,7 +51,7 @@
 //!   and adds the range as write conflict range; an atomic operation adds the key's
 //!   conflict range unless it is `SetVersionstampedKey`, and `Min`/`And` become
 //!   `MinV2`/`AndV2` (`apiVersionAtLeast(510)`). The atomic operations are checked as
-//!   `ReadYourWritesTransaction::atomicOp` (7.4:2211, 8.0:2127) checks them: a type that is
+//!   `ReadYourWritesTransaction::atomicOp` (7.4:2219, 8.0:2135) checks them: a type that is
 //!   not an atomic operation is `invalid_mutation_type` (2018).
 //! * **Versionstamped operations** (see [`with_versionstamp_offset`]): the last 4 bytes of a
 //!   `SetVersionstampedKey`'s key or a `SetVersionstampedValue`'s value are the
@@ -151,8 +151,7 @@
 //!   does that. The committer fetches one itself only for the dummy transaction.
 //! * **Not ported yet**: idempotency ids (they need the idempotency-record read path),
 //!   the `\xff/metadataVersion` special case of `atomicOp`, transaction tags and commit cost estimation, tenants,
-//!   `checkWrites`, debug ids and span contexts, the metadata-version cache and
-//!   `expireIdempotencyId`. The key legality checks (`key_outside_legal_range`, access to
+//!   `checkWrites`, debug ids and span contexts and `expireIdempotencyId`. The key legality checks (`key_outside_legal_range`, access to
 //!   `\xff` keys) are [`Transaction`](crate::Transaction)'s; the read-your-writes layer's
 //!   `extraConflictRanges` comes with it.
 
