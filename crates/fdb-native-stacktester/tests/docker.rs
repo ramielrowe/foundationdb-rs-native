@@ -256,6 +256,17 @@ async fn docker_stacktester_runs_a_script() {
         s.op("GET_RANGE_SELECTOR_SNAPSHOT"),
         b(&pack(vec![b(&foo1), b(b"bar")])),
     );
+    // Storage metrics: BEGIN, END (and CHUNK_SIZE).
+    s.bytes(&ws_end);
+    s.bytes(&ws);
+    expect(
+        s.op("GET_ESTIMATED_RANGE_SIZE"),
+        b(b"GOT_ESTIMATED_RANGE_SIZE"),
+    );
+    s.int(10_000_000);
+    s.bytes(&ws_end);
+    s.bytes(&ws);
+    expect(s.op("GET_RANGE_SPLIT_POINTS"), b(b"GOT_RANGE_SPLIT_POINTS"));
     // Exact mode without a limit.
     s.int(0);
     s.int(0);

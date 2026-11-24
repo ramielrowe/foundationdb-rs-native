@@ -38,7 +38,6 @@ use tokio::task::JoinHandle;
 
 use crate::Fatal;
 use crate::stack::{self, Stack};
-use crate::storage_metrics;
 use crate::unit_tests;
 use crate::values::{self, RESULT_NOT_PRESENT, bytes, error_value, into_bytes};
 
@@ -619,7 +618,7 @@ impl StackMachine {
                 let begin = self.pop_bytes().await?;
                 let end = self.pop_bytes().await?;
                 let tx = self.read_transaction(variant)?;
-                storage_metrics::estimated_range_size_bytes(&tx, &begin, &end).await?;
+                tx.get_estimated_range_size_bytes(&begin, &end).await?;
                 self.push(index, bytes(b"GOT_ESTIMATED_RANGE_SIZE"));
             }
             "GET_RANGE_SPLIT_POINTS" => {
@@ -627,11 +626,12 @@ impl StackMachine {
                 let end = self.pop_bytes().await?;
                 let chunk_size = self.pop_i64().await?;
                 if chunk_size <= 0 {
-                    // The Python binding raises a plain exception.
+                    // The Python binding raises a plain exception (not an FDB error) before
+                    // calling `fdb_c`; the client would fail with `client_invalid_operation`.
                     return Err(Fatal::new(format!("invalid chunk size {chunk_size}")).into());
                 }
                 let tx = self.read_transaction(variant)?;
-                storage_metrics::range_split_points(&tx, &begin, &end, chunk_size).await?;
+                tx.get_range_split_points(&begin, &end, chunk_size).await?;
                 self.push(index, bytes(b"GOT_RANGE_SPLIT_POINTS"));
             }
 

@@ -15,14 +15,11 @@
 //! behaviour, that of the latest API version.
 //!
 //! Not supported: the directory layer (`DIRECTORY_*`) and tenants (run the bindingtester
-//! with tenants off, as it does by default for a tester it does not know). The storage
-//! metrics instructions (`GET_ESTIMATED_RANGE_SIZE`, `GET_RANGE_SPLIT_POINTS`) are stubs
-//! until the client has the calls (see `storage_metrics`). `UNIT_TESTS` runs the parts of
-//! the Python binding's unit tests that the client can do.
+//! with tenants off, as it does by default for a tester it does not know). `UNIT_TESTS`
+//! runs the parts of the Python binding's unit tests that the client can do.
 
 mod machine;
 mod stack;
-mod storage_metrics;
 mod unit_tests;
 mod values;
 

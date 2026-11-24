@@ -5,10 +5,11 @@
 //!
 //! Left out: case (10) of `test_timeouts` (see there), the database options
 //! `LOCATION_CACHE_SIZE`, `DATACENTER_ID` and `MACHINE_ID` (not in the client yet, beads
-//! `blr.3`), `test_locality` (`get_addresses_for_key` and the
-//! shard boundaries), `test_get_client_status`, the tenant tests, the Python-specific tests
-//! of `@fdb.transactional`, and release-8.0's `test_range_split_points` (storage metrics,
-//! `blr.2`) and `test_value_truthiness` (a Python `Value`'s truth value).
+//! `blr.3`), `test_locality` (`get_addresses_for_key` and the shard boundaries),
+//! `test_get_client_status`, the tenant tests, the Python-specific tests of
+//! `@fdb.transactional`, and release-8.0's `test_range_split_points` (it passes a split
+//! point limit, which the client's `get_range_split_points` does not take) and
+//! `test_value_truthiness` (a Python `Value`'s truth value).
 
 use std::future::Future;
 use std::time::Duration;
