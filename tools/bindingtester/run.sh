@@ -273,10 +273,17 @@ start_server() {
   SERVER="$id"
   ip="$(docker inspect -f '{{(index .NetworkSettings.Networks "bridge").IPAddress}}' "$id")"
   [[ -n "$ip" ]] || die "server container has no bridge IP"
-  cf="$(docker exec "$id" cat /var/fdb/fdb.cluster)"
+  # The image's entrypoint writes the cluster file a moment after the container starts.
+  local i
+  cf=""
+  for ((i = 0; i < 60; i++)); do
+    cf="$(docker exec "$id" cat /var/fdb/fdb.cluster 2>/dev/null || true)"
+    [[ -z "$cf" ]] || break
+    [[ "$(docker inspect -f '{{.State.Running}}' "$id")" == true ]] || die "server container exited during startup"
+    sleep 0.5
+  done
   [[ "$cf" == "docker:docker@$ip:4500" ]] || die "unexpected cluster file '$cf' (expected docker:docker@$ip:4500)"
 
-  local i
   for ((i = 0; i < 60; i++)); do
     if docker exec "$id" fdbcli --timeout 5 --exec "$FDB_CONFIGURE" >/dev/null 2>&1; then break; fi
     [[ "$(docker inspect -f '{{.State.Running}}' "$id")" == true ]] || {
