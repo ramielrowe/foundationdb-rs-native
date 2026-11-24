@@ -132,6 +132,11 @@ about 2^-65 per random integer and is not changed. The two values themselves are
 tests of `fdb-native-tuple`. `--int-edge keep` removes the rewrite, and then the `tuple` suite fails
 with those 2 results; use it to confirm a failure is only this difference.
 
+## Conformance results
+
+`CONFORMANCE.md` records the seeds run on both versions, the pass rates, the divergences found
+(with their root causes and fixes) and the known exceptions.
+
 ## Debugging a failing seed
 
 Rerun the seed with `--keep-logs -s <suite> --seed-list S`. `--bt-arg ARG` (repeatable) appends

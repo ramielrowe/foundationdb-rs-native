@@ -185,7 +185,8 @@ so never aim it at a shared cluster. Logs and `summary.tsv` per seed go to
 `+-(2^64-1)` with `1d`/`0b` where we use `1c`/`0c`; by default the harness rewrites those two
 values in the `tuple` test (`--int-edge keep` shows the 2 resulting differences). On 7.4 the
 cluster is configured with `tenant_mode=optional_experimental` (the 7.4 bindingtester clears the
-tenant map). Details: `tools/bindingtester/README.md`.
+tenant map). Details: `tools/bindingtester/README.md`; seeds run, pass rates and the divergences
+fixed so far: `tools/bindingtester/CONFORMANCE.md` (failures tend to need 2000+ ops: `-n 2000`).
 
 ## Architecture Overview
 
