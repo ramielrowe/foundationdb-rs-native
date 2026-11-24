@@ -24,8 +24,9 @@ absolute capabilities of either client; treat differences under about 20% as noi
   concurrency (p50 1.11 ms): the GRV batcher's `sleep(batch_time)` on tokio rounded a
   sub-millisecond delay up to the timer tick, about 1.05 ms, so every transaction waited a
   millisecond for its read version. The batcher now waits out such a delay on the clock, which
-  keeps C++'s batching (60 transactions per GRV request at 256) at a CPU cost at concurrency 1
-  (47 vs 30 us per transaction; bead `foundationdb-rs-native-yw5`).
+  keeps C++'s batching (60 transactions per GRV request at 256); that cost CPU at concurrency
+  1 (47 vs 30 us per transaction), until a lone request stopped waiting for company that
+  cannot come (yw5: 18 us per transaction, [below](#waiting-less-yw5)).
 * **Once the read version is paid for, reads are on par or faster.** 100 gets in one
   transaction: p50 28 us vs 38 us per get at concurrency 1, and 386k vs 272k gets/s at
   concurrency 256 (native spreads the work over the tokio worker threads; libfdb_c's single
@@ -56,7 +57,7 @@ absolute capabilities of either client; treat differences under about 20% as noi
   transaction that had not written, SipHash. Native uses several cores where libfdb_c is
   capped at about one network thread, so it wins on throughput at equal application threads
   (429k vs 178k gets/s at 256 after e82). At concurrency 1 the GRV batcher's clock wait
-  dominates (bead `foundationdb-rs-native-yw5`).
+  dominated (bead `foundationdb-rs-native-yw5`, fixed: [below](#waiting-less-yw5)).
   [Details](#range-scans-and-cpu-per-operation-s1t-e82).
 
 ## What is compared
@@ -328,7 +329,8 @@ and 5 times (at 256) the GRV requests a C++ client would for the same transactio
 the rule that this client sends no more requests than C++ ([well-behaved
 client](well-behaved-client.md)). Waiting on the clock keeps C++'s batching and its throughput
 at 256 is as good; its cost is the polling while a batch waits, which at concurrency 1 (where
-nothing can join) is about 25 us of CPU per transaction (bead `foundationdb-rs-native-yw5`).
+nothing can join) is about 25 us of CPU per transaction (bead `foundationdb-rs-native-yw5`,
+fixed: [below](#waiting-less-yw5)).
 
 The same audit of the other sleeps: the commit, location and load-balancer backoffs, the
 `wrong_shard_server` and `future_version` delays, watch polling and the transport's timeouts
@@ -370,6 +372,49 @@ polling, above); at 256 it is within noise.
 The older `native+fix` column in the main table (suite `single-4t-grvfix`) is the
 send-after-one-yield experiment, built from a scratch copy before the fix and run at another
 time; it is kept for reference.
+
+## Waiting less (yw5)
+
+**yw5: the batch wait that nothing can join.** 8jn's `BatchDelay` polls the clock for
+`batchTime` (tens of microseconds on a LAN) so that requests arriving meanwhile join the
+batch. A serial client (one transaction at a time) has nothing to join it: its next request
+comes after the reply to this one. The polling cost 25 us or more of CPU per transaction there.
+Now the batcher counts batches in a row of one request; after two (`LONE_BATCHES_BEFORE_NO_WAIT`),
+a request that arrives with no read version request in flight is sent after the usual single
+yield instead of after `batchTime`. A batch of more than one request, or a request that finds
+another batch in flight (a second transaction is running), ends the lone run and `batchTime`
+applies again, so the batch sizes under load are those of 8jn. C++ always waits `batchTime`,
+but in its reactor, not by polling; skipping the wait when the last batches gathered nothing
+and nothing is outstanding is the one deviation. Its cost is bounded: requests that would have
+joined a lone request wait for the next batch instead, which restores the wait. Ideas not
+taken: a helper-thread timer for the batch wait (its wake-up is 50 to 60 us late, more than
+`batchTime` itself, and a cross-thread wake costs about what the polling did), and a smarter
+spin (the yields are what cost).
+
+Measured as in the 8jn table (single-process 7.4.10, 4 tokio threads, median of 3 runs,
+alternating builds on one cluster; "before" is main at `cdd8352`, "tx/GRV" is transactions
+per `GetReadVersionRequest`, from a counter in the batcher):
+
+| workload | conc | ops/s before / after | p50 before / after | CPU us/op before / after | tx/GRV before / after |
+|---|---:|---:|---:|---:|---:|
+| get, fresh tx | 1 | 15.2k / 19.3k | 64 us / 51 us | 41.5 / 18.3 | 1.0 / 1.0 |
+| get, fresh tx | 16 | 175k / 175k | 90 us / 90 us | 11.2 / 11.2 | 7.0 / 7.0 |
+| get, fresh tx | 256 | 427k / 420k | 583 us / 590 us | 7.6 / 7.7 | 61.1 / 61.1 |
+| set, 1 key commit | 1 | 285 / 295 | 3.38 ms / 3.36 ms | 92.1 / 58.0 | |
+| set, 1 key commit | 16 | 4620 / 4559 | 3.46 ms / 3.44 ms | 20.0 / 20.1 | 8.2 / 8.4 |
+| watch setup (5 reps) | 1 | 72 / 72 | 138 us / 116 us | 402.8 / 263.8 | |
+
+Concurrency 1 goes from 41.5 to 18.3 us of CPU per fresh-transaction get (libfdb_c: 29.5) and
+a quarter more throughput; at 16 and 256 the batches are unchanged (7.0 and 61.1 transactions
+per GRV request, against 5.9 and 60.0 in the 8jn run; the host differs) and so is everything
+else. Pinned by `a_lone_grv_does_not_poll_the_clock_while_it_waits` (13 clock reads per lone
+read version, 46 with the wait) next to 8jn's `a_lone_grv_does_not_wait_for_a_timer_tick` and
+`grv_requests_arriving_during_the_batch_time_join_the_batch`.
+
+The raw lines of the table are in
+[benchmarks-data/2026-11-24/yw5-iqy](benchmarks-data/2026-11-24/yw5-iqy) (one JSON line per
+cell and repetition: `build` is `base` (before) or `new` (after), `grv_tx` and `grv_batches`
+the batcher's counters).
 
 ## Range scans and CPU per operation (s1t, e82)
 
@@ -532,7 +577,7 @@ python3 -I tools/bench/perf_callers.py get.data memcmp   # who calls a leaf (fir
 | bead | priority | what |
 |---|---|---|
 | `foundationdb-rs-native-8jn` | P2 | GRV batcher sleep rounds up to 1 ms on tokio: every transaction pays about 1 ms before its first read (fixed, [above](#the-grv-batcher-fix-8jn)) |
-| `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency |
+| `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency (fixed: 18 us per get at 1, [above](#waiting-less-yw5)) |
 | `foundationdb-rs-native-iqy` | P4 | Load balancer second-request delay (at least 0.5 ms) rounds up to the timer tick on tokio |
 | `foundationdb-rs-native-s1t` | P3 | Range scans 1.7 to 2.4 times slower than libfdb_c: per-row key/value allocations (fixed: 1.2 to 1.4, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
 | `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads (fixed: 1.15 to 1.6, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |

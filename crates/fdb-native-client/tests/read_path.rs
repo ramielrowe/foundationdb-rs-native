@@ -572,6 +572,29 @@ async fn a_lone_grv_does_not_wait_for_a_timer_tick() {
     );
 }
 
+/// A serial client leaves nothing to join a batch, so its batch is not waited out: the batcher
+/// stops re-polling the clock for `batchTime` once batches of one request follow each other
+/// with nothing in flight (bead `foundationdb-rs-native-yw5`: the polling cost about 25 us of
+/// CPU per transaction). Counted in clock reads: 13 per read version without the wait, 46 with
+/// it (the other readers of the clock make the 13).
+#[tokio::test]
+async fn a_lone_grv_does_not_poll_the_clock_while_it_waits() {
+    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 1).await;
+    let reader = cluster.reader();
+    // The connection, `batchTime` above zero, and enough lone batches to stop waiting.
+    for _ in 0..40 {
+        within("GRV", reader.get_read_version()).await.unwrap();
+    }
+    const N: u64 = 100;
+    let before = cluster.net.now_reads();
+    for _ in 0..N {
+        within("GRV", reader.get_read_version()).await.unwrap();
+    }
+    let per_grv = (cluster.net.now_reads() - before) / N;
+    eprintln!("clock reads per lone GRV: {per_grv}");
+    assert!(per_grv < 25, "{per_grv} clock reads per read version");
+}
+
 /// On tokio's real clock, with `batchTime` below tokio's timer resolution: requests that
 /// arrive while a batch waits still join it, as in C++ (the batcher waits out `batchTime` on
 /// the clock rather than sending after one yield). 200 requests arrive one every 20 us over

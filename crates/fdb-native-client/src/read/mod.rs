@@ -106,8 +106,11 @@
 //!   `batchTime` below the runtime's
 //!   [`TIMER_RESOLUTION`](fdb_native_transport::runtime::Runtime::TIMER_RESOLUTION) (tokio's
 //!   1 ms tick) is waited out by re-reading the clock between yields rather than on the
-//!   timer, as flow's precise `delay` would wait it. Every transaction of the batch gets the
-//!   same reply.
+//!   timer, as flow's precise `delay` would wait it. Where C++ would wait for nothing, so
+//!   does this client: after two batches in a row of one request, a request that arrives with
+//!   no batch in flight (a serial client) is sent after the usual yield instead of polling the
+//!   clock for company that cannot come; the next batch with company, or a request that finds
+//!   another batch in flight, waits again. Every transaction of the batch gets the same reply.
 //! * **The reply.** `extractReadVersion` (7.4:7763-7863): `database_locked` if the database
 //!   is locked and the transaction is not lock aware; the version otherwise.
 //!

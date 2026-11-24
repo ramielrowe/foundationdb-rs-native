@@ -44,6 +44,7 @@ pub struct Net {
     hosts: Mutex<HashMap<String, Vec<std::net::IpAddr>>>,
     connects: Mutex<HashMap<SocketAddr, usize>>,
     resolves: Mutex<Vec<String>>,
+    now_reads: AtomicU64,
 }
 
 impl Net {
@@ -54,6 +55,11 @@ impl Net {
     /// Makes `host` resolve to `ips` (any port).
     pub fn set_host(&self, host: &str, ips: Vec<std::net::IpAddr>) {
         self.hosts.lock().unwrap().insert(host.to_owned(), ips);
+    }
+
+    /// How many times a [`MemRuntime`] on this network was asked for the time.
+    pub fn now_reads(&self) -> u64 {
+        self.now_reads.load(Ordering::Relaxed)
     }
 
     /// How many times `addr` was dialed.
@@ -158,6 +164,7 @@ impl<R: Runtime> Runtime for MemRuntime<R> {
     }
 
     fn now(&self) -> Instant {
+        self.net.now_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.now()
     }
 
