@@ -31,14 +31,16 @@
 //! (74-91), `operator++` 91-99 (93-101), `operator--` 101-109 (103-111), `skip` 119-124
 //! (121-126), `skipContiguous(Back)` 126-138 (128-140), `updateCmp` 157-160 (159-162).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use fdb_native_wire::KeyValue;
+use fdb_native_wire::{KeyValue, KeyValueRef};
 
 use crate::error::Error;
 use crate::error::codes::ACCESSED_UNREADABLE;
 use crate::ryw::{
-    ExtKey, SegmentType, SnapshotCache, SnapshotCacheIter, WriteMap, WriteMapIter, WriteSegmentType,
+    CachedRows, ExtKey, SegmentType, SnapshotCache, SnapshotCacheIter, WriteMap, WriteMapIter,
+    WriteSegmentType,
 };
 
 /// `RYWIterator::SEGMENT_TYPE`.
@@ -161,7 +163,21 @@ impl<'c> RywIter<'c> {
     pub(crate) fn kv(&self) -> Result<Option<KeyValue>, Error> {
         self.check_readable()?;
         if self.writes.is_unmodified_range() {
-            return Ok(self.cache.kv().cloned());
+            return Ok(self.cache.shared_kv());
+        }
+        Ok(self.value()?.map(|value| {
+            KeyValue::new(
+                self.writes.begin_key().assert_ref().to_vec(),
+                value.into_owned(),
+            )
+        }))
+    }
+
+    /// The value of [`kv`](Self::kv): borrowed from the cache for an unmodified key.
+    pub(crate) fn value(&self) -> Result<Option<Cow<'c, [u8]>>, Error> {
+        self.check_readable()?;
+        if self.writes.is_unmodified_range() {
+            return Ok(self.cache.kv().map(|kv| Cow::Borrowed(kv.value)));
         }
         let op = self
             .writes
@@ -170,15 +186,10 @@ impl<'c> RywIter<'c> {
         let base = if self.writes.is_independent() == Some(true) || self.cache.is_empty_range() {
             None
         } else {
-            self.cache.kv().map(|kv| &kv.value[..])
+            self.cache.kv().map(|kv| kv.value)
         };
         let result = WriteMap::coalesce_under(op, base)?;
-        Ok(result.value.map(|value| {
-            KeyValue::new(
-                self.writes.begin_key().assert_ref().to_vec(),
-                value.to_vec(),
-            )
-        }))
+        Ok(result.value.map(|value| Cow::Owned(value.to_vec())))
     }
 
     /// `operator++`.
@@ -217,34 +228,86 @@ impl<'c> RywIter<'c> {
     /// in the cache within an unmodified range (this segment's first), moving there. A
     /// segment that is not such a run gives its own key/value only (`None` if its operations
     /// clear the key), without moving.
-    pub(crate) fn take_contiguous(&mut self, key: &[u8]) -> Result<Vec<KeyValue>, Error> {
+    pub(crate) fn take_contiguous(&mut self, key: &[u8]) -> Result<Contiguous<'c>, Error> {
         if self.is_kv()? && self.writes.is_unmodified_range() {
             let bound = ExtKey::from(key).min(self.writes.end_key());
-            let rows = self.cache.skip_contiguous(bound).to_vec();
+            let rows = self.cache.skip_contiguous(bound);
             self.update_cmp();
-            return Ok(rows);
+            return Ok(Contiguous::Cached(rows));
         }
-        Ok(self.kv()?.into_iter().collect())
+        Ok(Contiguous::Single(self.kv()?))
     }
 
     /// `skipContiguousBack` and `getRangeValueBack`'s arithmetic around it: the key/values
     /// (ascending) from the first one at or after `key` contiguous with this one, moving to
     /// it; as [`take_contiguous`](Self::take_contiguous) otherwise.
-    pub(crate) fn take_contiguous_back(&mut self, key: &[u8]) -> Result<Vec<KeyValue>, Error> {
+    pub(crate) fn take_contiguous_back(&mut self, key: &[u8]) -> Result<Contiguous<'c>, Error> {
         if self.is_kv()? && self.writes.is_unmodified_range() {
             let wb = self.writes.begin_key();
             let after = wb.key_after().to_vec();
             let bound = ExtKey::from(key).max(ExtKey::from(&after));
-            let rows = self.cache.skip_contiguous_back(bound).to_vec();
+            let rows = self.cache.skip_contiguous_back(bound);
             self.update_cmp();
-            return Ok(rows);
+            return Ok(Contiguous::Cached(rows));
         }
-        Ok(self.kv()?.into_iter().collect())
+        Ok(Contiguous::Single(self.kv()?))
     }
 
     fn update_cmp(&mut self) {
         self.begin_cmp = self.cache.begin_key().cmp(&self.writes.begin_key());
         self.end_cmp = self.cache.end_key().cmp(&self.writes.end_key());
+    }
+}
+
+/// What [`RywIter::take_contiguous`] gives: a run of the cache's rows (ascending), or the
+/// segment's own key/value (`None` if its operations clear the key).
+#[derive(Debug)]
+pub(crate) enum Contiguous<'c> {
+    Cached(CachedRows<'c>),
+    Single(Option<KeyValue>),
+}
+
+impl Contiguous<'_> {
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Contiguous::Cached(rows) => rows.len(),
+            Contiguous::Single(kv) => usize::from(kv.is_some()),
+        }
+    }
+
+    /// The `i`th row (ascending), borrowed.
+    pub(crate) fn get(&self, i: usize) -> KeyValueRef<'_> {
+        match self {
+            Contiguous::Cached(rows) => rows.get(i),
+            Contiguous::Single(kv) => {
+                assert_eq!(i, 0, "a single row");
+                kv.as_ref().expect("a row").borrowed()
+            }
+        }
+    }
+
+    /// Appends the first `n` rows to `out`, or with `reverse` the last `n` rows, descending.
+    /// A cached row is appended as slices of the cache's buffers (no copy).
+    pub(crate) fn append_to(self, n: usize, reverse: bool, out: &mut Vec<KeyValue>) {
+        match self {
+            Contiguous::Cached(rows) => {
+                let range = if reverse {
+                    rows.len() - n..rows.len()
+                } else {
+                    0..n
+                };
+                rows.append_shared(range, reverse, out);
+            }
+            Contiguous::Single(kv) => out.extend(kv.into_iter().take(n)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Vec<KeyValue>> for Contiguous<'_> {
+    fn eq(&self, other: &Vec<KeyValue>) -> bool {
+        self.len() == other.len() && (0..self.len()).all(|i| self.get(i) == other[i].borrowed())
     }
 }
 

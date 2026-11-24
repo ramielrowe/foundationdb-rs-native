@@ -35,11 +35,12 @@
 //! (812-835), `skipUncachedBack` 843-870 (839-866), `countUncachedBack` 873-894 (869-890),
 //! `getRangeValueBack` 896-1127 (892-1130).
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 
 use fdb_native_schema::domain::KeySelector;
-use fdb_native_wire::KeyValue;
+use fdb_native_wire::{KeyValue, KeyValueRef};
 
 use crate::error::Error;
 use crate::error::codes::INVERTED_RANGE;
@@ -48,7 +49,7 @@ use crate::read::{
 };
 use crate::ryw::conflicts::ReadConflicts;
 use crate::ryw::iterator::RywIter;
-use crate::ryw::{ExtKey, RangeReadOutcome, SelectorBound, SnapshotCache, WriteMapIter};
+use crate::ryw::{CacheRows, ExtKey, RangeReadOutcome, SelectorBound, SnapshotCache, WriteMapIter};
 
 /// A boxed future, for the reads [`RywSource`] makes and the recursion of `getKey` into
 /// `getRangeValue`.
@@ -143,7 +144,7 @@ pub(crate) fn row_limit(rows: i64) -> Limits {
 }
 
 /// `GetRangeLimits::decrement(KeyValueRef)` (NativeAPI 7.4:3083-3089, 8.0:1098-1104).
-fn decrement(limits: &mut Limits, kv: &KeyValue) {
+fn decrement(limits: &mut Limits, kv: KeyValueRef<'_>) {
     limits.min_rows = (limits.min_rows - 1).max(0);
     if limits.rows != -1 {
         limits.rows -= 1;
@@ -419,7 +420,7 @@ pub(crate) async fn get<S: RywSource>(
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         let dependent = it.is_dependent();
         if it.is_kv()? {
-            return Ok(First::Done(it.kv()?.map(|kv| kv.value.to_vec())));
+            return Ok(First::Done(it.value()?.map(Cow::into_owned)));
         }
         if it.is_empty_range()? {
             return Ok(First::Done(None));
@@ -439,7 +440,7 @@ pub(crate) async fn get<S: RywSource>(
         // A dependent write at the key: its operations apply to the value read.
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         debug_assert!(it.is_kv().unwrap_or(false));
-        Ok(it.kv()?.map(|kv| kv.value.to_vec()))
+        Ok(it.value()?.map(Cow::into_owned))
     })?
 }
 
@@ -567,10 +568,10 @@ impl RangeState {
         begin: &KeySelector,
         end: &KeySelector,
     ) {
-        // The rows are slices of the replies (no copy): the cache shares them with the result.
-        let rows: Vec<KeyValue> = read.iter_shared().collect();
+        // The cache keeps the replies and the rows' places in them (no copy, no reference
+        // count per row); the result's rows are slices of them.
         let outcome = RangeReadOutcome {
-            rows,
+            rows: CacheRows::from_chunks(read.chunks()),
             more: read.more(),
             read_to_begin: read.read_to_begin(),
             read_through_end: read.read_through_end(),
@@ -777,7 +778,7 @@ impl RangeState {
                     limits: request,
                 });
             } else if it.is_kv()? {
-                if it.kv()?.is_none() {
+                if it.value()?.is_none() {
                     it.advance();
                     continue;
                 }
@@ -792,11 +793,11 @@ impl RangeState {
                 let max_count = rows.len();
                 let mut count = 0;
                 while count < max_count && !self.limits.is_reached() {
-                    decrement(&mut self.limits, &rows[count]);
+                    decrement(&mut self.limits, rows.get(count));
                     count += 1;
                 }
                 self.items_past += (max_count - count) as i64;
-                self.result.extend(rows.into_iter().take(count));
+                rows.append_to(count, false, &mut self.result);
                 it.advance();
             } else {
                 it.advance();
@@ -995,8 +996,8 @@ impl RangeState {
                     limits: request,
                 });
             } else {
-                let found = if it.is_kv()? { it.kv()? } else { None };
-                if found.is_some() {
+                let found = it.is_kv()? && it.value()?.is_some();
+                if found {
                     let bound = if is_first_greater_or_equal(&self.begin) {
                         self.begin.key.clone()
                     } else {
@@ -1007,11 +1008,11 @@ impl RangeState {
                     let max_count = rows.len();
                     let mut count = 0;
                     while count < max_count && !self.limits.is_reached() {
-                        decrement(&mut self.limits, &rows[max_count - count - 1]);
+                        decrement(&mut self.limits, rows.get(max_count - count - 1));
                         count += 1;
                     }
                     self.items_past += (max_count - count) as i64;
-                    self.result.extend(rows.iter().rev().take(count).cloned());
+                    rows.append_to(count, true, &mut self.result);
                 }
                 if it == it_end {
                     return Ok(Step::Break);

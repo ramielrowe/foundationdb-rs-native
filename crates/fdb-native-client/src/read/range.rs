@@ -361,6 +361,11 @@ impl RangeRead {
         out
     }
 
+    /// The replies' rows, in order.
+    pub(crate) fn chunks(&self) -> &[SharedKeyValueVector] {
+        &self.chunks
+    }
+
     /// The rows, as slices of the replies they came in (no copy).
     pub(crate) fn iter_shared(&self) -> impl Iterator<Item = KeyValue> + '_ {
         self.chunks.iter().flat_map(SharedKeyValueVector::shared)

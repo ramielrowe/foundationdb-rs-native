@@ -21,9 +21,12 @@
 //!
 //! # Differences from C++
 //!
-//! * Keys and values are owned `Vec<u8>` (`KeyValue`), not arena references, and
-//!   [`SnapshotCache::insert_range`] takes the rows it keeps by value; there is no arena to tie
-//!   lifetimes to, and so no bytes accounting (the C++ cache tracks none either).
+//! * There is no arena. The cache keeps the buffers its rows are in (a range read's replies,
+//!   [`CacheRows`]) for as long as it lives, as the transaction's arena keeps a C++ read's
+//!   replies, and a row is the place of its key and value in one of them ([`Row`]: no
+//!   reference count per row). A row leaves the cache as a [`KeyValueRef`] that borrows the
+//!   buffer, or as a [`KeyValue`] whose bytes are slices of it ([`CachedRows::append_shared`]).
+//!   No bytes accounting (the C++ cache tracks none either).
 //! * The `IndexedSet` is a `BTreeMap` keyed by an entry's begin key.
 //! * An iterator borrows the cache, so the borrow checker enforces what C++ documents as
 //!   "invalidation": after an `insert` the caller builds a new iterator (`ReadYourWrites`
@@ -40,7 +43,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use fdb_native_wire::{Bytes, KeyValue};
+use fdb_native_wire::{Bytes, KeyValue, KeyValueRef, SharedKeyValueVector};
 
 /// `allKeys.end`: the end of the key space a transaction can read (`\xff\xff`).
 const ALL_KEYS_END: &[u8] = b"\xff\xff";
@@ -218,14 +221,248 @@ pub(crate) enum SegmentType {
     KeyValue,
 }
 
+/// A row of the cache: its key and value, as ranges of one of the cache's buffers (20 bytes,
+/// no reference count).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Row {
+    /// The buffer's index (in the [`SnapshotCache`]'s buffers, or in a [`CacheRows`]' before
+    /// it is inserted).
+    buf: u32,
+    key: u32,
+    key_len: u32,
+    value: u32,
+    value_len: u32,
+}
+
+impl Row {
+    /// The row whose key and value are `kv`, which borrows from `buffer` (whose index is
+    /// `buf`).
+    fn locate(buf: u32, buffer: &[u8], kv: KeyValueRef<'_>) -> Row {
+        let base = buffer.as_ptr() as usize;
+        let place = |part: &[u8]| {
+            if part.is_empty() {
+                return (0, 0);
+            }
+            let offset = (part.as_ptr() as usize).wrapping_sub(base);
+            assert!(
+                offset <= buffer.len() && part.len() <= buffer.len() - offset,
+                "a row outside its buffer"
+            );
+            (offset32(offset), offset32(part.len()))
+        };
+        let (key, key_len) = place(kv.key);
+        let (value, value_len) = place(kv.value);
+        Row {
+            buf,
+            key,
+            key_len,
+            value,
+            value_len,
+        }
+    }
+
+    /// The row's key and value in `buffers`.
+    fn get(self, buffers: &[Bytes]) -> KeyValueRef<'_> {
+        let b = &buffers[self.buf as usize];
+        KeyValueRef {
+            key: &b[self.key as usize..(self.key + self.key_len) as usize],
+            value: &b[self.value as usize..(self.value + self.value_len) as usize],
+        }
+    }
+
+    /// The row's key in `buffers`.
+    fn key(self, buffers: &[Bytes]) -> &[u8] {
+        &buffers[self.buf as usize][self.key as usize..(self.key + self.key_len) as usize]
+    }
+
+    /// The row as a [`KeyValue`] of slices of its buffer (a reference count each for a
+    /// non-empty key and value, no copy).
+    fn shared(self, buffers: &[Bytes]) -> KeyValue {
+        let b = &buffers[self.buf as usize];
+        let slice = |at: u32, len: u32| {
+            if len == 0 {
+                Bytes::new()
+            } else {
+                b.slice(at as usize..(at + len) as usize)
+            }
+        };
+        KeyValue {
+            key: slice(self.key, self.key_len),
+            value: slice(self.value, self.value_len),
+        }
+    }
+}
+
+/// An offset or length in a buffer: a reply is far below 4 GiB (FDB's packet limit is 100 MB),
+/// and so is a pair inserted by itself (a key and a value, 110 kB at most).
+fn offset32(n: usize) -> u32 {
+    u32::try_from(n).expect("a snapshot cache buffer is smaller than 4 GiB")
+}
+
+/// Rows to insert ([`SnapshotCache::insert_range`]): the buffers they are in and each row's
+/// place there, in order.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CacheRows {
+    buffers: Vec<Bytes>,
+    rows: Vec<Row>,
+}
+
+impl CacheRows {
+    /// The rows of `chunks` (a range read's replies), in order: each chunk's buffer is kept
+    /// once (a reference count per chunk), its rows as places in it.
+    pub(crate) fn from_chunks<'a>(
+        chunks: impl IntoIterator<Item = &'a SharedKeyValueVector>,
+    ) -> CacheRows {
+        let mut out = CacheRows::default();
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            let buf = offset32(out.buffers.len());
+            let payload = chunk.payload();
+            out.rows.reserve(chunk.len());
+            out.rows
+                .extend(chunk.iter().map(|kv| Row::locate(buf, payload, kv)));
+            out.buffers.push(payload.clone());
+        }
+        out
+    }
+
+    /// The pairs `kvs`, copied into one buffer.
+    pub(crate) fn copy_of<'a>(kvs: impl Iterator<Item = KeyValueRef<'a>> + Clone) -> CacheRows {
+        let size = kvs.clone().map(|kv| kv.key.len() + kv.value.len()).sum();
+        let mut bytes = Vec::with_capacity(size);
+        let mut rows = Vec::with_capacity(kvs.size_hint().0);
+        for kv in kvs {
+            let key = offset32(bytes.len());
+            bytes.extend_from_slice(kv.key);
+            let value = offset32(bytes.len());
+            bytes.extend_from_slice(kv.value);
+            rows.push(Row {
+                buf: 0,
+                key,
+                key_len: offset32(kv.key.len()),
+                value,
+                value_len: offset32(kv.value.len()),
+            });
+        }
+        if rows.is_empty() {
+            return CacheRows::default();
+        }
+        CacheRows {
+            buffers: vec![Bytes::from(bytes)],
+            rows,
+        }
+    }
+
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there are no rows.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The `i`th row.
+    pub(crate) fn get(&self, i: usize) -> KeyValueRef<'_> {
+        self.rows[i].get(&self.buffers)
+    }
+
+    fn first_key(&self) -> Option<&[u8]> {
+        self.rows.first().map(|r| r.key(&self.buffers))
+    }
+
+    fn last_key(&self) -> Option<&[u8]> {
+        self.rows.last().map(|r| r.key(&self.buffers))
+    }
+}
+
+impl From<Vec<KeyValue>> for CacheRows {
+    /// Copies the pairs into one buffer.
+    fn from(kvs: Vec<KeyValue>) -> CacheRows {
+        CacheRows::copy_of(kvs.iter().map(KeyValue::borrowed))
+    }
+}
+
+impl From<&[KeyValue]> for CacheRows {
+    /// Copies the pairs into one buffer.
+    fn from(kvs: &[KeyValue]) -> CacheRows {
+        CacheRows::copy_of(kvs.iter().map(KeyValue::borrowed))
+    }
+}
+
+/// A run of the cache's rows ([`SnapshotCacheIter::skip_contiguous`]), ascending.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CachedRows<'a> {
+    buffers: &'a [Bytes],
+    rows: &'a [Row],
+}
+
+impl<'a> CachedRows<'a> {
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there are no rows.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The `i`th row, borrowed.
+    pub(crate) fn get(&self, i: usize) -> KeyValueRef<'a> {
+        self.rows[i].get(self.buffers)
+    }
+
+    /// The rows, borrowed.
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = KeyValueRef<'a>> + use<'a> {
+        let buffers = self.buffers;
+        self.rows.iter().map(move |r| r.get(buffers))
+    }
+
+    /// Appends the rows `range` to `out` (descending if `reverse`), as [`KeyValue`]s whose
+    /// bytes are slices of the cache's buffers: two reference counts per row, no copy.
+    pub(crate) fn append_shared(
+        &self,
+        range: std::ops::Range<usize>,
+        reverse: bool,
+        out: &mut Vec<KeyValue>,
+    ) {
+        let rows = &self.rows[range];
+        out.reserve(rows.len());
+        if reverse {
+            out.extend(rows.iter().rev().map(|r| r.shared(self.buffers)));
+        } else {
+            out.extend(rows.iter().map(|r| r.shared(self.buffers)));
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&[KeyValue]> for CachedRows<'_> {
+    fn eq(&self, other: &&[KeyValue]) -> bool {
+        self.iter().eq(other.iter().map(KeyValue::borrowed))
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Vec<KeyValue>> for CachedRows<'_> {
+    fn eq(&self, other: &Vec<KeyValue>) -> bool {
+        *self == other.as_slice()
+    }
+}
+
 /// One known range of the cache (C++ `SnapshotCache::Entry`; its begin key is the map key).
 #[derive(Clone, Debug)]
 struct Entry {
     /// The exclusive end of the range. Always fully materialized (the C++ `ExtStringRef` end of
     /// a single-key entry, `key + \x00`, is stored as bytes).
     end: Vec<u8>,
-    /// The keys in `[begin, end)` that have values, ascending; the others are known absent.
-    values: Vec<KeyValue>,
+    /// The keys in `[begin, end)` that have values, ascending, as places in the cache's
+    /// buffers; the others are known absent.
+    values: Vec<Row>,
 }
 
 impl Entry {
@@ -243,6 +480,9 @@ pub(crate) struct SnapshotCache {
     /// Entries by begin key. There are always degenerate entries at the two ends,
     /// `["", "")` and `[\xff\xff, \xff\xff\x00)`, which "reduce edge cases".
     entries: BTreeMap<Vec<u8>, Entry>,
+    /// The buffers the rows are in, kept until the cache is dropped (as C++'s rows are in the
+    /// transaction's arena), also after the rows in one are replaced.
+    buffers: Vec<Bytes>,
     /// Nothing was ever inserted: every key up to `\xff\xff` is unknown (the point reads
     /// of a new transaction need not search the map).
     untouched: bool,
@@ -274,6 +514,7 @@ impl SnapshotCache {
         );
         SnapshotCache {
             entries,
+            buffers: Vec::new(),
             untouched: true,
         }
     }
@@ -297,7 +538,7 @@ impl SnapshotCache {
     /// What the cache knows of `key`: `Some(Some(kv))` if it has a value, `Some(None)` if it
     /// is known to be absent, `None` if it is unknown (the type of its segment, as
     /// [`segment_at`](Self::segment_at) finds it).
-    pub(crate) fn lookup(&self, key: &[u8]) -> Option<Option<&KeyValue>> {
+    pub(crate) fn lookup(&self, key: &[u8]) -> Option<Option<KeyValueRef<'_>>> {
         if self.untouched && key < ALL_KEYS_END {
             return None;
         }
@@ -325,10 +566,18 @@ impl SnapshotCache {
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
-        let values = value
-            .map(|v| KeyValue::new(Bytes::copy_from_slice(key), Bytes::copy_from_slice(v)))
-            .into_iter()
-            .collect();
+        let values = match value {
+            Some(v) => {
+                let buf = offset32(self.buffers.len());
+                let rows = CacheRows::copy_of(std::iter::once(KeyValueRef::new(key, v)));
+                self.buffers.extend(rows.buffers);
+                rows.rows
+                    .into_iter()
+                    .map(|row| Row { buf, ..row })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         self.entries.insert(key.to_vec(), Entry { end, values });
         true
     }
@@ -342,14 +591,15 @@ impl SnapshotCache {
     /// ends, and replaces the entries strictly inside. That is correct because every read is at
     /// the same version, so the cache's data and `rows` agree wherever they overlap.
     ///
-    /// The cache keeps `rows` themselves (those in the range it records, which is the part of
-    /// `[begin, end)` described above): nothing is copied.
+    /// The cache keeps the rows in the range it records (the part of `[begin, end)`
+    /// described above) as places in `rows`' buffers, which it keeps: nothing is copied.
     pub(crate) fn insert_range(
         &mut self,
         begin: &[u8],
         end: &[u8],
-        mut rows: Vec<KeyValue>,
+        rows: impl Into<CacheRows>,
     ) -> bool {
+        let CacheRows { buffers, mut rows } = rows.into();
         let end = end.min(ALL_KEYS_END);
         if begin >= end {
             return false;
@@ -381,16 +631,24 @@ impl SnapshotCache {
         if new_begin >= new_end {
             return false;
         }
-        let lo = rows.partition_point(|kv| &kv.key[..] < new_begin);
-        let hi = rows.partition_point(|kv| &kv.key[..] < new_end).max(lo);
+        let lo = rows.partition_point(|r| r.key(&buffers) < new_begin);
+        let hi = rows.partition_point(|r| r.key(&buffers) < new_end).max(lo);
         let new_end = new_end.to_vec();
+        let new_begin = new_begin.to_vec();
         rows.truncate(hi);
         rows.drain(..lo);
+        if !rows.is_empty() {
+            // The buffers are numbered from the cache's last one on.
+            let base = offset32(self.buffers.len());
+            for row in &mut rows {
+                row.buf += base;
+            }
+            self.buffers.extend(buffers);
+        }
         let new_entry = Entry {
             end: new_end,
             values: rows,
         };
-        let new_begin = new_begin.to_vec();
 
         let doomed: Vec<Vec<u8>> = self
             .entries
@@ -438,7 +696,7 @@ impl SnapshotCache {
                 return false;
             };
             let mut ascending = outcome.rows;
-            ascending.reverse();
+            ascending.rows.reverse();
             self.insert_range(&b, &e, ascending)
         } else {
             let Some((b, e)) = known_key_range(&outcome, begin, end) else {
@@ -475,15 +733,16 @@ impl SnapshotCache {
                 assert!(p <= begin.as_slice(), "entries overlap at {begin:?}");
             }
             let mut prev_key: Option<&[u8]> = None;
-            for kv in &e.values {
+            for row in &e.values {
+                let key = row.key(&self.buffers);
                 assert!(
-                    kv.key >= *begin && kv.key < e.end,
+                    key >= begin.as_slice() && key < e.end.as_slice(),
                     "value outside its entry"
                 );
                 if let Some(p) = prev_key {
-                    assert!(p < &kv.key[..], "values not ascending");
+                    assert!(p < key, "values not ascending");
                 }
-                prev_key = Some(&kv.key);
+                prev_key = Some(key);
             }
             prev_end = Some(&e.end);
         }
@@ -568,7 +827,7 @@ impl<'a> SnapshotCacheIter<'a> {
                 .prev_entry()
                 .map_or(ExtKey::EMPTY, |(_, prev)| ExtKey::from(&prev.end)),
             1 => ExtKey::from(self.begin),
-            o => ExtKey::new(&self.entry.values[(o - 2) >> 1].key, o & 1),
+            o => ExtKey::new(self.key_of((o - 2) >> 1), o & 1),
         }
     }
 
@@ -579,19 +838,40 @@ impl<'a> SnapshotCacheIter<'a> {
         } else if self.offset == self.entry.segments() - 1 {
             ExtKey::from(&self.entry.end)
         } else {
-            ExtKey::new(
-                &self.entry.values[(self.offset - 1) >> 1].key,
-                1 - (self.offset & 1),
-            )
+            ExtKey::new(self.key_of((self.offset - 1) >> 1), 1 - (self.offset & 1))
         }
     }
 
     /// The key/value pair, if the segment [`is_kv`](Self::is_kv).
-    pub(crate) fn kv(&self) -> Option<&'a KeyValue> {
+    pub(crate) fn kv(&self) -> Option<KeyValueRef<'a>> {
+        let buffers: &'a [Bytes] = &self.cache.buffers;
+        self.row().map(|r| r.get(buffers))
+    }
+
+    /// The key/value pair, if the segment [`is_kv`](Self::is_kv), as slices of the cache's
+    /// buffer (no copy).
+    pub(crate) fn shared_kv(&self) -> Option<KeyValue> {
+        self.row().map(|r| r.shared(&self.cache.buffers))
+    }
+
+    fn row(&self) -> Option<Row> {
         if self.is_kv() {
-            self.entry.values.get((self.offset - 2) >> 1)
+            self.entry.values.get((self.offset - 2) >> 1).copied()
         } else {
             None
+        }
+    }
+
+    /// The key of the entry's `i`th value.
+    fn key_of(&self, i: usize) -> &'a [u8] {
+        let buffers: &'a [Bytes] = &self.cache.buffers;
+        self.entry.values[i].key(buffers)
+    }
+
+    fn rows(&self, rows: &'a [Row]) -> CachedRows<'a> {
+        CachedRows {
+            buffers: &self.cache.buffers,
+            rows,
         }
     }
 
@@ -648,8 +928,9 @@ impl<'a> SnapshotCacheIter<'a> {
                 self.offset = 1; // unreachable: the last entry begins at \xff\xff > key
             }
         } else {
-            let idx = entry.values.partition_point(|kv| &kv.key[..] < key);
-            let hit = entry.values.get(idx).is_some_and(|kv| kv.key == key);
+            let buffers = &self.cache.buffers;
+            let idx = entry.values.partition_point(|r| r.key(buffers) < key);
+            let hit = entry.values.get(idx).is_some_and(|r| r.key(buffers) == key);
             self.offset = idx * 2 + 1 + usize::from(hit);
         }
     }
@@ -660,16 +941,17 @@ impl<'a> SnapshotCacheIter<'a> {
     /// (this one first). Does nothing, returning no pairs, if the segment is not a key/value.
     ///
     /// The segment's own key must be `< key`.
-    pub(crate) fn skip_contiguous(&mut self, key: ExtKey<'_>) -> &'a [KeyValue] {
+    pub(crate) fn skip_contiguous(&mut self, key: ExtKey<'_>) -> CachedRows<'a> {
         if !self.is_kv() {
-            return &[];
+            return self.rows(&[]);
         }
-        let values = &self.entry.values;
+        let values: &'a [Row] = &self.entry.values;
+        let buffers = &self.cache.buffers;
         let first = (self.offset - 2) >> 1;
         let from = first + 1;
-        let j = from + values[from..].partition_point(|kv| ExtKey::from(&kv.key) < key);
+        let j = from + values[from..].partition_point(|r| ExtKey::from(r.key(buffers)) < key);
         self.offset = 2 * j;
-        &values[first..j]
+        self.rows(&values[first..j])
     }
 
     /// C++ `skipContiguousBack`: from a key/value segment, moves to the first key/value in the
@@ -678,15 +960,16 @@ impl<'a> SnapshotCacheIter<'a> {
     /// segment is not a key/value.
     ///
     /// The segment's own key must be `>= key`.
-    pub(crate) fn skip_contiguous_back(&mut self, key: ExtKey<'_>) -> &'a [KeyValue] {
+    pub(crate) fn skip_contiguous_back(&mut self, key: ExtKey<'_>) -> CachedRows<'a> {
         if !self.is_kv() {
-            return &[];
+            return self.rows(&[]);
         }
-        let values = &self.entry.values;
+        let values: &'a [Row] = &self.entry.values;
+        let buffers = &self.cache.buffers;
         let last = (self.offset - 2) >> 1;
-        let j = values[..last].partition_point(|kv| ExtKey::from(&kv.key) < key);
+        let j = values[..last].partition_point(|r| ExtKey::from(r.key(buffers)) < key);
         self.offset = 2 * j + 2;
-        &values[j..=last]
+        self.rows(&values[j..=last])
     }
 
     fn next_entry(&self) -> Option<(&'a Vec<u8>, &'a Entry)> {
@@ -745,7 +1028,7 @@ pub(crate) struct SelectorBound<'a> {
 pub(crate) struct RangeReadOutcome<'a> {
     /// The rows, in the order the read returned them. The cache takes them over
     /// ([`SnapshotCache::insert_read`]).
-    pub(crate) rows: Vec<KeyValue>,
+    pub(crate) rows: CacheRows,
     /// The read stopped at a limit with more data left.
     pub(crate) more: bool,
     /// The read reached the beginning of the key space.
@@ -786,14 +1069,14 @@ pub(crate) fn known_key_range(
         end_key = ExtKey::from(ALL_KEYS_END);
     }
 
-    if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
-        begin_key = begin_key.min(&first.key[..]);
+    if let (Some(first), Some(last)) = (outcome.rows.first_key(), outcome.rows.last_key()) {
+        begin_key = begin_key.min(first);
         end_key = if let Some(rt) = outcome.read_through {
             end_key.max(ExtKey::from(rt))
-        } else if !outcome.more && ExtKey::from(&last.key) < end_key {
+        } else if !outcome.more && ExtKey::from(last) < end_key {
             end_key
         } else {
-            ExtKey::new(&last.key, 1)
+            ExtKey::new(last, 1)
         };
     }
     (ExtKey::from(begin_key) < end_key).then(|| (begin_key.to_vec(), end_key.to_vec()))
@@ -824,18 +1107,18 @@ pub(crate) fn known_key_range_back(
         end_key = ExtKey::from(ALL_KEYS_END);
     }
 
-    if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
+    if let (Some(first), Some(last)) = (outcome.rows.first_key(), outcome.rows.last_key()) {
         begin_key = if let Some(rt) = outcome.read_through {
             rt.min(begin_key)
-        } else if !outcome.more && &last.key[..] > begin_key {
+        } else if !outcome.more && last > begin_key {
             begin_key
         } else {
-            &last.key
+            last
         };
-        end_key = if ExtKey::from(&first.key) < end_key {
+        end_key = if ExtKey::from(first) < end_key {
             end_key
         } else {
-            ExtKey::new(&first.key, 1)
+            ExtKey::new(first, 1)
         };
     }
     (ExtKey::from(begin_key) < end_key).then(|| (begin_key.to_vec(), end_key.to_vec()))
