@@ -68,19 +68,47 @@ pub(crate) fn check_mutation(
             param2: r.end,
         }));
     }
-    let max = limits.max_write_key_size(&m.param1);
-    if m.param1.len() > max {
-        return Err(error::key_too_large(m.param1.len(), max));
+    check_sizes(m.kind, &m.param1, &m.param2, limits)?;
+    Ok(Some(m))
+}
+
+/// The checks of a set or an atomic operation after its type's: `key_too_large`,
+/// `value_too_large`, then a versionstamped operation's offset.
+fn check_sizes(
+    kind: MutationType,
+    key: &[u8],
+    value: &[u8],
+    limits: &CommitLimits,
+) -> Result<(), Error> {
+    let max = limits.max_write_key_size(key);
+    if key.len() > max {
+        return Err(error::key_too_large(key.len(), max));
     }
-    if m.param2.len() > limits.value_size_limit {
-        return Err(error::value_too_large(
-            m.param2.len(),
-            limits.value_size_limit,
-        ));
+    if value.len() > limits.value_size_limit {
+        return Err(error::value_too_large(value.len(), limits.value_size_limit));
     }
     // After the size checks, as `ReadYourWritesTransaction::atomicOp` orders them.
-    check_offset(m.kind, &m.param1, &m.param2)?;
-    Ok(Some(m))
+    check_offset(kind, key, value)
+}
+
+/// The checks `ReadYourWritesTransaction::set` and `atomicOp` make before writing to the
+/// write map (`ReadYourWrites.actor.cpp` 7.4:2234-2241 and 2344-2348, `ReadYourWrites.cpp`
+/// 8.0:2150-2157 and 2260-2264; the offsets 7.4:2263-2287, 8.0:2179-2203), in their order:
+/// `invalid_mutation_type` (2018) if `kind` is not `SetValue` or an atomic operation,
+/// `key_too_large`, `value_too_large`, and for a versionstamped operation
+/// `client_invalid_operation` if its offset is not valid. What
+/// [`CommitBuffer::set`](super::CommitBuffer::set) and
+/// [`atomic_op`](super::CommitBuffer::atomic_op) check, without buffering anything.
+pub(crate) fn check_write(
+    kind: MutationType,
+    key: &[u8],
+    value: &[u8],
+    limits: &CommitLimits,
+) -> Result<(), Error> {
+    if !supported(kind) || kind == MutationType::CLEAR_RANGE {
+        return Err(error::invalid_mutation_type(kind.0));
+    }
+    check_sizes(kind, key, value, limits)
 }
 
 fn normalize_all(ranges: Vec<KeyRange>, limits: &CommitLimits) -> Result<Vec<KeyRange>, Error> {

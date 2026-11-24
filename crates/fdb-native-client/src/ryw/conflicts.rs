@@ -2,7 +2,7 @@
 //! `CoalescedKeyRefRangeMap<bool>` (`ReadYourWrites.h` 7.4:237; `ReadYourWrites.cpp` 8.0 keeps
 //! it in `RYWTransactionState`), which the reads fill (`updateConflictMap`) and the commit
 //! sends, one read conflict range per maximal range of `true`
-//! (`ReadYourWrites.actor.cpp` 7.4:1394-1399, 8.0:1375-1380).
+//! (`ReadYourWrites.actor.cpp` 7.4:1394-1399, 8.0:1388-1393).
 //!
 //! `CoalescedKeyRefRangeMap::insert` (`KeyRangeMap.h` 7.4:304-351) merges a range with the
 //! ranges of the same value it overlaps or touches, and only `true` is ever inserted, so the
@@ -19,15 +19,20 @@ use fdb_native_schema::domain::KeyRange;
 pub(crate) struct ReadConflicts {
     /// Disjoint, non-adjacent, non-empty ranges: begin -> end.
     ranges: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// What the reads added to the transaction's `approximateSize` (`updateConflictMap`
+    /// counts each insertion, overlapping or not).
+    approximate_size: u64,
 }
 
 impl ReadConflicts {
     /// No range.
+    #[cfg(test)]
     pub(crate) fn new() -> ReadConflicts {
         ReadConflicts::default()
     }
 
     /// Whether there is no range.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
@@ -66,6 +71,16 @@ impl ReadConflicts {
             }
         }
         self.ranges.insert(new_begin, new_end);
+    }
+
+    /// Counts `n` bytes in the transaction's approximate size.
+    pub(crate) fn add_approximate_size(&mut self, n: usize) {
+        self.approximate_size = self.approximate_size.saturating_add(n as u64);
+    }
+
+    /// What the insertions added to the transaction's approximate size.
+    pub(crate) fn approximate_size(&self) -> u64 {
+        self.approximate_size
     }
 
     /// The ranges, ascending.

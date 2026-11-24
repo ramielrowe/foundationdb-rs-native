@@ -1340,3 +1340,69 @@ async fn a_reset_during_a_watch_read_cancels_it_and_not_a_later_watch() {
     env.set_value(b"k", Some(b"v"));
     resolved("the second watch", &mut second).await.unwrap();
 }
+
+/// `ReadYourWritesTransaction::watch` with read-your-writes disabled: `watches_disabled`
+/// (7.4:2447-2448, 8.0:2364-2365).
+#[tokio::test(start_paused = true)]
+async fn watches_are_disabled_without_read_your_writes() {
+    let env = standard(SchemaVersion::V7_4).await;
+    let tx = env.db.create_transaction();
+    tx.set_option(fdb_native_client::TransactionOption::ReadYourWritesDisable)
+        .unwrap();
+    assert_eq!(
+        tx.watch(b"k").await.unwrap_err().code(),
+        codes::WATCHES_DISABLED
+    );
+    assert_eq!(env.db.outstanding_watches(), 0);
+    assert!(env.reads.lock().unwrap().is_empty(), "nothing read");
+    // The transaction goes on.
+    tx.set(b"k", b"v");
+    tx.commit().await.unwrap();
+}
+
+/// The watch's value is a read-your-writes `get` (`readWithConflictRange(GetValueReq)`):
+/// what the transaction read already comes from its cache, with the read conflict range
+/// once.
+#[tokio::test(start_paused = true)]
+async fn a_watch_reads_through_the_transactions_cache() {
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        env.set_value(b"k", Some(b"db"));
+        env.set_value(b"n", Some(&5u64.to_le_bytes()));
+        let tx = env.db.create_transaction();
+        assert_eq!(tx.get(b"k").await.unwrap(), Some(b"db".to_vec()));
+        assert_eq!(env.reads.lock().unwrap().len(), 1);
+        let mut watch = tx.watch(b"k").await.unwrap();
+        assert_eq!(env.reads.lock().unwrap().len(), 1, "the cache answers");
+        // A dependent write over a cached value: no read either.
+        assert!(tx.get(b"n").await.unwrap().is_some());
+        tx.atomic_op(b"n", &1u64.to_le_bytes(), MutationType::ADD_VALUE);
+        let mut by_n = tx.watch(b"n").await.unwrap();
+        assert_eq!(env.reads.lock().unwrap().len(), 2);
+        tx.set(b"other", b"x");
+        let result = tx.commit().await.unwrap();
+        let commit = env.commits.lock().unwrap().last().unwrap().clone();
+        let mut reads = commit.read_conflict_ranges.clone();
+        reads.retain(|r| !r.begin.starts_with(b"\xff/SC/"));
+        reads.sort_by(|a, b| a.begin.cmp(&b.begin));
+        assert_eq!(
+            reads,
+            vec![KeyRange::single_key(b"k"), KeyRange::single_key(b"n")]
+        );
+        until("the watch requests", || env.request_count() == 2).await;
+        let mut requests: Vec<_> = env.requests().into_iter().map(|(r, _, _)| r).collect();
+        requests.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(requests[0].value.as_deref(), Some(&b"db"[..]));
+        assert_eq!(requests[1].value, Some(6u64.to_le_bytes().to_vec()));
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.version == result.committed_version())
+        );
+        env.set_value(b"k", Some(b"theirs"));
+        resolved("the watch of k", &mut watch).await.unwrap();
+        assert!(pending(&mut by_n).await);
+        env.set_value(b"n", None);
+        resolved("the watch of n", &mut by_n).await.unwrap();
+    }
+}

@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use fdb_native_client::error::codes;
 use fdb_native_client::read::{RangeOptions, StreamingMode};
-use fdb_native_client::{Database, KeySelector, KeyValue, MutationType, Transaction};
+use fdb_native_client::{
+    Database, KeySelector, KeyValue, MutationType, Transaction, TransactionOption,
+};
 use fdb_native_testkit::FdbContainer;
 
 const LIMIT: Duration = Duration::from_secs(120);
@@ -248,10 +250,10 @@ async fn docker_ryw_conflicts_skip_own_writes_and_snapshot_reads() {
     assert_eq!(e.code(), codes::NOT_COMMITTED);
 }
 
-/// The boundaries of C++'s `readConflicts` map in `fdbcli`'s output: `(key, "1")` starts a
-/// range, `(key, "0")` ends one.
-fn parse_conflicts(out: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let prefix = "\\xff\\xff/transaction/read_conflict_range/";
+/// The boundaries of a conflict range module of the special key space in `fdbcli`'s output
+/// (`which` is `read` or `write`): `(key, "1")` starts a range, `(key, "0")` ends one.
+fn parse_conflicts(out: &str, which: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let prefix = format!("\\xff\\xff/transaction/{which}_conflict_range/");
     let mut bounds: Vec<(Vec<u8>, bool)> = Vec::new();
     for line in out.lines() {
         let Some(rest) = line.trim().strip_prefix('`') else {
@@ -260,7 +262,7 @@ fn parse_conflicts(out: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         let Some((key, value)) = rest.split_once("' is `") else {
             continue;
         };
-        let Some(key) = key.strip_prefix(prefix) else {
+        let Some(key) = key.strip_prefix(prefix.as_str()) else {
             continue;
         };
         bounds.push((unprintable(key), value.starts_with('1')));
@@ -322,6 +324,8 @@ enum Step {
     Get(&'static [u8]),
     /// `getrange begin end limit`: firstGreaterOrEqual selectors, a row limit, no byte limit.
     Range(&'static [u8], &'static [u8], u32),
+    /// The `NEXT_WRITE_NO_WRITE_CONFLICT_RANGE` option.
+    NoConflict,
 }
 
 /// Corpus cases `fdbcli` can express, with the ranges the fake-cluster corpus (`ryw.rs`)
@@ -410,6 +414,17 @@ fn corpus() -> Vec<Case> {
 
 /// Runs a corpus case with `fdbcli` and returns C++'s `readConflicts`.
 async fn cpp_conflicts(fdb: &Arc<FdbContainer>, steps: &[Step]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    cpp_conflict_ranges(fdb, steps, "read").await
+}
+
+/// Runs a corpus case with `fdbcli` and returns the `which` (`read` or `write`) conflict
+/// ranges of C++'s transaction (`getReadConflictRangeIntersecting`,
+/// `getWriteConflictRangeIntersecting`).
+async fn cpp_conflict_ranges(
+    fdb: &Arc<FdbContainer>,
+    steps: &[Step],
+    which: &str,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut script = String::from("writemode on; begin;");
     for step in steps {
         script.push_str(&match step {
@@ -418,14 +433,15 @@ async fn cpp_conflicts(fdb: &Arc<FdbContainer>, steps: &[Step]) -> Vec<(Vec<u8>,
             Step::ClearRange(b, e) => format!(" clearrange {} {};", arg(b), arg(e)),
             Step::Get(k) => format!(" get {};", arg(k)),
             Step::Range(b, e, n) => format!(" getrange {} {} {n};", arg(b), arg(e)),
+            Step::NoConflict => " option on NEXT_WRITE_NO_WRITE_CONFLICT_RANGE;".to_owned(),
         });
     }
-    script.push_str(
-        " getrange \\xff\\xff/transaction/read_conflict_range/ \
-         \\xff\\xff/transaction/read_conflict_range0 1000; rollback;",
-    );
+    script.push_str(&format!(
+        " getrange \\xff\\xff/transaction/{which}_conflict_range/ \
+         \\xff\\xff/transaction/{which}_conflict_range0 1000; rollback;"
+    ));
     let out = cli(fdb, &script).await;
-    parse_conflicts(&out)
+    parse_conflicts(&out, which)
 }
 
 /// The corpus against C++ itself: `fdbcli`'s transactions are C++'s read-your-writes
@@ -461,6 +477,9 @@ async fn docker_ryw_read_conflict_ranges_match_cpp() {
                 Step::Range(b, e, n) => {
                     rows(&tx, b, e, exact(*n)).await;
                 }
+                Step::NoConflict => tx
+                    .set_option(TransactionOption::NextWriteNoWriteConflictRange)
+                    .unwrap(),
             }
         }
         tx.add_write_conflict_range(b"q/", b"q0");
@@ -486,4 +505,400 @@ async fn docker_ryw_read_conflict_ranges_match_cpp() {
         }
         within("reset", reset.commit()).await.expect("reset");
     }
+}
+
+// ---- the commit -------------------------------------------------------------------------------
+
+fn key_after(k: &[u8]) -> Vec<u8> {
+    let mut k = k.to_vec();
+    k.push(0);
+    k
+}
+
+/// Write conflict range corpus cases `fdbcli` can express, with the ranges the fake-cluster
+/// commit corpus (`ryw.rs`) has for the same writes: the maximal runs of the write map's
+/// conflict segments, as `writeRangeToNativeTransaction` sends them.
+fn write_corpus() -> Vec<Case> {
+    use Step::*;
+    vec![
+        ("a set", vec![Set(b"w/a")], vec![(b"w/a", b"w/a\x00")]),
+        (
+            "sets of adjacent keys",
+            vec![Set(b"w/a"), Set(b"w/a\x00"), Set(b"w/c")],
+            vec![(b"w/a", b"w/a\x00\x00"), (b"w/c", b"w/c\x00")],
+        ),
+        (
+            "a clear, then a set in it",
+            vec![ClearRange(b"w/a", b"w/m"), Set(b"w/c")],
+            vec![(b"w/a", b"w/m")],
+        ),
+        (
+            "single clears",
+            vec![Clear(b"w/c"), Clear(b"w/e")],
+            vec![(b"w/c", b"w/c\x00"), (b"w/e", b"w/e\x00")],
+        ),
+        (
+            "writes without a write conflict range",
+            vec![NoConflict, Set(b"w/a"), Set(b"w/b")],
+            vec![(b"w/b", b"w/b\x00")],
+        ),
+        (
+            "a clear without one keeps the ranges in it",
+            vec![Set(b"w/b"), NoConflict, ClearRange(b"w/a", b"w/e")],
+            vec![(b"w/b", b"w/b\x00")],
+        ),
+        (
+            "a set with one in a clear without one",
+            vec![NoConflict, ClearRange(b"w/a", b"w/e"), Set(b"w/c")],
+            vec![(b"w/c", b"w/c\x00")],
+        ),
+        (
+            "a clear with one over a set without one",
+            vec![NoConflict, Set(b"w/c"), ClearRange(b"w/a", b"w/e")],
+            vec![(b"w/a", b"w/e")],
+        ),
+        (
+            "reads only",
+            vec![Get(b"w/a"), Range(b"w/", b"w0", 10)],
+            vec![],
+        ),
+    ]
+}
+
+/// The write conflict ranges of the corpus are C++'s (`fdbcli`'s transaction, read from
+/// `\xff\xff/transaction/write_conflict_range/`), and this client's commit makes the
+/// resolver fail exactly the transactions that read a key in them: one probe transaction per
+/// key of interest reads it (a read conflict range) at a read version before the commit, and
+/// commits after it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_ryw_write_conflict_ranges_match_cpp() {
+    let (fdb, db) = start().await;
+    for (name, steps, expected) in write_corpus() {
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = expected
+            .iter()
+            .map(|(b, e)| (b.to_vec(), e.to_vec()))
+            .collect();
+        let cpp = cpp_conflict_ranges(&fdb, &steps, "write").await;
+        assert_eq!(cpp, expected, "C++: {name}");
+
+        // The keys of interest: those of the steps, the ranges' bounds and the keys right
+        // after their begins.
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        for step in &steps {
+            match step {
+                Step::Set(k) | Step::Clear(k) | Step::Get(k) => probes.push(k.to_vec()),
+                Step::ClearRange(b, e) | Step::Range(b, e, _) => {
+                    probes.extend([b.to_vec(), e.to_vec(), key_after(b)]);
+                }
+                Step::NoConflict => {}
+            }
+        }
+        for (b, e) in &expected {
+            probes.extend([b.clone(), e.clone(), key_after(b)]);
+        }
+        probes.sort();
+        probes.dedup();
+        let mut readers = Vec::new();
+        for p in probes {
+            let reader = db.create_transaction();
+            within("read version", reader.get_read_version())
+                .await
+                .unwrap();
+            reader.add_read_conflict_range(&p, &key_after(&p));
+            reader.add_write_conflict_range(b"wprobe", b"wprobe\x00");
+            readers.push((p, reader));
+        }
+        let tx = db.create_transaction();
+        for step in &steps {
+            match step {
+                Step::Set(k) => tx.set(k, b"own"),
+                Step::Clear(k) => tx.clear(k),
+                Step::ClearRange(b, e) => tx.clear_range(b, e),
+                Step::Get(k) => {
+                    within("get", tx.get(k)).await.unwrap();
+                }
+                Step::Range(b, e, n) => {
+                    rows(&tx, b, e, exact(*n)).await;
+                }
+                Step::NoConflict => tx
+                    .set_option(TransactionOption::NextWriteNoWriteConflictRange)
+                    .unwrap(),
+            }
+        }
+        within("commit", tx.commit()).await.expect(name);
+        for (p, reader) in readers {
+            let wanted = expected
+                .iter()
+                .any(|(b, e)| b.as_slice() <= p.as_slice() && p < *e);
+            match within("probe", reader.commit()).await {
+                Ok(_) => assert!(!wanted, "{name}: {p:?} should conflict"),
+                Err(e) => {
+                    assert_eq!(e.code(), codes::NOT_COMMITTED, "{name}: {p:?}");
+                    assert!(wanted, "{name}: {p:?} should not conflict");
+                }
+            }
+        }
+    }
+}
+
+/// A xorshift generator.
+struct Gen(u64);
+
+impl Gen {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn key(&mut self, prefix: &[u8]) -> Vec<u8> {
+        let mut k = prefix.to_vec();
+        k.push(b'a' + self.below(8) as u8);
+        k.extend(std::iter::repeat_n(0, self.below(2) as usize));
+        k
+    }
+
+    fn value(&mut self) -> Vec<u8> {
+        (0..self.below(9)).map(|_| self.below(256) as u8).collect()
+    }
+}
+
+/// Every atomic operation (`Min` and `And` are sent as `MinV2` and `AndV2`).
+const ALL_OPS: [MutationType; 12] = [
+    MutationType::ADD_VALUE,
+    MutationType::AND,
+    MutationType::AND_V2,
+    MutationType::OR,
+    MutationType::XOR,
+    MutationType::MAX,
+    MutationType::MIN,
+    MutationType::MIN_V2,
+    MutationType::BYTE_MIN,
+    MutationType::BYTE_MAX,
+    MutationType::APPEND_IF_FITS,
+    MutationType::COMPARE_AND_CLEAR,
+];
+
+fn apply_model(model: &mut BTreeMap<Vec<u8>, Vec<u8>>, k: &[u8], op: MutationType, v: &[u8]) {
+    let op = match op {
+        MutationType::MIN => MutationType::MIN_V2,
+        MutationType::AND => MutationType::AND_V2,
+        other => other,
+    };
+    let new = fdb_native_client::atomic::apply(
+        op,
+        model.get(k).map(Vec::as_slice),
+        v,
+        fdb_native_client::atomic::VALUE_SIZE_LIMIT,
+    )
+    .unwrap();
+    match new {
+        Some(new) => model.insert(k.to_vec(), new),
+        None => model.remove(k),
+    };
+}
+
+/// Random atomic operations (every kind, on random values of 0 to 8 bytes), sets and clears
+/// through the read-your-writes layer: the transaction's reads see the values the model
+/// (`atomic::apply`) gives, and after the commit (the write map's coalesced mutations) the
+/// server holds them too: the server's own atomic operations agree with the model and with
+/// what the transaction read. Range reads only in rounds without `CompareAndClear` (a key it
+/// clears still counts for C++'s selectors, a quirk the unit tests pin).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_ryw_random_atomic_operations_match_the_server() {
+    let (_fdb, db) = start().await;
+    let mut g = Gen(0x5eed_a70c_0de5_0001);
+    for round in 0..24u32 {
+        let prefix = format!("ra/{round:02}/").into_bytes();
+        let end = {
+            let mut e = prefix.clone();
+            *e.last_mut().unwrap() += 1;
+            e
+        };
+        let mut base: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for _ in 0..g.below(8) {
+            base.insert(g.key(&prefix), g.value());
+        }
+        let pairs: Vec<(&[u8], &[u8])> = base
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        load(&db, &pairs).await;
+        let with_cac = round % 2 == 1;
+        let tx = db.create_transaction();
+        let mut model = base.clone();
+        for step in 0..40 {
+            match g.below(10) {
+                0 => {
+                    let (k, v) = (g.key(&prefix), g.value());
+                    tx.set(&k, &v);
+                    model.insert(k, v);
+                }
+                1 => {
+                    let k = g.key(&prefix);
+                    tx.clear(&k);
+                    model.remove(&k);
+                }
+                2 => {
+                    let (mut a, mut b) = (g.key(&prefix), g.key(&prefix));
+                    if a > b {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    tx.clear_range(&a, &b);
+                    let doomed: Vec<Vec<u8>> =
+                        model.range(a.clone()..b).map(|(k, _)| k.clone()).collect();
+                    for k in doomed {
+                        model.remove(&k);
+                    }
+                }
+                3..=6 => {
+                    let (k, v) = (g.key(&prefix), g.value());
+                    let n = if with_cac { 12 } else { 11 };
+                    let op = ALL_OPS[g.below(n) as usize];
+                    tx.atomic_op(&k, &v, op);
+                    apply_model(&mut model, &k, op, &v);
+                }
+                7 | 8 => {
+                    let k = g.key(&prefix);
+                    assert_eq!(
+                        within("get", tx.get(&k)).await.unwrap(),
+                        model.get(&k).cloned(),
+                        "round {round} step {step}: get {k:?}"
+                    );
+                }
+                _ if !with_cac => {
+                    let reverse = g.below(2) == 0;
+                    let got = rows(&tx, &prefix, &end, exact(0).reverse(reverse)).await;
+                    let mut expected: Vec<KeyValue> = model
+                        .iter()
+                        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                        .collect();
+                    if reverse {
+                        expected.reverse();
+                    }
+                    assert_eq!(got, expected, "round {round} step {step}: range");
+                }
+                _ => {}
+            }
+        }
+        within("commit", tx.commit())
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        let check = db.create_transaction();
+        let got = rows(&check, &prefix, &end, exact(0)).await;
+        let expected: Vec<KeyValue> = model
+            .iter()
+            .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, expected, "round {round}: the server's values");
+    }
+}
+
+/// A versionstamped key: the transaction's earlier writes in the range of keys it may take
+/// are sent first (`writeRangeToNativeTransaction`), its later ones after; a clear over it
+/// drops it (C++'s write map does), and the transaction's other writes go as usual.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_ryw_versionstamped_keys_with_writes_around_them() {
+    let (_fdb, db) = start().await;
+    let mut key = b"vs/".to_vec();
+    key.extend([0xff; 10]);
+    key.extend(3i32.to_le_bytes());
+    let tx = db.create_transaction();
+    let read_version = within("read version", tx.get_read_version()).await.unwrap();
+    // In the range: `vs/` + the stamp of a version after the read version.
+    let mut before = b"vs/".to_vec();
+    before.extend((read_version + 1).to_be_bytes());
+    before.extend([0, 0, b'b']);
+    let mut after = b"vs/".to_vec();
+    after.extend((read_version + 1).to_be_bytes());
+    after.extend([0, 0, b'a']);
+    tx.set(&before, b"before");
+    tx.atomic_op(&before, b"+", MutationType::APPEND_IF_FITS);
+    tx.set_versionstamped_key(&key, b"stamped");
+    tx.set(&after, b"after");
+    tx.set(b"vs0", b"outside");
+    let stamp = tx.get_versionstamp();
+    within("commit", tx.commit()).await.expect("commit");
+    let stamp = within("stamp", stamp).await.unwrap();
+    let mut stamped_key = b"vs/".to_vec();
+    stamped_key.extend(stamp);
+    let check = db.create_transaction();
+    let got = rows(&check, b"vs/", b"vs1", exact(0)).await;
+    let mut expected = vec![
+        KeyValue::new(before.clone(), b"before+".to_vec()),
+        KeyValue::new(after.clone(), b"after".to_vec()),
+        KeyValue::new(stamped_key, b"stamped".to_vec()),
+        KeyValue::new(b"vs0".to_vec(), b"outside".to_vec()),
+    ];
+    expected.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(got, expected);
+
+    // A clear over the versionstamped key drops it.
+    let tx = db.create_transaction();
+    tx.clear_range(b"vs/", b"vs0");
+    within("commit", tx.commit()).await.unwrap();
+    let tx = db.create_transaction();
+    tx.set_versionstamped_key(&key, b"dropped");
+    tx.clear_range(b"vs/", b"vs/\xff");
+    tx.set(b"vs/z", b"kept");
+    within("commit", tx.commit()).await.unwrap();
+    let check = db.create_transaction();
+    assert_eq!(
+        rows(&check, b"vs/", b"vs0", exact(0)).await,
+        vec![KeyValue::new(b"vs/z".to_vec(), b"kept".to_vec())]
+    );
+}
+
+/// A watch reads through the read-your-writes layer: a key the transaction read already is
+/// not read again, its read conflict range makes the commit fail if the key changed, and a
+/// transaction with read-your-writes disabled cannot watch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn docker_ryw_watches() {
+    let (_fdb, db) = start().await;
+    load(&db, &[(b"wt/k", b"1"), (b"wt/n", &[1, 0])]).await;
+
+    let tx = db.create_transaction();
+    tx.set_option(TransactionOption::ReadYourWritesDisable)
+        .unwrap();
+    assert_eq!(
+        within("watch", tx.watch(b"wt/k")).await.unwrap_err().code(),
+        codes::WATCHES_DISABLED
+    );
+
+    // A dependent write: the watch watches the database's value with the addition.
+    let tx = db.create_transaction();
+    tx.atomic_op(b"wt/n", &[1, 0], MutationType::ADD_VALUE);
+    let watch_n = within("watch", tx.watch(b"wt/n")).await.unwrap();
+    let watch_k = within("watch", tx.watch(b"wt/k")).await.unwrap();
+    within("commit", tx.commit()).await.unwrap();
+    assert_eq!(
+        within("get", db.create_transaction().get(b"wt/n"))
+            .await
+            .unwrap(),
+        Some(vec![2, 0])
+    );
+    load(&db, &[(b"wt/n", &[3, 0]), (b"wt/k", b"2")]).await;
+    within("watch n", watch_n).await.unwrap();
+    within("watch k", watch_k).await.unwrap();
+
+    // The watch's read conflict range: a change after the read version fails the commit.
+    let tx = db.create_transaction();
+    tx.atomic_op(b"wt/n", &[1, 0], MutationType::ADD_VALUE);
+    let watch = within("watch", tx.watch(b"wt/n")).await.unwrap();
+    load(&db, &[(b"wt/n", &[9, 0])]).await;
+    let e = within("commit", tx.commit()).await.unwrap_err();
+    assert_eq!(e.code(), codes::NOT_COMMITTED);
+    assert_eq!(
+        within("watch", watch).await.unwrap_err().code(),
+        codes::NOT_COMMITTED
+    );
 }

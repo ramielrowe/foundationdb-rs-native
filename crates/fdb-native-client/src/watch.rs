@@ -23,8 +23,9 @@
 //! ## In the transaction (the read-your-writes layer)
 //!
 //! * **`watch(key)`** (`ReadYourWritesTransaction::watch`, RYW 7.4:2440-2459, 8.0:2356;
-//!   `RYWImpl::watch`, 7.4:1284-1340, 8.0:1278): checks the transaction (`used_during_commit`,
-//!   the key's range `key_outside_legal_range`, its size `key_too_large`), reads the key
+//!   `RYWImpl::watch`, 7.4:1284-1335, 8.0:1278): checks the transaction (`used_during_commit`,
+//!   `watches_disabled` (1034) with read-your-writes disabled, the key's range
+//!   `key_outside_legal_range`, its size `key_too_large`), reads the key
 //!   through the read-your-writes layer (`readWithConflictRange`, 7.4:379-395: the database's
 //!   value at the read version with the transaction's own writes applied, see below), counted
 //!   in the reads the commit waits for (`ryw->reading`), and registers a `Watch` object with the transaction (`Transaction::watch`, NativeAPI
@@ -41,14 +42,17 @@
 //!   the value without reading (and adds **no** read conflict range); atomic operations on
 //!   top of a set or clear are folded into it ([`crate::atomic`]); atomic operations alone
 //!   (a dependent write) apply, in order, to the database's value at the read version; no
-//!   write reads the database's value. The last two add the key as a **read conflict range**
+//!   write reads the database's value. The database's value comes through the
+//!   transaction's snapshot cache, as any read's: a key the transaction read already is not
+//!   read again. The last two add the key as a **read conflict range**
 //!   (`updateConflictMap`, 7.4:322-333: an unmodified key or a dependent write), so a watch
 //!   whose value depends on the database conflicts if the key changes before the commit,
 //!   and the value watched is the key's value as of the commit. A key a pending
 //!   `SetVersionstampedValue` wrote, or in the range a pending `SetVersionstampedKey` may
 //!   write (`getVersionstampKeyRange`, from the key stamped with the read version + 1 if the
 //!   transaction has one, to the key with ten `0xff` bytes there), is **unreadable** until a
-//!   clear covers it: the watch fails with `accessed_unreadable` (1036).
+//!   clear covers it: the watch fails with `accessed_unreadable` (1036) (unless the
+//!   `BypassUnreadable` option is set, as for a read).
 //! * **Later writes to the key** (`triggerWatches`, RYW 7.4:1243-1282, called by `set`
 //!   2354, `clear` 2403 and 2437, `atomicOp` 2296, each after the write's checks passed): a
 //!   watch whose value was read, or whose key was written since, fires **at once** (before
@@ -93,10 +97,6 @@
 //!
 //! ## Differences
 //!
-//! * **The watch's own writes come from the commit buffer.** `watch` does what
-//!   `ReadYourWritesTransaction::watch` does (above), but works out the key's value from the
-//!   commit buffer's mutations in place of the write map, and reads the database directly
-//!   rather than through the read-your-writes read (the move to the write map is ygr.4).
 //! * **A watch started after the commit started** fails with `used_during_commit` (maybe
 //!   committed once the commit may have been sent) **without failing the commit**; C++'s
 //!   `checkUsedDuringCommit` also makes the commit fail with it.
@@ -125,11 +125,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use fdb_native_schema::domain::{KeyRange, Mutation, MutationType};
 use fdb_native_transport::runtime::{Runtime, TaskHandle};
 use futures_channel::oneshot;
 
-use crate::atomic;
 use crate::database::ClientTls;
 use crate::error::Error;
 use crate::error::codes::*;
@@ -485,19 +483,6 @@ impl PendingWatches {
         Ok(watch)
     }
 
-    /// A watch of `key` whose value the transaction's own writes give (no read):
-    /// registered at once.
-    pub(crate) fn add_known(
-        &mut self,
-        key: &[u8],
-        value: Option<Vec<u8>>,
-        use_provisional: bool,
-        counter: &Arc<Counter>,
-    ) -> Result<Watch, Error> {
-        let (id, _) = self.register(key, use_provisional);
-        self.finish_read(&id, value, counter)
-    }
-
     /// `triggerWatches` for a write to `begin` (when `end` is `None`) or to `[begin, end)`.
     pub(crate) fn trigger(&mut self, begin: &[u8], end: Option<&[u8]>, written: Written<'_>) {
         let low = Bound::Included((begin.to_vec(), 0));
@@ -571,109 +556,6 @@ impl PendingWatches {
             }
         }
     }
-}
-
-// ---- what the transaction's own writes make of a key ----------------------------------------
-
-/// A `SetVersionstampedKey` of the transaction, as `ReadYourWritesTransaction::atomicOp`
-/// leaves it in the write map: the mutation's index in the buffer, the range of keys it may
-/// write (`getVersionstampKeyRange` at the time of the call, unreadable until the commit;
-/// `None` if that range was inverted) and the key with the placeholder stamped
-/// (`transformVersionstampKey`, the write map's key for it, also unreadable).
-#[derive(Clone, Debug)]
-pub(crate) struct StampedKey {
-    pub(crate) index: usize,
-    pub(crate) range: Option<KeyRange>,
-    pub(crate) key: Vec<u8>,
-}
-
-/// What a transaction's own writes make of a key (the write map's segment for it, as
-/// `RYWImpl::read` sees it).
-#[derive(Debug, PartialEq)]
-pub(crate) enum Own {
-    /// Nothing written: the database's value (an unmodified range).
-    Unmodified,
-    /// Known without the database (an independent write: a set or clear last, with the
-    /// atomic operations since folded in).
-    Known(Option<Vec<u8>>),
-    /// Atomic operations on whatever the database has (a dependent write), in order.
-    Dependent(Vec<(MutationType, Vec<u8>)>),
-    /// A versionstamped operation makes the value unknown before the commit
-    /// (`accessed_unreadable`).
-    Unreadable,
-}
-
-/// What the buffered `mutations` make of `key`, in order, as `WriteMap::mutate` and
-/// `WriteMap::clear` build the write map (`WriteMap.cpp` 7.4:88-202):
-///
-/// * a set gives the value; a clear (or a covering clear range) none; both start a new,
-///   independent stack, and a clear makes the key readable again;
-/// * an atomic operation folds into a known value (`coalesce`), or stacks on the database's
-///   value;
-/// * a `SetVersionstampedValue` of the key, or a `SetVersionstampedKey` whose range (or
-///   stamped key) holds it, makes the key unreadable, and a later set or atomic operation
-///   keeps it so (only a clear does not).
-pub(crate) fn own_writes(
-    mutations: &[Mutation],
-    stamped: &[StampedKey],
-    key: &[u8],
-    value_size_limit: usize,
-) -> Own {
-    let mut stamped = stamped.iter().peekable();
-    let mut own = Own::Unmodified;
-    for (index, m) in mutations.iter().enumerate() {
-        match m.kind {
-            MutationType::CLEAR_RANGE => {
-                if &m.param1[..] <= key && key < &m.param2[..] {
-                    own = Own::Known(None);
-                }
-            }
-            MutationType::SET_VERSIONSTAMPED_KEY => {
-                let entry = stamped.next_if(|s| s.index == index);
-                let hit = entry.is_some_and(|s| {
-                    s.key == key
-                        || s.range
-                            .as_ref()
-                            .is_some_and(|r| &r.begin[..] <= key && key < &r.end[..])
-                });
-                if hit {
-                    own = Own::Unreadable;
-                }
-            }
-            _ if m.param1 != key => {}
-            _ if own == Own::Unreadable => {}
-            MutationType::SET_VALUE => own = Own::Known(Some(m.param2.clone())),
-            MutationType::SET_VERSIONSTAMPED_VALUE => own = Own::Unreadable,
-            op => {
-                own = match own {
-                    Own::Unmodified => Own::Dependent(vec![(op, m.param2.clone())]),
-                    Own::Dependent(mut ops) => {
-                        ops.push((op, m.param2.clone()));
-                        Own::Dependent(ops)
-                    }
-                    Own::Known(value) => {
-                        Own::Known(fold(&[(op, m.param2.clone())], value, value_size_limit))
-                    }
-                    Own::Unreadable => Own::Unreadable,
-                }
-            }
-        }
-    }
-    own
-}
-
-/// `WriteMap::coalesceUnder`: `ops` applied in order to `value`.
-pub(crate) fn fold(
-    ops: &[(MutationType, Vec<u8>)],
-    mut value: Option<Vec<u8>>,
-    value_size_limit: usize,
-) -> Option<Vec<u8>> {
-    for (op, operand) in ops {
-        // The buffer holds only mutations `apply` knows (versionstamps are handled above).
-        value = atomic::apply(*op, value.as_deref(), operand, value_size_limit)
-            .unwrap_or_else(|_| value.take());
-    }
-    value
 }
 
 // ---- the database's watches -------------------------------------------------------------------

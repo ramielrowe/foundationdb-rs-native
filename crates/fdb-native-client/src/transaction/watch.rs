@@ -1,54 +1,53 @@
 //! [`Transaction::watch`] and the hooks that keep a transaction's watches right: the commit
 //! that starts them and the failures that cancel them (the writes that trigger them are in
-//! `transaction.rs`, after each write's checks). The watch machinery is [`crate::watch`];
-//! see its documentation for what C++ does.
+//! `write.rs`, after each write's checks). The watch machinery is [`crate::watch`]; see its
+//! documentation for what C++ does.
 
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use fdb_native_schema::domain::MutationType;
 use fdb_native_transport::runtime::Runtime;
 use futures_channel::oneshot;
 
-use super::{CommitStage, ReadGuard, SYSTEM_KEYS_END, Transaction};
+use super::{CommitStage, ReadGuard, ReadStart, RywView, SYSTEM_KEYS_END, Transaction, TxSource};
 use crate::error::Error;
 use crate::error::codes::*;
-use crate::read::key_after;
 use crate::read::util::{Either, race};
-use crate::watch::{Own, PendingId, Watch, fold, own_writes};
+use crate::ryw;
+use crate::watch::{PendingId, Watch};
 
 /// What the read of a watch needs.
 struct WatchRead {
     key: Vec<u8>,
     id: PendingId,
-    /// Resolves if a write of the transaction fires the watch during the read.
+    /// Resolves if a write fires the watch during the read.
     fired: oneshot::Receiver<()>,
-    /// The transaction's own atomic operations on the key, to apply to the value read.
-    ops: Vec<(MutationType, Vec<u8>)>,
-    epoch: u64,
-    use_provisional: bool,
-    value_size_limit: usize,
+    start: ReadStart,
+    /// The transaction's writes when `watch` was called.
+    view: RywView,
 }
 
 impl<R: Runtime> Transaction<R> {
     /// `watch(key)`: a [`Watch`] that resolves when the value of `key` changes, once this
     /// transaction has committed.
     ///
-    /// Like `ReadYourWritesTransaction::watch`, this works out the key's value as the
-    /// transaction sees it (its own writes to the key applied to the database's value) and
-    /// counts the watch against the database's cap. The watch is **registered when the
-    /// transaction commits** (also a read-only one, which commits without contacting the
-    /// cluster), watching that value as of the commit. If the transaction fails to commit,
-    /// or is reset or dropped first, the watch fails (see [`Watch`]).
+    /// Like `ReadYourWritesTransaction::watch`, this reads the key's value as the
+    /// transaction sees it (a [`get`](Self::get) of it) and counts the watch against the
+    /// database's cap. The watch is **registered when the transaction commits** (also a
+    /// read-only one, which commits without contacting the cluster), watching that value as
+    /// of the commit. If the transaction fails to commit, or is reset or dropped first, the
+    /// watch fails (see [`Watch`]).
     ///
-    /// * **The value watched.** A set or clear of the key (with any atomic operations since
-    ///   folded in, [`crate::atomic`]) gives it without a read. Otherwise the key is read at
-    ///   the read version, **with a read conflict range**, and the transaction's atomic
-    ///   operations on it, if any, are applied in order: a commit then fails with
-    ///   `not_committed` if another transaction changed the key after the read version, so
-    ///   the value is the key's value at the commit. The read counts as a read in progress:
-    ///   a commit started meanwhile waits for it, and registers the watch.
+    /// * **The value watched** is what `get(key)` returns, with the transaction's writes
+    ///   before the call: a set or clear of the key (with any atomic operations since folded
+    ///   in, [`crate::atomic`]) gives it without a read; otherwise the key is read at the read
+    ///   version (or found in what the transaction read already), **with a read conflict
+    ///   range**, and the transaction's atomic operations on it, if any, are applied: a
+    ///   commit then fails with `not_committed` if another transaction changed the key after
+    ///   the read version, so the value is the key's value at the commit. The read counts as
+    ///   a read in progress: a commit started meanwhile waits for it, and registers the
+    ///   watch.
     /// * **Later writes** of the transaction to the key that give it another value than the
     ///   one watched resolve the watch at once; an atomic operation on the key always does.
     ///
@@ -57,12 +56,15 @@ impl<R: Runtime> Transaction<R> {
     ///
     /// # Errors
     ///
+    /// `watches_disabled` (1034) with
+    /// [`ReadYourWritesDisable`](super::TransactionOption::ReadYourWritesDisable).
     /// `too_many_watches` (1032): the database has [`max_outstanding_watches`] outstanding
     /// watches. `key_outside_legal_range` (2004) for a key from `\xff` on (unless the
     /// `ReadSystemKeys` or `AccessSystemKeys` option is set) or from `\xff\xff` on,
     /// `key_too_large` (2102), `accessed_unreadable` (1036) for a key whose value a pending
-    /// versionstamped operation of the transaction makes unknown (see [`crate::watch`]), the
-    /// errors of [`get`](Self::get), and `used_during_commit` (2017) after the commit started
+    /// versionstamped operation of the transaction makes unknown (unless
+    /// [`BypassUnreadable`](super::TransactionOption::BypassUnreadable)), the errors of
+    /// [`get`](Self::get), and `used_during_commit` (2017) after the commit started
     /// ([maybe committed](Error::is_maybe_committed) once the commit may have been sent; the
     /// commit itself goes on).
     ///
@@ -78,43 +80,31 @@ impl<R: Runtime> Transaction<R> {
             if let Some(e) = state.used_during_commit() {
                 return Err(e);
             }
-            if key >= SYSTEM_KEYS_END || key >= state.flags.max_read_key() {
+            let start = ReadStart {
+                epoch: state.epoch,
+                use_provisional_proxies: state.flags.use_provisional_proxies,
+                max_read_key: state.flags.max_read_key(),
+            };
+            // `ReadYourWritesTransaction::watch` (7.4:2440-2459, 8.0:2356-2375).
+            let Some(view) = Self::ryw_view(&state, false) else {
+                return Err(Error::new(WATCHES_DISABLED));
+            };
+            if key >= SYSTEM_KEYS_END || key >= start.max_read_key {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }
-            let limits = *state.buffer.limits();
-            if key.len() > limits.max_write_key_size(key) {
+            if key.len() > state.buffer.limits().max_write_key_size(key) {
                 return Err(Error::new(KEY_TOO_LARGE));
             }
-            let use_provisional = state.flags.use_provisional_proxies;
-            let own = own_writes(
-                state.buffer.mutations(),
-                &state.stamped_keys,
-                key,
-                limits.value_size_limit,
-            );
-            let ops = match own {
-                Own::Unreadable => return Err(Error::new(ACCESSED_UNREADABLE)),
-                // The write map answers: nothing to read or to wait for.
-                Own::Known(value) => {
-                    let counter = &self.inner.db.inner.watches.counter;
-                    return state
-                        .watches
-                        .add_known(key, value, use_provisional, counter);
-                }
-                Own::Unmodified => Vec::new(),
-                Own::Dependent(ops) => ops,
-            };
-            let (id, fired) = state.watches.register(key, use_provisional);
-            // `ryw->reading.add(done)`: held until the watch is registered (or failed).
+            // `RYWImpl::watch`: `watchMap[key].push_back(watch)`, then the read, counted in
+            // `ryw->reading` until the watch is registered (or failed).
+            let (id, fired) = state.watches.register(key, start.use_provisional_proxies);
             let guard = self.start_read(&mut state);
             let read = WatchRead {
                 key: key.to_vec(),
                 id,
                 fired,
-                ops,
-                epoch: state.epoch,
-                use_provisional,
-                value_size_limit: limits.value_size_limit,
+                start,
+                view,
             };
             (read, guard)
         };
@@ -127,30 +117,21 @@ impl<R: Runtime> Transaction<R> {
         .await
     }
 
-    /// `RYWImpl::watch` from the read on: the value read (unless a write fires the watch
-    /// first), the read conflict range, then the registration.
+    /// `RYWImpl::watch` (7.4:1284-1335, 8.0:1278-1327) from the read on: the value read
+    /// (`readWithConflictRange(GetValueReq(key), Snapshot::False)`, unless a write fires the
+    /// watch first), its read conflict range, then the registration.
     async fn watch_read(&self, read: WatchRead, guard: &ReadGuard<R>) -> Result<Watch, Error> {
         let WatchRead {
             key,
             id,
             fired,
-            ops,
-            epoch,
-            use_provisional,
-            value_size_limit,
+            start,
+            view,
         } = read;
-        let mut value = pin!(async {
-            self.guarded(epoch, async {
-                let version = self.read_version(false).await?;
-                self.inner
-                    .db
-                    .inner
-                    .reader
-                    .get_with(&key, version, use_provisional)
-                    .await
-            })
-            .await?
-        });
+        let epoch = start.epoch;
+        let source = TxSource::new(self, &start);
+        let ryw_read = view.read(&source, start.max_read_key);
+        let mut value = pin!(ryw::read::get(&ryw_read, &key));
         let value = match race(fired, value.as_mut()).await {
             Either::Right(result) => result,
             // `onChangeTrigger`: a write fired it; the read is abandoned.
@@ -183,18 +164,9 @@ impl<R: Runtime> Transaction<R> {
                 .used_during_commit()
                 .unwrap_or(Error::new(USED_DURING_COMMIT)));
         }
-        // `updateConflictMap`: the key was unmodified or had dependent writes. With
-        // read-your-writes, the range joins the reads' (`readConflicts`).
-        let end = key_after(&key);
-        if state.flags.read_your_writes_disabled {
-            if let Err(e) = state.buffer.add_read_conflict_range(&key, &end) {
-                state.watches.remove(&id);
-                return Err(e);
-            }
-        } else {
-            state.ryw.read_conflicts.insert(&key, &end);
-        }
-        let value = fold(&ops, value, value_size_limit);
+        // `addConflictRange(GetValueReq)`: the key, if its value depended on the database
+        // (unmodified, or dependent writes) in the writes the read saw.
+        ryw::read::add_get_conflict(&mut state.ryw.read_conflicts, &key, &ryw_read.writes);
         let counter = &self.inner.db.inner.watches.counter;
         state.watches.finish_read(&id, value, counter)
     }

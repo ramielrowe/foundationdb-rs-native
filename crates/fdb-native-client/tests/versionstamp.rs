@@ -100,10 +100,15 @@ async fn versionstamped_writes_reach_the_proxy_with_their_offsets_and_get_versio
         grv.reply_grv(100);
         let call = env.commit.next().await;
         let (commit, _) = call.commit();
+        // The key goes with its placeholder filled with the smallest stamp it may get
+        // (`transformVersionstampKey`: zeros, without a read version at the time of the
+        // write), as C++ sends it; the proxy overwrites the 10 bytes.
+        let mut sent_key = key.clone();
+        sent_key[4..14].fill(0);
         assert_eq!(
             commit.mutations,
             vec![
-                Mutation::new(Mt::SET_VERSIONSTAMPED_KEY, key.clone(), "payload").unwrap(),
+                Mutation::new(Mt::SET_VERSIONSTAMPED_KEY, sent_key, "payload").unwrap(),
                 Mutation::new(Mt::SET_VERSIONSTAMPED_VALUE, "stamped", value.clone()).unwrap(),
             ],
             "{schema:?}"

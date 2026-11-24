@@ -1100,12 +1100,17 @@ async fn range_value<S: RywSource>(
 
 // ---- read conflict ranges ----------------------------------------------------------------
 
+/// `sizeof(KeyRangeRef)`, as `approximateSize` counts a conflict range.
+const KEY_RANGE_REF_SIZE: usize = crate::commit::KEY_RANGE_REF_SIZE as usize;
+
 /// `updateConflictMap(key)`: the read of `key` depended on the database if the key is
 /// unmodified or has dependent writes (`it` is at the key's segment).
 fn update_conflict_map_key(conflicts: &mut ReadConflicts, key: &[u8], it: &WriteMapIter) {
     if it.is_unmodified_range() || (it.is_operation() && it.is_independent() == Some(false)) {
         let mut end = key.to_vec();
         end.push(0);
+        // `approximateSize += 2 * key.expectedSize() + 1 + sizeof(KeyRangeRef)`.
+        conflicts.add_approximate_size(2 * key.len() + 1 + KEY_RANGE_REF_SIZE);
         conflicts.insert(key, &end);
     }
 }
@@ -1123,7 +1128,12 @@ fn update_conflict_map_range(
         if it.is_unmodified_range() || (it.is_operation() && it.is_independent() == Some(false)) {
             let b = ExtKey::from(begin).max(it.begin_key()).to_vec();
             let e = end_key.min(it.end_key()).to_vec();
-            conflicts.insert(&b, &e);
+            if b < e {
+                // `approximateSize += keys.expectedSize() + sizeof(KeyRangeRef)`: the whole
+                // range read, for each part inserted.
+                conflicts.add_approximate_size(begin.len() + end.len() + KEY_RANGE_REF_SIZE);
+                conflicts.insert(&b, &e);
+            }
         }
         if !it.advance() && it.begin_key() < end_key {
             // Past the last segment: nothing more (C++ cannot get here either).

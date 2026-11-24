@@ -64,6 +64,12 @@ impl CommitBuffer {
         self.skip_write_conflict = skip;
     }
 
+    /// Whether the writes that follow add no write conflict range
+    /// ([`set_skip_write_conflict`](Self::set_skip_write_conflict)).
+    pub(crate) fn skip_write_conflict(&self) -> bool {
+        self.skip_write_conflict
+    }
+
     /// The write conflict range of a write, unless it is to have none.
     fn add_write_conflict(&mut self, range: KeyRange) {
         if !self.skip_write_conflict {

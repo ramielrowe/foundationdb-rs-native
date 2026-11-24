@@ -664,3 +664,390 @@ fn compare_and_clear_quirk() {
     .unwrap();
     assert!(out.rows.is_empty(), "{out:?}");
 }
+
+// ---- the conflict ranges cover every key a result depends on --------------------------------
+//
+// An oracle for the read conflict ranges (from the ygr.3 review): run a sequence of writes
+// and reads over a database, then, for every key `k` of a small universe and a database
+// that differs from it only at `k` (the key removed, or set, or set to another value), check
+// that if the results the reads returned are not what a transaction could have seen over
+// that database, `k` is in the read conflict ranges. A conflict range that misses a key the
+// results depend on would let a transaction commit on a stale read.
+
+/// A xorshift generator.
+struct XGen(u64);
+
+impl XGen {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn key(&mut self) -> Vec<u8> {
+        let mut k = vec![b'a' + self.below(6) as u8];
+        k.extend(std::iter::repeat_n(0u8, self.below(3) as usize));
+        k
+    }
+
+    fn sel(&mut self) -> KeySelector {
+        KeySelector::new(self.key(), self.below(2) == 0, self.below(13) as i32 - 6)
+    }
+}
+
+/// The keys the oracle changes: `a`..`g` with 0 to 2 zero bytes after.
+fn universe() -> Vec<Vec<u8>> {
+    let mut u = Vec::new();
+    for c in 0..7u8 {
+        for z in 0..3 {
+            let mut k = vec![b'a' + c];
+            k.extend(std::iter::repeat_n(0u8, z));
+            u.push(k);
+        }
+    }
+    u
+}
+
+/// What a read returned.
+#[derive(Debug, PartialEq)]
+enum Out {
+    V(Option<Vec<u8>>),
+    K(Vec<u8>),
+    R(Vec<KeyValue>, bool),
+    E(u16),
+}
+
+/// Runs `ops` over `db` (split at `boundaries`) as a transaction does: the results and the
+/// read conflict ranges.
+fn run_ops(
+    db: &BTreeMap<Vec<u8>, Vec<u8>>,
+    boundaries: &[Vec<u8>],
+    ops: &[Op],
+) -> (Vec<Out>, ReadConflicts) {
+    let mem = Mem::new(db.clone(), boundaries.to_vec());
+    let mut writes = WriteMap::new();
+    let mut model = db.clone();
+    let mut conflicts = ReadConflicts::new();
+    let mut outs = Vec::new();
+    for op in ops {
+        let r = match op {
+            Op::Write(w) => {
+                apply(&mut model, &mut writes, w);
+                continue;
+            }
+            Op::Read(r) => r,
+        };
+        let ryw = read(&mem, &writes);
+        match r {
+            Read::Get(k) => match block_on(get(&ryw, k)) {
+                Ok(v) => {
+                    add_get_conflict(&mut conflicts, k, &ryw.writes);
+                    outs.push(Out::V(v));
+                }
+                Err(e) => outs.push(Out::E(e.code())),
+            },
+            Read::GetKey(sel) => match block_on(get_key(&ryw, sel.clone())) {
+                Ok(k) => {
+                    add_get_key_conflict(&mut conflicts, sel, &k, &ryw.writes).unwrap();
+                    outs.push(Out::K(k));
+                }
+                Err(e) => outs.push(Out::E(e.code())),
+            },
+            Read::Range {
+                begin,
+                end,
+                rows,
+                bytes,
+                reverse,
+            } => {
+                let begin = remove_or_equal(begin);
+                let end = remove_or_equal(end);
+                if begin.offset >= end.offset && begin.key >= end.key {
+                    outs.push(Out::R(Vec::new(), false));
+                    continue;
+                }
+                let bytes = if rows.is_none() && bytes.is_none() {
+                    Some(100_000)
+                } else {
+                    *bytes
+                };
+                let limits = Limits::new(crate::read::RangeLimits::new(*rows, bytes));
+                let out = if *reverse {
+                    block_on(get_range_value_back(
+                        &ryw,
+                        begin.clone(),
+                        end.clone(),
+                        limits,
+                    ))
+                } else {
+                    block_on(get_range_value(&ryw, begin.clone(), end.clone(), limits))
+                };
+                match out {
+                    Ok(out) => {
+                        add_range_read_conflict(
+                            &mut conflicts,
+                            &begin,
+                            &end,
+                            *reverse,
+                            &out,
+                            MAX,
+                            &ryw.writes,
+                        )
+                        .unwrap();
+                        outs.push(Out::R(out.rows.clone(), out.more));
+                    }
+                    Err(e) => outs.push(Out::E(e.code())),
+                }
+            }
+        }
+    }
+    (outs, conflicts)
+}
+
+/// Whether `k` is in the read conflict ranges.
+fn covers(c: &ReadConflicts, k: &[u8]) -> bool {
+    c.ranges()
+        .any(|r| r.begin.as_slice() <= k && k < r.end.as_slice())
+}
+
+/// Whether `outs` are results a transaction could have seen running `ops` over `db`:
+/// `Some(why)` if not. A range read's rows must be a prefix of the rows in its range, all of
+/// them if it says there are no more.
+fn valid_under(db: &BTreeMap<Vec<u8>, Vec<u8>>, ops: &[Op], outs: &[Out]) -> Option<String> {
+    let mut model = db.clone();
+    let mut wm = WriteMap::new();
+    let mut outs = outs.iter();
+    for op in ops {
+        let r = match op {
+            Op::Write(w) => {
+                apply(&mut model, &mut wm, w);
+                continue;
+            }
+            Op::Read(r) => r,
+        };
+        match (r, outs.next().expect("a result per read")) {
+            (_, Out::E(_)) => {}
+            (Read::Get(k), Out::V(v)) => {
+                if model.get(k) != v.as_ref() {
+                    return Some(format!("get {k:?}: {v:?} vs {:?}", model.get(k)));
+                }
+            }
+            (Read::GetKey(sel), Out::K(k)) => {
+                let want = model_key(&model, sel);
+                if &want != k {
+                    return Some(format!("get_key {sel:?}: {k:?} vs {want:?}"));
+                }
+            }
+            (
+                Read::Range {
+                    begin,
+                    end,
+                    rows,
+                    reverse,
+                    ..
+                },
+                Out::R(got, more),
+            ) => {
+                let b = model_key(&model, &remove_or_equal(begin));
+                let e = model_key(&model, &remove_or_equal(end));
+                let mut exp: Vec<KeyValue> = if b < e {
+                    model
+                        .range(b..e)
+                        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if *reverse {
+                    exp.reverse();
+                }
+                if let Some(r) = rows {
+                    exp.truncate(*r as usize);
+                }
+                if got.len() > exp.len() || got[..] != exp[..got.len()] {
+                    return Some(format!("range rows {got:?} vs {exp:?}"));
+                }
+                if !*more && got.len() != exp.len() {
+                    return Some(format!("range !more {got:?} vs {exp:?}"));
+                }
+            }
+            (r, o) => unreachable!("{r:?} {o:?}"),
+        }
+    }
+    None
+}
+
+/// The oracle on one case: `Some(failure)` for a key the results depend on that the read
+/// conflict ranges miss.
+fn uncovered_dependency(
+    db: &BTreeMap<Vec<u8>, Vec<u8>>,
+    boundaries: &[Vec<u8>],
+    ops: &[Op],
+) -> Option<String> {
+    let (outs, conflicts) = run_ops(db, boundaries, ops);
+    for k in universe() {
+        let mut variants = Vec::new();
+        match db.get(&k) {
+            Some(v) => {
+                let mut d = db.clone();
+                d.remove(&k);
+                variants.push(d);
+                let mut d = db.clone();
+                let mut other = v.clone();
+                other.push(7);
+                d.insert(k.clone(), other);
+                variants.push(d);
+            }
+            None => {
+                let mut d = db.clone();
+                d.insert(k.clone(), vec![5]);
+                variants.push(d);
+            }
+        }
+        for d in variants {
+            if let Some(why) = valid_under(&d, ops, &outs) {
+                if !covers(&conflicts, &k) {
+                    return Some(format!(
+                        "key {k:?}: {why}\n db {db:?}\n bounds {boundaries:?}\n ops {ops:?}\n \
+                         outs {outs:?}\n conflicts {:?}",
+                        conflicts.ranges().collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn db_of(keys: &[&[u8]]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    keys.iter().map(|k| (k.to_vec(), vec![1])).collect()
+}
+
+fn range_op(begin: KeySelector, end: KeySelector, rows: u32, reverse: bool) -> Op {
+    Op::Read(Read::Range {
+        begin,
+        end,
+        rows: Some(rows),
+        bytes: None,
+        reverse,
+    })
+}
+
+/// The cases where a range read's result depends on keys past the rows it returned
+/// (`addConflictRange(GetRangeReq)`, `ReadYourWrites.actor.cpp` 7.4:250-300): a read cut by
+/// its limit depends on the keys between its last row and its end only if its end selector
+/// counts back (offset 0 or less), and, reversed, on the keys between its begin and its
+/// lowest row only if its begin selector counts forward past the first key (offset over 1).
+#[test]
+fn conflicts_cover_dependencies_past_a_limit() {
+    let lt = |k: &[u8], offset: i32| KeySelector::new(k.to_vec(), false, offset);
+    let cases: Vec<(&str, Vec<&[u8]>, Op)> = vec![
+        // `[a, lastLessThan(c))` is `[a, b)`; one row: `a`, and more. Without `b` the end
+        // is `a` and the range empty.
+        (
+            "forward, end offset 0, cut",
+            vec![b"a", b"b", b"c"],
+            range_op(fge(b"a"), lt(b"c", 0), 1, false),
+        ),
+        // The end two keys before `d`: `b`.
+        (
+            "forward, end offset -1, cut",
+            vec![b"a", b"b", b"c", b"d"],
+            range_op(fge(b"a"), lt(b"d", -1), 1, false),
+        ),
+        // `[second key from a, end)` reversed, two rows `c b`, and more. Without `a` the
+        // begin is `c`.
+        (
+            "reverse, begin offset 2, cut",
+            vec![b"a", b"b", b"c"],
+            range_op(lt(b"a", 2), fge(b"z"), 2, true),
+        ),
+        (
+            "reverse, begin offset 3, cut",
+            vec![b"a", b"b", b"c", b"d"],
+            range_op(lt(b"a", 3), fge(b"z"), 2, true),
+        ),
+    ];
+    for (name, keys, op) in cases {
+        let db = db_of(&keys);
+        for boundaries in [vec![], vec![b"b".to_vec()], vec![b"c".to_vec()]] {
+            let ops = vec![op.clone()];
+            if let Some(failure) = uncovered_dependency(&db, &boundaries, &ops) {
+                panic!("{name}: {failure}");
+            }
+        }
+        // The rows came from the database (not from the transaction's writes): the read
+        // depended on them.
+        let (outs, _) = run_ops(&db, &[], std::slice::from_ref(&op));
+        assert!(
+            matches!(&outs[0], Out::R(rows, true) if !rows.is_empty()),
+            "{name}: {outs:?}"
+        );
+    }
+}
+
+/// The oracle over random sequences of writes and reads over random databases and shard
+/// boundaries (`PSEED` and `PCASES` choose the seed and the number of cases).
+#[test]
+fn conflicts_cover_dependencies() {
+    let seed: u64 = std::env::var("PSEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x5eed_1234_abcd_0001);
+    let cases: usize = std::env::var("PCASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let mut g = XGen(seed);
+    let ops_list = [M::ADD_VALUE, M::MAX, M::BYTE_MIN, M::APPEND_IF_FITS, M::XOR];
+    let mut failures = Vec::new();
+    for case in 0..cases {
+        let mut db = BTreeMap::new();
+        for _ in 0..g.below(10) {
+            db.insert(g.key(), vec![g.below(3) as u8]);
+        }
+        let boundaries: Vec<Vec<u8>> = (0..g.below(3)).map(|_| g.key()).collect();
+        let mut ops = Vec::new();
+        for _ in 0..(1 + g.below(10)) {
+            let op = match g.below(8) {
+                0 => Op::Write(Write::Set(g.key(), vec![g.below(3) as u8])),
+                1 => Op::Write(Write::Clear(g.key())),
+                2 => {
+                    let (mut a, mut b) = (g.key(), g.key());
+                    if a > b {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    Op::Write(Write::ClearRange(a, b))
+                }
+                3 => Op::Write(Write::Atomic(
+                    g.key(),
+                    ops_list[g.below(5) as usize],
+                    vec![g.below(3) as u8],
+                )),
+                4 => Op::Read(Read::Get(g.key())),
+                5 => Op::Read(Read::GetKey(g.sel())),
+                _ => Op::Read(Read::Range {
+                    begin: g.sel(),
+                    end: g.sel(),
+                    rows: [None, Some(1), Some(2), Some(3)][g.below(4) as usize],
+                    bytes: [None, Some(1), Some(12)][g.below(3) as usize],
+                    reverse: g.below(2) == 0,
+                }),
+            };
+            ops.push(op);
+        }
+        if let Some(failure) = uncovered_dependency(&db, &boundaries, &ops) {
+            failures.push(format!("case {case}: {failure}"));
+        }
+    }
+    if !failures.is_empty() {
+        let n = failures.len();
+        failures.sort_by_key(String::len);
+        panic!("{n} failures; shortest:\n{}", failures[0]);
+    }
+}

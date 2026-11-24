@@ -87,6 +87,7 @@ impl<'c> RywIter<'c> {
     /// The snapshot cache iterator a read without read-your-writes uses (C++'s
     /// `SnapshotCache::iterator` as the read path's `Iter`): an `RYWIterator` over an empty
     /// write map behaves the same (all its keys are unmodified and readable).
+    #[cfg(test)]
     pub(crate) fn without_writes(cache: &'c SnapshotCache) -> RywIter<'c> {
         RywIter::new(cache, WriteMap::new().iter())
     }
@@ -94,16 +95,6 @@ impl<'c> RywIter<'c> {
     /// `bypassUnreadableProtection`.
     pub(crate) fn bypass_unreadable_protection(&mut self) {
         self.bypass_unreadable = true;
-    }
-
-    /// The write map iterator, at its segment (`extractWriteMapIterator`).
-    pub(crate) fn writes(&self) -> &WriteMapIter {
-        &self.writes
-    }
-
-    /// The write map iterator, to keep over a wait.
-    pub(crate) fn into_writes(self) -> WriteMapIter {
-        self.writes
     }
 
     fn check_readable(&self) -> Result<(), Error> {
