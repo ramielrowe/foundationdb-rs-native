@@ -6,7 +6,9 @@
 //! 1. **Setup.** The cluster's shape ([`ClusterConfig::randomized`]), the faulty network's
 //!    settings ([`NetConfig::randomized`]), the client's seeds and the stream's write promises
 //!    (from `seed % 4`: both kept, neither, or one of the two) are drawn from the seed. The
-//!    bank's accounts are written on a clean network.
+//!    bank's accounts are written on a clean network. A third of the seeds (`seed % 3 == 2`)
+//!    open a second database on the client node, which shares the first one's connections
+//!    and runs the bank workloads.
 //! 2. **Chaos.** For 5 to 25 s the network is faulty and a chaos task strikes, at random
 //!    times, faults drawn with per-seed weights: process kills (crash or power off) and
 //!    restarts, recoveries (with version jumps and gaps without proxies), clogs, partitions
@@ -25,6 +27,8 @@
 //!    off, and reads of its shard keep succeeding, fast once the failure monitor has caught
 //!    up; it is restarted, and the client's load balancing sends it requests again.
 //! 6. **Shutdown**: `Database::shutdown`, then no task of the client's node may be left.
+//!    With two databases, the first one's shutdown must leave the second working (a read
+//!    succeeds, on the connections they shared), and the second one's ends everything.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -68,6 +72,10 @@ pub struct SeedConfig {
     /// (every trust setting gets both), as C++'s simulation flips
     /// `LOCATION_CACHE_PEER_EVICTOR_ENABLED`.
     pub peer_evictor: Option<bool>,
+    /// How many databases the client opens (1 or 2; two share the node's connections, and
+    /// the bank workloads use the second); `None` takes it from the seed: 2 when
+    /// `seed % 3 == 2`.
+    pub databases: Option<usize>,
 }
 
 impl SeedConfig {
@@ -81,7 +89,14 @@ impl SeedConfig {
             convergence: None,
             net: None,
             peer_evictor: None,
+            databases: None,
         }
+    }
+
+    /// The same, with `databases` (1 or 2) databases on the client node.
+    pub fn with_databases(mut self, databases: usize) -> Self {
+        self.databases = Some(databases);
+        self
     }
 
     /// The same, with or without the location cache's peer evictor.
@@ -150,6 +165,8 @@ pub struct SeedReport {
     pub convergence: bool,
     /// Whether the client ran the location cache's peer evictor.
     pub peer_evictor: bool,
+    /// How many databases the client opened (sharing its connections).
+    pub databases: usize,
 }
 
 impl SeedReport {
@@ -174,8 +191,8 @@ impl fmt::Display for SeedReport {
         )?;
         writeln!(
             f,
-            "  faults: {:?}, convergence: {}, peer evictor: {}",
-            self.faults, self.convergence, self.peer_evictor
+            "  faults: {:?}, convergence: {}, peer evictor: {}, databases: {}",
+            self.faults, self.convergence, self.peer_evictor, self.databases
         )?;
         writeln!(f, "  network: {:?}", self.net)?;
         writeln!(f, "  cluster: {:?}", self.cluster)?;
@@ -237,6 +254,10 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
         config.convergence.unwrap_or_else(|| rng.chance(0.33)) && cluster_config.replication >= 2;
     let accounts = rng.range(3, 8);
     let peer_evictor = config.peer_evictor.unwrap_or(config.seed / 4 % 2 == 0);
+    let databases = config
+        .databases
+        .unwrap_or(if config.seed % 3 == 2 { 2 } else { 1 })
+        .clamp(1, 2);
     let records = Records::new(&sim);
     let faults = Arc::new(Mutex::new(BTreeMap::new()));
     let mut violations = Vec::new();
@@ -253,7 +274,18 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
             .parse()
             .expect("a valid connection string"),
     );
-    let db = Database::from_record(rt.clone(), record, options).expect("the database opens");
+    let db = Database::from_record(rt.clone(), record.clone(), options.clone())
+        .expect("the database opens");
+    // A second database of the same cluster on the same node shares the connections (one
+    // per address, one failure monitor) and has its own long poll, location cache and
+    // batchers.
+    let second = (databases == 2)
+        .then(|| Database::from_record(rt.clone(), record, options).expect("the database opens"));
+    if let Some(second) = &second {
+        if !db.peers().shares_connections_with(second.peers()) {
+            violations.push("sharing: the second database has connections of its own".to_owned());
+        }
+    }
 
     // Every report also lists what was recorded along the way: panics, breaches of the stream
     // contract, protocol breaches the servers saw.
@@ -284,6 +316,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
             faults: lock(&faults).clone(),
             convergence,
             peer_evictor,
+            databases,
         }
     };
 
@@ -330,7 +363,7 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     for w in 0..rng.range(1, 3) {
         let ops = rng.range(4, 12);
         tasks.push(rt.spawn(workload::bank(
-            db.clone(),
+            second.clone().unwrap_or_else(|| db.clone()),
             records.clone(),
             w,
             ops,
@@ -406,15 +439,41 @@ fn run_with<const E: bool, const P: bool>(config: &SeedConfig) -> SeedReport {
     }
 
     // 6. Shutdown: nothing of the client may be left, first with the database still held
-    // (`shutdown` must end every task by itself), then once it is dropped.
+    // (`shutdown` must end every task by itself), then once it is dropped. With two
+    // databases, the first one's shutdown must leave the second working on the shared
+    // connections, and the second one's must end everything.
     let shutdown = async {
         db.shutdown().await;
     };
     if let Err(e) = sim.block_on_within(Duration::from_secs(60), shutdown) {
         violations.push(format!("liveness: Database::shutdown did not finish: {e}"));
     }
+    if let Some(second) = &second {
+        match sim.block_on_within(Duration::from_secs(120), read_once(second, COUNTER)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => violations.push(format!(
+                "sharing: the second database failed a read after the first was shut down: \
+                 {e:?}"
+            )),
+            Err(e) => violations.push(format!(
+                "sharing: the second database's read did not finish after the first was shut \
+                 down: {e}"
+            )),
+        }
+        if second.is_shut_down() || second.peers().users() != 1 {
+            violations.push(format!(
+                "sharing: the first database's shutdown reached the second ({:?})",
+                second.peers()
+            ));
+        }
+        if let Err(e) = sim.block_on_within(Duration::from_secs(60), second.shutdown()) {
+            violations.push(format!(
+                "liveness: the second Database::shutdown did not finish: {e}"
+            ));
+        }
+    }
     drop(tasks);
-    let mut held = Some(db);
+    let mut held = Some((db, second));
     for when in ["after Database::shutdown", "after the database was dropped"] {
         if let Err(e) = sim.run_for(Duration::from_secs(5)) {
             violations.push(format!("{when}: {e}"));

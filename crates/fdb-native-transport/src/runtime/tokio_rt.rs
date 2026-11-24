@@ -93,6 +93,12 @@ impl Runtime for TokioRuntime {
     /// wrote nothing.
     const PENDING_TAKES_NOTHING: bool = true;
 
+    /// The same tokio runtime ([`Handle::id`], unique among the runtimes alive, and a handle
+    /// keeps its runtime's id from being reused).
+    fn same_runtime(&self, other: &Self) -> bool {
+        self.handle.id() == other.handle.id()
+    }
+
     fn now(&self) -> Instant {
         // The context decides which clock `tokio::time::Instant::now` reads.
         let _enter = self.handle.enter();

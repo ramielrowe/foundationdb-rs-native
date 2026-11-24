@@ -401,3 +401,44 @@ fn a_refused_connection_is_an_error_not_a_hang() {
         mgr.shutdown().await;
     });
 }
+
+/// Two users of one manager on smol share the connection, and one user's shutdown leaves the
+/// other's requests working; the connection closes with the last user. Smol runtimes are the
+/// same runtime when they share the executor.
+#[test]
+fn users_share_the_connection_on_smol() {
+    let server = Server::start(ProtocolVersion::V7_4);
+    block_on(async {
+        let rt = SmolRuntime::new();
+        assert!(rt.same_runtime(&SmolRuntime::new()));
+        let own = SmolRuntime::with_executor(Arc::new(async_executor::Executor::new()));
+        assert!(!rt.same_runtime(&own));
+        let a = PeerManager::new(
+            rt.clone(),
+            config(vec![ProtocolVersion::V7_4]),
+            DiscardEvents,
+        );
+        assert!(a.downgrade().share_on(&own).is_none());
+        let b = a
+            .downgrade()
+            .share_on(&SmolRuntime::new())
+            .expect("same runtime");
+        let (pa, pb) = (a.peer(&server.address()), b.peer(&server.address()));
+        within(&rt, "a request of a", protocol_info(&pa))
+            .await
+            .unwrap();
+        within(&rt, "a request of b", protocol_info(&pb))
+            .await
+            .unwrap();
+        assert_eq!(server.knobs.accepted.load(Ordering::SeqCst), 1);
+        within(&rt, "a's shutdown", a.shutdown()).await;
+        assert_eq!(protocol_info(&pa).await, Err(RequestError::NotSent(None)));
+        within(&rt, "b after a's shutdown", protocol_info(&pb))
+            .await
+            .unwrap();
+        assert_eq!(pb.status().phase, PeerPhase::Connected);
+        assert_eq!(server.knobs.accepted.load(Ordering::SeqCst), 1);
+        within(&rt, "b's shutdown", b.shutdown()).await;
+        assert_eq!(pb.status().phase, PeerPhase::Shutdown);
+    });
+}

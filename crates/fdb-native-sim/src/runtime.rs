@@ -75,6 +75,11 @@ impl<const E: bool, const P: bool> Runtime for SimRuntime<E, P> {
     const WRITE_ERRORS_TAKE_NOTHING: bool = E;
     const PENDING_TAKES_NOTHING: bool = P;
 
+    /// The same node of the same simulation.
+    fn same_runtime(&self, other: &Self) -> bool {
+        self.sim.same_sim(&other.sim) && self.node == other.node
+    }
+
     fn now(&self) -> Instant {
         self.sim.now()
     }

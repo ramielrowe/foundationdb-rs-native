@@ -210,6 +210,19 @@ pub trait Runtime: Clone + Send + Sync + 'static {
         host: &str,
         port: u16,
     ) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send;
+
+    /// Whether `other` is a handle to the same executor (and network) as `self`: its tasks,
+    /// timers and sockets are the same ones. Connections are only shared between users of the
+    /// same runtime (the client shares them between the databases opened on one runtime; see
+    /// `fdb_native_client::Database`): a connection's task runs on the runtime that opened it,
+    /// and stops with it.
+    ///
+    /// The answer must stay the same while both handles live. `false`, the default, is always
+    /// safe: nothing is shared.
+    fn same_runtime(&self, other: &Self) -> bool {
+        let _ = other;
+        false
+    }
 }
 
 /// A handle to a spawned task.

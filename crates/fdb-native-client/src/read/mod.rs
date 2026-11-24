@@ -851,8 +851,20 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// fail with it once the peer manager is shut down or the cluster monitor closed (see the
     /// [module documentation](self)). [`Database::shutdown`](crate::Database::shutdown)
     /// calls this. Idempotent.
+    ///
+    /// It also lets go of the reader's [references](fdb_native_transport::peer::PeerRef) to
+    /// servers: the location cache is emptied and the proxies are no longer referenced, so
+    /// connections that other databases share are not kept (or probed) for this one.
     pub fn shutdown(&self) {
         self.inner.stop(true);
+        let references = lock(&self.inner.shared.state).proxy_references.take();
+        drop(references);
+        let emptied = {
+            let mut cache = lock(&self.inner.shared.locations);
+            let capacity = cache.capacity();
+            std::mem::replace(&mut *cache, LocationCache::new(capacity))
+        };
+        drop(emptied);
     }
 
     /// A read version for a default transaction (`getReadVersion`): batched with the other

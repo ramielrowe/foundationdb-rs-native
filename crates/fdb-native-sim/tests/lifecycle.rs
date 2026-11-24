@@ -11,6 +11,8 @@ use fdb_native_client::error::codes;
 use fdb_native_client::{Database, DatabaseOptions, KeySelector, RangeOptions};
 use fdb_native_sim::cluster::{ClusterConfig, ProcessClass, SimCluster};
 use fdb_native_sim::{NodeId, Sim, SimRuntime, TraceLevel};
+use fdb_native_transport::peer::{Generation, PeerHandle, PeerPhase};
+use fdb_native_wire::NetworkAddress;
 
 const CLIENT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 9, 1));
 
@@ -141,5 +143,124 @@ fn a_dropped_transaction_ends_its_stuck_reads_and_shutdown_ends_everything() {
         assert_eq!(e.code(), codes::OPERATION_CANCELLED, "seed {seed}");
         assert!(s.sim.live_tasks(s.client).is_empty(), "seed {seed}");
         drop(held);
+    }
+}
+
+/// The live client tasks, as text.
+fn client_tasks(sim: &Sim, client: NodeId) -> Vec<String> {
+    sim.live_tasks(client)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Two databases opened on the client node share its connections (b35.7): the first going
+/// (shut down with a transaction of it held, or dropped) leaves the second working on the same
+/// connections (none of them reconnects), and nothing of the client is left once the second
+/// goes too (shut down, then dropped).
+#[test]
+fn two_databases_share_connections_and_the_last_one_ends_everything() {
+    for seed in 0..4 {
+        for shut_down in [true, false] {
+            let s = setup(seed);
+            let rt = SimRuntime::new(&s.sim, s.client);
+            let record = ConnectionRecord::memory(s.cluster.connection_string().parse().unwrap());
+            let mut options = DatabaseOptions::default();
+            options.peers = s.db.peers().config().clone();
+            let other = Database::from_record(rt, record, options).expect("the database opens");
+            assert!(s.db.peers().shares_connections_with(other.peers()));
+            assert_eq!(other.peers().users(), 2);
+
+            // A write, then a read of it (a storage server), through one database.
+            let write = |db: Database<SimRuntime>, value: &'static [u8]| async move {
+                db.run(|tx, _| async move {
+                    tx.set(b"k", value);
+                    Ok(())
+                })
+                .await?;
+                db.run(|tx, _| async move { tx.get(b"k").await }).await
+            };
+            s.sim
+                .block_on_within(Duration::from_secs(60), write(s.db.clone(), b"a"))
+                .expect("in time")
+                .expect("committed");
+            let read = s
+                .sim
+                .block_on_within(Duration::from_secs(60), write(other.clone(), b"b"))
+                .expect("in time")
+                .expect("committed");
+            assert_eq!(read.as_deref(), Some(&b"b"[..]), "seed {seed}");
+
+            // The connections both used: they must outlive the first database.
+            let connected: Vec<(PeerHandle, Generation)> = s
+                .cluster
+                .processes()
+                .iter()
+                .map(|p| NetworkAddress::new(p.addr.ip().into(), p.addr.port(), true, false))
+                .filter_map(|address| {
+                    let peer = other.peers().peer(&address);
+                    let status = peer.status();
+                    (status.phase == PeerPhase::Connected).then_some((peer, status.generation))
+                })
+                .collect();
+            assert!(!connected.is_empty());
+
+            // The first goes, a transaction of it held: the second still reads and writes, on
+            // the same connections.
+            let held = s.db.create_transaction();
+            let Setup {
+                sim,
+                cluster: _cluster,
+                db,
+                client,
+            } = s;
+            if shut_down {
+                sim.block_on(db.shutdown()).unwrap();
+                let e = sim
+                    .block_on_within(Duration::from_millis(1), held.get_read_version())
+                    .expect("at once")
+                    .unwrap_err();
+                assert_eq!(e.code(), codes::OPERATION_CANCELLED, "seed {seed}");
+            }
+            drop((held, db));
+            sim.run_for(Duration::from_secs(5)).unwrap();
+            assert!(!other.is_shut_down());
+            assert_eq!(other.peers().users(), 1);
+            let read = sim
+                .block_on_within(Duration::from_secs(60), {
+                    let other = other.clone();
+                    async move { other.create_transaction().get(b"k").await }
+                })
+                .expect("in time")
+                .expect("read");
+            assert_eq!(read.as_deref(), Some(&b"b"[..]), "seed {seed}");
+            sim.block_on_within(Duration::from_secs(60), write(other.clone(), b"c"))
+                .expect("in time")
+                .expect("committed");
+            for (peer, generation) in &connected {
+                let status = peer.status();
+                assert_eq!(status.phase, PeerPhase::Connected, "seed {seed}");
+                assert_eq!(status.generation, *generation, "seed {seed}: reconnected");
+            }
+            drop(connected);
+
+            // The last one goes: nothing of the client is left.
+            let weak = other.peers().downgrade();
+            sim.block_on(other.shutdown()).unwrap();
+            sim.run_for(Duration::from_secs(5)).unwrap();
+            assert!(weak.is_shut_down());
+            assert_eq!(
+                client_tasks(&sim, client),
+                Vec::<String>::new(),
+                "seed {seed}"
+            );
+            drop(other);
+            sim.run_for(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                client_tasks(&sim, client),
+                Vec::<String>::new(),
+                "seed {seed}"
+            );
+        }
     }
 }
