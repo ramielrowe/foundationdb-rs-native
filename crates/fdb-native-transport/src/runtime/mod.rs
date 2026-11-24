@@ -124,11 +124,22 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     ///
     /// Not necessarily a plain TCP socket: M7 layers TLS on top by wrapping
     /// this type.
+    ///
+    /// **Writes and at-most-once.** The peer manager decides from what `poll_write` returns
+    /// which requests certainly never left this process (see
+    /// [Written offsets](crate::connection#written-offsets)), so the stream must report what
+    /// it takes: `Ok(n)` must mean that it took exactly the first `n` bytes (taken bytes count
+    /// as delivered, sent or not). Whatever else it returns is trusted to have taken nothing
+    /// only where the runtime says so: a `Pending` with
+    /// [`PENDING_TAKES_NOTHING`](Runtime::PENDING_TAKES_NOTHING), an error or `Ok(0)` with
+    /// [`WRITE_ERRORS_TAKE_NOTHING`](Runtime::WRITE_ERRORS_TAKE_NOTHING). Otherwise every byte
+    /// offered to that write (at most 64 KiB) counts as possibly delivered.
     type Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static;
 
-    /// Whether a `poll_write` on [`Stream`](Runtime::Stream) that returns an error took none
-    /// of the buffer it was given, as `write(2)` does and [`std::io::Write::write`]'s contract
-    /// says ("if an error is returned then no bytes in the buffer were written").
+    /// Whether a `poll_write` on [`Stream`](Runtime::Stream) that returns an error (or
+    /// `Ok(0)`) took none of the buffer it was given, as `write(2)` does and
+    /// [`std::io::Write::write`]'s contract says ("if an error is returned then no bytes in
+    /// the buffer were written").
     ///
     /// The peer manager relies on it when a write fails: with `true`, a request none of whose
     /// bytes were accepted by an earlier write is reported
@@ -139,6 +150,15 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// `false`. (TLS streams, made by a [`StreamWrapper`](crate::peer::StreamWrapper), are
     /// always treated as `false`.)
     const WRITE_ERRORS_TAKE_NOTHING: bool = false;
+
+    /// Whether a `poll_write` on [`Stream`](Runtime::Stream) that returns `Pending` took none
+    /// of the buffer it was given (a socket that would block wrote nothing). With `false` (the
+    /// default, always safe) every byte offered to a pending write counts as possibly
+    /// delivered, as for [`WRITE_ERRORS_TAKE_NOTHING`](Runtime::WRITE_ERRORS_TAKE_NOTHING). A
+    /// stream that can send part of the buffer and still return `Pending` (an OpenSSL session
+    /// without `SSL_MODE_ENABLE_PARTIAL_WRITE` that hits `WANT_WRITE` after writing a record)
+    /// must leave it `false`.
+    const PENDING_TAKES_NOTHING: bool = false;
 
     /// Handle to a task started by [`spawn`](Runtime::spawn), yielding `T`.
     type Task<T: Send + 'static>: TaskHandle<T>;

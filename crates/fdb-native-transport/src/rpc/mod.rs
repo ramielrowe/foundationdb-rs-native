@@ -75,16 +75,20 @@
 //!   written if the handshake fails (see the [connection documentation](crate::connection#sending));
 //!   whether the handshake completed is the connection's own record
 //!   ([`Connection::was_established`]), not only what the event stream showed;
-//! * a request whose frame was still entirely in the output buffer: the registry records
-//!   where each frame starts in the connection's output stream
+//! * on a connection whose driver reports everything its transport may have taken
+//!   ([`ConnectionConfig::unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent),
+//!   which the peer manager sets), a request whose frame was still entirely in the output
+//!   buffer: the registry records where each frame starts in the connection's output stream
 //!   ([`Connection::output_offset`]) and compares it, at the end, with how far the stream may
 //!   have been handed to the transport ([`Connection::maybe_written`]; see
 //!   [Written offsets](crate::connection#written-offsets)).
 //!
 //! Every other request fails with [`RequestError::MaybeDelivered`] when the connection ends:
 //! one byte written is enough, and bytes taken by a TLS session or the socket's send buffer
-//! count as written, as do the bytes offered to a write that failed on a stream that may take
-//! part of its buffer before failing.
+//! count as written, as do the bytes offered to a write that failed or was pending on a
+//! stream that does not promise it took nothing. Without `unwritten_not_sent` (the default
+//! for a [`Connection`] driven by other code), every request on an established connection is
+//! `MaybeDelivered`, as in C++.
 //!
 //! **Undecodable replies.** A reply that came but cannot be decoded (a wrong file identifier, a
 //! malformed table) proves the request was delivered without saying what became of it:

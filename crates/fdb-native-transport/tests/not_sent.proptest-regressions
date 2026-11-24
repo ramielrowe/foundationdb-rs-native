@@ -4,5 +4,8 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 5370a2f1666d039c5d442073ec5e6becaebe8022f7d042698d1e078c76197a98 # shrinks to ops = [Send, Hello, Write(11766469917364445035), Io]
-cc 8dfe22b817236d4a3df07e9a90a6524b68b2a11918fd102d92777b2c8842649c # shrinks to ops = [Write(634329364318184602), Write(2608209526173346369), Write(4030706843924382656), Send, Hello, Io]
+cc 24e74a010d6a34bb3fe59ca69390fd6d624933c874001615d9a4c5b432db556a # shrinks to ops = [Send]
+cc 938bd8b56a69d97869edc38a35a497b80d01919391538a063b2c593ccf08d1bb # shrinks to ops = [FailWrite { offered: 1, taken: 0 }]
+cc fae71b03abcba7cb8a583652468be20a94e1b0e0bfe4a60ebdbed371a6f8908b # shrinks to ops = [Hello, Send, Write(69990134325513319), Send, Send, FailWrite { offered: 17978385948626400, taken: 0 }]
+cc 39e12da398387eb463246c8c9cc8408a861e35969777ddaa3e510eba20378c68 # shrinks to ops = [Send, Send, Send, Hello, FailWrite { offered: 6319345066909193010, taken: 0 }]
+cc 8f307fd71d37c586c814f3f113cfd9f8da0a55a6f9232b72de6a4de8f9f45c93 # shrinks to ops = [Send, Send, Write(8886772057449181240), Hello, Write(10472887291971124173), Send, Send, Write(6231530290532278396), Send, FailWrite { offered: 16758076406126300880, taken: 0 }]

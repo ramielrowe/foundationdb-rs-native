@@ -37,11 +37,46 @@ type BoxedSleep<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// How much is read from the socket at once.
 const READ_SIZE: usize = 16 * 1024;
 
-/// The most offered to one write on a stream that may take part of its buffer before failing
-/// (see [`Run::write_errors_take_nothing`]): if the write fails, these bytes count as possibly
-/// delivered, and what lies past them was certainly not written. (rustls buffers at most 64 KiB
-/// of plaintext by default, so a TLS stream takes no more than this at once anyway.)
+/// The most offered to one write on a stream that is not trusted to take nothing when it fails
+/// or is pending (see [`WriteTrust`]). Such a write counts everything it was offered as
+/// possibly delivered, so this cap is what keeps the frames past it certainly unwritten. (A
+/// TLS session can take the whole slice in one `poll_write`: `futures-rustls` keeps encrypting
+/// while the socket accepts records, so only the size of the slice bounds what it took.)
 const UNSURE_WRITE_MAX: usize = 64 * 1024;
+
+/// What a connection's stream promises about writes that report no count (see
+/// [Written offsets](crate::connection#written-offsets)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriteTrust {
+    /// An error (or `Ok(0)`) took none of the buffer.
+    errors_take_nothing: bool,
+    /// A `Pending` took none of the buffer.
+    pending_takes_nothing: bool,
+}
+
+impl WriteTrust {
+    /// The runtime's own socket: what the runtime promises.
+    fn plain<R: Runtime>() -> WriteTrust {
+        WriteTrust {
+            errors_take_nothing: R::WRITE_ERRORS_TAKE_NOTHING,
+            pending_takes_nothing: R::PENDING_TAKES_NOTHING,
+        }
+    }
+
+    /// A TLS stream: errors are never trusted (a session can take plaintext and then fail on
+    /// the socket), `Pending` as far as the wrapper promises.
+    fn tls<S, W: StreamWrapper<S>>() -> WriteTrust {
+        WriteTrust {
+            errors_take_nothing: false,
+            pending_takes_nothing: W::PENDING_TAKES_NOTHING,
+        }
+    }
+
+    /// Whether every write that reports no count took nothing.
+    fn exact(self) -> bool {
+        self.errors_take_nothing && self.pending_takes_nothing
+    }
+}
 
 /// The capacity above which the vector encoders write into is dropped after use instead of kept.
 const SCRATCH_KEEP: usize = 1 << 20;
@@ -201,33 +236,41 @@ struct Run<'a, R: Runtime, S> {
     established: bool,
     needs_flush: bool,
     sleep: Option<(Instant, BoxedSleep<'a>)>,
-    /// Whether a failed write on `stream` took nothing ([`Runtime::WRITE_ERRORS_TAKE_NOTHING`]
-    /// for a plain socket; never for a TLS stream). Otherwise the bytes offered to a failed
-    /// write count as possibly delivered.
-    write_errors_take_nothing: bool,
+    /// What `stream` promises about writes that report no count; the bytes offered to a
+    /// write it does not vouch for count as possibly delivered.
+    trust: WriteTrust,
 }
 
 impl<R: Runtime, S: AsyncWrite + Unpin> Run<'_, R, S> {
     /// The bytes to offer to the next write: everything pending, or a bounded prefix of it
-    /// on a stream whose failed writes may have taken part of their buffer.
+    /// on a stream that may take part of its buffer without reporting it.
     fn offer_len(&self) -> usize {
         let pending = self.conn.pending_output().len();
-        if self.write_errors_take_nothing {
+        if self.trust.exact() {
             pending
         } else {
             pending.min(UNSURE_WRITE_MAX)
         }
     }
 
-    /// A write of the first `offered` bytes failed with `error`: the connection ends, with
-    /// the offered bytes counted as possibly delivered unless the stream guarantees that a
-    /// failed write takes nothing.
+    /// A write of the first `offered` bytes failed with `error` (or wrote 0): the connection
+    /// ends, with the offered bytes counted as possibly delivered unless the stream guarantees
+    /// that a failed write takes nothing.
     fn write_error(&mut self, offered: usize, error: std::io::Error) {
         let now = self.rt.now();
-        if self.write_errors_take_nothing {
+        if self.trust.errors_take_nothing {
             self.conn.io_error(error, now);
         } else {
             self.conn.write_failed(offered, error, now);
+        }
+    }
+
+    /// A write of the first `offered` bytes is pending: unless the stream guarantees that a
+    /// pending write took nothing, the offered bytes count as possibly delivered (they stay
+    /// pending, and are offered again).
+    fn write_pending(&mut self, offered: usize) {
+        if !self.trust.pending_takes_nothing {
+            self.conn.output_maybe_written(offered);
         }
     }
 }
@@ -582,8 +625,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             };
             // Only the runtime's own socket can promise that a failed write took nothing: a
             // TLS session may have encrypted part of the buffer before the socket failed.
-            let exact = R::WRITE_ERRORS_TAKE_NOTHING && matches!(stream, MaybeTls::Plain(_));
-            let error = match self.run_connection(stream, announce, exact).await {
+            let trust = match &stream {
+                MaybeTls::Plain(_) => WriteTrust::plain::<R>(),
+                MaybeTls::Tls(_) => WriteTrust::tls::<R::Stream, W>(),
+            };
+            let error = match self.run_connection(stream, announce, trust).await {
                 RunEnd::Shutdown => return false,
                 RunEnd::Closed(error) => error,
             };
@@ -1033,13 +1079,12 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         Poll::Pending
     }
 
-    /// Runs one connection over `stream` until it ends. `write_errors_take_nothing`: see
-    /// [`Run::write_errors_take_nothing`].
+    /// Runs one connection over `stream`, whose writes `trust` describes, until it ends.
     async fn run_connection<S>(
         &mut self,
         stream: S,
         announce: ProtocolVersion,
-        write_errors_take_nothing: bool,
+        trust: WriteTrust,
     ) -> RunEnd
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1060,6 +1105,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         cc.handshake_timeout = config.handshake_timeout;
         cc.monitor = config.monitor;
         cc.max_pending_output = config.max_pending_output;
+        // The write path below reports every byte the stream may have taken (see
+        // `WriteTrust`), so requests never handed to it can be reported as not sent.
+        cc.unwritten_not_sent = true;
         cc.max_packet_len = config.max_packet_len;
         if config.seed.is_some() {
             cc.seed = self.rng.next_u64();
@@ -1080,7 +1128,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             established: false,
             needs_flush: false,
             sleep: None,
-            write_errors_take_nothing,
+            trust,
         };
 
         let end = poll_fn(|cx| self.poll_run(&mut run, cx)).await;
@@ -1110,19 +1158,26 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let rt = self.rt();
-        // A write is polled to completion inside one poll of `work`, and its count reported
-        // at once: the timeout can only drop `work` while a write is pending, which took
-        // nothing.
+        // What each poll of a write returned is reported at once, a pending one included:
+        // the timeout can only drop `work` while a write is pending, which is accounted for.
         let work = async {
             while !run.conn.pending_output().is_empty() {
                 let offered = run.offer_len();
                 let written = poll_fn(|cx| {
-                    Pin::new(&mut run.stream).poll_write(cx, &run.conn.pending_output()[..offered])
+                    let buf = &run.conn.pending_output()[..offered];
+                    let written = Pin::new(&mut run.stream).poll_write(cx, buf);
+                    if written.is_pending() {
+                        run.write_pending(offered);
+                    }
+                    written
                 })
                 .await;
                 match written {
                     Ok(n) if n > 0 => run.conn.consume_output(n),
-                    Ok(_) => return,
+                    Ok(_) => {
+                        run.write_error(offered, std::io::ErrorKind::WriteZero.into());
+                        return;
+                    }
                     Err(e) => {
                         // What it may have taken counts, though the requests have completed
                         // (as cancelled) already.
@@ -1152,9 +1207,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Drop for PeerTask<R, W> {
 ///
 /// Every byte a write may have taken is reported to the connection before anything else
 /// happens to it (see [Written offsets](crate::connection#written-offsets)): `Ok(n)` is
-/// consumed at once (bytes a TLS session took count, flushed or not), `Pending` took nothing,
-/// `Ok(0)` took nothing, and an error took nothing only on a stream that promises so;
-/// otherwise the bytes offered to it count as possibly delivered.
+/// consumed at once (bytes a TLS session took count, flushed or not); an error or `Ok(0)`,
+/// and a `Pending`, took nothing only on a stream that promises so ([`WriteTrust`]); otherwise
+/// the bytes offered to it count as possibly delivered.
 fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
     run: &mut Run<'_, R, S>,
     cx: &mut Context<'_>,
@@ -1165,8 +1220,7 @@ fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
         let buf = &run.conn.pending_output()[..offered];
         match Pin::new(&mut run.stream).poll_write(cx, buf) {
             Poll::Ready(Ok(0)) => {
-                run.conn
-                    .io_error(std::io::ErrorKind::WriteZero, run.rt.now());
+                run.write_error(offered, std::io::ErrorKind::WriteZero.into());
                 return true;
             }
             Poll::Ready(Ok(n)) => {
@@ -1178,7 +1232,10 @@ fn write_stage<R: Runtime, S: AsyncWrite + Unpin>(
                 run.write_error(offered, e);
                 return true;
             }
-            Poll::Pending => return progress,
+            Poll::Pending => {
+                run.write_pending(offered);
+                return progress;
+            }
         }
     }
     if run.needs_flush {

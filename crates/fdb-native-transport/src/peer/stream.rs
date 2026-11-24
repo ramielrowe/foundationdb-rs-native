@@ -37,7 +37,26 @@ use futures_io::{AsyncRead, AsyncWrite};
 pub trait StreamWrapper<S>: Send + Sync + 'static {
     /// The stream a TLS connection reads and writes. Frames over it carry no checksum
     /// ([`Checksum::for_tls`](crate::Checksum::for_tls)), so it must authenticate.
+    ///
+    /// **Writes and at-most-once.** The peer manager decides from what `poll_write` returns
+    /// which requests certainly never left this process (see
+    /// [Written offsets](crate::connection#written-offsets)). `Ok(n)` must mean that the
+    /// stream took exactly the first `n` bytes (taken bytes count as delivered, even if the
+    /// session never sends them). An error or `Ok(0)` is never trusted to have taken nothing:
+    /// a TLS session can take plaintext and then fail on the socket (`futures-rustls` does),
+    /// so every byte offered to the write (at most 64 KiB) counts as possibly delivered. A
+    /// `Pending` is trusted to have taken nothing only with
+    /// [`PENDING_TAKES_NOTHING`](Self::PENDING_TAKES_NOTHING).
     type Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static;
+
+    /// Whether a `poll_write` on [`Stream`](Self::Stream) that returns `Pending` took none of
+    /// the buffer it was given and sent none of it. With `false` (the default, always safe)
+    /// every byte offered to a pending write counts as possibly delivered. Leave it `false` for
+    /// a session that can put records on the wire and still return `Pending`, as an OpenSSL
+    /// `SSL_write` without `SSL_MODE_ENABLE_PARTIAL_WRITE` does when it hits `WANT_WRITE`.
+    /// `tls::peer::TlsStreamWrapper` (feature `tls`) sets it: `futures-rustls` returns
+    /// `Pending` only when its session took nothing.
+    const PENDING_TAKES_NOTHING: bool = false;
 
     /// Whether this process speaks TLS: the TLS-ness [`choose_primary_address`](super::choose_primary_address)
     /// compares endpoints against, and whether TLS addresses

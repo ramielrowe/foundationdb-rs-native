@@ -282,34 +282,10 @@ fn send_with_writes_the_callers_encoding() {
 
 /// An encoder that shortens the shared output buffer destroyed the frames before its own: the
 /// connection fails (nothing is written) and the request, which was never written, is `NotSent`
-/// with the reason. The request queued before it completes with the connection's end: not
-/// sent if none of it had been written (its frame was destroyed), maybe delivered if it had.
+/// with the reason. The request queued before it completes as maybe delivered with the
+/// connection's end.
 #[test]
 fn an_encoder_that_shortens_the_output_fails_the_connection() {
-    for written in [false, true] {
-        let (first, mut conn) = shortened_output(written);
-        if written {
-            assert!(matches!(
-                first,
-                Err(RequestError::MaybeDelivered(Some(
-                    ConnectionError::InternalEncode(_)
-                )))
-            ));
-        } else {
-            assert!(matches!(
-                first,
-                Err(RequestError::NotSent(Some(
-                    ConnectionError::InternalEncode(_)
-                )))
-            ));
-        }
-        assert!(conn.poll_event().is_none());
-    }
-}
-
-/// Sends a request, writes it if `written`, then sends one whose encoder shortens the output.
-/// Returns the first request's outcome.
-fn shortened_output(written: bool) -> (Result<Vec<u8>, RequestError>, Connection) {
     let mut registry = Registry::new(registry_config(2));
     let (mut conn, _server) = connected(&mut registry);
     registry
@@ -321,11 +297,6 @@ fn shortened_output(written: bool) -> (Result<Vec<u8>, RequestError>, Connection
             Ok(())
         })
         .unwrap();
-    if written {
-        // Half of it (writing all of it would empty the buffer, and an encoder that replaces
-        // an empty buffer cannot be caught): the rest is in the buffer the next one shortens.
-        conn.consume_output(conn.pending_output().len() / 2);
-    }
     let err = registry
         .send_with(&mut conn, EP_A, 2, |_, out| {
             *out = vec![1, 2, 3];
@@ -341,9 +312,13 @@ fn shortened_output(written: bool) -> (Result<Vec<u8>, RequestError>, Connection
     let done = completions(&events);
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].key, 1);
-    let first = done[0].result.clone();
+    assert!(matches!(
+        done[0].result,
+        Err(RequestError::MaybeDelivered(Some(
+            ConnectionError::InternalEncode(_)
+        )))
+    ));
     assert!(registry.is_empty());
-    (first, conn)
 }
 
 #[test]

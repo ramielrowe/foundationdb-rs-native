@@ -89,6 +89,10 @@ impl Runtime for TokioRuntime {
     /// written nothing (a partial write returns its count instead).
     const WRITE_ERRORS_TAKE_NOTHING: bool = true;
 
+    /// A [`TokioStream`] write is pending only when the socket's `write` would block, which
+    /// wrote nothing.
+    const PENDING_TAKES_NOTHING: bool = true;
+
     fn now(&self) -> Instant {
         // The context decides which clock `tokio::time::Instant::now` reads.
         let _enter = self.handle.enter();

@@ -43,7 +43,15 @@ fn t(ms: u64) -> Instant {
     Instant::from_origin(Duration::from_millis(ms))
 }
 
+/// A connection whose driver (the test) reports everything the transport may have taken.
 fn conn_config() -> ConnectionConfig {
+    let mut c = default_config();
+    c.unwritten_not_sent = true;
+    c
+}
+
+/// A connection with the default: no promise about the driver's reports.
+fn default_config() -> ConnectionConfig {
     let mut c = ConnectionConfig::new(
         ConnectPacket::multi_version_client(ProtocolVersion::V7_4, 0x1234_5678),
         false,
@@ -372,6 +380,64 @@ fn offsets_start_over_on_the_next_connection() {
     assert_not_sent(&failures(&drain(&mut reg, &mut next))[&3]);
 }
 
+/// Without `unwritten_not_sent` (a driver that made no promise about its reports, say one
+/// that reports a TLS write failure with `io_error`), every request put on an established
+/// connection is maybe delivered when it ends, written or not, as before as8.8; only requests
+/// held by a handshake that never completed are not sent.
+#[test]
+fn without_the_opt_in_every_sent_request_is_maybe_delivered() {
+    for how in [End::Io, End::Eof, End::Close, End::WriteFailed(0)] {
+        let mut reg = registry();
+        let mut conn = Connection::new(default_config(), t(0));
+        write(&mut conn, ConnectPacket::SIZE as u64);
+        conn.recv(&server_hello(), t(1));
+        drain(&mut reg, &mut conn);
+        let (_, a) = send(&mut reg, &mut conn, 1);
+        send(&mut reg, &mut conn, 2);
+        write_to(&mut conn, a + 1);
+        end(&mut conn, how);
+        let f = failures(&drain(&mut reg, &mut conn));
+        assert_maybe(&f[&1]);
+        assert_maybe(&f[&2]);
+    }
+    let mut reg = registry();
+    let mut conn = Connection::new(default_config(), t(0));
+    send(&mut reg, &mut conn, 1);
+    conn.io_error(ErrorKind::ConnectionReset, t(1));
+    assert_not_sent(&failures(&drain(&mut reg, &mut conn))[&1]);
+}
+
+/// An encoder that shortens the shared output destroys the frames before its own, which the
+/// connection then never writes: the request before it is not sent if none of it had been
+/// written, maybe delivered if some had.
+#[test]
+fn a_frame_destroyed_by_a_shortening_encoder_is_classified_by_what_was_written() {
+    for written in [false, true] {
+        let mut reg = registry();
+        let mut conn = connected(&mut reg);
+        send(&mut reg, &mut conn, 1);
+        if written {
+            // Half of it: the rest stays in the buffer the next encoder shortens (an encoder
+            // that replaces an emptied buffer cannot be caught).
+            let half = conn.pending_output().len() as u64 / 2;
+            write(&mut conn, half);
+        }
+        let err = reg
+            .send_with(&mut conn, EP, 2, |_, out| {
+                *out = vec![1, 2, 3];
+                Ok(())
+            })
+            .unwrap_err();
+        assert_not_sent(&err);
+        let f = failures(&drain(&mut reg, &mut conn));
+        if written {
+            assert_maybe(&f[&1]);
+        } else {
+            assert_not_sent(&f[&1]);
+        }
+    }
+}
+
 // ---- random write chunkings ----------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -380,13 +446,17 @@ enum Op {
     Hello,
     /// Writes this many bytes (modulo what is pending, plus one).
     Write(usize),
-    /// A write of this many bytes fails, after the stream delivered `taken` of them (modulo).
+    /// A write of `offered` bytes fails, after the stream delivered `taken` of them (modulo).
     FailWrite {
         offered: usize,
         taken: usize,
     },
-    /// A write whose outcome is unknown; the connection carries on.
-    Unknown(usize),
+    /// A write of `offered` bytes whose outcome is unknown (it may have delivered `taken` of
+    /// them); the connection carries on, and the bytes stay pending.
+    Unknown {
+        offered: usize,
+        taken: usize,
+    },
     Io,
     Eof,
     Close,
@@ -397,31 +467,45 @@ fn op() -> impl Strategy<Value = Op> {
         5 => Just(Op::Send),
         1 => Just(Op::Hello),
         6 => any::<usize>().prop_map(Op::Write),
-        1 => (any::<usize>(), any::<usize>()).prop_map(|(offered, taken)| Op::FailWrite { offered, taken }),
-        1 => any::<usize>().prop_map(Op::Unknown),
+        1 => (any::<usize>(), any::<usize>())
+            .prop_map(|(offered, taken)| Op::FailWrite { offered, taken }),
+        1 => (any::<usize>(), any::<usize>())
+            .prop_map(|(offered, taken)| Op::Unknown { offered, taken }),
         1 => Just(Op::Io),
         1 => Just(Op::Eof),
         1 => Just(Op::Close),
     ]
 }
 
-/// The bytes of the output stream a test has seen: written bytes, then whatever is pending.
-/// Parses the frames in it to learn, independently of the registry, where each request's
-/// frame starts.
+/// The test's own model of the output stream, independent of the connection's offsets: the
+/// bytes written, how far the stream was handed to the transport, how far it may actually
+/// have reached the server, and (from parsing the bytes) where each request's frame starts.
 #[derive(Default)]
 struct Oracle {
-    /// Bytes the "server" actually received.
-    delivered: Vec<u8>,
+    /// The bytes reported written, in order.
+    written: Vec<u8>,
+    /// How far any byte was handed to the transport (written, or offered to a write that
+    /// failed or whose outcome is unknown).
+    handed: u64,
+    /// How far bytes may actually have reached the server: written, or delivered by a write
+    /// that failed or whose outcome is unknown. At most `handed`.
+    reached: u64,
     /// Where each request's frame starts, by reply token.
     starts: HashMap<Uid, u64>,
 }
 
 impl Oracle {
+    fn hand(&mut self, offered: usize, taken: usize) {
+        let base = self.written.len() as u64;
+        self.handed = self.handed.max(base + offered as u64);
+        self.reached = self.reached.max(base + taken as u64);
+    }
+
     /// Looks at the whole stream as it is now (only meaningful once established, when no
     /// frame is held) and records the start of every request frame in it.
     fn scan(&mut self, conn: &Connection) {
-        let mut stream = self.delivered.clone();
-        stream.truncate(usize::try_from(conn.written()).unwrap());
+        assert_eq!(self.written.len() as u64, conn.written());
+        let mut stream = self.written.clone();
         stream.extend_from_slice(conn.pending_output());
         let header = frame_config().header_len();
         let mut at = ConnectPacket::SIZE;
@@ -489,22 +573,22 @@ impl Run {
             Op::Write(n) => {
                 let n = n % (pending + 1);
                 self.oracle
-                    .delivered
+                    .written
                     .extend_from_slice(&self.conn.pending_output()[..n]);
+                self.oracle.hand(0, 0);
                 self.conn.consume_output(n);
             }
             Op::FailWrite { offered, taken } => {
                 let offered = offered % (pending + 1);
                 let taken = taken % (offered + 1);
-                // The stream delivered part of what it was offered, then failed.
-                self.oracle
-                    .delivered
-                    .extend_from_slice(&self.conn.pending_output()[..taken]);
+                self.oracle.hand(offered, taken);
                 self.conn.write_failed(offered, ErrorKind::BrokenPipe, now);
             }
-            Op::Unknown(n) => {
-                let n = n % (pending + 1);
-                self.conn.output_maybe_written(n);
+            Op::Unknown { offered, taken } => {
+                let offered = offered % (pending + 1);
+                let taken = taken % (offered + 1);
+                self.oracle.hand(offered, taken);
+                self.conn.output_maybe_written(offered);
             }
             Op::Io => self.conn.io_error(ErrorKind::ConnectionReset, now),
             Op::Eof => self.conn.recv_eof(now),
@@ -521,8 +605,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
     /// At the end of a connection, a request is `NotSent` if and only if no byte of its frame
-    /// was handed to the transport (written, or offered to a write whose outcome is unknown),
-    /// and never if any byte of it reached the server.
+    /// was handed to the transport (written, or offered to a write that failed or whose
+    /// outcome is unknown), and never if any byte of it may have reached the server. Both
+    /// marks come from the test's own model, not from the connection's offsets.
     #[test]
     fn not_sent_iff_no_byte_of_the_frame_was_handed_over(ops in proptest::collection::vec(op(), 0..60)) {
         let mut run = Run {
@@ -540,10 +625,12 @@ proptest! {
         run.conn.close();
         events.extend(drain(&mut run.reg, &mut run.conn));
         prop_assert!(run.reg.is_empty());
-        let handed = run.conn.maybe_written();
-        prop_assert!(handed >= run.conn.written());
-        prop_assert!(run.oracle.delivered.len() as u64 <= handed);
-        let delivered = run.oracle.delivered.len() as u64;
+        let written = run.oracle.written.len() as u64;
+        let handed = run.oracle.handed.max(written);
+        let reached = run.oracle.reached.max(written);
+        prop_assert!(reached <= handed);
+        prop_assert_eq!(run.conn.written(), written);
+        prop_assert_eq!(run.conn.maybe_written(), handed);
         let mut completed = 0;
         for e in &events {
             let RpcEvent::Completion(c) = e else { continue };
@@ -554,11 +641,11 @@ proptest! {
             let start = run.oracle.starts.get(&c.reply_token).copied();
             prop_assert!(start.is_some() || !run.conn.was_established(), "{:?}", c);
             let untouched = start.is_none_or(|s| s >= handed);
-            let reached_server = start.is_some_and(|s| s < delivered);
+            let may_have_reached_server = start.is_some_and(|s| s < reached);
             match err {
                 RequestError::NotSent(_) => {
                     prop_assert!(untouched, "{:?} at {:?}, handed {}", c, start, handed);
-                    prop_assert!(!reached_server);
+                    prop_assert!(!may_have_reached_server, "{:?} at {:?}, reached {}", c, start, reached);
                 }
                 RequestError::MaybeDelivered(_) => {
                     prop_assert!(!untouched, "{:?} at {:?}, handed {}", c, start, handed);

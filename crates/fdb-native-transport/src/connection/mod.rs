@@ -243,26 +243,37 @@
 //! ([`write_failed`](Connection::write_failed),
 //! [`output_maybe_written`](Connection::output_maybe_written)). A frame that starts at or past
 //! `maybe_written` when the connection ends was never handed to the transport, not one byte
-//! of it, and never will be: the [`ReplyRegistry`](crate::rpc::ReplyRegistry) fails the
-//! request it carried as [`NotSent`](crate::rpc::RequestError::NotSent). Any other frame may
-//! have been delivered, even if only its first byte was taken.
+//! of it, and never will be. Any other frame may have been delivered, even if only its first
+//! byte was taken.
 //!
-//! This is only as exact as the driver's reports, which must cover every byte the transport
-//! **may** have taken:
+//! **This is opt-in.** The offsets are only as exact as the driver's reports, so the
+//! [`ReplyRegistry`](crate::rpc::ReplyRegistry) fails a request whose frame was never handed
+//! over as [`NotSent`](crate::rpc::RequestError::NotSent) only on a connection configured with
+//! [`unwritten_not_sent`](ConnectionConfig::unwritten_not_sent), by which the driver promises
+//! reports that cover every byte the transport **may** have taken. Without it (the default),
+//! every request put on an established connection is maybe delivered when it ends. The
+//! [peer manager](crate::peer) opts in. The reports it takes:
 //!
 //! * bytes a write accepted (`Ok(n)`) are written, whatever becomes of them: a TLS session's
 //!   buffer, the socket's send buffer and the network all count as delivered;
-//! * a write that returned an error may still have taken part of its buffer, unless the
-//!   stream guarantees otherwise: a TLS stream (`futures-rustls`) returns the socket's error
-//!   after encrypting part of the buffer into its session. Report it with
+//! * a write that returned an error (or `Ok(0)`) may still have taken part of its buffer,
+//!   unless the stream guarantees otherwise: a TLS stream (`futures-rustls`) returns the
+//!   socket's error after encrypting part of the buffer into its session. Report it with
 //!   [`write_failed`](Connection::write_failed) and the number of bytes offered. Only a
 //!   stream that takes nothing when it fails, as `write(2)` and [`std::io::Write::write`]'s
 //!   contract say, may be reported with plain [`io_error`](Connection::io_error);
-//! * a write that returned `Pending` took nothing;
+//! * a write that returned `Pending` took nothing only if the stream guarantees it (a socket
+//!   that would block wrote nothing; an OpenSSL session without
+//!   `SSL_MODE_ENABLE_PARTIAL_WRITE` can send a record and then say `WANT_WRITE`). Otherwise
+//!   report the bytes offered with [`output_maybe_written`](Connection::output_maybe_written);
 //! * a write whose outcome is unknown (a write future abandoned halfway, by a driver that
 //!   writes from a copy) is [`output_maybe_written`](Connection::output_maybe_written);
 //! * report before anything ends the connection: its end discards the output, and the
 //!   offsets are final from then on.
+//!
+//! Since a write the stream does not vouch for counts everything it was offered, offer such
+//! a stream bounded slices (the peer manager offers at most 64 KiB): the frames past the slice
+//! stay certainly unwritten.
 
 mod config;
 mod error;

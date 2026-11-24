@@ -65,9 +65,11 @@ pub enum RequestState {
     /// ([`RequestError::NotSent`]).
     Queued,
     /// Put on an established connection's output. If the connection ends before the reply,
-    /// the request fails with [`RequestError::NotSent`] if not one byte of its frame was
-    /// handed to the transport ([`Connection::maybe_written`]), and with
-    /// [`RequestError::MaybeDelivered`] otherwise.
+    /// the request fails with [`RequestError::MaybeDelivered`]; or, on a connection whose
+    /// driver reports what the transport may have taken
+    /// ([`unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent), as the peer
+    /// manager's does), with [`RequestError::NotSent`] if not one byte of its frame was handed
+    /// to the transport ([`Connection::maybe_written`]).
     Sent,
 }
 
@@ -281,7 +283,8 @@ impl<K> ReplyRegistry<K> {
     /// The offset of the pending request's frame in its connection's output stream
     /// ([`Connection::output_offset`] when it was sent). Once the connection has ended, the
     /// request was never handed to the transport if this is at or past
-    /// [`Connection::maybe_written`].
+    /// [`Connection::maybe_written`] (provided the driver reported everything the transport
+    /// may have taken: [`unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent)).
     pub fn frame_offset(&self, reply_token: Uid) -> Option<u64> {
         self.pending.get(&reply_token).map(|p| p.offset)
     }
@@ -544,9 +547,11 @@ impl<K> ReplyRegistry<K> {
     ///   [`RequestError::Unauthorized`]. Each gives [`RpcEvent::EndpointFailed`] the first time.
     /// * [`Event::Closed`]: every pending request fails, [`NotSent`](RequestError::NotSent) if
     ///   not one byte of its frame was handed to the transport (the handshake never completed,
-    ///   [`Connection::was_established`], or its frame starts at or past
-    ///   [`Connection::maybe_written`]) and [`MaybeDelivered`](RequestError::MaybeDelivered)
-    ///   otherwise; then [`RpcEvent::Closed`].
+    ///   [`Connection::was_established`]; or, with
+    ///   [`unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent), its frame starts
+    ///   at or past [`Connection::maybe_written`]) and
+    ///   [`MaybeDelivered`](RequestError::MaybeDelivered) otherwise; then
+    ///   [`RpcEvent::Closed`].
     /// * Other frames and unknown tokens are passed on.
     ///
     /// If the connection has ended, its events are exhausted and requests are still pending
@@ -659,12 +664,13 @@ impl<K> ReplyRegistry<K> {
     }
 
     /// The connection ended: every pending request fails, then `Closed` is given (if
-    /// `give_closed`). A request was not sent if not one byte of its frame was handed to the
-    /// transport: its frame starts at or past [`Connection::maybe_written`], which is final
-    /// now that the connection has ended (its output is discarded). That covers the frames
-    /// held during a handshake that never completed, which the connection discarded; they are
-    /// also told apart by the handshake, as a second, independent reason. Every other request
-    /// may have been delivered, if only its first byte was written.
+    /// `give_closed`). A request held during a handshake that never completed was not sent
+    /// (the connection discarded it). With
+    /// [`unwritten_not_sent`](crate::ConnectionConfig::unwritten_not_sent), neither was one
+    /// not one byte of whose frame was handed to the transport: its frame starts at or past
+    /// [`Connection::maybe_written`], which is final now that the connection has ended (its
+    /// output is discarded). Every other request may have been delivered, if only its first
+    /// byte was written.
     fn close_all(
         &mut self,
         conn: &mut Connection,
@@ -673,6 +679,9 @@ impl<K> ReplyRegistry<K> {
     ) {
         debug_assert_eq!(conn.state(), ConnectionState::Closed);
         let established = conn.was_established();
+        // Offsets count only if the driver promised to report everything the transport may
+        // have taken.
+        let by_offset = conn.config().unwritten_not_sent;
         let reached = conn.maybe_written();
         let mut all: Vec<(Uid, Pending<K>)> = self.pending.drain().collect();
         self.by_endpoint.clear();
@@ -681,7 +690,7 @@ impl<K> ReplyRegistry<K> {
         for (token, pending) in all {
             conn.unregister(token);
             let held_and_discarded = !established && pending.state == RequestState::Queued;
-            let unwritten = pending.offset >= reached;
+            let unwritten = by_offset && pending.offset >= reached;
             let result = Err(if held_and_discarded || unwritten {
                 RequestError::NotSent(error.clone())
             } else {

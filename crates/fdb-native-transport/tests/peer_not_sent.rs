@@ -1,8 +1,9 @@
 //! Unwritten requests are `NotSent` through the peer manager (as8.8): a socket that accepts
 //! N bytes and then fails, a runtime that does not promise that failed writes take nothing,
-//! and a TLS-like stream that takes bytes into its own buffer without sending them (the bytes
+//! and TLS-like streams that take bytes into their own buffer without sending them (the bytes
 //! a TLS writer took count as possibly delivered, and so does what it was offered when it
-//! failed).
+//! failed, or when it was pending on a stream that does not promise a pending write took
+//! nothing).
 
 #![cfg(feature = "tokio")]
 
@@ -17,7 +18,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use common::*;
-use fdb_native_transport::peer::{PeerHandle, PeerManager, PeerManagerConfig, event_channel};
+use fdb_native_transport::peer::{
+    PeerHandle, PeerManager, PeerManagerConfig, StreamWrapper, event_channel,
+};
 use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::{Instant, Runtime, TokioTask};
 use fdb_native_transport::{Checksum, ConnectPacket, FrameConfig, MonitorConfig};
@@ -27,21 +30,30 @@ use futures_lite::future::poll_once;
 
 const V74: ProtocolVersion = ProtocolVersion::V7_4;
 
+/// What the peer manager offers at most to one write on a stream it does not fully trust.
+const UNSURE_WRITE_MAX: usize = 64 * 1024;
+
 fn endpoint() -> Uid {
     Uid::new(0x5eed_0000_0000_0000 | 1, 1)
 }
 
-/// What a [`Faulty`] stream does with writes.
+/// What a [`Faulty`] stream does with writes once its plan's pass-through bytes are written.
 #[derive(Clone, Copy, Debug)]
 enum Then {
     /// Every write fails, taking nothing.
     Fail,
     /// Writes are taken into a buffer that is never sent (a TLS session whose socket is
-    /// stuck), up to this many bytes; then writes are pending.
+    /// stuck), up to this many bytes; then writes are pending (having taken nothing).
     Swallow(usize),
     /// The next write takes up to this many bytes into its buffer and then fails (as
     /// `futures-rustls` does when the socket fails after the session took plaintext).
     SwallowThenFail(usize),
+    /// Writes send up to this many bytes to the socket and return `Pending` without reporting
+    /// them (as an OpenSSL `SSL_write` that sent a record and then hit `WANT_WRITE`, without
+    /// `SSL_MODE_ENABLE_PARTIAL_WRITE`). Pending ever after.
+    ForwardThenPending(usize),
+    /// The next write takes up to this many bytes into its buffer and then says it wrote 0.
+    ZeroAfterTaking(usize),
 }
 
 #[derive(Debug)]
@@ -50,8 +62,11 @@ struct Plan {
     pass: usize,
     then: Then,
     passed: usize,
+    /// Bytes taken by `then` (kept, or forwarded unreported).
     swallowed: usize,
     failed: bool,
+    /// The largest slice a write was offered once `then` applied.
+    max_offered: usize,
 }
 
 impl Plan {
@@ -62,6 +77,7 @@ impl Plan {
             passed: 0,
             swallowed: 0,
             failed: false,
+            max_offered: 0,
         }))
     }
 }
@@ -101,6 +117,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Faulty<S> {
             }
             return written;
         }
+        plan.max_offered = plan.max_offered.max(buf.len());
         match plan.then {
             Then::Fail => {
                 plan.failed = true;
@@ -119,6 +136,22 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Faulty<S> {
                 plan.failed = true;
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             }
+            Then::ForwardThenPending(k) => {
+                let n = buf.len().min(k - plan.swallowed);
+                if n > 0 {
+                    if let Poll::Ready(Ok(m)) = Pin::new(&mut self.inner).poll_write(cx, &buf[..n])
+                    {
+                        plan.swallowed += m;
+                    }
+                    let _ = Pin::new(&mut self.inner).poll_flush(cx);
+                }
+                Poll::Pending
+            }
+            Then::ZeroAfterTaking(take) => {
+                plan.swallowed += buf.len().min(take);
+                plan.failed = true;
+                Poll::Ready(Ok(0))
+            }
         }
     }
 
@@ -131,19 +164,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Faulty<S> {
     }
 }
 
-/// A [`MemRuntime`] whose first connection follows a plan, and which says (with `EXACT`)
-/// whether a failed write took nothing.
+/// A [`MemRuntime`] whose first connection follows a plan, and which says whether a failed
+/// (`ERRORS`) or pending (`PENDING`, by default the same) write took nothing.
 #[derive(Clone)]
-struct FaultRuntime<const EXACT: bool> {
+struct FaultRuntime<const ERRORS: bool, const PENDING: bool = ERRORS> {
     mem: MemRuntime,
     plan: Arc<Mutex<Option<Arc<Mutex<Plan>>>>>,
 }
 
-impl<const EXACT: bool> Runtime for FaultRuntime<EXACT> {
+impl<const ERRORS: bool, const PENDING: bool> FaultRuntime<ERRORS, PENDING> {
+    fn new(net: &Arc<Net>, plan: Option<Arc<Mutex<Plan>>>) -> Self {
+        FaultRuntime {
+            mem: MemRuntime::new(net),
+            plan: Arc::new(Mutex::new(plan)),
+        }
+    }
+}
+
+impl<const ERRORS: bool, const PENDING: bool> Runtime for FaultRuntime<ERRORS, PENDING> {
     type Stream = Faulty<MemStream>;
     type Task<T: Send + 'static> = TokioTask<T>;
 
-    const WRITE_ERRORS_TAKE_NOTHING: bool = EXACT;
+    const WRITE_ERRORS_TAKE_NOTHING: bool = ERRORS;
+    const PENDING_TAKES_NOTHING: bool = PENDING;
 
     fn now(&self) -> Instant {
         self.mem.now()
@@ -173,6 +216,35 @@ impl<const EXACT: bool> Runtime for FaultRuntime<EXACT> {
 
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.mem.resolve(host, port).await
+    }
+}
+
+/// A "TLS" wrapper whose stream follows a plan, and which says (with `PENDING_TRUSTED`)
+/// whether a pending write took nothing, as the in-tree rustls wrapper does.
+struct FaultWrapper<const PENDING_TRUSTED: bool> {
+    plan: Arc<Mutex<Plan>>,
+}
+
+impl<const PENDING_TRUSTED: bool> StreamWrapper<Faulty<MemStream>>
+    for FaultWrapper<PENDING_TRUSTED>
+{
+    type Stream = Faulty<Faulty<MemStream>>;
+
+    const PENDING_TAKES_NOTHING: bool = PENDING_TRUSTED;
+
+    fn tls_enabled(&self) -> bool {
+        true
+    }
+
+    async fn wrap(
+        &self,
+        stream: Faulty<MemStream>,
+        _peer: NetworkAddress,
+    ) -> io::Result<Self::Stream> {
+        Ok(Faulty {
+            inner: stream,
+            plan: Some(self.plan.clone()),
+        })
     }
 }
 
@@ -234,9 +306,17 @@ fn check(outcomes: &[RequestError], first_not_sent: usize) {
     }
 }
 
+/// The index of the first request whose frame starts at or past stream offset `end`, the
+/// frames being `len` bytes each, right after the ConnectPacket.
+fn first_starting_at_or_past(end: usize, len: usize, n: usize) -> usize {
+    (0..n)
+        .find(|i| ConnectPacket::SIZE + i * len >= end)
+        .unwrap_or(n)
+}
+
 /// A socket that accepts the ConnectPacket, the first request and part of the second, then
-/// fails. Its writes take nothing when they fail (as a TCP socket's), so the requests after
-/// the part written are not sent, and the server never saw them.
+/// fails. Its writes take nothing when they fail or are pending (as a TCP socket's), so the
+/// requests after the part written are not sent, and the server never saw them.
 #[tokio::test(start_paused = true)]
 async fn a_socket_that_accepts_n_bytes_then_fails() {
     let size = 500;
@@ -244,10 +324,7 @@ async fn a_socket_that_accepts_n_bytes_then_fails() {
     let net = Net::new();
     let server = listen_one(&net, sock(4500), Script::new(V74));
     let plan = Plan::new(ConnectPacket::SIZE + len + 10, Then::Fail);
-    let rt = FaultRuntime::<true> {
-        mem: MemRuntime::new(&net),
-        plan: Arc::new(Mutex::new(Some(plan.clone()))),
-    };
+    let rt = FaultRuntime::<true>::new(&net, Some(plan.clone()));
     let (sink, _events) = event_channel();
     let mgr = PeerManager::new(rt, config(), sink);
     let peer = mgr.peer(&server.address);
@@ -273,27 +350,25 @@ async fn a_failed_write_on_an_unsure_stream_counts_what_it_was_offered() {
     let server = listen_one(&net, sock(4500), Script::new(V74));
     let pass = ConnectPacket::SIZE + len + 10;
     let plan = Plan::new(pass, Then::Fail);
-    let rt = FaultRuntime::<false> {
-        mem: MemRuntime::new(&net),
-        plan: Arc::new(Mutex::new(Some(plan.clone()))),
-    };
+    let rt = FaultRuntime::<false>::new(&net, Some(plan.clone()));
     let (sink, _events) = event_channel();
     let mgr = PeerManager::new(rt, config(), sink);
     let peer = mgr.peer(&server.address);
     let outcomes = send_all(&peer, 6, size).await;
-    assert!(plan.lock().unwrap().failed);
-    // Request i starts at 44 + i * len; the failed write was offered [pass, pass + 64 KiB).
-    let offered_end = pass + 64 * 1024;
-    let first_not_sent = (0..6)
-        .find(|i| ConnectPacket::SIZE + i * len >= offered_end)
-        .unwrap();
+    let plan = plan.lock().unwrap();
+    assert!(plan.failed);
+    // The failed write was offered [pass, pass + 64 KiB), no more.
+    assert_eq!(plan.max_offered, UNSURE_WRITE_MAX);
+    let first_not_sent = first_starting_at_or_past(pass + UNSURE_WRITE_MAX, len, 6);
     assert_eq!(first_not_sent, 4);
     check(&outcomes, first_not_sent);
 }
 
 /// Bytes a TLS session took count as delivered even if the session never sent them: here the
 /// session takes the first request and part of the second into its buffer and the socket is
-/// stuck; the server hangs up. The third request, which the session never took, is not sent.
+/// stuck; the server hangs up. The third request, which the session never took (its writes
+/// were pending, and the wrapper promises a pending write took nothing, as the rustls one
+/// does), is not sent.
 #[tokio::test(start_paused = true)]
 async fn bytes_taken_by_a_tls_writer_are_maybe_delivered() {
     let size = 300;
@@ -303,21 +378,12 @@ async fn bytes_taken_by_a_tls_writer_are_maybe_delivered() {
     script.tls = true;
     let mut server = listen_one(&net, sock(4500), script);
     let tls_plan = Plan::new(ConnectPacket::SIZE, Then::Swallow(len + 5));
-    let wrapper_plan = tls_plan.clone();
-    let wrapper = move |stream: Faulty<MemStream>, _peer: NetworkAddress| {
-        let plan = wrapper_plan.clone();
-        async move {
-            Ok(Faulty {
-                inner: stream,
-                plan: Some(plan),
-            })
-        }
+    let wrapper = FaultWrapper::<true> {
+        plan: tls_plan.clone(),
     };
-    // The runtime's own socket promises exact errors; the TLS stream on it is never trusted.
-    let rt = FaultRuntime::<true> {
-        mem: MemRuntime::new(&net),
-        plan: Arc::new(Mutex::new(None)),
-    };
+    // The runtime's own socket promises exact writes; the TLS stream's errors are never
+    // trusted.
+    let rt = FaultRuntime::<true>::new(&net, None);
     let (sink, _events) = event_channel();
     let mgr = PeerManager::with_stream_wrapper(rt, config(), wrapper, sink);
     let peer = mgr.peer(&server.address);
@@ -338,7 +404,8 @@ async fn bytes_taken_by_a_tls_writer_are_maybe_delivered() {
 
 /// A TLS session that takes part of the buffer and then fails (as `futures-rustls` returns
 /// the socket's error after encrypting plaintext): everything offered to that write counts as
-/// possibly delivered, even on a runtime whose plain sockets are exact.
+/// possibly delivered, even on a runtime whose plain sockets are exact; it was offered no
+/// more than 64 KiB, so the frames past that are not sent.
 #[tokio::test(start_paused = true)]
 async fn a_tls_write_that_fails_after_taking_bytes_counts_what_it_was_offered() {
     let size = 30_000;
@@ -348,30 +415,178 @@ async fn a_tls_write_that_fails_after_taking_bytes_counts_what_it_was_offered() 
     script.tls = true;
     let server = listen_one(&net, sock(4500), script);
     let tls_plan = Plan::new(ConnectPacket::SIZE, Then::SwallowThenFail(10));
-    let wrapper_plan = tls_plan.clone();
-    let wrapper = move |stream: Faulty<MemStream>, _peer: NetworkAddress| {
-        let plan = wrapper_plan.clone();
-        async move {
-            Ok(Faulty {
-                inner: stream,
-                plan: Some(plan),
-            })
-        }
+    let wrapper = FaultWrapper::<true> {
+        plan: tls_plan.clone(),
     };
-    let rt = FaultRuntime::<true> {
-        mem: MemRuntime::new(&net),
-        plan: Arc::new(Mutex::new(None)),
-    };
+    let rt = FaultRuntime::<true>::new(&net, None);
     let (sink, _events) = event_channel();
     let mgr = PeerManager::with_stream_wrapper(rt, config(), wrapper, sink);
     let peer = mgr.peer(&server.address);
     let outcomes = send_all(&peer, 5, size).await;
-    assert!(tls_plan.lock().unwrap().failed);
+    let plan = tls_plan.lock().unwrap();
+    assert!(plan.failed);
     // The failed write was offered [44, 44 + 64 KiB): requests 0, 1 and 2 start in it.
-    let offered_end = ConnectPacket::SIZE + 64 * 1024;
-    let first_not_sent = (0..5)
-        .find(|i| ConnectPacket::SIZE + i * len >= offered_end)
-        .unwrap();
+    assert_eq!(plan.max_offered, UNSURE_WRITE_MAX);
+    let first_not_sent = first_starting_at_or_past(ConnectPacket::SIZE + UNSURE_WRITE_MAX, len, 5);
+    assert_eq!(first_not_sent, 3);
+    check(&outcomes, first_not_sent);
+}
+
+/// The same, with a session that takes the whole slice it was offered before failing: every
+/// frame that starts inside what it took is maybe delivered, whatever the cap.
+#[tokio::test(start_paused = true)]
+async fn a_tls_write_that_takes_the_whole_slice_and_fails() {
+    let size = 30_000;
+    let n = 5;
+    let len = frame_len(true, size);
+    let net = Net::new();
+    let mut script = Script::new(V74);
+    script.tls = true;
+    let server = listen_one(&net, sock(4500), script);
+    let tls_plan = Plan::new(ConnectPacket::SIZE, Then::SwallowThenFail(usize::MAX));
+    let wrapper = FaultWrapper::<true> {
+        plan: tls_plan.clone(),
+    };
+    let rt = FaultRuntime::<true>::new(&net, None);
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::with_stream_wrapper(rt, config(), wrapper, sink);
+    let peer = mgr.peer(&server.address);
+    let outcomes = send_all(&peer, n, size).await;
+    let plan = tls_plan.lock().unwrap();
+    assert!(plan.failed);
+    assert_eq!(plan.swallowed, plan.max_offered);
+    assert!(plan.max_offered <= UNSURE_WRITE_MAX, "{}", plan.max_offered);
+    // From what the stream actually took, not from the cap.
+    let first_not_sent = first_starting_at_or_past(ConnectPacket::SIZE + plan.swallowed, len, n);
+    assert!(first_not_sent < n, "something must be left unwritten");
+    check(&outcomes, first_not_sent);
+}
+
+/// A wrapper stream that puts bytes on the wire and returns `Pending` without reporting them
+/// (an OpenSSL session without partial writes that hits `WANT_WRITE`). The wrapper does not
+/// promise that a pending write took nothing (the default), so what it was offered counts:
+/// the request the server decoded is never reported not sent.
+#[tokio::test(start_paused = true)]
+async fn a_pending_write_that_sent_bytes_is_maybe_delivered() {
+    let size = 300;
+    let len = frame_len(true, size);
+    let net = Net::new();
+    let mut script = Script::new(V74);
+    script.tls = true;
+    let mut server = listen_one(&net, sock(4500), script);
+    let tls_plan = Plan::new(ConnectPacket::SIZE, Then::ForwardThenPending(len + 5));
+    let wrapper = FaultWrapper::<false> {
+        plan: tls_plan.clone(),
+    };
+    let rt = FaultRuntime::<true>::new(&net, None);
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::with_stream_wrapper(rt, config(), wrapper, sink);
+    let peer = mgr.peer(&server.address);
+    let sending = tokio::spawn({
+        let peer = peer.clone();
+        async move { send_all(&peer, 3, size).await }
+    });
+    let conn = server.conns_next().await;
+    until("forwarded", || {
+        tls_plan.lock().unwrap().swallowed == len + 5
+    })
+    .await;
+    until("the server decoded the first request", || {
+        server.frames(0) == 1
+    })
+    .await;
+    conn.close();
+    let outcomes = sending.await.unwrap();
+    // Every frame was in the slice offered to the pending write.
+    let plan = tls_plan.lock().unwrap();
+    assert!(plan.max_offered <= UNSURE_WRITE_MAX);
+    assert!(plan.max_offered >= 3 * len);
+    check(&outcomes, 3);
+}
+
+/// The same pending-write stream as the runtime's own socket, on a runtime that does not
+/// promise a pending write took nothing.
+#[tokio::test(start_paused = true)]
+async fn a_pending_write_on_an_unsure_runtime_is_maybe_delivered() {
+    let size = 300;
+    let len = frame_len(false, size);
+    let net = Net::new();
+    let mut server = listen_one(&net, sock(4500), Script::new(V74));
+    let plan = Plan::new(ConnectPacket::SIZE, Then::ForwardThenPending(len + 5));
+    let rt = FaultRuntime::<false>::new(&net, Some(plan.clone()));
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::new(rt, config(), sink);
+    let peer = mgr.peer(&server.address);
+    let sending = tokio::spawn({
+        let peer = peer.clone();
+        async move { send_all(&peer, 3, size).await }
+    });
+    let conn = server.conns_next().await;
+    until("the server decoded the first request", || {
+        server.frames(0) == 1
+    })
+    .await;
+    conn.close();
+    let outcomes = sending.await.unwrap();
+    check(&outcomes, 3);
+}
+
+/// A runtime that trusts its failed writes but not its pending ones: a pending write counts
+/// what it was offered, so that slice must still be bounded, or every frame in the output
+/// would be maybe delivered.
+#[tokio::test(start_paused = true)]
+async fn a_pending_write_is_offered_a_bounded_slice() {
+    let size = 30_000;
+    let n = 5;
+    let len = frame_len(false, size);
+    let net = Net::new();
+    let mut server = listen_one(&net, sock(4500), Script::new(V74));
+    let plan = Plan::new(ConnectPacket::SIZE, Then::ForwardThenPending(len + 10));
+    let rt = FaultRuntime::<true, false>::new(&net, Some(plan.clone()));
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::new(rt, config(), sink);
+    let peer = mgr.peer(&server.address);
+    let sending = tokio::spawn({
+        let peer = peer.clone();
+        async move { send_all(&peer, n, size).await }
+    });
+    let conn = server.conns_next().await;
+    until("the server decoded the first request", || {
+        server.frames(0) == 1
+    })
+    .await;
+    conn.close();
+    let outcomes = sending.await.unwrap();
+    assert_eq!(plan.lock().unwrap().max_offered, UNSURE_WRITE_MAX);
+    let first_not_sent = first_starting_at_or_past(ConnectPacket::SIZE + UNSURE_WRITE_MAX, len, n);
+    assert_eq!(first_not_sent, 3);
+    check(&outcomes, first_not_sent);
+}
+
+/// A TLS write that takes bytes and then reports 0 written: `Ok(0)` from a stream that does
+/// not promise exact failures is treated as a failure that may have taken what it was offered.
+#[tokio::test(start_paused = true)]
+async fn a_zero_write_after_taking_bytes_counts_what_it_was_offered() {
+    let size = 30_000;
+    let n = 5;
+    let len = frame_len(true, size);
+    let net = Net::new();
+    let mut script = Script::new(V74);
+    script.tls = true;
+    let server = listen_one(&net, sock(4500), script);
+    let tls_plan = Plan::new(ConnectPacket::SIZE, Then::ZeroAfterTaking(10));
+    let wrapper = FaultWrapper::<true> {
+        plan: tls_plan.clone(),
+    };
+    let rt = FaultRuntime::<true>::new(&net, None);
+    let (sink, _events) = event_channel();
+    let mgr = PeerManager::with_stream_wrapper(rt, config(), wrapper, sink);
+    let peer = mgr.peer(&server.address);
+    let outcomes = send_all(&peer, n, size).await;
+    let plan = tls_plan.lock().unwrap();
+    assert!(plan.failed);
+    assert_eq!(plan.max_offered, UNSURE_WRITE_MAX);
+    let first_not_sent = first_starting_at_or_past(ConnectPacket::SIZE + UNSURE_WRITE_MAX, len, n);
     assert_eq!(first_not_sent, 3);
     check(&outcomes, first_not_sent);
 }

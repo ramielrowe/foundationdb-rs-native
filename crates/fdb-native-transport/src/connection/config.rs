@@ -118,6 +118,21 @@ pub struct ConnectionConfig {
     /// Seed of the connection's random numbers (the jitter and the reply tokens of its pings).
     /// [`ConnectionConfig::new`] draws one; set it for a reproducible run.
     pub seed: u64,
+    /// Whether the driver reports every byte its transport **may** have taken, as
+    /// [Written offsets](super#written-offsets) requires: bytes accepted with
+    /// [`consume_output`](super::Connection::consume_output), and those offered to a write
+    /// that failed, was pending or was abandoned on a stream that does not promise it took
+    /// nothing, with [`write_failed`](super::Connection::write_failed) /
+    /// [`output_maybe_written`](super::Connection::output_maybe_written). Only then may the
+    /// [`ReplyRegistry`](crate::rpc::ReplyRegistry) fail a request whose frame was never
+    /// handed to the transport as [`NotSent`](crate::rpc::RequestError::NotSent) when the
+    /// connection ends.
+    ///
+    /// Default `false`: every request put on an established connection is
+    /// [`MaybeDelivered`](crate::rpc::RequestError::MaybeDelivered) when it ends, whatever
+    /// was written, as in C++ (only requests held by a handshake that never completed are not
+    /// sent). The [peer manager](crate::peer), which makes those reports, sets it.
+    pub unwritten_not_sent: bool,
 }
 
 impl ConnectionConfig {
@@ -139,6 +154,7 @@ impl ConnectionConfig {
             monitor: MonitorConfig::FDB_DEFAULT,
             max_pending_output: DEFAULT_MAX_PENDING_OUTPUT,
             seed: RandomState::new().build_hasher().finish(),
+            unwritten_not_sent: false,
         }
     }
 }
