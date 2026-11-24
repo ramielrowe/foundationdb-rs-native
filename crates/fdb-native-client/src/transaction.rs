@@ -207,12 +207,12 @@ use crate::commit::{CommitBuffer, CommitLimits, CommitOptions, CommitOutcome};
 use crate::database::Database;
 use crate::error::codes::*;
 use crate::error::{Error, TransactionRetry};
-use crate::read::util::{Either, never, race};
+use crate::read::util::{Either, Race, never, race};
 use crate::read::{
     Limits, METADATA_VERSION_KEY, RangeRead, ReadOptions, ReadParams, ReadVersionOptions, key_after,
 };
 use crate::ryw::read::{BoxFuture, RywRead, RywSource};
-use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap, WriteMapIter};
+use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap};
 use crate::watch::PendingWatches;
 
 mod metrics;
@@ -717,7 +717,8 @@ impl ReadStart {
 
 /// What a read-your-writes read sees of the transaction's writes ([`Transaction::ryw_view`]).
 struct RywView {
-    writes: WriteMapIter,
+    /// A snapshot of the write map (cloning one shares it).
+    writes: WriteMap,
     bypass_unreadable: bool,
 }
 
@@ -725,10 +726,15 @@ impl RywView {
     fn read<'s, S>(&self, source: &'s S, max_read_key: &'static [u8]) -> RywRead<'s, S> {
         RywRead {
             source,
-            writes: self.writes.clone(),
+            writes: self.writes.iter(),
             max_read_key,
             bypass_unreadable: self.bypass_unreadable,
         }
+    }
+
+    /// Whether the read sees no writes ([`WriteMap::is_untouched`]): only the cache.
+    fn sees_no_writes(&self) -> bool {
+        self.writes.is_untouched()
     }
 }
 
@@ -760,12 +766,10 @@ impl<R: Runtime> RywSource for TxSource<'_, R> {
         Ok(f(&mut state.ryw.cache))
     }
 
-    fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
-        Box::pin(async move {
-            self.tx
-                .native_get_value(&key, self.epoch, self.params)
-                .await
-        })
+    async fn read_value(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        self.tx
+            .native_get_value(&key, self.epoch, self.params)
+            .await
     }
 
     fn read_range(
@@ -919,24 +923,38 @@ impl<R: Runtime> Transaction<R> {
     /// operation started in: `transaction_cancelled`), and interrupts it if the transaction
     /// is cancelled, reset or times out meanwhile (`Err` with that error). The deadline is
     /// looked at again whenever the timeout option changes.
-    async fn guarded<T>(
-        &self,
+    ///
+    /// Nothing happens until the future is first polled: then the transaction is checked,
+    /// and `op` raced against its [`interruption`]. (A [`Guarded`] future rather than an
+    /// `async fn`, which would keep `op` twice.)
+    fn guarded<'a, T, F>(
+        &'a self,
         epoch: u64,
-        op: impl Future<Output = Result<T, Error>>,
-    ) -> Result<Result<T, Error>, Error> {
-        {
-            let mut state = self.state();
-            self.check_handle(&state)?;
-            state.check_alive(self.rt().now())?;
-            if state.epoch != epoch {
-                return Err(Error::new(TRANSACTION_CANCELLED));
-            }
+        op: F,
+    ) -> Guarded<'a, R, F, impl Future<Output = Error> + Send + 'a>
+    where
+        F: Future<Output = Result<T, Error>>,
+    {
+        Guarded {
+            tx: self,
+            epoch,
+            checked: false,
+            race: race(
+                op,
+                interruption(Arc::downgrade(&self.inner), self.rt(), epoch),
+            ),
         }
-        let inner = Arc::downgrade(&self.inner);
-        match race(op, interruption(&inner, self.rt(), epoch)).await {
-            Either::Left(result) => Ok(result),
-            Either::Right(e) => Err(e),
+    }
+
+    /// [`guarded`](Self::guarded)'s check when its future is first polled.
+    fn guard_check(&self, epoch: u64) -> Result<(), Error> {
+        let mut state = self.state();
+        self.check_handle(&state)?;
+        state.check_alive(self.rt().now())?;
+        if state.epoch != epoch {
+            return Err(Error::new(TRANSACTION_CANCELLED));
         }
+        Ok(())
     }
 
     /// The transaction's read version: the one it has, or the one being requested, or a new
@@ -991,7 +1009,8 @@ impl<R: Runtime> Transaction<R> {
         // transaction): those waiting for the version are interrupted then too.
         drop(self.rt().spawn(async move {
             let request = reader.get_read_version_and_metadata(options);
-            let fetched = match race(request, interruption(&guard.inner, &rt, epoch)).await {
+            let interrupted = interruption(guard.inner.clone(), &rt, epoch);
+            let fetched = match race(request, interrupted).await {
                 Either::Left(fetched) => fetched,
                 Either::Right(_) => return,
             };
@@ -1129,9 +1148,9 @@ impl<R: Runtime> Transaction<R> {
             return None;
         }
         let writes = if snapshot && state.flags.snapshot_ryw <= 0 {
-            WriteMap::new().iter()
+            WriteMap::new()
         } else {
-            state.ryw.writes.iter()
+            state.ryw.writes.clone()
         };
         Some(RywView {
             writes,
@@ -1169,6 +1188,19 @@ impl<R: Runtime> Transaction<R> {
         ReadFuture::Task(self.spawn_read(async move {
             let result = match view {
                 None => tx.native_get_value(&key, start.epoch, start.params()).await,
+                // The common case, a transaction that has not written: no write map to walk.
+                Some(view) if view.sees_no_writes() => {
+                    let source = TxSource::new(&tx, &start);
+                    match ryw::read::get_without_writes(&source, &key).await {
+                        Ok(value) if !snapshot => tx
+                            .add_ryw_conflict(&guard, |c| {
+                                ryw::read::add_get_conflict_without_writes(c, &key);
+                                Ok(())
+                            })
+                            .map(|()| value),
+                        other => other,
+                    }
+                }
                 Some(view) => {
                     let source = TxSource::new(&tx, &start);
                     let read = view.read(&source, start.max_read_key);
@@ -1199,7 +1231,8 @@ impl<R: Runtime> Transaction<R> {
         self.guarded(epoch, async {
             let version = self.read_version(false).await?;
             if key == METADATA_VERSION_KEY {
-                return self.metadata_version(version, epoch, params).await;
+                // Boxed: a rare read, which would otherwise size every `get`'s future.
+                return Box::pin(self.metadata_version(version, epoch, params)).await;
             }
             self.inner
                 .db
@@ -1933,12 +1966,47 @@ impl<R: Runtime> Transaction<R> {
     }
 }
 
+pin_project_lite::pin_project! {
+    /// The future of [`Transaction::guarded`]: `op` raced against the transaction's
+    /// interruption `I`, after the transaction's check on the first poll.
+    #[must_use = "futures do nothing unless polled"]
+    struct Guarded<'a, R: Runtime, F, I> {
+        tx: &'a Transaction<R>,
+        epoch: u64,
+        checked: bool,
+        #[pin]
+        race: Race<F, I>,
+    }
+}
+
+impl<R: Runtime, T, F, I> Future for Guarded<'_, R, F, I>
+where
+    F: Future<Output = Result<T, Error>>,
+    I: Future<Output = Error>,
+{
+    type Output = Result<Result<T, Error>, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if !*this.checked {
+            *this.checked = true;
+            if let Err(e) = this.tx.guard_check(*this.epoch) {
+                return Poll::Ready(Err(e));
+            }
+        }
+        this.race.poll(cx).map(|either| match either {
+            Either::Left(result) => Ok(result),
+            Either::Right(e) => Err(e),
+        })
+    }
+}
+
 /// Resolves with the error that ends the operations of epoch `epoch` of the transaction:
 /// the error that killed it (cancelled, timed out, poisoned by a use during the commit),
 /// or `transaction_cancelled` once it is reset or gone. The deadline is looked at again
 /// whenever the timeout option changes, and kills the transaction when it passes
 /// ([`State::fire_timebomb`]). Holds the transaction weakly.
-async fn interruption<R: Runtime>(inner: &Weak<Inner<R>>, rt: &R, epoch: u64) -> Error {
+async fn interruption<R: Runtime>(inner: Weak<Inner<R>>, rt: &R, epoch: u64) -> Error {
     loop {
         let (interrupted, deadline) = {
             let Some(inner) = inner.upgrade() else {

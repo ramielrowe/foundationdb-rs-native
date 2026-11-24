@@ -153,6 +153,31 @@ fn ext_key_assert_ref_panics_with_padding() {
 /// C++ `testSnapshotCache` (which only prints the segments): the same inserts, with the
 /// segments asserted.
 #[test]
+fn lookup_of_a_new_cache_and_after_inserts() {
+    for first in [true, false] {
+        let mut cache = SnapshotCache::new();
+        assert_eq!(cache.lookup(b"a"), None);
+        assert_eq!(cache.lookup(b"\xff\xfe"), None);
+        // The final segment is always known empty.
+        assert_eq!(cache.lookup(b"\xff\xff"), Some(None));
+        if first {
+            assert!(cache.insert_key(b"a", Some(b"1")));
+            assert!(!cache.insert_key(b"a", Some(b"2")));
+        } else {
+            assert!(cache.insert_range(b"a", b"c", vec![kv(b"a", b"1")]));
+        }
+        assert_eq!(
+            cache.lookup(b"a").map(|kv| kv.map(|kv| &kv.value[..])),
+            Some(Some(&b"1"[..]))
+        );
+        assert_eq!(cache.lookup(b"a\0"), if first { None } else { Some(None) });
+        assert_eq!(cache.lookup(b"d"), None);
+        assert!(!cache.insert_key(b"\xff\xff", None));
+        cache.assert_invariants();
+    }
+}
+
+#[test]
 fn cpp_test_snapshot_cache_segments() {
     let mut cache = SnapshotCache::new();
     assert!(cache.is_empty());
@@ -857,6 +882,13 @@ fn check_against_model(cache: &SnapshotCache, model: &Model) {
         let (b, e) = (it.begin_key().to_vec(), it.end_key().to_vec());
         assert!(b <= *p && *p < e, "skip({p:?}) -> [{b:?}, {e:?})");
         assert!(fwd.contains(&(it.segment_type(), b, e)));
+        // `lookup` is the segment's answer (also for a cache nothing was inserted into).
+        let expected = match it.segment_type() {
+            SegmentType::Unknown => None,
+            SegmentType::Empty => Some(None),
+            SegmentType::KeyValue => Some(it.kv()),
+        };
+        assert_eq!(cache.lookup(p), expected, "lookup({p:?})");
         match it.kv() {
             Some(row) => assert_eq!(
                 model.truth.get(&row.key[..]).map(Vec::as_slice),

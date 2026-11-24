@@ -1,5 +1,7 @@
 //! Encoding and decoding the client's messages for a [`SchemaVersion`].
 
+use std::cell::RefCell;
+
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, FileIdentified, Uid, Writer,
     decode, encode,
@@ -126,12 +128,49 @@ pub fn decode_reply<R: Request>(
     R::decode_reply(version, bytes)
 }
 
+/// The largest message buffer a thread keeps for its next request ([`encode_into`]).
+const KEPT_WRITER_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// A writer per thread for the requests it encodes, so that a request costs no
+    /// allocation for the writer's buffers. A reused writer writes the bytes a new one does
+    /// (`fdb-native-wire`'s `tests/writer_reuse.rs`).
+    static WRITER: RefCell<Writer> = RefCell::new(Writer::new());
+}
+
 /// Appends `value` as the only member of a message with `T`'s file identifier.
 fn encode_into<T: Encode + FileIdentified>(
     value: &T,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let mut w = Writer::new();
+    let reused = WRITER.try_with(|cell| {
+        let Ok(mut w) = cell.try_borrow_mut() else {
+            // Encoding a request from inside an `Encode` impl: not this one.
+            return None;
+        };
+        let result = write_into(&mut w, value, out);
+        if result.is_err() {
+            // `finish_into` resets the writer; an error before it leaves a partial message.
+            w.reset();
+        }
+        if w.buffer_capacity() > KEPT_WRITER_BYTES {
+            // A large commit: do not keep its buffer for the thread's next request.
+            *w = Writer::new();
+        }
+        Some(result)
+    });
+    match reused {
+        Ok(Some(result)) => result,
+        // The thread is exiting, or its writer is in use.
+        _ => write_into(&mut Writer::new(), value, out),
+    }
+}
+
+fn write_into<T: Encode + FileIdentified>(
+    w: &mut Writer,
+    value: &T,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
     let mut root = w.table();
     root.field(value)?;
     let root = root.finish()?;

@@ -66,6 +66,8 @@ pings, TLS with rustls, `Runtime` adapters for tokio and smol), the per-release 
 and binary codecs, checked against the C++ readers with golden vectors. As in C++, a peer made
 anew starts with its address available, and a failed peer that is referenced again is probed again
 (found by the deterministic simulation, `fdb-native-sim`, which is not published).
+Requests are encoded with a writer each thread keeps (new: `Writer::buffer_capacity`, to drop
+one that grew large), and the transport's reply and request maps use FxHash (bead `e82`).
 
 ### API decisions made before the first release
 

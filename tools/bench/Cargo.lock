@@ -135,6 +135,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
+name = "bytes"
+version = "1.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
+
+[[package]]
 name = "cc"
 version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,7 +278,9 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
+ "pin-project-lite",
  "rpds",
+ "rustc-hash",
  "thiserror",
 ]
 
@@ -301,6 +309,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-io",
+ "rustc-hash",
  "thiserror",
  "tokio",
  "xxhash-rust",
@@ -310,6 +319,7 @@ dependencies = [
 name = "fdb-native-wire"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fdb-native-wire-derive",
  "thiserror",
 ]

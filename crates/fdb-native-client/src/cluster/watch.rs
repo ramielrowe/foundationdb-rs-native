@@ -1,12 +1,13 @@
 //! The state the monitor's task publishes and its handles read, with executor-neutral waits
 //! (a lock and one waker slot per waiter).
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+
+use rustc_hash::FxHashMap;
 
 use super::error::MonitorClosed;
 use super::info::ClusterInfo;
@@ -18,8 +19,12 @@ pub(crate) struct State {
     pub(crate) sequence: u64,
     pub(crate) closed: bool,
     pub(crate) status: MonitorStatus,
-    waiters: HashMap<u64, Waker>,
+    /// FxHash: slots numbered here.
+    waiters: FxHashMap<u64, Waker>,
     next_waiter: u64,
+    /// How many times [`Shared::modify`] ran: a [`Wait`] whose function said no at this
+    /// generation is still registered and need not look again.
+    generation: u64,
 }
 
 /// What the task and the handles share.
@@ -45,8 +50,9 @@ impl Shared {
                 sequence: 0,
                 closed: false,
                 status,
-                waiters: HashMap::new(),
+                waiters: FxHashMap::default(),
                 next_waiter: 0,
+                generation: 0,
             }),
         }
     }
@@ -60,6 +66,7 @@ impl Shared {
         let (result, wakers) = {
             let mut state = self.lock();
             let result = f(&mut state);
+            state.generation += 1;
             let wakers: Vec<Waker> = state.waiters.drain().map(|(_, w)| w).collect();
             (result, wakers)
         };
@@ -93,6 +100,7 @@ impl Shared {
         Wait {
             shared: self,
             slot: None,
+            looked_at: None,
             f,
         }
     }
@@ -101,6 +109,8 @@ impl Shared {
 pub(crate) struct Wait<'a, F> {
     shared: &'a Shared,
     slot: Option<u64>,
+    /// The [`State::generation`] `f` last said no at (the waiter is registered then).
+    looked_at: Option<u64>,
     f: F,
 }
 
@@ -113,6 +123,18 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let mut state = this.shared.lock();
+        if let (Some(slot), Some(generation)) = (this.slot, this.looked_at) {
+            // Nothing changed since `f` said no (a change drains the waiters and moves the
+            // generation on): only the waker may be new.
+            if generation == state.generation {
+                if let Some(waker) = state.waiters.get_mut(&slot) {
+                    if !waker.will_wake(cx.waker()) {
+                        waker.clone_from(cx.waker());
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
         if let Some(value) = (this.f)(&state) {
             if let Some(slot) = this.slot.take() {
                 state.waiters.remove(&slot);
@@ -129,8 +151,9 @@ where
             state.next_waiter += 1;
             state.next_waiter
         });
-        // Registered again on every poll: `modify` drains the map.
+        // Registered again after every change: `modify` drains the map.
         state.waiters.insert(slot, cx.waker().clone());
+        this.looked_at = Some(state.generation);
         Poll::Pending
     }
 }

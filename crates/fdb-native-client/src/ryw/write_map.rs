@@ -356,6 +356,8 @@ pub(crate) struct WriteMap {
     /// `writeMapEmpty`: no write has been made (`addUnmodifiedAndUnreadableRange` does not
     /// count, as in C++).
     empty: bool,
+    /// `addUnmodifiedAndUnreadableRange` was called.
+    unreadable: bool,
 }
 
 impl Default for WriteMap {
@@ -366,17 +368,41 @@ impl Default for WriteMap {
 
 impl WriteMap {
     /// An empty write map: one unmodified range over the whole key space.
+    ///
+    /// Every transaction makes one: it is a clone of one built once per thread (the tree is
+    /// persistent, so the first write copies the path it changes).
     pub(crate) fn new() -> WriteMap {
+        thread_local! {
+            static EMPTY: WriteMap = WriteMap::build();
+        }
+        EMPTY
+            .try_with(WriteMap::clone)
+            .unwrap_or_else(|_| WriteMap::build())
+    }
+
+    fn build() -> WriteMap {
         let mut tree = Tree::new_sync();
         for key in [&b""[..], ALL_KEYS_END, AFTER_ALL_KEYS] {
             tree.insert_mut(Arc::from(key), Entry::default());
         }
-        WriteMap { tree, empty: true }
+        WriteMap {
+            tree,
+            empty: true,
+            unreadable: false,
+        }
     }
 
     /// `empty`: whether no write has been made.
     pub(crate) fn is_empty(&self) -> bool {
         self.empty
+    }
+
+    /// Whether the map is as [`new`](Self::new) made it: one unmodified, readable range
+    /// over the whole key space (no write, clear, conflict range or unreadable range was
+    /// added). A read then sees the snapshot cache alone (`RYWIterator`'s types are the
+    /// cache's), and every key it reads is unmodified for its read conflict range.
+    pub(crate) fn is_untouched(&self) -> bool {
+        self.empty && !self.unreadable
     }
 
     /// An iterator over a snapshot of the map (later writes do not change what it sees), at
@@ -597,6 +623,7 @@ impl WriteMap {
         if begin >= end {
             return;
         }
+        self.unreadable = true;
         let end_key = ExtKey::from(end);
 
         let mut it = self.iter_at(begin);

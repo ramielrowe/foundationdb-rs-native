@@ -61,8 +61,12 @@ pub(crate) trait RywSource: Send + Sync {
     /// was reset since the read started (its cache is another one now).
     fn with_cache<T>(&self, f: impl FnOnce(&mut SnapshotCache) -> T) -> Result<T, Error>;
 
-    /// `tr.get(key, Snapshot::True)`.
-    fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>>;
+    /// `tr.get(key, Snapshot::True)`. (Not boxed: a `get` is the hottest read, and its
+    /// task holds this future inline.)
+    fn read_value(
+        &self,
+        key: Vec<u8>,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send + '_;
 
     /// `tr.getRange(begin, end, limits, Snapshot::True, reverse)`.
     fn read_range(
@@ -437,6 +441,27 @@ pub(crate) async fn get<S: RywSource>(
         debug_assert!(it.is_kv().unwrap_or(false));
         Ok(it.kv()?.map(|kv| kv.value.to_vec()))
     })?
+}
+
+/// [`get`] when the read sees no writes ([`WriteMap::is_untouched`](crate::ryw::WriteMap::is_untouched)):
+/// every segment of the write map is then an unmodified, readable range, so the
+/// `RYWIterator` is the cache's iterator (no dependent write, no unreadable key) and the
+/// read is the cache's answer, or the database's (recorded in the cache). The same result
+/// as [`get`], without walking the write map.
+pub(crate) async fn get_without_writes<S: RywSource>(
+    source: &S,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    let cached =
+        source.with_cache(|cache| cache.lookup(key).map(|kv| kv.map(|kv| kv.value.to_vec())))?;
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+    let value = source.read_value(key.to_vec()).await?;
+    source.with_cache(|cache| {
+        cache.insert_key(key, value.as_deref());
+    })?;
+    Ok(value)
 }
 
 /// `read(GetKeyReq)`: the key `key` resolves to as the transaction sees it: `""` before
@@ -1130,12 +1155,18 @@ const KEY_RANGE_REF_SIZE: usize = crate::commit::KEY_RANGE_REF_SIZE as usize;
 /// unmodified or has dependent writes (`it` is at the key's segment).
 fn update_conflict_map_key(conflicts: &mut ReadConflicts, key: &[u8], it: &WriteMapIter) {
     if it.is_unmodified_range() || (it.is_operation() && it.is_independent() == Some(false)) {
-        let mut end = key.to_vec();
-        end.push(0);
-        // `approximateSize += 2 * key.expectedSize() + 1 + sizeof(KeyRangeRef)`.
-        conflicts.add_approximate_size(2 * key.len() + 1 + KEY_RANGE_REF_SIZE);
-        conflicts.insert(key, &end);
+        add_key_conflict(conflicts, key);
     }
+}
+
+/// `updateConflictMap(key, ...)`'s insertion: `[key, key\x00)`.
+fn add_key_conflict(conflicts: &mut ReadConflicts, key: &[u8]) {
+    let mut end = Vec::with_capacity(key.len() + 1);
+    end.extend_from_slice(key);
+    end.push(0);
+    // `approximateSize += 2 * key.expectedSize() + 1 + sizeof(KeyRangeRef)`.
+    conflicts.add_approximate_size(2 * key.len() + 1 + KEY_RANGE_REF_SIZE);
+    conflicts.insert(key, &end);
 }
 
 /// `updateConflictMap(keys)`: the parts of `[begin, end)` that are unmodified or have
@@ -1163,6 +1194,12 @@ fn update_conflict_map_range(
             break;
         }
     }
+}
+
+/// [`add_get_conflict`] of a read that saw no writes
+/// ([`WriteMap::is_untouched`](crate::ryw::WriteMap::is_untouched)): the key was unmodified.
+pub(crate) fn add_get_conflict_without_writes(conflicts: &mut ReadConflicts, key: &[u8]) {
+    add_key_conflict(conflicts, key);
 }
 
 /// `addConflictRange(GetValueReq)`.

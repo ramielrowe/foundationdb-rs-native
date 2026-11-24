@@ -161,10 +161,13 @@ impl RywSource for Mem {
         Ok(f(&mut self.cache.lock().unwrap()))
     }
 
-    fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>> {
+    fn read_value(
+        &self,
+        key: Vec<u8>,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send + '_ {
         self.value_reads.fetch_add(1, Ordering::SeqCst);
         let value = self.db.get(&key).cloned();
-        Box::pin(async move { Ok(value) })
+        std::future::ready(Ok(value))
     }
 
     fn read_range(
@@ -519,6 +522,29 @@ fn check_read(
     let ryw = read(mem, writes);
     match r {
         Read::Get(k) => {
+            if writes.is_untouched() {
+                // The fast path gives what `get` gives, and asks the database (and fills
+                // the cache) exactly when `get` would.
+                let reads = mem.value_reads.load(Ordering::SeqCst);
+                let cache = mem.cache.lock().unwrap().clone();
+                let fast = block_on(get_without_writes(mem, k)).unwrap();
+                let fast_reads = mem.value_reads.load(Ordering::SeqCst) - reads;
+                let fast_cache = std::mem::replace(&mut *mem.cache.lock().unwrap(), cache);
+                let slow = block_on(get(&ryw, k)).unwrap();
+                prop_assert_eq!(&fast, &slow, "get {:?}", k);
+                prop_assert_eq!(
+                    fast_reads,
+                    mem.value_reads.load(Ordering::SeqCst) - reads - fast_reads
+                );
+                prop_assert_eq!(
+                    format!("{fast_cache:?}"),
+                    format!("{:?}", mem.cache.lock().unwrap())
+                );
+                let (mut a, mut b) = (ReadConflicts::new(), ReadConflicts::new());
+                add_get_conflict_without_writes(&mut a, k);
+                add_get_conflict(&mut b, k, &writes.iter());
+                prop_assert_eq!(a, b);
+            }
             prop_assert_eq!(
                 block_on(get(&ryw, k)).unwrap(),
                 model.get(k).cloned(),

@@ -3,7 +3,6 @@
 //! servers), including second (hedged) requests and lagging requests. See the [module
 //! documentation](super) for what is ported and what is left out.
 
-use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -18,6 +17,7 @@ use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::rpc::RequestError;
 use fdb_native_transport::runtime::{Runtime, TaskHandle};
 use fdb_native_wire::{Bytes, DecodeError, EncodeError, Endpoint, ErrorOr, NetworkAddress, Uid};
+use rustc_hash::FxHashMap;
 
 use super::Shared;
 use super::location::Location;
@@ -163,7 +163,8 @@ impl Default for QueueData {
 /// three entries, as `getAdjustedEndpoint` makes them), with the second-request state (`secondMultiplier`, `secondBudget`).
 #[derive(Debug)]
 pub(crate) struct QueueModel {
-    data: HashMap<u64, QueueData>,
+    /// FxHash: the first half of a storage server's id, looked up for every request.
+    data: FxHashMap<u64, QueueData>,
     /// `secondMultiplier`: scales how long the first request is given before a second one
     /// is sent (at least 1; grows with each second request, decays with each reply).
     pub(crate) second_multiplier: f64,
@@ -175,7 +176,7 @@ pub(crate) struct QueueModel {
 impl Default for QueueModel {
     fn default() -> Self {
         QueueModel {
-            data: HashMap::new(),
+            data: FxHashMap::default(),
             second_multiplier: 1.0,
             second_budget: 0.0,
         }

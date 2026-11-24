@@ -17,6 +17,9 @@ pub const WORKLOADS: &[&str] = &["get", "get_seq", "set", "scan", "mixed", "many
 pub struct Opts {
     pub warmup: Duration,
     pub dur: Duration,
+    /// The concurrencies of `get`, `get_seq`, `set` and `mixed` (`--concs`; default
+    /// [`CONCS`]).
+    pub concs: &'static [usize],
 }
 
 pub async fn run<B: Backend>(
@@ -81,11 +84,11 @@ fn emit_m(emit: &mut dyn FnMut(Value), m: &Measurement, w: &str, variant: &str, 
     emit(m.json(w, variant, conc));
 }
 
-const CONCS: [usize; 3] = [1, 16, 256];
+pub const CONCS: &[usize] = &[1, 16, 256];
 
 /// A fresh transaction per get: the read version and the read.
 async fn get<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
-    for conc in CONCS {
+    for &conc in o.concs {
         let b = b.clone();
         let m = closed_loop(conc, o.warmup, o.dur, move |ctx| {
             let k = key("get", ctx.rng.below(KEYSPACE));
@@ -103,7 +106,7 @@ async fn get<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
 /// 100 gets in one transaction: the read version is paid once, so this is the storage read
 /// path. The latency is per get (the first get of each transaction is not sampled).
 async fn get_seq<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
-    for conc in CONCS {
+    for &conc in o.concs {
         let b = b.clone();
         let m = closed_loop(conc, o.warmup, o.dur, move |ctx| {
             let keys: Vec<Vec<u8>> = (0..100)
@@ -124,7 +127,7 @@ async fn get_seq<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
 }
 
 async fn set<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
-    for conc in CONCS {
+    for &conc in o.concs {
         let b = b.clone();
         let m = closed_loop(conc, o.warmup, o.dur, move |ctx| {
             let k = key("set", ctx.rng.below(KEYSPACE));
@@ -166,7 +169,7 @@ async fn scan<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
 /// 90% read transactions (10 gets) and 10% write transactions (5 gets + 5 sets, commit).
 /// One iteration is one transaction.
 async fn mixed<B: Backend>(b: &B, o: Opts, emit: &mut dyn FnMut(Value)) {
-    for conc in CONCS {
+    for &conc in o.concs {
         let b = b.clone();
         let m = closed_loop(conc, o.warmup, o.dur, move |ctx| {
             let write_tx = ctx.rng.below(100) < 10;

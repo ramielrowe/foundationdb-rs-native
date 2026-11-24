@@ -243,6 +243,9 @@ pub(crate) struct SnapshotCache {
     /// Entries by begin key. There are always degenerate entries at the two ends,
     /// `["", "")` and `[\xff\xff, \xff\xff\x00)`, which "reduce edge cases".
     entries: BTreeMap<Vec<u8>, Entry>,
+    /// Nothing was ever inserted: every key up to `\xff\xff` is unknown (the point reads
+    /// of a new transaction need not search the map).
+    untouched: bool,
 }
 
 impl Default for SnapshotCache {
@@ -269,7 +272,10 @@ impl SnapshotCache {
                 values: Vec::new(),
             },
         );
-        SnapshotCache { entries }
+        SnapshotCache {
+            entries,
+            untouched: true,
+        }
     }
 
     /// `empty()`: is nothing known about the snapshot's contents?
@@ -288,13 +294,34 @@ impl SnapshotCache {
         it
     }
 
+    /// What the cache knows of `key`: `Some(Some(kv))` if it has a value, `Some(None)` if it
+    /// is known to be absent, `None` if it is unknown (the type of its segment, as
+    /// [`segment_at`](Self::segment_at) finds it).
+    pub(crate) fn lookup(&self, key: &[u8]) -> Option<Option<&KeyValue>> {
+        if self.untouched && key < ALL_KEYS_END {
+            return None;
+        }
+        let it = self.segment_at(key);
+        match it.segment_type() {
+            SegmentType::Unknown => None,
+            SegmentType::Empty => Some(None),
+            SegmentType::KeyValue => Some(it.kv()),
+        }
+    }
+
     /// `insert(KeyRef, Optional<ValueRef>)`: records that, in the snapshot, `key` has `value`
     /// (or is absent, if `None`). Does nothing, returning `false`, when `key` is already known;
     /// the new entry is `[key, key + \x00)`.
     pub(crate) fn insert_key(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
-        if !self.segment_at(key).is_unknown_range() {
+        let unknown = if self.untouched {
+            key < ALL_KEYS_END
+        } else {
+            self.segment_at(key).is_unknown_range()
+        };
+        if !unknown {
             return false;
         }
+        self.untouched = false;
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
@@ -379,6 +406,7 @@ impl SnapshotCache {
         // `begin != allKeys.begin && itb.it->beginKey == allKeys.begin`: the erased entry was
         // the one at the start of the key space. (C++ keeps this case; it cannot arise.)
         let add_begin = !new_begin.is_empty() && erase_from.is_empty();
+        self.untouched = false;
         self.entries.insert(new_begin, new_entry);
         if add_begin {
             self.entries.insert(

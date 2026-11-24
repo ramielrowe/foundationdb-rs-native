@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 
 use super::{Instant, JoinError, Runtime, TaskHandle};
@@ -99,6 +99,13 @@ impl Runtime for TokioRuntime {
     const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 
     fn now(&self) -> Instant {
+        // Only a current-thread runtime's clock can be paused (`tokio::time::pause` and
+        // `start_paused` refuse the others), so on any other `tokio::time::Instant::now` is
+        // the system clock: read it without entering the runtime, which clones the runtime
+        // handle's `Arc` (an atomic every worker thread contends for, on the hot path).
+        if self.handle.runtime_flavor() != RuntimeFlavor::CurrentThread {
+            return Instant::from_std(std::time::Instant::now());
+        }
         // The context decides which clock `tokio::time::Instant::now` reads.
         let _enter = self.handle.enter();
         Instant::from_std(tokio::time::Instant::now().into_std())

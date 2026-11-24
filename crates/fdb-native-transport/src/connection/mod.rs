@@ -279,7 +279,7 @@ mod config;
 mod error;
 mod messages;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -287,6 +287,7 @@ use fdb_native_wire::{
     DecodeError, DecodeOwned, Encode, EncodeError, FileIdentified, ProtocolVersion, ReplyPromise,
     Uid, Writer, binary,
 };
+use rustc_hash::FxHashSet;
 
 pub use config::{ConnectionConfig, DEFAULT_MAX_PENDING_OUTPUT, MonitorConfig};
 pub use error::{ConnectionError, IoError, SendError};
@@ -458,7 +459,8 @@ struct Core {
     internal_pending: usize,
     /// The length of the slice `recv_buf` last returned.
     recv_room: usize,
-    receivers: HashSet<Uid>,
+    /// FxHash: reply tokens minted by this client, looked up for every frame received.
+    receivers: FxHashSet<Uid>,
     events: VecDeque<Queued>,
     /// The peer closed its side; buffered frames are still delivered.
     eof: bool,
@@ -500,7 +502,7 @@ impl Connection {
             internal: VecDeque::new(),
             internal_pending: 0,
             recv_room: 0,
-            receivers: HashSet::new(),
+            receivers: FxHashSet::default(),
             events: VecDeque::new(),
             eof: false,
             rng: Rng(config.seed),

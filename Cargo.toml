@@ -23,6 +23,10 @@ rpds = "1.2.1"
 # Shared byte buffers (MIT, no dependencies, MSRV 1.57): the rows of a range read are slices of
 # the reply they came in (`KeyValue`), so a row costs a reference count, not two allocations.
 bytes = "1.12.2"
+# FxHash (MIT/Apache-2.0, no dependencies, MSRV 1.77) for the hot maps keyed by ids the client
+# mints or the cluster sends (reply tokens, request and waiter counters, endpoint tokens):
+# SipHash's resistance to chosen keys buys nothing there and cost about 4% of a read's CPU.
+rustc-hash = "2.1.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

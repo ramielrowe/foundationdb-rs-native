@@ -3,7 +3,7 @@
 
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use fdb_native_schema::SchemaVersion;
@@ -76,19 +76,37 @@ pub(crate) enum Either<A, B> {
 }
 
 /// Polls `a` then `b` until one finishes (C++'s `race`/`choose`, favouring the first).
-pub(crate) async fn race<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
-    let mut a = std::pin::pin!(a);
-    let mut b = std::pin::pin!(b);
-    poll_fn(|cx| {
-        if let Poll::Ready(v) = a.as_mut().poll(cx) {
+///
+/// A struct rather than an `async fn`: an `async fn` keeps its arguments and the pinned
+/// copies it polls, so each `race` of a large future doubled its size.
+pub(crate) fn race<A: Future, B: Future>(a: A, b: B) -> Race<A, B> {
+    Race { a, b }
+}
+
+pin_project_lite::pin_project! {
+    /// The future of [`race`].
+    #[must_use = "futures do nothing unless polled"]
+    pub(crate) struct Race<A, B> {
+        #[pin]
+        a: A,
+        #[pin]
+        b: B,
+    }
+}
+
+impl<A: Future, B: Future> Future for Race<A, B> {
+    type Output = Either<A::Output, B::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Poll::Ready(v) = this.a.poll(cx) {
             return Poll::Ready(Either::Left(v));
         }
-        if let Poll::Ready(v) = b.as_mut().poll(cx) {
+        if let Poll::Ready(v) = this.b.poll(cx) {
             return Poll::Ready(Either::Right(v));
         }
         Poll::Pending
-    })
-    .await
+    }
 }
 
 /// A future that never resolves.
