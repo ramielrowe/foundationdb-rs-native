@@ -11,7 +11,7 @@ use fdb_native_schema::domain::{GetKeyValues, GetKeyValuesReply, KeyRange, KeySe
 use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::runtime::Runtime;
-use fdb_native_wire::{KeyValue, KeyValueRef, KeyValueVector, VersionVector};
+use fdb_native_wire::{Bytes, KeyValue, KeyValueRef, SharedKeyValueVector, VersionVector};
 
 use super::balance::{LoadBalanced, LoadBalancedReply};
 use super::key::is_backward;
@@ -272,12 +272,12 @@ impl RangeOptions {
 /// `readThrough`): the rows, in the order read (descending for a reverse read), and whether
 /// the range may have more.
 ///
-/// The rows stay in the blobs the storage servers sent them in (one copy of each reply's
-/// rows, no allocation per row); [`iter`](Self::iter) borrows them, and
-/// [`into_key_values`](Self::into_key_values) copies them out.
+/// The rows stay in the replies the storage servers sent them in (no copy, no allocation per
+/// row); [`iter`](Self::iter) borrows them, and [`into_key_values`](Self::into_key_values)
+/// gives them as [`KeyValue`]s whose bytes are slices of those replies.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RangeRead {
-    chunks: Vec<KeyValueVector>,
+    chunks: Vec<SharedKeyValueVector>,
     len: usize,
     more: bool,
     read_to_begin: bool,
@@ -298,7 +298,7 @@ impl RangeRead {
 
     /// The rows, borrowed.
     pub fn iter(&self) -> impl Iterator<Item = KeyValueRef<'_>> + '_ {
-        self.chunks.iter().flat_map(KeyValueVector::iter)
+        self.chunks.iter().flat_map(SharedKeyValueVector::iter)
     }
 
     /// The first row.
@@ -354,11 +354,16 @@ impl RangeRead {
         })
     }
 
-    /// The rows, copied out.
+    /// The rows, as slices of the replies they came in (no copy).
     pub fn into_key_values(self) -> Vec<KeyValue> {
         let mut out = Vec::with_capacity(self.len);
-        out.extend(self.iter().map(KeyValueRef::into_owned));
+        out.extend(self.iter_shared());
         out
+    }
+
+    /// The rows, as slices of the replies they came in (no copy).
+    pub(crate) fn iter_shared(&self) -> impl Iterator<Item = KeyValue> + '_ {
+        self.chunks.iter().flat_map(SharedKeyValueVector::shared)
     }
 
     /// A result with these rows and flags, for tests of the code that reads one.
@@ -378,13 +383,16 @@ impl RangeRead {
             ..RangeRead::default()
         };
         read.push(
-            KeyValueVector::from_pairs(rows.iter().map(|kv| KeyValueRef::new(&kv.key, &kv.value)))
-                .expect("rows"),
+            fdb_native_wire::KeyValueVector::from_pairs(
+                rows.iter().map(|kv| KeyValueRef::new(&kv.key, &kv.value)),
+            )
+            .expect("rows")
+            .into(),
         );
         read
     }
 
-    fn push(&mut self, chunk: KeyValueVector) {
+    fn push(&mut self, chunk: SharedKeyValueVector) {
         if !chunk.is_empty() {
             self.len += chunk.len();
             self.chunks.push(chunk);
@@ -392,11 +400,11 @@ impl RangeRead {
     }
 }
 
-/// A decoded `GetKeyValuesReply`'s result: its rows (one copy of the reply's blob) and
+/// A decoded `GetKeyValuesReply`'s result: its rows (a slice of the reply's buffer) and
 /// `more`.
 #[derive(Clone, Debug)]
 pub(crate) struct KeyValuesReply {
-    data: KeyValueVector,
+    data: SharedKeyValueVector,
     more: bool,
 }
 
@@ -404,12 +412,16 @@ impl LoadBalanced for GetKeyValues {
     type Output = KeyValuesReply;
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_key_values;
 
-    fn split(reply: GetKeyValuesReply<'_>, keep: bool) -> LoadBalancedReply<KeyValuesReply> {
+    fn split(
+        reply: GetKeyValuesReply<'_>,
+        payload: &Bytes,
+        keep: bool,
+    ) -> LoadBalancedReply<KeyValuesReply> {
         (
             reply.penalty,
             reply.error.map(|e| e.code),
             keep.then(|| KeyValuesReply {
-                data: reply.data.into_owned(),
+                data: SharedKeyValueVector::slice_of(payload, reply.data),
                 more: reply.more,
             }),
         )
@@ -417,7 +429,7 @@ impl LoadBalanced for GetKeyValues {
 }
 
 /// The bytes of the keys and values of `rows`.
-fn kv_bytes(rows: &KeyValueVector) -> i64 {
+fn kv_bytes(rows: &SharedKeyValueVector) -> i64 {
     // The blob is a 4-byte count, then per row two 4-byte lengths, the key and the value.
     (rows.payload().len() - 4 - 8 * rows.len()) as i64
 }
@@ -586,7 +598,7 @@ impl Limits {
 
     /// `decrement(VectorRef<KeyValueRef>)` (NativeAPI 7.4:3071-3081, 8.0:1086-1096): each
     /// row costs its key and value plus 8 bytes.
-    fn decrement(&mut self, rows: &KeyValueVector) {
+    fn decrement(&mut self, rows: &SharedKeyValueVector) {
         let n = rows.len() as i64;
         if self.has_row_limit() {
             self.rows -= n;
@@ -1272,6 +1284,7 @@ fn check_reply(reply: &KeyValuesReply, limits: &Limits) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fdb_native_wire::KeyValueVector;
 
     fn sel(key: &[u8], or_equal: bool, offset: i32) -> KeySelector {
         KeySelector::new(key.to_vec(), or_equal, offset)
@@ -1356,7 +1369,8 @@ mod tests {
             KeyValueRef::new(b"ab", b"xyz"),
             KeyValueRef::new(b"c", b""),
         ])
-        .unwrap();
+        .unwrap()
+        .into();
         assert_eq!(kv_bytes(&rows), 6);
         let mut l = Limits::new(RangeLimits::new(Some(5), Some(30)));
         assert_eq!(l.request(false), (5, 30));
@@ -1408,7 +1422,11 @@ mod tests {
 
     fn read(keys: &[&[u8]], more: bool) -> RangeRead {
         let mut r = RangeRead::default();
-        r.push(KeyValueVector::from_pairs(keys.iter().map(|k| KeyValueRef::new(k, b"v"))).unwrap());
+        r.push(
+            KeyValueVector::from_pairs(keys.iter().map(|k| KeyValueRef::new(k, b"v")))
+                .unwrap()
+                .into(),
+        );
         r.more = more;
         r
     }
@@ -1466,8 +1484,12 @@ mod tests {
     #[test]
     fn range_read_accessors() {
         let mut r = read(&[b"a", b"b"], true);
-        r.push(KeyValueVector::from_pairs([KeyValueRef::new(b"c", b"3")]).unwrap());
-        r.push(KeyValueVector::new());
+        r.push(
+            KeyValueVector::from_pairs([KeyValueRef::new(b"c", b"3")])
+                .unwrap()
+                .into(),
+        );
+        r.push(KeyValueVector::new().into());
         assert_eq!(r.len(), 3);
         assert_eq!(r.first().unwrap().key, b"a");
         assert_eq!(r.last().unwrap().key, b"c");

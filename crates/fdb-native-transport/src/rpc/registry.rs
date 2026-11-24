@@ -1,10 +1,11 @@
 //! The [`ReplyRegistry`]: pending requests of one peer and what becomes of them.
 
+use std::collections::VecDeque;
 use std::collections::hash_map::{Entry, RandomState};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 
 use fdb_native_wire::{Encode, EncodeError, FileIdentified, Uid};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::RequestError;
 use super::error::error_code::BROKEN_PROMISE;
@@ -220,10 +221,12 @@ pub struct ReplyRegistry<K> {
     config: RegistryConfig,
     rng: Rng,
     next_seq: u64,
-    pending: HashMap<Uid, Pending<K>>,
+    /// By reply token (FxHash: the tokens are minted here, and every request and reply looks
+    /// one up).
+    pending: FxHashMap<Uid, Pending<K>>,
     /// Reply tokens of the pending requests, by remote endpoint.
-    by_endpoint: HashMap<Uid, HashSet<Uid>>,
-    failed: HashMap<Uid, EndpointFailure>,
+    by_endpoint: FxHashMap<Uid, FxHashSet<Uid>>,
+    failed: FxHashMap<Uid, EndpointFailure>,
     /// Events to give before polling the connection again.
     queue: VecDeque<RpcEvent<K>>,
     /// The [`Connection::id`] the registry is bound to.
@@ -242,9 +245,9 @@ impl<K> ReplyRegistry<K> {
             rng: Rng(config.seed),
             config,
             next_seq: 0,
-            pending: HashMap::new(),
-            by_endpoint: HashMap::new(),
-            failed: HashMap::new(),
+            pending: FxHashMap::default(),
+            by_endpoint: FxHashMap::default(),
+            failed: FxHashMap::default(),
             queue: VecDeque::new(),
             bound: None,
             queued: 0,
@@ -291,7 +294,7 @@ impl<K> ReplyRegistry<K> {
 
     /// How many requests to the remote endpoint `endpoint` are pending.
     pub fn pending_to(&self, endpoint: Uid) -> usize {
-        self.by_endpoint.get(&endpoint).map_or(0, HashSet::len)
+        self.by_endpoint.get(&endpoint).map_or(0, FxHashSet::len)
     }
 
     /// Why the remote endpoint `endpoint` is failed, if it is (`permanentlyFailed`,

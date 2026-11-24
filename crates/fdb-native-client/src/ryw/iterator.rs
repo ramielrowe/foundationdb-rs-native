@@ -170,7 +170,7 @@ impl<'c> RywIter<'c> {
         let base = if self.writes.is_independent() == Some(true) || self.cache.is_empty_range() {
             None
         } else {
-            self.cache.kv().map(|kv| kv.value.as_slice())
+            self.cache.kv().map(|kv| &kv.value[..])
         };
         let result = WriteMap::coalesce_under(op, base)?;
         Ok(result.value.map(|value| {

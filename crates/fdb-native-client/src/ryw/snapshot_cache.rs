@@ -40,7 +40,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use fdb_native_wire::KeyValue;
+use fdb_native_wire::{Bytes, KeyValue};
 
 /// `allKeys.end`: the end of the key space a transaction can read (`\xff\xff`).
 const ALL_KEYS_END: &[u8] = b"\xff\xff";
@@ -156,6 +156,15 @@ impl<'a> From<&'a [u8]> for ExtKey<'a> {
     }
 }
 
+impl<'a> From<&'a Bytes> for ExtKey<'a> {
+    fn from(base: &'a Bytes) -> ExtKey<'a> {
+        ExtKey {
+            base,
+            extra_zero_bytes: 0,
+        }
+    }
+}
+
 impl<'a> From<&'a Vec<u8>> for ExtKey<'a> {
     fn from(base: &'a Vec<u8>) -> ExtKey<'a> {
         ExtKey {
@@ -234,6 +243,9 @@ pub(crate) struct SnapshotCache {
     /// Entries by begin key. There are always degenerate entries at the two ends,
     /// `["", "")` and `[\xff\xff, \xff\xff\x00)`, which "reduce edge cases".
     entries: BTreeMap<Vec<u8>, Entry>,
+    /// Nothing was ever inserted: every key up to `\xff\xff` is unknown (the point reads
+    /// of a new transaction need not search the map).
+    untouched: bool,
 }
 
 impl Default for SnapshotCache {
@@ -260,7 +272,10 @@ impl SnapshotCache {
                 values: Vec::new(),
             },
         );
-        SnapshotCache { entries }
+        SnapshotCache {
+            entries,
+            untouched: true,
+        }
     }
 
     /// `empty()`: is nothing known about the snapshot's contents?
@@ -279,17 +294,41 @@ impl SnapshotCache {
         it
     }
 
+    /// What the cache knows of `key`: `Some(Some(kv))` if it has a value, `Some(None)` if it
+    /// is known to be absent, `None` if it is unknown (the type of its segment, as
+    /// [`segment_at`](Self::segment_at) finds it).
+    pub(crate) fn lookup(&self, key: &[u8]) -> Option<Option<&KeyValue>> {
+        if self.untouched && key < ALL_KEYS_END {
+            return None;
+        }
+        let it = self.segment_at(key);
+        match it.segment_type() {
+            SegmentType::Unknown => None,
+            SegmentType::Empty => Some(None),
+            SegmentType::KeyValue => Some(it.kv()),
+        }
+    }
+
     /// `insert(KeyRef, Optional<ValueRef>)`: records that, in the snapshot, `key` has `value`
     /// (or is absent, if `None`). Does nothing, returning `false`, when `key` is already known;
     /// the new entry is `[key, key + \x00)`.
     pub(crate) fn insert_key(&mut self, key: &[u8], value: Option<&[u8]>) -> bool {
-        if !self.segment_at(key).is_unknown_range() {
+        let unknown = if self.untouched {
+            key < ALL_KEYS_END
+        } else {
+            self.segment_at(key).is_unknown_range()
+        };
+        if !unknown {
             return false;
         }
+        self.untouched = false;
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
-        let values = value.map(|v| KeyValue::new(key, v)).into_iter().collect();
+        let values = value
+            .map(|v| KeyValue::new(Bytes::copy_from_slice(key), Bytes::copy_from_slice(v)))
+            .into_iter()
+            .collect();
         self.entries.insert(key.to_vec(), Entry { end, values });
         true
     }
@@ -342,10 +381,8 @@ impl SnapshotCache {
         if new_begin >= new_end {
             return false;
         }
-        let lo = rows.partition_point(|kv| kv.key.as_slice() < new_begin);
-        let hi = rows
-            .partition_point(|kv| kv.key.as_slice() < new_end)
-            .max(lo);
+        let lo = rows.partition_point(|kv| &kv.key[..] < new_begin);
+        let hi = rows.partition_point(|kv| &kv.key[..] < new_end).max(lo);
         let new_end = new_end.to_vec();
         rows.truncate(hi);
         rows.drain(..lo);
@@ -369,6 +406,7 @@ impl SnapshotCache {
         // `begin != allKeys.begin && itb.it->beginKey == allKeys.begin`: the erased entry was
         // the one at the start of the key space. (C++ keeps this case; it cannot arise.)
         let add_begin = !new_begin.is_empty() && erase_from.is_empty();
+        self.untouched = false;
         self.entries.insert(new_begin, new_entry);
         if add_begin {
             self.entries.insert(
@@ -443,7 +481,7 @@ impl SnapshotCache {
                     "value outside its entry"
                 );
                 if let Some(p) = prev_key {
-                    assert!(p < kv.key.as_slice(), "values not ascending");
+                    assert!(p < &kv.key[..], "values not ascending");
                 }
                 prev_key = Some(&kv.key);
             }
@@ -610,7 +648,7 @@ impl<'a> SnapshotCacheIter<'a> {
                 self.offset = 1; // unreachable: the last entry begins at \xff\xff > key
             }
         } else {
-            let idx = entry.values.partition_point(|kv| kv.key.as_slice() < key);
+            let idx = entry.values.partition_point(|kv| &kv.key[..] < key);
             let hit = entry.values.get(idx).is_some_and(|kv| kv.key == key);
             self.offset = idx * 2 + 1 + usize::from(hit);
         }
@@ -749,7 +787,7 @@ pub(crate) fn known_key_range(
     }
 
     if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
-        begin_key = begin_key.min(first.key.as_slice());
+        begin_key = begin_key.min(&first.key[..]);
         end_key = if let Some(rt) = outcome.read_through {
             end_key.max(ExtKey::from(rt))
         } else if !outcome.more && ExtKey::from(&last.key) < end_key {
@@ -789,7 +827,7 @@ pub(crate) fn known_key_range_back(
     if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
         begin_key = if let Some(rt) = outcome.read_through {
             rt.min(begin_key)
-        } else if !outcome.more && last.key.as_slice() > begin_key {
+        } else if !outcome.more && &last.key[..] > begin_key {
             begin_key
         } else {
             &last.key

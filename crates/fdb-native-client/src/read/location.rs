@@ -1,7 +1,7 @@
 //! The key location cache: C++'s `DatabaseContext::locationCache`, a range map from key
 //! ranges (shards) to the storage servers that hold them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use fdb_native_schema::domain::{KeyRange, StorageServer};
 use fdb_native_transport::peer::PeerRef;
 use fdb_native_wire::{Endpoint, NetworkAddress, Uid};
+use rustc_hash::FxHashMap;
 
 use super::util::Rng;
 
@@ -156,7 +157,8 @@ pub(crate) struct LocationCache {
     next_generation: u64,
     capacity: usize,
     /// `DatabaseContext::server_interf`: one [`ServerInfo`] per storage server id.
-    servers: HashMap<Uid, Weak<ServerInfo>>,
+    /// FxHash: storage server ids, from the cluster.
+    servers: FxHashMap<Uid, Weak<ServerInfo>>,
     /// The size of `servers` after its last pruning of dead entries.
     servers_after_prune: usize,
     /// The client's locality (`DatabaseContext::clientLocality`): its `dcid` (which
@@ -183,7 +185,7 @@ impl LocationCache {
             pool: Vec::new(),
             next_generation: 0,
             capacity: capacity.max(1),
-            servers: HashMap::new(),
+            servers: FxHashMap::default(),
             servers_after_prune: 0,
             locality: ClientLocality::default(),
         }

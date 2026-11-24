@@ -161,6 +161,12 @@ impl Writer {
         self.protocol_version
     }
 
+    /// The bytes the writer's message buffer holds: about the largest message it has
+    /// written. A caller that keeps a writer for reuse can drop one that grew large.
+    pub fn buffer_capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Discards the message being built, keeping the allocated memory and the protocol
     /// version.
     pub fn reset(&mut self) {

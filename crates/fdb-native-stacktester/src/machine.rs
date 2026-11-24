@@ -148,8 +148,8 @@ fn pack_range(rows: Vec<KeyValue>, prefix: Option<&[u8]>) -> Result<Element, Fat
     let mut items = Vec::with_capacity(rows.len() * 2);
     for row in rows {
         if prefix.is_none_or(|p| row.key.starts_with(p)) {
-            items.push(Element::Bytes(row.key));
-            items.push(Element::Bytes(row.value));
+            items.push(Element::Bytes(row.key.into()));
+            items.push(Element::Bytes(row.value.into()));
         }
     }
     Ok(Element::Bytes(values::pack(items)?))

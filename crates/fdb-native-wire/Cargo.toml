@@ -13,6 +13,7 @@ default = ["derive"]
 derive = ["dep:fdb-native-wire-derive"]
 
 [dependencies]
+bytes.workspace = true
 fdb-native-wire-derive = { workspace = true, optional = true }
 thiserror = "2.0.21"
 

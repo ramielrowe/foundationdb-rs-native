@@ -723,7 +723,12 @@ async fn read_all<R: Runtime>(
         options.reverse = reverse;
         let batch = tx.get_range(&b, &e, &options).await?;
         let last = batch.kvs.last().map(|kv| kv.key.clone());
-        out.extend(batch.kvs.into_iter().map(|kv| (kv.key, kv.value)));
+        out.extend(
+            batch
+                .kvs
+                .into_iter()
+                .map(|kv| (kv.key.to_vec(), kv.value.to_vec())),
+        );
         match last {
             Some(last) if batch.more => {
                 if reverse {

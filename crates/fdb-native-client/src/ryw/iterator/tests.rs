@@ -48,7 +48,7 @@ fn seg(b: &[u8], e: &[u8], t: RywSegment, v: Option<&[u8]>) -> Seg {
 fn here(it: &RywIter<'_>) -> Seg {
     let t = it.segment_type().unwrap();
     let v = if t == SegmentType::KeyValue {
-        it.kv().unwrap().map(|kv| kv.value)
+        it.kv().unwrap().map(|kv| kv.value.to_vec())
     } else {
         None
     };

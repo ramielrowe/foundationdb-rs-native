@@ -13,6 +13,7 @@ use fdb_native_schema::domain::{
 use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
 use fdb_native_transport::peer::StreamWrapper;
 use fdb_native_transport::runtime::Runtime;
+use fdb_native_wire::Bytes;
 
 use super::balance::{LoadBalanced, LoadBalancedReply};
 use super::location::{KEY_SPACE_END, Location};
@@ -32,7 +33,7 @@ impl LoadBalanced for WaitMetrics {
 
     /// `StorageMetrics` is not a `LoadBalancedReply`: no penalty (C++'s `-1`, which leaves
     /// the model's alone) and no error but the envelope's.
-    fn split(reply: StorageMetrics, keep: bool) -> LoadBalancedReply<StorageMetrics> {
+    fn split(reply: StorageMetrics, _: &Bytes, keep: bool) -> LoadBalancedReply<StorageMetrics> {
         (-1.0, None, keep.then_some(reply))
     }
 }
@@ -42,7 +43,7 @@ impl LoadBalanced for SplitRange {
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_range_split_points;
 
     /// Not a `LoadBalancedReply` either.
-    fn split(reply: SplitRangeReply, keep: bool) -> LoadBalancedReply<Vec<Vec<u8>>> {
+    fn split(reply: SplitRangeReply, _: &Bytes, keep: bool) -> LoadBalancedReply<Vec<Vec<u8>>> {
         (-1.0, None, keep.then_some(reply.split_points))
     }
 }

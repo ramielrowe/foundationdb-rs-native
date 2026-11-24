@@ -1,5 +1,7 @@
 //! Encoding and decoding the client's messages for a [`SchemaVersion`].
 
+use std::cell::RefCell;
+
 use fdb_native_wire::{
     Decode, DecodeError, Encode, EncodeError, EnsureTable, ErrorOr, FileIdentified, Uid, Writer,
     decode, encode,
@@ -126,12 +128,73 @@ pub fn decode_reply<R: Request>(
     R::decode_reply(version, bytes)
 }
 
+/// The largest message buffer a thread keeps for its next request ([`encode_into`]).
+const KEPT_WRITER_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// A writer per thread for the requests it encodes, so that a request costs no
+    /// allocation for the writer's buffers. A reused writer writes the bytes a new one does
+    /// (`fdb-native-wire`'s `tests/writer_reuse.rs`).
+    static WRITER: RefCell<Writer> = RefCell::new(Writer::new());
+}
+
 /// Appends `value` as the only member of a message with `T`'s file identifier.
 fn encode_into<T: Encode + FileIdentified>(
     value: &T,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let mut w = Writer::new();
+    let reused = WRITER.try_with(|cell| {
+        let Ok(w) = cell.try_borrow_mut() else {
+            // Encoding a request from inside an `Encode` impl: not this one.
+            return None;
+        };
+        let mut guard = WriterGuard {
+            writer: w,
+            finished: false,
+        };
+        // Whatever the writer holds is discarded first (`reset` keeps the memory).
+        guard.writer.reset();
+        let result = write_into(&mut guard.writer, value, out);
+        guard.finished = true;
+        if result.is_err() {
+            // `finish_into` resets the writer; an error before it leaves a partial message.
+            guard.writer.reset();
+        }
+        if guard.writer.buffer_capacity() > KEPT_WRITER_BYTES {
+            // A large commit: do not keep its buffer for the thread's next request.
+            *guard.writer = Writer::new();
+        }
+        Some(result)
+    });
+    match reused {
+        Ok(Some(result)) => result,
+        // The thread is exiting, or its writer is in use.
+        _ => write_into(&mut Writer::new(), value, out),
+    }
+}
+
+/// The thread's writer while [`encode_into`] uses it. If the encode does not finish (an
+/// `Encode` impl panicked, and the peer task's `catch_unwind` goes on with the thread), the
+/// writer, which may hold part of that message and be in the middle of an update, is
+/// replaced by a new one: the thread's next message must not carry any of it.
+struct WriterGuard<'a> {
+    writer: std::cell::RefMut<'a, Writer>,
+    finished: bool,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.writer = Writer::new();
+        }
+    }
+}
+
+fn write_into<T: Encode + FileIdentified>(
+    w: &mut Writer,
+    value: &T,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
     let mut root = w.table();
     root.field(value)?;
     let root = root.finish()?;
@@ -652,5 +715,102 @@ impl Request for domain::SplitRange {
         bytes: &[u8],
     ) -> Result<ErrorOr<domain::SplitRangeReply>, DecodeError> {
         decode_envelope(bytes, |r: common::SplitRangeReply| Ok(r.into()))
+    }
+}
+
+#[cfg(test)]
+mod writer_reuse_tests {
+    use fdb_native_wire::{FileIdentifier, ObjectRef, Shape, Wire};
+
+    use super::*;
+
+    /// Writes part of a message, then panics (as an `Encode` impl with a bug could).
+    struct Panics;
+
+    impl Wire for Panics {
+        const SHAPE: Shape = Shape::Table;
+    }
+
+    impl Encode for Panics {
+        fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+            w.blob(b"partial message that must not leak into the next one")?;
+            let mut t = w.table();
+            t.field(&b"more of it".to_vec())?;
+            t.field(&7u32)?;
+            panic!("an encoder panicked");
+        }
+    }
+
+    impl FileIdentified for Panics {
+        const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(0x0012_3456);
+    }
+
+    /// Fails after writing part of a message.
+    struct Fails;
+
+    impl Wire for Fails {
+        const SHAPE: Shape = Shape::Table;
+    }
+
+    impl Encode for Fails {
+        fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+            w.blob(b"partial message of a failed encode")?;
+            Err(EncodeError::TooLarge)
+        }
+    }
+
+    impl FileIdentified for Fails {
+        const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(0x0012_3457);
+    }
+
+    struct Good(Vec<u8>, u64);
+
+    impl Wire for Good {
+        const SHAPE: Shape = Shape::Table;
+    }
+
+    impl Encode for Good {
+        fn encode_object(&self, w: &mut Writer) -> Result<ObjectRef, EncodeError> {
+            let mut t = w.table();
+            t.field(&self.0)?;
+            t.field(&self.1)?;
+            t.finish()
+        }
+    }
+
+    impl FileIdentified for Good {
+        const FILE_IDENTIFIER: FileIdentifier = FileIdentifier::new(0x0012_3458);
+    }
+
+    fn fresh(v: &Good) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_into(&mut Writer::new(), v, &mut out).unwrap();
+        out
+    }
+
+    /// The thread's writer after an encode that panicked (caught, as the peer task does) or
+    /// failed writes exactly what a new writer does.
+    #[test]
+    fn a_panicked_or_failed_encode_leaves_nothing_in_the_threads_writer() {
+        let v = Good(b"hello".to_vec(), 42);
+        let mut out = Vec::new();
+        encode_into(&v, &mut out).unwrap();
+        assert_eq!(out, fresh(&v));
+
+        let caught = std::panic::catch_unwind(|| {
+            let mut out = Vec::new();
+            let _ = encode_into(&Panics, &mut out);
+        });
+        assert!(caught.is_err());
+        let mut out = Vec::new();
+        encode_into(&v, &mut out).unwrap();
+        assert_eq!(out, fresh(&v));
+
+        let mut out = b"frame header".to_vec();
+        assert_eq!(encode_into(&Fails, &mut out), Err(EncodeError::TooLarge));
+        assert_eq!(out, b"frame header");
+        let mut out = Vec::new();
+        encode_into(&v, &mut out).unwrap();
+        assert_eq!(out, fresh(&v));
     }
 }

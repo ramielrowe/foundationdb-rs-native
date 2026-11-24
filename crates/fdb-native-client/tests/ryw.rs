@@ -847,7 +847,7 @@ fn keys_of(read: &RangeRead) -> Vec<Vec<u8>> {
 }
 
 fn keys(rows: &[KeyValue]) -> Vec<Vec<u8>> {
-    rows.iter().map(|kv| kv.key.clone()).collect()
+    rows.iter().map(|kv| kv.key.to_vec()).collect()
 }
 
 fn ks(list: &[&[u8]]) -> Vec<Vec<u8>> {
@@ -1368,6 +1368,76 @@ async fn read_your_writes_disable_reads_the_database_with_native_conflict_ranges
         );
         tx.set_option(TransactionOption::ReadYourWritesDisable)
             .unwrap();
+    }
+}
+
+/// A `get` of a transaction whose write map is untouched skips the write map (the fast path
+/// of `ryw::read::get_without_writes`); any change of the map (a write conflict range, a
+/// versionstamped key's unreadable range, a write) sends the next `get` through the
+/// write map. Both give C++'s answers, cache use and read conflict ranges.
+#[tokio::test(start_paused = true)]
+async fn point_gets_with_and_without_writes_in_the_map() {
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 2).await;
+        env.set(&KEYS);
+        env.layout(&TWO_SHARDS);
+
+        // Untouched: the fast path. The cache answers the second read of each key.
+        let tx = env.transaction();
+        assert_eq!(get(&tx, b"a").await, Some(b"v".to_vec()));
+        assert_eq!(get(&tx, b"b").await, None);
+        assert_eq!(get(&tx, b"a").await, Some(b"v".to_vec()));
+        assert_eq!(get(&tx, b"b").await, None);
+        assert_eq!(env.value_requests().len(), 2, "{schema:?}");
+        let mut reads = commit_reads(&env, &tx).await;
+        reads.sort_by(|x, y| x.begin.cmp(&y.begin));
+        assert_eq!(
+            reads,
+            ranges(&[(b"a", b"a\x00"), (b"b", b"b\x00")]),
+            "{schema:?}"
+        );
+
+        // A write conflict range only: the general path, the same answers and ranges.
+        let tx = env.transaction();
+        tx.add_write_conflict_range(b"c", b"d").unwrap();
+        assert_eq!(get(&tx, b"c").await, None);
+        assert_eq!(get(&tx, b"f").await, Some(b"v".to_vec()));
+        let mut reads = commit_reads(&env, &tx).await;
+        reads.sort_by(|x, y| x.begin.cmp(&y.begin));
+        assert_eq!(
+            reads,
+            ranges(&[(b"c", b"c\x00"), (b"f", b"f\x00")]),
+            "{schema:?}"
+        );
+
+        // A versionstamped key: its range is unreadable (the map is not untouched), the
+        // rest reads the database.
+        let tx = env.transaction();
+        let mut key = b"vs".to_vec();
+        key.extend([0xff; 10]);
+        key.push(b'z');
+        key.extend(2i32.to_le_bytes());
+        tx.set_versionstamped_key(&key, b"value");
+        let unreadable =
+            fdb_native_client::atomic::versionstamp_key_range(&key, Some(READ_VERSION), b"\xff")
+                .unwrap();
+        assert_eq!(
+            code_of(within("get", tx.get(&unreadable.begin)).await),
+            codes::ACCESSED_UNREADABLE,
+            "{schema:?}"
+        );
+        assert_eq!(get(&tx, b"k").await, Some(b"v".to_vec()));
+        // A snapshot read that does not see the writes sees an untouched map: the fast
+        // path, the database's value, no conflict range.
+        tx.set_option(TransactionOption::SnapshotRywDisable)
+            .unwrap();
+        tx.set(b"q", b"own");
+        assert_eq!(get(&tx, b"q").await, Some(b"own".to_vec()));
+        assert_eq!(
+            within("get", tx.snapshot().get(b"q")).await.unwrap(),
+            Some(b"v".to_vec()),
+            "{schema:?}"
+        );
     }
 }
 

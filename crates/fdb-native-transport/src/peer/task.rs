@@ -1,7 +1,7 @@
 //! The task of one peer: connects, runs the [`Connection`] and its [`ReplyRegistry`],
 //! reconnects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
@@ -14,6 +14,7 @@ use fdb_native_wire::{EncodeError, NetworkAddress, ProtocolVersion, Uid};
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
 use futures_io::{AsyncRead, AsyncWrite};
+use rustc_hash::FxHashMap;
 
 use super::address::PeerKey;
 use super::backoff::Backoff;
@@ -307,12 +308,13 @@ pub(crate) struct PeerTask<R: Runtime, W: StreamWrapper<R::Stream>> {
     /// Requests sent and awaiting replies, by command id. Empty between connections: the
     /// registry completes every one when a connection ends.
     registry: ReplyRegistry<u64>,
-    waiters: HashMap<u64, Waiter>,
+    /// By request id (FxHash: ids minted here, looked up on every request and reply).
+    waiters: FxHashMap<u64, Waiter>,
     /// Tokens registered on the connection by commands, by command id and by token: a
     /// registration whose caller dropped the future after it was applied is undone by its
     /// cancellation. Cleared with the connection.
-    registered: HashMap<u64, Uid>,
-    registered_by_token: HashMap<Uid, u64>,
+    registered: FxHashMap<u64, Uid>,
+    registered_by_token: FxHashMap<Uid, u64>,
     /// The vector request encoders write into (see [`encode_isolated`]).
     scratch: Vec<u8>,
     backoff: Backoff,
@@ -366,9 +368,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> PeerTask<R, W> {
             peer,
             ctrl,
             registry: ReplyRegistry::new(registry_config),
-            waiters: HashMap::new(),
-            registered: HashMap::new(),
-            registered_by_token: HashMap::new(),
+            waiters: FxHashMap::default(),
+            registered: FxHashMap::default(),
+            registered_by_token: FxHashMap::default(),
             scratch: Vec::new(),
             rng,
             generation: 0,

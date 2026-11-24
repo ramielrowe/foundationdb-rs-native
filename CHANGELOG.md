@@ -66,6 +66,8 @@ pings, TLS with rustls, `Runtime` adapters for tokio and smol), the per-release 
 and binary codecs, checked against the C++ readers with golden vectors. As in C++, a peer made
 anew starts with its address available, and a failed peer that is referenced again is probed again
 (found by the deterministic simulation, `fdb-native-sim`, which is not published).
+Requests are encoded with a writer each thread keeps (new: `Writer::buffer_capacity`, to drop
+one that grew large), and the transport's reply and request maps use FxHash (bead `e82`).
 
 ### API decisions made before the first release
 
@@ -92,6 +94,19 @@ These changed the API that earlier development builds had:
   `runtime` (the transport's), `TlsConfig` (with `tls`), `database::PeerManagerConfig`. The
   knob fields of `DatabaseOptions`, `Database::from_record` and the lower-layer accessors
   (`reader`, `committer`, `peers`, `cluster_monitor`) follow the lower tier's stability.
+* **The rows of a range read share the reply they came in** (bead `s1t`): `KeyValue`'s
+  `key` and `value` are `Bytes` (`bytes::Bytes`, re-exported as `fdb_native_client::Bytes`
+  and `fdb_native_wire::Bytes`), not `Vec<u8>`, and are slices of the storage server's reply,
+  as C++'s rows point into the reply's arena: a row costs two reference counts instead of two
+  allocations and copies, on the way from the reply through the read-your-writes cache to
+  `RangeResult::kvs` and `KeyValueStream`. They deref to `[u8]` and compare with `[u8]`,
+  `&[u8]` and `Vec<u8>` (not with a byte array: `kv.key == b"a"[..]`); `to_vec()` copies.
+  A row keeps its whole reply alive: about 80 kB (`REPLY_BYTE_LIMIT` is soft, so a reply can
+  be that plus the row that crosses it: up to about 190 kB with a 10 kB key and a 100 kB
+  value). Copy the few rows you keep for long.
+  `KeyValue::new` takes `impl Into<Bytes>` (`Vec<u8>`, `&'static [u8]`, `String`, `Bytes`).
+  New in `fdb-native-wire`: `SharedKeyValueVector` (a `GetKeyValuesReply` blob in a shared
+  buffer). `read::RangeRead::into_key_values` no longer copies.
 * `Error::on_error` is private (use `Error::transaction_retry`, or `Transaction::on_error`).
 * `CommitResult` is `Copy` and `Hash`; `RangeOptions::limit` joins the other builder
   methods; builders, `create_transaction`, `snapshot` and the range streams are

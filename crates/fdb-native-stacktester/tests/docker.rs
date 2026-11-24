@@ -118,7 +118,7 @@ async fn read_prefix(db: &Database, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     .await
     .unwrap()
     .into_iter()
-    .map(|kv| (kv.key, kv.value))
+    .map(|kv| (kv.key.to_vec(), kv.value.to_vec()))
     .collect()
 }
 

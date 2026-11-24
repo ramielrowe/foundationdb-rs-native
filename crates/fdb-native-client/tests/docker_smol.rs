@@ -147,7 +147,7 @@ fn docker_smol_database_reads_writes_ranges_watches_and_atomics() {
         .unwrap();
         assert_eq!(last.kvs.len(), 5);
         assert!(last.more);
-        assert_eq!(last.kvs[0].key, b"smol/range/0599");
+        assert_eq!(last.kvs[0].key, &b"smol/range/0599"[..]);
         drop(tx);
 
         // A watch fires when another transaction changes the key.

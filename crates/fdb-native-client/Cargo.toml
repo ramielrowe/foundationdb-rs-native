@@ -31,9 +31,14 @@ fdb-native-schema.workspace = true
 fdb-native-transport.workspace = true
 fdb-native-wire.workspace = true
 rpds.workspace = true
+rustc-hash.workspace = true
 futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-core = "0.3.34"
 futures-io = "0.3.34"
+# Hand-written futures without `unsafe` (`read::util::Race`, `Transaction::guarded`): an
+# `async fn` that takes a future and awaits it stores it twice, which made a read's task
+# about 11 KB. MIT/Apache-2.0, no dependencies (tokio's).
+pin-project-lite = "0.2.18"
 thiserror = "2.0.21"
 
 [dev-dependencies]

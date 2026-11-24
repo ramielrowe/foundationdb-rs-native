@@ -1,0 +1,11 @@
+{
+  "what": "foundationdb-rs-native-s1t and -e82: the native client with both (range rows as Bytes slices of the reply; the e82 CPU fixes), interleaved with ../single-4t-s1t-e82 on the same cluster",
+  "cluster": "single (fdb-bench serve: one fdbserver, single memory, testkit container)",
+  "image": "foundationdb/foundationdb:7.4.10",
+  "backends": ["native"],
+  "threads": ["4"],
+  "workloads": ["get", "get_seq", "mixed", "scan", "many_tx"],
+  "reps": 3,
+  "duration_s": 8.0,
+  "warmup_s": 2.0
+}

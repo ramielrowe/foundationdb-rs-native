@@ -61,8 +61,12 @@ pub(crate) trait RywSource: Send + Sync {
     /// was reset since the read started (its cache is another one now).
     fn with_cache<T>(&self, f: impl FnOnce(&mut SnapshotCache) -> T) -> Result<T, Error>;
 
-    /// `tr.get(key, Snapshot::True)`.
-    fn read_value(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, Error>>;
+    /// `tr.get(key, Snapshot::True)`. (Not boxed: a `get` is the hottest read, and its
+    /// task holds this future inline.)
+    fn read_value(
+        &self,
+        key: Vec<u8>,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Error>> + Send + '_;
 
     /// `tr.getRange(begin, end, limits, Snapshot::True, reverse)`.
     fn read_range(
@@ -415,7 +419,7 @@ pub(crate) async fn get<S: RywSource>(
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         let dependent = it.is_dependent();
         if it.is_kv()? {
-            return Ok(First::Done(it.kv()?.map(|kv| kv.value)));
+            return Ok(First::Done(it.kv()?.map(|kv| kv.value.to_vec())));
         }
         if it.is_empty_range()? {
             return Ok(First::Done(None));
@@ -435,8 +439,29 @@ pub(crate) async fn get<S: RywSource>(
         // A dependent write at the key: its operations apply to the value read.
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         debug_assert!(it.is_kv().unwrap_or(false));
-        Ok(it.kv()?.map(|kv| kv.value))
+        Ok(it.kv()?.map(|kv| kv.value.to_vec()))
     })?
+}
+
+/// [`get`] when the read sees no writes ([`WriteMap::is_untouched`](crate::ryw::WriteMap::is_untouched)):
+/// every segment of the write map is then an unmodified, readable range, so the
+/// `RYWIterator` is the cache's iterator (no dependent write, no unreadable key) and the
+/// read is the cache's answer, or the database's (recorded in the cache). The same result
+/// as [`get`], without walking the write map.
+pub(crate) async fn get_without_writes<S: RywSource>(
+    source: &S,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    let cached =
+        source.with_cache(|cache| cache.lookup(key).map(|kv| kv.map(|kv| kv.value.to_vec())))?;
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+    let value = source.read_value(key.to_vec()).await?;
+    source.with_cache(|cache| {
+        cache.insert_key(key, value.as_deref());
+    })?;
+    Ok(value)
 }
 
 /// `read(GetKeyReq)`: the key `key` resolves to as the transaction sees it: `""` before
@@ -455,7 +480,7 @@ pub(crate) fn get_key<'a, S: RywSource>(
             if result.read_through_end || result.rows.is_empty() {
                 return Ok(read.current_max_read_key().to_vec());
             }
-            Ok(result.rows[0].key.clone())
+            Ok(result.rows[0].key.to_vec())
         } else {
             key.offset += 1;
             let result = get_range_value_back(read, fge(Vec::new()), key, row_limit(1)).await?;
@@ -465,7 +490,7 @@ pub(crate) fn get_key<'a, S: RywSource>(
             if result.read_to_begin || result.rows.is_empty() {
                 return Ok(Vec::new());
             }
-            Ok(result.rows[0].key.clone())
+            Ok(result.rows[0].key.to_vec())
         }
     })
 }
@@ -542,7 +567,8 @@ impl RangeState {
         begin: &KeySelector,
         end: &KeySelector,
     ) {
-        let rows: Vec<KeyValue> = read.iter().map(|kv| kv.into_owned()).collect();
+        // The rows are slices of the replies (no copy): the cache shares them with the result.
+        let rows: Vec<KeyValue> = read.iter_shared().collect();
         let outcome = RangeReadOutcome {
             rows,
             more: read.more(),
@@ -784,7 +810,7 @@ impl RangeState {
         if is_first_greater_or_equal(&self.end) {
             let keep = self
                 .result
-                .partition_point(|kv| kv.key.as_slice() < self.end.key.as_slice());
+                .partition_point(|kv| &kv.key[..] < self.end.key.as_slice());
             if keep < self.result.len() {
                 more = false;
             }
@@ -1002,7 +1028,7 @@ impl RangeState {
             // The rows are descending: those at or after the begin come first.
             let keep = self
                 .result
-                .partition_point(|kv| kv.key.as_slice() >= self.begin.key.as_slice());
+                .partition_point(|kv| &kv.key[..] >= self.begin.key.as_slice());
             if keep < self.result.len() {
                 more = false;
             }
@@ -1129,12 +1155,18 @@ const KEY_RANGE_REF_SIZE: usize = crate::commit::KEY_RANGE_REF_SIZE as usize;
 /// unmodified or has dependent writes (`it` is at the key's segment).
 fn update_conflict_map_key(conflicts: &mut ReadConflicts, key: &[u8], it: &WriteMapIter) {
     if it.is_unmodified_range() || (it.is_operation() && it.is_independent() == Some(false)) {
-        let mut end = key.to_vec();
-        end.push(0);
-        // `approximateSize += 2 * key.expectedSize() + 1 + sizeof(KeyRangeRef)`.
-        conflicts.add_approximate_size(2 * key.len() + 1 + KEY_RANGE_REF_SIZE);
-        conflicts.insert(key, &end);
+        add_key_conflict(conflicts, key);
     }
+}
+
+/// `updateConflictMap(key, ...)`'s insertion: `[key, key\x00)`.
+fn add_key_conflict(conflicts: &mut ReadConflicts, key: &[u8]) {
+    let mut end = Vec::with_capacity(key.len() + 1);
+    end.extend_from_slice(key);
+    end.push(0);
+    // `approximateSize += 2 * key.expectedSize() + 1 + sizeof(KeyRangeRef)`.
+    conflicts.add_approximate_size(2 * key.len() + 1 + KEY_RANGE_REF_SIZE);
+    conflicts.insert(key, &end);
 }
 
 /// `updateConflictMap(keys)`: the parts of `[begin, end)` that are unmodified or have
@@ -1162,6 +1194,12 @@ fn update_conflict_map_range(
             break;
         }
     }
+}
+
+/// [`add_get_conflict`] of a read that saw no writes
+/// ([`WriteMap::is_untouched`](crate::ryw::WriteMap::is_untouched)): the key was unmodified.
+pub(crate) fn add_get_conflict_without_writes(conflicts: &mut ReadConflicts, key: &[u8]) {
+    add_key_conflict(conflicts, key);
 }
 
 /// `addConflictRange(GetValueReq)`.
@@ -1260,14 +1298,14 @@ pub(crate) fn add_range_read_conflict(
         if reverse {
             // The rows are descending: the last one is the lowest key.
             if last.key < range_begin {
-                range_begin = last.key.clone();
+                range_begin = last.key.to_vec();
             }
             if end.offset > 0 && range_end <= first.key {
                 range_end = key_after(&first.key);
             }
         } else {
             if begin.offset <= 0 && first.key < range_begin {
-                range_begin = first.key.clone();
+                range_begin = first.key.to_vec();
             }
             if range_end <= last.key {
                 range_end = key_after(&last.key);

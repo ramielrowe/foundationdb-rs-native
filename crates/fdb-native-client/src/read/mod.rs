@@ -500,6 +500,7 @@ use fdb_native_transport::peer::{NoTls, PeerManager, PeerRef, StreamWrapper};
 use fdb_native_transport::runtime::{Runtime, TaskHandle};
 use fdb_native_wire::{Endpoint, NetworkAddress, Uid, VersionVector};
 use futures_channel::oneshot;
+use rustc_hash::FxHashMap;
 
 use crate::cluster::{ClusterInfo, ClusterMonitor};
 use crate::error::Error;
@@ -677,7 +678,9 @@ struct State {
     /// `DatabaseContext::backoffDelay`, for key location requests.
     location_backoff: f64,
     /// `failedEndpointsOnHealthyServersInfo`.
-    failed_endpoints: HashMap<(NetworkAddress, Uid), EndpointFailureInfo>,
+    /// FxHash: looked up for each storage request (the keys are the cluster's addresses and
+    /// endpoint tokens, not chosen by a caller).
+    failed_endpoints: FxHashMap<(NetworkAddress, Uid), EndpointFailureInfo>,
     /// References to the peers of the proxies of the info last used, so that they are
     /// connected and probed while the client uses them.
     proxy_references: Option<(u64, Vec<PeerRef>)>,
@@ -820,7 +823,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                     last_skip: f64::NEG_INFINITY,
                 },
                 location_backoff: 0.0,
-                failed_endpoints: HashMap::new(),
+                failed_endpoints: FxHashMap::default(),
                 proxy_references: None,
                 peer_evictions: 0,
             }),

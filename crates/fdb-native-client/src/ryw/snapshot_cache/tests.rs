@@ -12,7 +12,7 @@ use super::*;
 type Seg = (SegmentType, Vec<u8>, Vec<u8>);
 
 fn kv(k: &[u8], v: &[u8]) -> KeyValue {
-    KeyValue::new(k, v)
+    KeyValue::new(k.to_vec(), v.to_vec())
 }
 
 /// All segments of the cache, forward from the first.
@@ -152,6 +152,31 @@ fn ext_key_assert_ref_panics_with_padding() {
 
 /// C++ `testSnapshotCache` (which only prints the segments): the same inserts, with the
 /// segments asserted.
+#[test]
+fn lookup_of_a_new_cache_and_after_inserts() {
+    for first in [true, false] {
+        let mut cache = SnapshotCache::new();
+        assert_eq!(cache.lookup(b"a"), None);
+        assert_eq!(cache.lookup(b"\xff\xfe"), None);
+        // The final segment is always known empty.
+        assert_eq!(cache.lookup(b"\xff\xff"), Some(None));
+        if first {
+            assert!(cache.insert_key(b"a", Some(b"1")));
+            assert!(!cache.insert_key(b"a", Some(b"2")));
+        } else {
+            assert!(cache.insert_range(b"a", b"c", vec![kv(b"a", b"1")]));
+        }
+        assert_eq!(
+            cache.lookup(b"a").map(|kv| kv.map(|kv| &kv.value[..])),
+            Some(Some(&b"1"[..]))
+        );
+        assert_eq!(cache.lookup(b"a\0"), if first { None } else { Some(None) });
+        assert_eq!(cache.lookup(b"d"), None);
+        assert!(!cache.insert_key(b"\xff\xff", None));
+        cache.assert_invariants();
+    }
+}
+
 #[test]
 fn cpp_test_snapshot_cache_segments() {
     let mut cache = SnapshotCache::new();
@@ -857,8 +882,18 @@ fn check_against_model(cache: &SnapshotCache, model: &Model) {
         let (b, e) = (it.begin_key().to_vec(), it.end_key().to_vec());
         assert!(b <= *p && *p < e, "skip({p:?}) -> [{b:?}, {e:?})");
         assert!(fwd.contains(&(it.segment_type(), b, e)));
+        // `lookup` is the segment's answer (also for a cache nothing was inserted into).
+        let expected = match it.segment_type() {
+            SegmentType::Unknown => None,
+            SegmentType::Empty => Some(None),
+            SegmentType::KeyValue => Some(it.kv()),
+        };
+        assert_eq!(cache.lookup(p), expected, "lookup({p:?})");
         match it.kv() {
-            Some(row) => assert_eq!(model.truth.get(&row.key), Some(&row.value)),
+            Some(row) => assert_eq!(
+                model.truth.get(&row.key[..]).map(Vec::as_slice),
+                Some(&row.value[..])
+            ),
             None => assert_ne!(it.segment_type(), V),
         }
         // `skip_contiguous` over a run of pairs: ascending, all `< limit`, nothing but empty
@@ -867,7 +902,7 @@ fn check_against_model(cache: &SnapshotCache, model: &Model) {
             for limit in model
                 .points
                 .iter()
-                .filter(|l| l.as_slice() > first.key.as_slice())
+                .filter(|l| l.as_slice() > &first.key[..])
                 .take(8)
             {
                 let mut fwd_it = it.clone();
@@ -984,18 +1019,18 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                     let (lo, hi) = if reverse {
                         let lo = if more {
                             let dropped = &all_rows[all_rows.len() - 1 - limit].key;
-                            [dropped.as_slice(), &[0]].concat()
+                            [&dropped[..], &[0]].concat()
                         } else {
                             sb.clone()
                         };
-                        (lo, last.clone())
+                        (lo, last.to_vec())
                     } else {
                         let hi = if more {
-                            all_rows[limit].key.clone()
+                            all_rows[limit].key.to_vec()
                         } else {
                             se.clone()
                         };
-                        ([last.as_slice(), &[0]].concat(), hi)
+                        ([&last[..], &[0]].concat(), hi)
                     };
                     Some(at(idx).clamp(lo, hi))
                 });
@@ -1030,7 +1065,7 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                     let known = if reverse {
                         // Known from the lowest row returned, if cut short.
                         let from = if more {
-                            rows.last().expect("limit >= 1").key.clone()
+                            rows.last().expect("limit >= 1").key.to_vec()
                         } else {
                             bk.clone()
                         };
@@ -1038,7 +1073,7 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                     } else {
                         // Known up to just past the last row returned, if cut short.
                         let to = if more {
-                            [rows.last().expect("limit >= 1").key.as_slice(), &[0]].concat()
+                            [&rows.last().expect("limit >= 1").key[..], &[0]].concat()
                         } else {
                             ek.clone()
                         };
@@ -1063,8 +1098,8 @@ fn run_model(truth_mask: Vec<bool>, ops: Vec<Op>) {
                 );
                 // Not too timid: the rows are in the claim, and the ends the selectors and
                 // flags describe are known.
-                let first = rows.first().map(|r| r.key.clone());
-                let last = rows.last().map(|r| r.key.clone());
+                let first = rows.first().map(|r| r.key.to_vec());
+                let last = rows.last().map(|r| r.key.to_vec());
                 let after = |k: &Option<Vec<u8>>| k.as_ref().map(|k| [k.as_slice(), &[0]].concat());
                 let (lowest, highest) = if reverse {
                     (&last, &first)

@@ -10,14 +10,20 @@ cluster = { max-threads = 2 }
 
 [profile.default]
 fail-fast = true
+# A test that hangs (a lost wakeup, say) fails after 5 minutes instead of stalling the run.
+# The longest unit tests take seconds (the sim sweep about 1 s); the container tests get more
+# below (the slowest cluster tests take about 5 minutes on a busy host).
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 filter = 'binary(cluster) | binary(cluster_faults)'
 test-group = 'cluster'
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 [[profile.default.overrides]]
 filter = 'binary(docker) | test(/(^|::)docker_/)'
 test-group = 'docker'
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Tests that stop or restart their container run alone: Docker hands a stopped container's bridge
 # IP to the next container that starts, and the cluster file (and the test) would then be stale.
@@ -28,14 +34,17 @@ threads-required = "num-test-threads"
 [profile.ci]
 fail-fast = false
 retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'binary(cluster) | binary(cluster_faults)'
 test-group = 'cluster'
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 [[profile.ci.overrides]]
 filter = 'binary(docker) | test(/(^|::)docker_/)'
 test-group = 'docker'
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.ci.overrides]]
 filter = 'binary(integration_docker) & test(/docker_(server_restart|vanished_server)/)'

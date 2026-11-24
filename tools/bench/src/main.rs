@@ -5,7 +5,7 @@
 //!               [--backends native,c] [--threads 4] [--workloads get,set,...] [--out DIR]
 //! fdb-bench serve [--cluster single|triple]   # a cluster for manual `worker` runs / profiling
 //! fdb-bench report RESULTS.jsonl
-//! fdb-bench worker --backend native|c --cluster-file F --workload W [--threads N] ...
+//! fdb-bench worker --backend native|c --cluster-file F --workload W [--threads N] [--concs 1,16,256] ...
 //! ```
 //!
 //! `run` starts the cluster (a single-process container, or a 3-process `FdbCluster`),
@@ -110,6 +110,13 @@ fn worker(args: &Args) {
     let opts = Opts {
         warmup: Duration::from_secs_f64(args.num("--warmup", 2.0)),
         dur: Duration::from_secs_f64(args.num("--duration", 8.0)),
+        concs: args.get("--concs").map_or(workloads::CONCS, |s| {
+            let v: Vec<usize> = s
+                .split(',')
+                .map(|c| c.parse().unwrap_or_else(|_| die("bad value for --concs")))
+                .collect();
+            Vec::leak(v)
+        }),
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)

@@ -212,7 +212,7 @@ async fn cluster_get_range_reads_across_shards() {
     reversed.reverse();
     let fge = |k: &[u8]| KeySelector::first_greater_or_equal(k.to_vec());
     let keys_of =
-        |rows: &[KeyValue]| -> Vec<Vec<u8>> { rows.iter().map(|kv| kv.key.clone()).collect() };
+        |rows: &[KeyValue]| -> Vec<Vec<u8>> { rows.iter().map(|kv| kv.key.to_vec()).collect() };
 
     let db = Database::open(Some(cluster.cluster_file())).expect("database");
     let reader = db.reader();

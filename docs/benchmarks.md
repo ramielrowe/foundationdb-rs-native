@@ -8,7 +8,9 @@ reproduces every table below except the "fix" columns.
 The main tables were measured before the GRV batcher fix (bead `foundationdb-rs-native-8jn`):
 read latency at low concurrency there carries a 1 ms timer floor that the client no longer
 has. [The GRV batcher fix](#the-grv-batcher-fix-8jn) has before/after numbers of the affected
-cells (get, set, mixed, watch) measured side by side.
+cells (get, set, mixed, watch) measured side by side. They were also measured before the
+range-row and CPU work of beads `s1t` and `e82`; [its section](#range-scans-and-cpu-per-operation-s1t-e82)
+has before/after numbers of get, get_seq, scan, mixed and many_tx.
 
 Numbers are from one machine that was shared with other development work while the runs went
 (see [Host and caveats](#host-and-caveats)). They show the shape of the difference, not
@@ -28,26 +30,34 @@ absolute capabilities of either client; treat differences under about 20% as noi
   transaction: p50 28 us vs 38 us per get at concurrency 1, and 386k vs 272k gets/s at
   concurrency 256 (native spreads the work over the tokio worker threads; libfdb_c's single
   network thread is its ceiling).
-* **Range scans are 1.7 to 2.4 times slower** (2.7 to 4.1M rows/s vs 6.0 to 7.0M), with 2.4 to
-  2.8 times the CPU per row. perf: more than half of the samples are malloc/free, from the
-  per-row owned key and value copies. Bead `foundationdb-rs-native-s1t` (P3).
+* **Range scans are 1.2 to 1.4 times slower** after s1t (5.0 to 5.4M rows/s vs 6.3 to 7.3M;
+  they were 1.7 to 2.4 times slower), with 1.8 to 2.1 times the CPU per row (was 2.4 to 2.8).
+  The rows are now slices of the reply (`KeyValue` holds `Bytes`): no allocation per row;
+  what is left is reference counting (bead `foundationdb-rs-native-rrx`).
+  [Details](#range-scans-and-cpu-per-operation-s1t-e82).
 * **Commits are bounded by the server, and at par now that the GRV floor is gone.** Set +
   commit takes 4 to 6 ms on this cluster's memory engine. Before 8jn, at concurrency 256: 29k
   (native) vs 40k (libfdb_c) commits/s on the single-process cluster, with a p50 1.7 ms higher,
   and 20.3k vs 21.2k on the 3-process cluster. After it (side by side): 38.6k vs 31.0k at 256
   and 4183 vs 3542 at 16, p50 3.49 vs 3.60 ms. The numbers are noisy (min-max in
   `results.md`).
-* **Many transactions in flight (1000, 5000) are at par** in throughput and tail latency, with
-  about twice the memory (265 MB vs 140 MB at 5000) and 1.5 to 2 times the CPU per
-  transaction. Beads `foundationdb-rs-native-0et` (P4) and `foundationdb-rs-native-e82` (P3).
+* **Many transactions in flight (1000, 5000) are at par** in throughput and tail latency. Before
+  e82 they took about twice the memory (265 MB vs 140 MB at 5000) and 1.5 to 2 times the CPU
+  per transaction; after it, 126 MB vs 142 MB and 1.3 to 1.5 times the CPU (bead
+  `foundationdb-rs-native-0et`, P4, for memory).
 * **Watches**: setup latency had the same 1 ms floor (p50 1.16 ms vs 147 us; 160 us vs 143 us
   after 8jn); when one write
   fires 5000 watches the median watch fires 35 ms (native) vs 38 ms (libfdb_c) after the write
   starts, and 5000 setups at concurrency 256 run at 81k/s vs 82k/s.
-* **CPU per operation** is 1.5 to 2 times libfdb_c's under load (11.1 vs 6.6 us per fresh-
-  transaction get at 256), but native uses several cores where libfdb_c is capped at about one
-  network thread, so it wins on throughput at equal application threads when reads are
-  GRV-free and the cluster is not the limit.
+* **CPU per operation** was 1.5 to 2 times libfdb_c's under load (12.2 vs 6.5 us per fresh-
+  transaction get at 256) and is 1.15 to 1.6 times after e82 (7.5 vs 6.5; 6.4 vs 5.3 with
+  100 gets per transaction; 78 vs 50 us per 90/10 transaction): the clock reads entered the
+  tokio runtime, a get's task future was 11.5 KB, a get walked the write map of a
+  transaction that had not written, SipHash. Native uses several cores where libfdb_c is
+  capped at about one network thread, so it wins on throughput at equal application threads
+  (429k vs 178k gets/s at 256 after e82). At concurrency 1 the GRV batcher's clock wait
+  dominates (bead `foundationdb-rs-native-yw5`).
+  [Details](#range-scans-and-cpu-per-operation-s1t-e82).
 
 ## What is compared
 
@@ -258,13 +268,15 @@ frame-pointer build, 33k samples) puts 32% in libc, of which memcmp 8.6% comes m
 read-your-writes layer's ordered maps (the snapshot cache's `BTreeMap`, the write map's
 persistent tree iterator and `RywIter`, the location cache's `BTreeMap`), malloc/free about 15%
 (wire `Writer` slot and vtable vectors, per-request state, boxed task cells), SipHash about 4%
-and clock reads (vdso) 7.7%. Beads `foundationdb-rs-native-e82`.
+and clock reads (vdso) 7.7%. Beads `foundationdb-rs-native-e82`; fixed [below](#range-scans-and-cpu-per-operation-s1t-e82)
+(the clock reads were in fact 12.7%, and the `[vdso]` entry is something else).
 
 **Scans.** The profile of the scan workload is 54% libc, mostly malloc/free: each row is
 copied out of the reply into an owned key and an owned value (`KeyValueRef::into_owned`), then
 moved through the RYW merge iterator and the batch `Vec`. libfdb_c hands out pointers into the
 reply buffer. At 100k rows that is the difference between 14 ms and 24 ms per scan; the
-streaming mode makes no measurable difference at these sizes. Bead `foundationdb-rs-native-s1t`.
+streaming mode makes no measurable difference at these sizes. Bead `foundationdb-rs-native-s1t`;
+fixed [below](#range-scans-and-cpu-per-operation-s1t-e82).
 
 **Commits, many transactions, watches.** Commit-bound workloads are at par within the noise of
 a shared disk, and `many_tx` at 1000 and 5000 in flight shows no scaling problem in the client
@@ -359,6 +371,122 @@ The older `native+fix` column in the main table (suite `single-4t-grvfix`) is th
 send-after-one-yield experiment, built from a scratch copy before the fix and run at another
 time; it is kept for reference.
 
+## Range scans and CPU per operation (s1t, e82)
+
+Beads `foundationdb-rs-native-s1t` (scans) and `foundationdb-rs-native-e82` (CPU per
+operation). Measured, then fixed, then measured again, with perf on frame-pointer builds
+([Reproducing](#reproducing)).
+
+**What the profiles showed.**
+
+* *Scan* (100k rows, before): malloc/free were more than half of the samples. A row was copied
+  out of the reply into an owned key and value (`KeyValueRef::into_owned`: two allocations),
+  inserted into the read-your-writes snapshot cache, then cloned out of the cache into the
+  result (`RywIter::take_contiguous`: two more), and moved through a `VecDeque` in
+  `KeyValueStream`.
+* *Get at concurrency 256* (before, 52k samples): the clock was 12.7% of all samples
+  (`Runtime::now` inclusive), almost all of it tokio's `Handle::enter`, which the adapter did
+  on every `now()` so that a paused test clock is read: entering clones the runtime handle's
+  `Arc`, an atomic every worker thread contends for. The callers: the GRV batcher's clock wait
+  (3.3%), `interruption` (1.9%), the transaction's timebomb check on every lock, the load
+  balancer and the read path. memmove was 8.7%: a get's task future was 11.5 KB (the `async
+  fn`s `guarded` and `race` each kept the future they were given twice, and the RYW-disabled
+  branch, inlined, carried it), moved into the task and copied again into a second 11 KB box
+  (`RywSource::read_value`); allocating them went through glibc's arena lock
+  (`__lll_lock_wait_private` 1%). memcmp was 7.6%, from the RYW maps a fresh transaction
+  builds and searches for a point get (the snapshot cache `BTreeMap` 2.1%, the write map's
+  persistent tree 1.4%, `RywIter::skip`), and the location cache (0.6%). SipHash 4.8% (reply
+  tokens, request ids, waiter ids, endpoint keys, peer keys). The wire `Writer`'s vectors
+  were allocated afresh for every request (about a third of the malloc samples).
+* Not clock reads: perf's `[vdso] 0x...a06` entry (7 to 9%) has no symbol and stayed where it
+  was after the clock fix, in every profile; kernel symbols are hidden on this host, so it is
+  most likely kernel time misattributed. The bead's "vdso 7.7% (clock reads)" was this entry.
+
+**What changed.**
+
+* s1t, scans: a `KeyValue`'s key and value are `Bytes` slices of the reply they came in
+  (the transport's exact-sized reply `Vec` becomes a `Bytes` without a copy, and a
+  `GetKeyValuesReply`'s rows are a `SharedKeyValueVector` in it). The snapshot cache, the
+  result, `RangeResult::kvs` and `KeyValueStream` share the rows: a row costs reference
+  counts, no allocation. `KeyValueStream` walks each batch's `Vec` instead of a `VecDeque`.
+  A breaking change of `KeyValue` (see the [changelog](../CHANGELOG.md)).
+* e82, CPU per operation (each change measured with the bench and perf as it went in):
+  * `TokioRuntime::now` reads the system clock directly unless the runtime is a
+    current-thread one (only those can have a paused clock), instead of entering the
+    runtime.
+  * `race` and `Transaction::guarded` are hand-written futures (`pin-project-lite`) that
+    hold their futures once; `RywSource::read_value` is no longer boxed, and the rare
+    `\xff/metadataVersion` read is. A get's task future went from 11.5 KB to 2.5 KB, with
+    one allocation instead of two.
+  * A get of a transaction that has written nothing (`WriteMap::is_untouched`: no write,
+    clear, conflict range or unreadable range) asks the snapshot cache directly and adds its
+    read conflict range without walking the write map (`ryw::read::get_without_writes`,
+    checked against the general path by `random_reads_match_the_model`); a cache nothing was
+    inserted into answers "unknown" without a search; `WriteMap::new` clones a per-thread
+    empty map instead of building one per transaction.
+  * FxHash (`rustc-hash`) for the maps keyed by ids the client mints or the cluster sends:
+    the reply registry, the peer task's waiters, a connection's receivers, the failed
+    endpoints, the queue model, the location cache's servers, the cluster monitor's waiters.
+    The `PeerKey` maps (`PeerManager`, `FailureMonitor`) are left for after b35.7.
+  * Requests are encoded with a `Writer` each thread keeps (dropped if it grew past 64 KiB;
+    a reused writer writes the bytes a new one does, `tests/writer_reuse.rs`).
+  * A cluster monitor wait whose condition was false is not evaluated again until the
+    monitor's state changes (it was evaluated, allocating the proxy id lists, and its waker
+    re-inserted, on every poll of a GRV request).
+
+**Before and after**, side by side as for 8jn: one `fdb-bench serve` cluster (single
+process, 7.4.10), `fdb-bench worker` cells of the build before both beads (`6502858`, with
+8jn), the build with both, and libfdb_c, in rotating order within each of 3 repetitions (8 s
+windows, 4 threads; host load average 3.2 to 6.6, median 4.4, a quieter host than the main
+tables'). `native` is before, `native+fix` after:
+
+| workload | variant | conc | libfdb_c ops/s | native ops/s | ratio | native+fix ops/s | libfdb_c p50 / p99 | native p50 / p99 | native+fix p50 / p99 | CPU us/op c / native / fix |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| get | fresh_tx | 1 | 9835 | 14.0k | 1.43 | 15.1k | 95 us / 122 us | 70 us / 84 us | 64 us / 80 us | 28.6 / 46.4 / 41.1 |
+| get | fresh_tx | 16 | 112.2k | 152.9k | 1.36 | 176.8k | 143 us / 180 us | 103 us / 157 us | 89 us / 132 us | 7.1 / 16.0 / 11.2 |
+| get | fresh_tx | 256 | 178.2k | 304.5k | 1.71 | 429.2k | 1.43 ms / 1.79 ms | 812 us / 1.54 ms | 582 us / 1.06 ms | 6.5 / 12.2 / 7.5 |
+| get_seq | 100_per_tx | 1 | 25.1k | 33.9k | 1.35 | 38.2k | 38 us / 45 us | 27 us / 35 us | 24 us / 31 us | 14.9 / 13.7 / 10.4 |
+| get_seq | 100_per_tx | 16 | 245.7k | 296.3k | 1.21 | 356.5k | 61 us / 87 us | 50 us / 97 us | 43 us / 72 us | 5.3 / 10.1 / 6.8 |
+| get_seq | 100_per_tx | 256 | 275.6k | 397.4k | 1.44 | 508.8k | 917 us / 1.18 ms | 599 us / 1.07 ms | 472 us / 1.01 ms | 5.3 / 9.6 / 6.4 |
+| scan | 100k/iterator | 1 | 7.01M | 4.52M | 0.65 | 5.39M | 14.3 ms / 15.8 ms | 22.1 ms / 22.9 ms | 18.6 ms / 19.7 ms | 0.070 / 0.163 / 0.129 |
+| scan | 100k/wantall | 1 | 7.25M | 4.57M | 0.63 | 5.37M | 13.5 ms / 15.6 ms | 21.7 ms / 22.9 ms | 18.6 ms / 19.6 ms | 0.067 / 0.162 / 0.130 |
+| scan | 10k/iterator | 1 | 6.27M | 4.06M | 0.65 | 5.04M | 1.58 ms / 1.84 ms | 2.45 ms / 2.83 ms | 1.96 ms / 2.27 ms | 0.073 / 0.182 / 0.134 |
+| scan | 10k/wantall | 1 | 7.31M | 4.28M | 0.59 | 5.38M | 1.34 ms / 1.65 ms | 2.30 ms / 2.72 ms | 1.81 ms / 2.15 ms | 0.061 / 0.175 / 0.126 |
+| mixed | 90r_10w_10ops | 1 | 1239 | 1481 | 1.19 | 1562 | 469 us / 3.79 ms | 344 us / 3.64 ms | 312 us / 3.64 ms | 175.8 / 180.1 / 145.6 |
+| mixed | 90r_10w_10ops | 16 | 14.5k | 15.9k | 1.10 | 16.7k | 642 us / 6.37 ms | 538 us / 6.21 ms | 467 us / 6.21 ms | 62.4 / 130.0 / 95.6 |
+| mixed | 90r_10w_10ops | 256 | 29.1k | 34.4k | 1.18 | 38.0k | 8.56 ms / 12.2 ms | 6.74 ms / 14.1 ms | 6.31 ms / 10.5 ms | 49.7 / 106.7 / 78.2 |
+| many_tx | 3r_2w_commit | 1000 | 39.0k | 36.1k | 0.92 | 41.7k | 19.2 ms / 113.8 ms | 21.7 ms / 125.7 ms | 19.8 ms / 95.3 ms | 23.4 / 49.2 / 35.0 |
+| many_tx | 3r_2w_commit | 5000 | 36.0k | 30.4k | 0.85 | 34.5k | 123.3 ms / 408.3 ms | 133.2 ms / 491.4 ms | 119.3 ms / 399.8 ms | 31.1 / 61.1 / 41.2 |
+
+(Scan CPU is per row, to three decimals here; `summarize.py` rounds it to one.)
+
+* **Scans**: 18 to 26% more rows per second (5.0 to 5.4M rows/s; libfdb_c 6.3 to 7.3M), 21
+  to 28% less CPU per row (0.126 to 0.134 us; libfdb_c 0.061 to 0.073), p50 of a 100k-row
+  scan 18.6 ms (was 21.7 to 22.1, libfdb_c 13.5 to 14.3). Peak RSS of the 100k scans 45 MB
+  (was 46; libfdb_c 39). malloc/free went from 53% of the scan's samples (libc) to 6%.
+  What is left is reference counting: each row's two `Bytes` are counted into the cache,
+  out of it into the result, and dropped twice (8 atomic operations through `Bytes`' vtable
+  per row: `SharedKeyValueIter::next` and `Bytes::slice_ref` 13% of the samples,
+  `KeyValue` clones in `RywIter::take_contiguous` 7.5%, the drops about 15%). libfdb_c's
+  rows point into the reply with no count at all. Keeping the reply's buffer once per
+  snapshot-cache entry and the rows as offsets would halve that: bead
+  `foundationdb-rs-native-rrx` (P3).
+* **CPU per operation**: a fresh-transaction get at concurrency 256 7.5 us (was 12.2;
+  libfdb_c 6.5), at 16 11.2 (was 16.0), 100 gets per transaction 6.4 to 6.8 (was 9.6 to
+  10.1; libfdb_c 5.3); the 90/10 mix at 256 78 us per transaction (was 107; libfdb_c 50),
+  `many_tx` 35 and 41 (was 49 and 61; libfdb_c 23 and 31). Throughput follows where the
+  client was the busy part: 429k vs 305k gets/s at 256 (libfdb_c 178k, held to one network
+  thread), 509k vs 397k with 100 gets per transaction. In the get profile at 256 (perf's
+  per-symbol totals), clock reads went from 12.7% to 4.2% of the samples (what is left is
+  mostly the GRV batcher's clock wait, bead `foundationdb-rs-native-yw5`), memmove 8.7% to
+  5.8%, memcmp 7.6% to 2.5%, malloc/free 15.2% to 12.9%, SipHash 4.8% to 2.0% (what is left:
+  the `PeerKey` maps and the GRV batchers' map). At concurrency 1 the CPU
+  per get is still the batcher's clock wait (yw5).
+* What remains on the get path (bead `foundationdb-rs-native-51w`, P4): SipHash on the
+  `PeerKey` maps and the GRV batchers' map, per-transaction allocations (the snapshot cache's map, the oneshot of each
+  `guarded` interruption, the read and GRV tasks), the cluster monitor's mutex taken by every
+  GRV batch's wait, and the unexplained `[vdso]` entry.
+
 ## Reproducing
 
 ```bash
@@ -372,10 +500,13 @@ The raw data of the runs in this document (every measurement of every repetition
 the tables with `tools/bench/summarize.py docs/benchmarks-data/2026-11-24/single-4t --fix
 docs/benchmarks-data/2026-11-24/single-4t-grvfix`, and the 8jn before/after table with
 `tools/bench/summarize.py docs/benchmarks-data/2026-11-24/single-4t-8jn --fix
-docs/benchmarks-data/2026-11-24/single-4t-8jn-fixed`. Those two were run by hand: `fdb-bench
+docs/benchmarks-data/2026-11-24/single-4t-8jn-fixed`, and the s1t/e82 table with
+`tools/bench/summarize.py docs/benchmarks-data/2026-11-24/single-4t-s1t-e82 --fix
+docs/benchmarks-data/2026-11-24/single-4t-s1t-e82-fixed`. Those were run by hand: `fdb-bench
 serve` for the cluster, then `fdb-bench worker --workload W --threads 4 --duration 8 --warmup 2
 --cluster-file F` of each build (and `--backend c`), the JSON lines collected with `rep` and
-`load1` added.
+`load1` added. `--concs 256` (worker only) runs one concurrency of get, get_seq, set or mixed,
+for profiling.
 
 Needs docker, the host `libfdb_c.so` 7.4.x (the `foundationdb` crate links it dynamically) and
 libclang (its bindgen). `FDB_IMAGE` selects the server image (a 7.4 image). Each suite
@@ -403,8 +534,10 @@ python3 -I tools/bench/perf_callers.py get.data memcmp   # who calls a leaf (fir
 | `foundationdb-rs-native-8jn` | P2 | GRV batcher sleep rounds up to 1 ms on tokio: every transaction pays about 1 ms before its first read (fixed, [above](#the-grv-batcher-fix-8jn)) |
 | `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency |
 | `foundationdb-rs-native-iqy` | P4 | Load balancer second-request delay (at least 0.5 ms) rounds up to the timer tick on tokio |
-| `foundationdb-rs-native-s1t` | P3 | Range scans 1.7 to 2.4 times slower than libfdb_c: per-row key/value allocations |
-| `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads |
+| `foundationdb-rs-native-s1t` | P3 | Range scans 1.7 to 2.4 times slower than libfdb_c: per-row key/value allocations (fixed: 1.2 to 1.4, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
+| `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads (fixed: 1.15 to 1.6, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
+| `foundationdb-rs-native-rrx` | P3 | Range scans after s1t: 8 reference counts per row through the snapshot cache; keep reply buffers and row offsets there |
+| `foundationdb-rs-native-51w` | P4 | CPU per operation after e82: `PeerKey` SipHash, per-transaction allocations, the cluster monitor's mutex |
 | `foundationdb-rs-native-0et` | P4 | Memory per in-flight transaction about 2 times libfdb_c |
 
 ## Not covered

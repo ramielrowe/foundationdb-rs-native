@@ -145,6 +145,35 @@ fn emptiness() {
     assert!(!wm.is_empty());
 }
 
+#[test]
+fn untouched_until_any_change() {
+    let wm = WriteMap::new();
+    assert!(wm.is_untouched());
+    let changes: [fn(&mut WriteMap); 4] = [
+        |wm| wm.mutate(b"a", M::ADD_VALUE, b"\x01", true).unwrap(),
+        |wm| wm.clear(b"a", b"b", false),
+        |wm| wm.add_conflict_range(b"a", b"b"),
+        // Not a write (the map stays `is_empty`), but the range is unreadable.
+        |wm| wm.add_unmodified_and_unreadable_range(b"a", b"b"),
+    ];
+    for change in changes {
+        let mut wm = WriteMap::new();
+        change(&mut wm);
+        assert!(!wm.is_untouched());
+        // The view of a read made before the change is still untouched.
+        assert!(WriteMap::new().clone().is_untouched());
+    }
+    let mut wm = WriteMap::new();
+    wm.add_unmodified_and_unreadable_range(b"a", b"b");
+    assert!(wm.is_empty() && !wm.is_untouched());
+    // Empty ranges change nothing.
+    let mut wm = WriteMap::new();
+    wm.clear(b"b", b"a", true);
+    wm.add_unmodified_and_unreadable_range(b"b", b"b");
+    assert!(wm.is_untouched());
+    assert_eq!(segments(&wm), segments(&WriteMap::new()));
+}
+
 /// `/fdbclient/WriteMap/VersionstampedvalueAfterSet`: C++ reads the key through an
 /// `RYWIterator` over an empty snapshot cache with the unreadable protection bypassed; the
 /// write map's part is an unreadable independent write whose value is the versionstamped

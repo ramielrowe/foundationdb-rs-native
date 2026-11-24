@@ -237,7 +237,7 @@ pub use error::{Error, TransactionRetry};
 pub use fdb_native_schema::domain::KeySelector;
 #[cfg(feature = "tls")]
 pub use fdb_native_transport::tls::TlsConfig;
-pub use fdb_native_wire::KeyValue;
+pub use fdb_native_wire::{Bytes, KeyValue};
 pub use keys::strinc;
 pub use read::{RangeOptions, StreamingMode};
 pub use transaction::{
