@@ -72,13 +72,25 @@ impl<R: Runtime> Transaction<R> {
     /// option), `client_invalid_operation` (2000) for `\xff/metadataVersion` (see the
     /// [module documentation](super)).
     pub fn set(&self, key: &[u8], value: &[u8]) {
-        let written = self.write_then(|state, add_conflict| {
-            if key == METADATA_VERSION_KEY {
-                return Err(Error::with_message(
+        if key == METADATA_VERSION_KEY {
+            // `ReadYourWritesTransaction::set` (7.4:2299-2302, 8.0:2215-2218) refuses the key
+            // first thing: before `getAndResetWriteConflictDisabled` (the
+            // `NextWriteNoWriteConflictRange` option is not used up) and before
+            // `checkUsedDuringCommit` (during a commit the error is this one, and the
+            // transaction is not poisoned).
+            let mut state = self.state();
+            let error = if self.is_stale(&state) {
+                Self::stale()
+            } else {
+                Error::with_message(
                     CLIENT_INVALID_OPERATION,
                     "\\xff/metadataVersion can only be written with SetVersionstampedValue",
-                ));
-            }
+                )
+            };
+            state.defer(error);
+            return;
+        }
+        let written = self.write_then(|state, add_conflict| {
             if key >= state.flags.max_write_key() {
                 return Err(Error::new(KEY_OUTSIDE_LEGAL_RANGE));
             }

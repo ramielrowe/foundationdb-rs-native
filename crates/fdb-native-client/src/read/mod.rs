@@ -391,7 +391,11 @@
 //!   load balancer waiting for a failed alternative to come back, and the retry loops
 //!   (checked before each attempt). The peer manager has no shutdown notification, so a
 //!   parked wait notices its shutdown within a second. A request already sent is not
-//!   interrupted: the transport ends it.
+//!   interrupted: the transport ends it. [`Reader::shutdown`] (which
+//!   [`Database::shutdown`](crate::Database::shutdown) calls) also stops the read version
+//!   batchers and the lagging requests at once, even while clones of the reader are held: the
+//!   read version requests waiting fail with `operation_cancelled`, and so does every later
+//!   one, without starting a batcher.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -553,15 +557,35 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Inner<R: Runtime, W> {
     shared: Arc<Shared<R, W>>,
-    batchers: Mutex<HashMap<BatcherKey, Batcher<R>>>,
+    batchers: Mutex<Batchers<R>>,
+}
+
+/// The read version batchers, one per [`BatcherKey`] in use.
+struct Batchers<R: Runtime> {
+    running: HashMap<BatcherKey, Batcher<R>>,
+    /// [`Reader::shutdown`] was called: no batcher starts any more.
+    shut_down: bool,
+}
+
+impl<R: Runtime, W> Inner<R, W> {
+    /// Stops the batchers (their waiting requests fail with `operation_cancelled`) and the
+    /// lagging requests; with `shut_down`, for good.
+    fn stop(&self, shut_down: bool) {
+        let running = {
+            let mut batchers = lock(&self.batchers);
+            batchers.shut_down |= shut_down;
+            std::mem::take(&mut batchers.running)
+        };
+        for (_, batcher) in running {
+            batcher.task.abort();
+        }
+        self.shared.abort_lagging();
+    }
 }
 
 impl<R: Runtime, W> Drop for Inner<R, W> {
     fn drop(&mut self) {
-        for (_, batcher) in lock(&self.batchers).drain() {
-            batcher.task.abort();
-        }
-        self.shared.abort_lagging();
+        self.stop(false);
     }
 }
 
@@ -569,7 +593,8 @@ impl<R: Runtime, W> Drop for Inner<R, W> {
 /// documentation](self) for what it does and how it follows C++.
 ///
 /// Cheap to clone (a shared handle). Create it inside the executor: it spawns a task per set
-/// of read version flags in use (the batchers), which end when the last clone is dropped.
+/// of read version flags in use (the batchers), which end when the last clone is dropped, or
+/// at [`shutdown`](Self::shutdown).
 pub struct Reader<R: Runtime, W = NoTls> {
     inner: Arc<Inner<R, W>>,
 }
@@ -634,7 +659,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         Reader {
             inner: Arc::new(Inner {
                 shared,
-                batchers: Mutex::new(HashMap::new()),
+                batchers: Mutex::new(Batchers {
+                    running: HashMap::new(),
+                    shut_down: false,
+                }),
             }),
         }
     }
@@ -642,6 +670,17 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
     /// The configuration.
     pub fn config(&self) -> &ReadConfig {
         &self.inner.shared.config
+    }
+
+    /// Stops the reader's tasks for good, while clones of it may still be held: the read
+    /// version batchers (the requests waiting for a read version fail with
+    /// `operation_cancelled`, 1101) and the lagging requests of the load balancer. Every
+    /// later read version request fails with `operation_cancelled` at once. The other reads
+    /// fail with it once the peer manager is shut down or the cluster monitor closed (see the
+    /// [module documentation](self)). [`Database::shutdown`](crate::Database::shutdown)
+    /// calls this. Idempotent.
+    pub fn shutdown(&self) {
+        self.inner.stop(true);
     }
 
     /// A read version for a default transaction (`getReadVersion`): batched with the other
@@ -674,7 +713,11 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
         for _ in 0..2 {
             let sent = {
                 let mut batchers = lock(&self.inner.batchers);
+                if batchers.shut_down {
+                    return Err(Error::new(OPERATION_CANCELLED));
+                }
                 let batcher = batchers
+                    .running
                     .entry(key)
                     .or_insert_with(|| Batcher::start(self.inner.shared.clone(), key));
                 match batcher
@@ -685,7 +728,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Reader<R, W> {
                     Err(e) => {
                         // The batcher ended (it panicked): start another.
                         waiter = Some(e.into_inner());
-                        if let Some(old) = batchers.remove(&key) {
+                        if let Some(old) = batchers.running.remove(&key) {
                             old.task.abort();
                         }
                         false

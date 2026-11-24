@@ -226,9 +226,8 @@ The seed decides the cluster's shape, the network's fault rates, the chaos sched
 seeds and the stream's write promises (`seed % 4`: both `Runtime` safety constants true, both
 false, or one of each); `tests/faults.rs` turns write-time resets up under both settings. A client
 change that makes a seed nondeterministic (iterating a `HashMap` with effects, a `RandomState` RNG
-without a seed option) shows up as `NONDETERMINISTIC` in the sweep. The harness tolerates one known
-gap: the GRV batcher tasks outlive `Database::shutdown` until the database is dropped
-(`foundationdb-rs-native-x4q`).
+without a seed option) shows up as `NONDETERMINISTIC` in the sweep. The leak check allows no client
+task after `Database::shutdown`, even while the database is still held.
 
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.

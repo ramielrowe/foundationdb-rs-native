@@ -1303,5 +1303,38 @@ async fn metadata_version_writes() {
             fdb_native_schema::domain::MutationType::SET_VERSIONSTAMPED_VALUE
         );
         assert_eq!(commit.mutations[0].param1, METADATA_VERSION);
+
+        // `set` refuses the key before `checkUsedDuringCommit` (RYW 7.4:2299-2302,
+        // 8.0:2215-2218): during a commit it is a deferred `client_invalid_operation`, and
+        // the commit is not poisoned (any other write would make it `used_during_commit`).
+        let tx = env.db.create_transaction();
+        tx.set_read_version(10);
+        tx.set(b"a", b"1");
+        let handle = spawn({
+            let tx = tx.clone();
+            async move { tx.commit().await }
+        });
+        let call = env.commit.next().await;
+        tx.set(METADATA_VERSION, b"x");
+        call.reply_commit(committed(20, 0));
+        assert_eq!(done(handle).await.unwrap().committed_version(), 20);
+        assert_eq!(
+            tx.get(b"a").await.unwrap_err().code(),
+            codes::CLIENT_INVALID_OPERATION
+        );
+        // An atomic operation on it checks `used_during_commit` first (7.4:2219-2231).
+        let tx = env.db.create_transaction();
+        tx.set_read_version(10);
+        tx.set(b"a", b"1");
+        let handle = spawn({
+            let tx = tx.clone();
+            async move { tx.commit().await }
+        });
+        let _call = env.commit.next().await;
+        tx.atomic_op(METADATA_VERSION, &[0; 14], MutationType::Add);
+        assert_eq!(
+            done(handle).await.unwrap_err().code(),
+            codes::USED_DURING_COMMIT
+        );
     }
 }

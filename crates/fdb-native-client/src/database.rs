@@ -562,10 +562,17 @@ impl<R: Runtime> Database<R> {
     /// Stops the cluster monitor and closes every connection, and waits for both. Every
     /// handle of the database (and its transactions) then fails with `operation_cancelled`
     /// (1101). Idempotent.
+    ///
+    /// None of the database's tasks outlives the call, also while handles of it (or of its
+    /// transactions) are still held: the read version batchers and the watches stop at once
+    /// ([`Reader::shutdown`](crate::read::Reader::shutdown)), and a read version request after
+    /// it fails at once with `operation_cancelled` instead of starting one.
     pub async fn shutdown(&self) {
         // The watches fail with `operation_cancelled` (the cluster monitor and the
-        // connections would only end them eventually).
+        // connections would only end them eventually), and so do the read version requests
+        // (the batchers would otherwise live as long as a handle of the database).
         self.inner.watches.shutdown();
+        self.inner.reader.shutdown();
         self.inner.monitor.shutdown().await;
         self.inner.peers.shutdown().await;
     }

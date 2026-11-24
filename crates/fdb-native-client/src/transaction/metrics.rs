@@ -59,7 +59,7 @@ impl<R: Runtime> Transaction<R> {
                 Err(e) => return ReadFuture::ready(Err(e)),
             }
         };
-        let tx = self.clone();
+        let tx = self.task_handle();
         let (begin, end) = (begin.to_vec(), end.to_vec());
         ReadFuture::Task(self.spawn_read(async move {
             let reader = &tx.inner.db.inner.reader;
@@ -143,7 +143,7 @@ impl<R: Runtime> Transaction<R> {
                 "the chunk size of get_range_split_points must be positive",
             )));
         }
-        let tx = self.clone();
+        let tx = self.task_handle();
         let (begin, end) = (begin.to_vec(), end.to_vec());
         ReadFuture::Task(self.spawn_read(async move {
             let reader = &tx.inner.db.inner.reader;
