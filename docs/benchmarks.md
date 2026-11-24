@@ -3,7 +3,12 @@
 How this client's throughput, latency and CPU use compare with `libfdb_c` 7.4.10 on the same
 disposable cluster, what the numbers say about the client, and how to reproduce them. The tool
 is [`tools/bench`](../tools/bench) (dev-only, outside the workspace); `tools/bench/run.sh full`
-reproduces every table below except the "fix" column (see [With the GRV timer fix](#with-the-grv-timer-fix)).
+reproduces every table below except the "fix" columns.
+
+The main tables were measured before the GRV batcher fix (bead `foundationdb-rs-native-8jn`):
+read latency at low concurrency there carries a 1 ms timer floor that the client no longer
+has. [The GRV batcher fix](#the-grv-batcher-fix-8jn) has before/after numbers of the affected
+cells (get, set, mixed, watch) measured side by side.
 
 Numbers are from one machine that was shared with other development work while the runs went
 (see [Host and caveats](#host-and-caveats)). They show the shape of the difference, not
@@ -11,13 +16,14 @@ absolute capabilities of either client; treat differences under about 20% as noi
 
 ## Summary
 
-* **Point reads at low concurrency are 8 to 11 times slower in latency** (p50 1.12 ms vs
-  98 us for a fresh transaction plus one `get`; 883 vs 9877 ops/s at concurrency 1). The cause
-  is one thing: the GRV batcher's `sleep(batch_time)` on tokio rounds a sub-millisecond delay up
-  to the timer tick, about 1.05 ms, so every transaction waits a millisecond for its read
-  version. A one-line experiment (no sleep below 1 ms) turns 883 ops/s into 13.2k (p50 58 us,
-  better than libfdb_c's 98 us) and the 256-concurrency point read from 144k to 329k ops/s.
-  Bead `foundationdb-rs-native-8jn` (P2).
+* **Point reads with a fresh transaction are now faster than libfdb_c at every concurrency**
+  (after 8jn: 13.9k vs 10.2k ops/s and p50 70 vs 97 us at concurrency 1; 152k vs 114k at 16;
+  308k vs 174k at 256). Before the fix they were 8 to 11 times slower in latency at low
+  concurrency (p50 1.11 ms): the GRV batcher's `sleep(batch_time)` on tokio rounded a
+  sub-millisecond delay up to the timer tick, about 1.05 ms, so every transaction waited a
+  millisecond for its read version. The batcher now waits out such a delay on the clock, which
+  keeps C++'s batching (60 transactions per GRV request at 256) at a CPU cost at concurrency 1
+  (47 vs 30 us per transaction; bead `foundationdb-rs-native-yw5`).
 * **Once the read version is paid for, reads are on par or faster.** 100 gets in one
   transaction: p50 28 us vs 38 us per get at concurrency 1, and 386k vs 272k gets/s at
   concurrency 256 (native spreads the work over the tokio worker threads; libfdb_c's single
@@ -25,15 +31,17 @@ absolute capabilities of either client; treat differences under about 20% as noi
 * **Range scans are 1.7 to 2.4 times slower** (2.7 to 4.1M rows/s vs 6.0 to 7.0M), with 2.4 to
   2.8 times the CPU per row. perf: more than half of the samples are malloc/free, from the
   per-row owned key and value copies. Bead `foundationdb-rs-native-s1t` (P3).
-* **Commits are bounded by the server, and at par once the GRV floor is gone.** Set + commit
-  takes 4 to 6 ms on this cluster's memory engine. At concurrency 256: 29k (native) vs 40k
-  (libfdb_c) commits/s on the single-process cluster, with a p50 1.7 ms higher, and 20.3k vs
-  21.2k on the 3-process cluster; with the GRV experiment native does 39.6k with the same p50
-  as libfdb_c (5.71 vs 5.73 ms). The numbers are noisy (min-max in `results.md`).
+* **Commits are bounded by the server, and at par now that the GRV floor is gone.** Set +
+  commit takes 4 to 6 ms on this cluster's memory engine. Before 8jn, at concurrency 256: 29k
+  (native) vs 40k (libfdb_c) commits/s on the single-process cluster, with a p50 1.7 ms higher,
+  and 20.3k vs 21.2k on the 3-process cluster. After it (side by side): 38.6k vs 31.0k at 256
+  and 4183 vs 3542 at 16, p50 3.49 vs 3.60 ms. The numbers are noisy (min-max in
+  `results.md`).
 * **Many transactions in flight (1000, 5000) are at par** in throughput and tail latency, with
   about twice the memory (265 MB vs 140 MB at 5000) and 1.5 to 2 times the CPU per
   transaction. Beads `foundationdb-rs-native-0et` (P4) and `foundationdb-rs-native-e82` (P3).
-* **Watches**: setup latency has the same 1 ms floor (p50 1.16 ms vs 147 us); when one write
+* **Watches**: setup latency had the same 1 ms floor (p50 1.16 ms vs 147 us; 160 us vs 143 us
+  after 8jn); when one write
   fires 5000 watches the median watch fires 35 ms (native) vs 38 ms (libfdb_c) after the write
   starts, and 5000 setups at concurrency 256 run at 81k/s vs 82k/s.
 * **CPU per operation** is 1.5 to 2 times libfdb_c's under load (11.1 vs 6.6 us per fresh-
@@ -139,8 +147,9 @@ Server   foundationdb/foundationdb:7.4.10, memory storage engine; client and ser
 `libfdb_c / native` (and `/ fix` for the last column). For `scan`, ops/s are rows per second
 (M = million, k = thousand) and latencies are per whole scan; for `watch`, `setup`,
 `writer_commit` and `write_to_fire` are one-at-a-time latencies (ops/s is the cycle rate).
-The `native+fix` column is [the experiment below](#with-the-grv-timer-fix), not the client as
-committed.
+`native` is the client before 8jn (commit `ee25ccf`). The `native+fix` column is the
+one-yield experiment that preceded the fix ([below](#the-grv-batcher-fix-8jn)), not the client
+as committed; the committed fix's numbers are in that section.
 
 ### Single-process cluster, 4 application threads
 
@@ -229,8 +238,8 @@ C++'s `readVersionBatcher`: it waits `batch_time` (half the smoothed GRV latency
 `Runtime::sleep` on tokio cannot sleep that short: tokio's timer wheel has 1 ms resolution
 (measured: `sleep(0)`, `sleep(20us)` and `sleep(100us)` all take 1.05 ms; `sleep(1ms)` takes
 2.06 ms). With 256 concurrent transactions the delay is hidden because the batches fill and
-the proxy is busy anyway (native 144k vs 176k ops/s, p50 1.9 ms vs 1.5 ms). Bead
-`foundationdb-rs-native-8jn`.
+the proxy is busy anyway (native 144k vs 176k ops/s, p50 1.9 ms vs 1.5 ms). Fixed by bead
+`foundationdb-rs-native-8jn` ([below](#the-grv-batcher-fix-8jn)).
 
 **Threading.** libfdb_c does all client work on one thread, so one core caps it: at 256
 concurrent gets it uses 1.2 cores and tops out near 176k gets/s, and with 100 gets per
@@ -263,19 +272,92 @@ a shared disk, and `many_tx` at 1000 and 5000 in flight shows no scaling problem
 twice the memory per in-flight transaction (about 50 KB vs 27 KB); bead
 `foundationdb-rs-native-0et`. 5000 watches register and fire at libfdb_c's rate.
 
-## With the GRV timer fix
+## The GRV batcher fix (8jn)
 
-The `native+fix` column is the native client with one change in `read/grv.rs`'s `run_batcher`:
-when `batch_time` is under 1 ms the batch timer is an immediately-ready future (the loop still
-yields once before sending, as C++'s `delay(0)` does) instead of `rt.sleep(batch_time)`. It was
-built from a scratch copy of the crates (the committed client is unchanged), run as the
-native-only suite `single-4t-grvfix` with the same method but at a different time than the
-`single-4t` run (load average 4.5 to 15, median 6.6), so small differences are not significant.
-With it native matches or beats libfdb_c on read latency at every concurrency (get p50 58 us
-at 1, 97 us at 16, 751 us at 256 vs 98 us, 142 us, 1.48 ms), and the low-concurrency `mixed`
-and `set` gaps close. It is a measurement of what the floor costs, not a proposed patch: the
-bead lists what a real fix has to consider (other short sleeps, batching under load, the smol
-adapter).
+**What C++ does.** `readVersionBatcher` (NativeAPI 7.4:7671-7761, 8.0:5383-5482) arms
+`delay(batchTime, TaskPriority::GetConsistentReadVersion)` when the first request of a batch
+arrives and sends the batch when it fires, or at once when the batch reaches `MAX_BATCH_SIZE`
+(1000). `batchTime` starts at 0 and follows half the reply latency of earlier batches, smoothed
+(`0.1 * target + 0.9 * batchTime`) and capped at `GRV_BATCH_TIMEOUT` (5 ms); the first batch
+after start is therefore a `delay(0)`, which in `Net2::delay` queues the actor as ready (a
+yield), and any other is a timer. There is no limit on outstanding GRV requests: a batch is sent
+whatever is still in flight, so with `batchTime` about half the latency two or three are in
+flight under load. Flow's timers are precise: `Net2` checks its timer heap on every run-loop
+iteration, and an idle loop sleeps in `ASIOReactor::sleep` with a microsecond deadline
+(`BUSY_WAIT_THRESHOLD` is 0, so it never spins). So a C++ batch collects whatever arrives in
+`batchTime`, tens of microseconds on a LAN.
+
+**Timers here.** Measured with the adapters (`Runtime::sleep`, 400 samples, p50): tokio
+(current-thread and multi-thread alike) takes 1.05 ms for `sleep(0)` to `sleep(300us)`,
+1.07 ms for `sleep(500us)`, 2.07 ms for `sleep(900us)` and `sleep(1ms)`, and even
+`sleep_until` a deadline 10 us past often waits for the next tick (1.05 ms); its wheel rounds
+a deadline up to the next millisecond and fires it on the tick after. smol (async-io, a timerfd
+on Linux) is precise: 25 us for `sleep(20us)`, 507 us for `sleep(500us)`, 0 for a past
+deadline. The simulator's virtual timers are exact.
+
+**The fix.** `Runtime` has a `TIMER_RESOLUTION` (tokio 1 ms, smol 0 on Linux/BSD/Apple and 1 ms
+elsewhere, the simulator 0, 1 ms by default for other adapters). The batcher's `BatchDelay`
+sleeps only for a `batchTime` at or above it; a shorter one is waited out on the clock: the
+batcher yields to the other tasks and re-reads `now()` until the deadline, so the requests that
+arrive meanwhile join the batch as they would in C++. A clock that does not move over 64 polls
+(tokio's paused clock, which advances only when every task waits) makes it fall back to the
+timer, so paused-clock tests still finish. The alternatives measured (get, fresh transaction,
+single-process cluster, 4 threads, median of 3 runs, same cluster; "tx/GRV" is transactions per
+`GetReadVersionRequest`, from a counter in the batcher):
+
+| batch wait below 1 ms | conc | ops/s | p50 | CPU us/op | tx/GRV | GRV requests/s |
+|---|---:|---:|---:|---:|---:|---:|
+| `sleep(batchTime)` (before) | 1 / 16 / 256 | 893 / 13.3k / 139k | 1.11 ms / 1.20 ms / 1.92 ms | 28.2 / 13.0 / 11.7 | 1.0 / 16 / 221 | 892 / 832 / 626 |
+| send after one yield (the experiment) | 1 / 16 / 256 | 17.8k / 162k / 268k | 55 us / 96 us / 826 us | 22.4 / 15.6 / 12.2 | 1.0 / 1.8 / 11.7 | 17.8k / 91.6k / 24.7k |
+| wait on the clock (committed) | 1 / 16 / 256 | 13.9k / 151k / 294k | 71 us / 104 us / 826 us | 47.1 / 16.3 / 12.6 | 1.0 / 5.9 / 60.0 | 13.8k / 25.3k / 4.9k |
+
+Sending after one yield is fastest at concurrency 1, but under load it sends 3.6 times (at 16)
+and 5 times (at 256) the GRV requests a C++ client would for the same transactions, against
+the rule that this client sends no more requests than C++ ([well-behaved
+client](well-behaved-client.md)). Waiting on the clock keeps C++'s batching and its throughput
+at 256 is as good; its cost is the polling while a batch waits, which at concurrency 1 (where
+nothing can join) is about 25 us of CPU per transaction (bead `foundationdb-rs-native-yw5`).
+
+The same audit of the other sleeps: the commit, location and load-balancer backoffs, the
+`wrong_shard_server` and `future_version` delays, watch polling and the transport's timeouts
+are all 10 ms or more (or randomized retry delays off the hot path), so a tick of rounding does
+not matter. The load balancer's second-request delay (`delay(0)` when the first replica is far
+slower than the second, else at least `BASE_SECOND_REQUEST_TIME`, 0.5 ms) was the other
+sub-millisecond timer: its `delay(0)` is now immediate instead of the next tick, and the
+0.5 ms+ hedge still rounds up to 1-2 ms on tokio, which only delays the second request of a
+read whose first replica is slow (bead `foundationdb-rs-native-iqy`).
+
+**Before and after**, side by side: one `fdb-bench serve` cluster (single process, 7.4.10),
+`fdb-bench worker` cells of the build before the fix (`ee25ccf`), the build with it, and
+libfdb_c, in rotating order within each of 3 repetitions (8 s windows, 4 threads; host load
+average 3 to 23, median 6.8). `native` is before, `native+fix` after:
+
+| workload | variant | conc | libfdb_c ops/s | native ops/s | ratio | native+fix ops/s | libfdb_c p50 / p99 | native p50 / p99 | native+fix p50 / p99 | CPU us/op c / native / fix |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| get | fresh_tx | 1 | 10.2k | 882 | 0.09 | 13.9k | 97 us / 114 us | 1.11 ms / 2.12 ms | 70 us / 92 us | 29.5 / 28.6 / 46.9 |
+| get | fresh_tx | 16 | 113.6k | 13.5k | 0.12 | 151.9k | 138 us / 174 us | 1.19 ms / 1.26 ms | 103 us / 163 us | 7.0 / 12.3 / 16.1 |
+| get | fresh_tx | 256 | 174.3k | 143.5k | 0.82 | 307.8k | 1.46 ms / 1.69 ms | 1.88 ms / 2.49 ms | 810 us / 1.48 ms | 6.5 / 11.2 / 12.1 |
+| set | 1_key_commit | 1 | 147 | 219 | 1.48 | 288 | 6.15 ms / 18.4 ms | 4.39 ms / 7.86 ms | 3.38 ms / 6.19 ms | 71.5 / 51.9 / 94.9 |
+| set | 1_key_commit | 16 | 3542 | 2930 | 0.83 | 4183 | 3.60 ms / 12.5 ms | 5.44 ms / 8.94 ms | 3.49 ms / 8.87 ms | 17.8 / 19.7 / 23.0 |
+| set | 1_key_commit | 256 | 31.0k | 33.7k | 1.09 | 38.6k | 6.14 ms / 28.8 ms | 5.92 ms / 23.5 ms | 5.78 ms / 20.6 ms | 9.1 / 13.3 / 17.4 |
+| mixed | 90r_10w_10ops | 1 | 1228 | 484 | 0.39 | 1231 | 465 us / 4.04 ms | 1.41 ms / 8.35 ms | 349 us / 5.48 ms | 173.0 / 162.2 / 186.9 |
+| mixed | 90r_10w_10ops | 16 | 14.2k | 7438 | 0.52 | 14.1k | 646 us / 6.30 ms | 1.71 ms / 7.55 ms | 554 us / 10.3 ms | 62.1 / 111.4 / 132.6 |
+| mixed | 90r_10w_10ops | 256 | 29.1k | 35.1k | 1.21 | 34.0k | 8.57 ms / 12.9 ms | 6.63 ms / 13.7 ms | 6.73 ms / 15.2 ms | 49.9 / 94.1 / 109.7 |
+| watch | fire_5000 | 5000 | 104.7k | 115.2k | 1.10 | 120.0k | 39.0 ms / 47.6 ms | 36.2 ms / 43.3 ms | 33.9 ms / 41.6 ms | 8.2 / 9.2 / 11.1 |
+| watch | setup | 1 | 72.6 | 53.6 | 0.74 | 70.3 | 143 us / 210 us | 1.17 ms / 2.21 ms | 160 us / 995 us | 220.3 / 267.1 / 507.8 |
+| watch | setup_5000_c256 | 256 | 86.5k | 93.0k | 1.08 | 106.7k | 2.97 ms / 3.50 ms | 1.97 ms / 3.23 ms | 1.53 ms / 2.33 ms | 14.3 / 32.6 / 38.3 |
+| watch | write_to_fire | 1 | 72.6 | 53.6 | 0.74 | 70.3 | 11.3 ms / 20.0 ms | 15.6 ms / 18.4 ms | 12.6 ms / 14.4 ms | 0.0 / 0.0 / 0.0 |
+| watch | writer_commit | 1 | 72.6 | 53.6 | 0.74 | 70.3 | 4.23 ms / 11.5 ms | 5.03 ms / 15.0 ms | 3.58 ms / 10.6 ms | 0.0 / 0.0 / 0.0 |
+
+The 1 ms is gone everywhere it showed: fresh-transaction reads are now ahead of libfdb_c in
+throughput and p50 at every concurrency, the low-concurrency `mixed` mix is at par (1231 vs
+1228 transactions/s), watch setup is within 20 us of libfdb_c, and `set` is at or above it
+(commit-bound, noisy). CPU per operation is higher than before at low concurrency (the
+polling, above); at 256 it is within noise.
+
+The older `native+fix` column in the main table (suite `single-4t-grvfix`) is the
+send-after-one-yield experiment, built from a scratch copy before the fix and run at another
+time; it is kept for reference.
 
 ## Reproducing
 
@@ -288,7 +370,12 @@ python3 tools/bench/summarize.py tools/bench/results/<run>/single-4t   # side-by
 The raw data of the runs in this document (every measurement of every repetition, the server
 `status`, the host) is in [benchmarks-data/2026-11-24](benchmarks-data/2026-11-24); regenerate
 the tables with `tools/bench/summarize.py docs/benchmarks-data/2026-11-24/single-4t --fix
-docs/benchmarks-data/2026-11-24/single-4t-grvfix`.
+docs/benchmarks-data/2026-11-24/single-4t-grvfix`, and the 8jn before/after table with
+`tools/bench/summarize.py docs/benchmarks-data/2026-11-24/single-4t-8jn --fix
+docs/benchmarks-data/2026-11-24/single-4t-8jn-fixed`. Those two were run by hand: `fdb-bench
+serve` for the cluster, then `fdb-bench worker --workload W --threads 4 --duration 8 --warmup 2
+--cluster-file F` of each build (and `--backend c`), the JSON lines collected with `rep` and
+`load1` added.
 
 Needs docker, the host `libfdb_c.so` 7.4.x (the `foundationdb` crate links it dynamically) and
 libclang (its bindgen). `FDB_IMAGE` selects the server image (a 7.4 image). Each suite
@@ -313,7 +400,9 @@ python3 -I tools/bench/perf_callers.py get.data memcmp   # who calls a leaf (fir
 
 | bead | priority | what |
 |---|---|---|
-| `foundationdb-rs-native-8jn` | P2 | GRV batcher sleep rounds up to 1 ms on tokio: every transaction pays about 1 ms before its first read |
+| `foundationdb-rs-native-8jn` | P2 | GRV batcher sleep rounds up to 1 ms on tokio: every transaction pays about 1 ms before its first read (fixed, [above](#the-grv-batcher-fix-8jn)) |
+| `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency |
+| `foundationdb-rs-native-iqy` | P4 | Load balancer second-request delay (at least 0.5 ms) rounds up to the timer tick on tokio |
 | `foundationdb-rs-native-s1t` | P3 | Range scans 1.7 to 2.4 times slower than libfdb_c: per-row key/value allocations |
 | `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads |
 | `foundationdb-rs-native-0et` | P4 | Memory per in-flight transaction about 2 times libfdb_c |

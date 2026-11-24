@@ -9,7 +9,7 @@ use std::task::Poll;
 use fdb_native_schema::Request;
 use fdb_native_schema::domain::{GetReadVersion, INVALID_VERSION, ReadVersion};
 use fdb_native_transport::peer::StreamWrapper;
-use fdb_native_transport::runtime::Runtime;
+use fdb_native_transport::runtime::{Instant, Runtime};
 use fdb_native_wire::Endpoint;
 use futures_channel::{mpsc, oneshot};
 use futures_core::Stream;
@@ -255,10 +255,90 @@ impl<R: Runtime> Batcher<R> {
 
 type InFlight = Pin<Box<dyn Future<Output = f64> + Send>>;
 
+/// How many polls in a row may read the same [`Runtime::now`] before a [`BatchDelay`] stops
+/// yielding and sleeps instead: a clock that stands still while tasks run is virtual (tokio's
+/// paused clock moves only when every task waits on a timer), and yielding would never reach
+/// the deadline.
+const FROZEN_CLOCK_POLLS: u32 = 64;
+
+/// `delay(batchTime, TaskPriority::GetConsistentReadVersion)`: the wait from a batch's first
+/// request to its sending.
+///
+/// Flow's `delay` is precise: `Net2` checks its timer heap on every run-loop iteration and
+/// sleeps in the reactor to the microsecond, and `delay(0)` queues the task as ready (a yield).
+/// `batchTime` is half the GRV latency, tens of microseconds on a LAN, which is below what some
+/// runtimes' timers can wait: tokio's `sleep(20us)` takes 1.05 ms, so every transaction would
+/// pay a millisecond for its read version. A wait shorter than the runtime's
+/// [`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION) therefore re-polls, yielding to the other
+/// tasks each time, until the clock passes the deadline: the requests that arrive meanwhile
+/// join the batch, as in C++ (sending after a single yield instead made batches 3 to 5 times
+/// smaller under load; see `docs/benchmarks.md`). The cost is the polling, for less than one
+/// resolution per batch. A longer wait, or any wait on a precise timer, sleeps.
+enum BatchDelay<'a, R: Runtime> {
+    /// On the runtime's timer.
+    Sleep(Pin<Box<dyn Future<Output = ()> + Send + 'a>>),
+    /// Yielding until `rt.now()` reaches `deadline`. `last` is the previous reading and
+    /// `frozen` how many polls in a row saw it unchanged.
+    Yield {
+        rt: &'a R,
+        deadline: Instant,
+        last: Instant,
+        frozen: u32,
+    },
+}
+
+impl<'a, R: Runtime> BatchDelay<'a, R> {
+    fn new(rt: &'a R, batch_time: f64) -> Self {
+        let wait = secs(batch_time);
+        let now = rt.now();
+        let deadline = now + wait;
+        if !wait.is_zero() && wait >= R::TIMER_RESOLUTION {
+            BatchDelay::Sleep(Box::pin(rt.sleep_until(deadline)))
+        } else {
+            BatchDelay::Yield {
+                rt,
+                deadline,
+                last: now,
+                frozen: 0,
+            }
+        }
+    }
+
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        match self {
+            BatchDelay::Sleep(sleep) => sleep.as_mut().poll(cx),
+            BatchDelay::Yield {
+                rt,
+                deadline,
+                last,
+                frozen,
+            } => {
+                let now = rt.now();
+                if now >= *deadline {
+                    return Poll::Ready(());
+                }
+                if now == *last {
+                    *frozen += 1;
+                    if *frozen >= FROZEN_CLOCK_POLLS {
+                        let sleep = Box::pin(rt.sleep_until(*deadline));
+                        *self = BatchDelay::Sleep(sleep);
+                        return self.poll(cx);
+                    }
+                } else {
+                    *last = now;
+                    *frozen = 0;
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+}
+
 /// The batcher's loop. A batch is sent when it reaches `max_batch_size`, or `batch_time`
-/// after its first request; `batch_time` follows half the reply latency, smoothed
-/// (`0.1 * target + 0.9 * batch_time`) and capped at `GRV_BATCH_TIMEOUT`. Batches in flight
-/// are driven by this task, so they end with it.
+/// after its first request ([`BatchDelay`]); `batch_time` follows half the reply latency,
+/// smoothed (`0.1 * target + 0.9 * batch_time`) and capped at `GRV_BATCH_TIMEOUT`. Batches in
+/// flight are driven by this task, so they end with it.
 async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
     shared: Arc<Shared<R, W>>,
     key: BatcherKey,
@@ -268,7 +348,7 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
     let max_batch_time = shared.config.grv_batch_timeout.as_secs_f64();
     let mut batch_time = 0.0_f64;
     let mut pending: Vec<Waiter> = Vec::new();
-    let mut timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+    let mut timer: Option<BatchDelay<'_, R>> = None;
     let mut in_flight: Vec<InFlight> = Vec::new();
     let mut closed = false;
 
@@ -286,7 +366,7 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
                         if pending.len() >= max_batch {
                             send = true;
                         } else if timer.is_none() {
-                            timer = Some(Box::pin(shared.rt.sleep(secs(batch_time))));
+                            timer = Some(BatchDelay::new(&shared.rt, batch_time));
                             new_timer = true;
                         }
                     }
@@ -303,7 +383,7 @@ async fn run_batcher<R: Runtime, W: StreamWrapper<R::Stream>>(
                     // `delay(batchTime)` yields at least once, even for 0: let the other
                     // tasks of the moment add their requests first.
                     cx.waker().wake_by_ref();
-                } else if t.as_mut().poll(cx).is_ready() {
+                } else if t.poll(cx).is_ready() {
                     send = true;
                 }
             }
@@ -359,7 +439,65 @@ async fn send_batch<R: Runtime, W: StreamWrapper<R::Stream>>(
 
 #[cfg(test)]
 mod tests {
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
+    use fdb_native_transport::runtime::TokioRuntime;
+
     use super::*;
+
+    async fn wait<R: Runtime>(mut delay: BatchDelay<'_, R>) {
+        poll_fn(|cx| delay.poll(cx)).await
+    }
+
+    #[tokio::test]
+    async fn batch_delay_sleeps_only_from_the_timer_resolution() {
+        let rt = TokioRuntime::new();
+        assert_eq!(TokioRuntime::TIMER_RESOLUTION, Duration::from_millis(1));
+        assert!(matches!(
+            BatchDelay::new(&rt, 0.0),
+            BatchDelay::Yield { .. }
+        ));
+        assert!(matches!(
+            BatchDelay::new(&rt, 0.000_999),
+            BatchDelay::Yield { .. }
+        ));
+        assert!(matches!(BatchDelay::new(&rt, 0.001), BatchDelay::Sleep(_)));
+        assert!(matches!(BatchDelay::new(&rt, 0.005), BatchDelay::Sleep(_)));
+        // `delay(0)`: ready at its first poll (the batcher has yielded once already).
+        let mut zero = BatchDelay::new(&rt, 0.0);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(zero.poll(&mut cx).is_ready());
+    }
+
+    /// Below tokio's resolution the wait is timed by the clock: at least the batch time, and
+    /// well under the 1.05 ms that `sleep(300us)` takes.
+    #[tokio::test]
+    async fn batch_delay_below_the_resolution_waits_on_the_clock() {
+        let rt = TokioRuntime::new();
+        let mut fastest = Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            wait(BatchDelay::new(&rt, 0.000_3)).await;
+            let took = start.elapsed();
+            assert!(took >= Duration::from_micros(300), "{took:?}");
+            fastest = fastest.min(took);
+        }
+        assert!(fastest < Duration::from_micros(900), "{fastest:?}");
+    }
+
+    /// tokio's paused clock does not move while a task is runnable, so yielding would never
+    /// reach the deadline: the wait notices the clock standing still and sleeps instead, which
+    /// lets tokio advance it.
+    #[tokio::test(start_paused = true)]
+    async fn batch_delay_on_a_frozen_clock_sleeps() {
+        let rt = TokioRuntime::new();
+        let start = rt.now();
+        tokio::time::timeout(Duration::from_secs(10), wait(BatchDelay::new(&rt, 0.000_3)))
+            .await
+            .expect("the wait ends");
+        assert!(rt.now() - start >= Duration::from_micros(300));
+    }
 
     #[test]
     fn metadata_version_cache_keeps_the_newest() {

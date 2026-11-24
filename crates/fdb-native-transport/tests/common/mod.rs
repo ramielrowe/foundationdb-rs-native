@@ -140,6 +140,8 @@ impl Runtime for MemRuntime {
     type Stream = MemStream;
     type Task<T: Send + 'static> = TokioTask<T>;
 
+    const TIMER_RESOLUTION: Duration = TokioRuntime::TIMER_RESOLUTION;
+
     fn now(&self) -> Instant {
         self.tokio.now()
     }

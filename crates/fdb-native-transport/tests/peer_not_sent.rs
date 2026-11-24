@@ -187,6 +187,7 @@ impl<const ERRORS: bool, const PENDING: bool> Runtime for FaultRuntime<ERRORS, P
 
     const WRITE_ERRORS_TAKE_NOTHING: bool = ERRORS;
     const PENDING_TAKES_NOTHING: bool = PENDING;
+    const TIMER_RESOLUTION: Duration = MemRuntime::TIMER_RESOLUTION;
 
     fn now(&self) -> Instant {
         self.mem.now()

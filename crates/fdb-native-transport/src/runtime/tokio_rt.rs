@@ -93,6 +93,11 @@ impl Runtime for TokioRuntime {
     /// wrote nothing.
     const PENDING_TAKES_NOTHING: bool = true;
 
+    /// tokio's timer wheel has millisecond ticks: a deadline is rounded up to the next tick
+    /// and fires when the driver processes it, so `sleep(0)` to `sleep(900us)` take 1.05 to
+    /// 2.07 ms (measured on Linux, tokio 1.54, current-thread and multi-thread runtimes alike).
+    const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+
     fn now(&self) -> Instant {
         // The context decides which clock `tokio::time::Instant::now` reads.
         let _enter = self.handle.enter();

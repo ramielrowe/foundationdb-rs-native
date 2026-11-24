@@ -79,8 +79,15 @@
 //! `sleep(d)` fixes its deadline when the method is called (not at first
 //! poll) and is equivalent to `sleep_until(now() + d)`. A sleep never
 //! completes before its deadline on that clock; it may complete somewhat
-//! later (tokio, for instance, rounds up to a millisecond). A deadline in the
-//! past completes at once.
+//! later, by up to about the runtime's
+//! [`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION) (tokio's timer wheel rounds a
+//! deadline up to its next millisecond tick and fires it on the tick after:
+//! `sleep(0)` to `sleep(900us)` take 1.05 to 2.07 ms; smol's async-io reactor
+//! times its waits to the microsecond on Linux and the BSDs). A deadline in
+//! the past completes without waiting for a later deadline, but not
+//! necessarily at its first poll: tokio fires a deadline of a few
+//! microseconds ago on its next tick, about 1 ms later. Code that may compute
+//! a zero delay and wants no wait checks for it instead of sleeping.
 //!
 //! Sleeps drift if chained: `sleep(period)` in a loop adds the loop body's
 //! run time to every cycle. Schedule periodic work from deadlines instead:
@@ -168,6 +175,17 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// must leave it `false`.
     const PENDING_TAKES_NOTHING: bool = false;
 
+    /// The resolution of this runtime's timer: a [`sleep`](Runtime::sleep) shorter than this
+    /// may take about this long, or longer (see [Clocks](self#clocks)).
+    ///
+    /// Code that has to wait less than this, and for which waiting a whole tick would cost
+    /// more than a few wake-ups (the client's GRV batcher, whose `delay(batchTime)` is tens of
+    /// microseconds on a LAN), does not sleep: it yields and re-reads [`now`](Runtime::now)
+    /// until the deadline. `Duration::ZERO` says the timer is precise enough for any delay.
+    /// The default, 1 ms, is safe for any timer whose resolution is unknown: short waits are
+    /// then timed by the clock instead.
+    const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+
     /// Handle to a task started by [`spawn`](Runtime::spawn), yielding `T`.
     type Task<T: Send + 'static>: TaskHandle<T>;
 
@@ -178,8 +196,9 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// `sleep_until(self.now() + duration)`.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
 
-    /// Completes once the clock reaches `deadline`; immediately if it already
-    /// has.
+    /// Completes once the clock reaches `deadline`; without waiting for a later deadline if it
+    /// already has (though possibly not until the timer's next tick, see
+    /// [`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION)).
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send;
 
     /// Runs `future` to completion on the executor as an independent task.

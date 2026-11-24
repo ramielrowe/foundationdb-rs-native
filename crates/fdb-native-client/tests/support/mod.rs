@@ -150,6 +150,8 @@ impl<R: Runtime> Runtime for MemRuntime<R> {
     type Stream = MemStream;
     type Task<T: Send + 'static> = R::Task<T>;
 
+    const TIMER_RESOLUTION: Duration = R::TIMER_RESOLUTION;
+
     fn now(&self) -> Instant {
         self.inner.now()
     }
