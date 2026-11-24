@@ -17,15 +17,15 @@ fn data() -> (SnapshotCache, WriteMap) {
     cache.insert_range(
         b"d",
         b"f\x00",
-        &[
+        vec![
             kv(b"d", b"doo"),
             kv(b"e", b"eoo"),
             kv(b"e\x00", b"zoo"),
             kv(b"f", b"foo"),
         ],
     );
-    cache.insert_range(b"g", b"h", &[]);
-    cache.insert_range(b"j", b"m", &[kv(b"k", b"koo"), kv(b"l", b"loo")]);
+    cache.insert_range(b"g", b"h", vec![]);
+    cache.insert_range(b"j", b"m", vec![kv(b"k", b"koo"), kv(b"l", b"loo")]);
 
     let mut writes = WriteMap::new();
     writes.mutate(b"c", M::SET_VALUE, b"c--", true).unwrap();

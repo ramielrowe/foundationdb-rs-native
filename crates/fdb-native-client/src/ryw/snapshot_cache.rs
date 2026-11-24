@@ -22,8 +22,8 @@
 //! # Differences from C++
 //!
 //! * Keys and values are owned `Vec<u8>` (`KeyValue`), not arena references, and
-//!   [`SnapshotCache::insert_range`] copies what it keeps; there is no arena to tie lifetimes
-//!   to, and so no bytes accounting (the C++ cache tracks none either).
+//!   [`SnapshotCache::insert_range`] takes the rows it keeps by value; there is no arena to tie
+//!   lifetimes to, and so no bytes accounting (the C++ cache tracks none either).
 //! * The `IndexedSet` is a `BTreeMap` keyed by an entry's begin key.
 //! * An iterator borrows the cache, so the borrow checker enforces what C++ documents as
 //!   "invalidation": after an `insert` the caller builds a new iterator (`ReadYourWrites`
@@ -302,7 +302,15 @@ impl SnapshotCache {
     /// the part of `[begin, end)` that is not in the (at most two) entries that straddle its
     /// ends, and replaces the entries strictly inside. That is correct because every read is at
     /// the same version, so the cache's data and `rows` agree wherever they overlap.
-    pub(crate) fn insert_range(&mut self, begin: &[u8], end: &[u8], rows: &[KeyValue]) -> bool {
+    ///
+    /// The cache keeps `rows` themselves (those in the range it records, which is the part of
+    /// `[begin, end)` described above): nothing is copied.
+    pub(crate) fn insert_range(
+        &mut self,
+        begin: &[u8],
+        end: &[u8],
+        mut rows: Vec<KeyValue>,
+    ) -> bool {
         let end = end.min(ALL_KEYS_END);
         if begin >= end {
             return false;
@@ -338,9 +346,12 @@ impl SnapshotCache {
         let hi = rows
             .partition_point(|kv| kv.key.as_slice() < new_end)
             .max(lo);
+        let new_end = new_end.to_vec();
+        rows.truncate(hi);
+        rows.drain(..lo);
         let new_entry = Entry {
-            end: new_end.to_vec(),
-            values: rows[lo..hi].to_vec(),
+            end: new_end,
+            values: rows,
         };
         let new_begin = new_begin.to_vec();
 
@@ -380,18 +391,19 @@ impl SnapshotCache {
     pub(crate) fn insert_read(
         &mut self,
         reverse: bool,
-        outcome: &RangeReadOutcome<'_>,
+        outcome: RangeReadOutcome<'_>,
         begin: SelectorBound<'_>,
         end: SelectorBound<'_>,
     ) -> bool {
         if reverse {
-            let Some((b, e)) = known_key_range_back(outcome, begin, end) else {
+            let Some((b, e)) = known_key_range_back(&outcome, begin, end) else {
                 return false;
             };
-            let ascending: Vec<KeyValue> = outcome.rows.iter().rev().cloned().collect();
-            self.insert_range(&b, &e, &ascending)
+            let mut ascending = outcome.rows;
+            ascending.reverse();
+            self.insert_range(&b, &e, ascending)
         } else {
-            let Some((b, e)) = known_key_range(outcome, begin, end) else {
+            let Some((b, e)) = known_key_range(&outcome, begin, end) else {
                 return false;
             };
             self.insert_range(&b, &e, outcome.rows)
@@ -691,10 +703,11 @@ pub(crate) struct SelectorBound<'a> {
 
 /// What a storage range read returned, as far as [`known_key_range`] needs it (the fields of
 /// C++ `RangeResultRef`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RangeReadOutcome<'a> {
-    /// The rows, in the order the read returned them.
-    pub(crate) rows: &'a [KeyValue],
+    /// The rows, in the order the read returned them. The cache takes them over
+    /// ([`SnapshotCache::insert_read`]).
+    pub(crate) rows: Vec<KeyValue>,
     /// The read stopped at a limit with more data left.
     pub(crate) more: bool,
     /// The read reached the beginning of the key space.

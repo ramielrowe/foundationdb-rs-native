@@ -17,6 +17,10 @@ fdb-native-schema = { version = "0.0.0", path = "crates/fdb-native-schema" }
 # `TokioRuntime` must enable it itself (`features = ["tokio"]`, for tests a dev-dependency).
 fdb-native-transport = { version = "0.0.0", path = "crates/fdb-native-transport", default-features = false }
 
+# Persistent ordered map for the client's write map (O(log n) structural sharing, so a snapshot
+# iterator makes the next write cost a path copy, not a copy of the whole map). MSRV 1.85.
+imbl = "7.0.2"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

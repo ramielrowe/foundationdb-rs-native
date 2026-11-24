@@ -83,6 +83,9 @@
 //!   `FDB_TLS_*` variables, or [`DatabaseOptions`]`::tls`).
 
 pub mod atomic;
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;
 pub mod cluster;
 pub mod cluster_file;
 pub mod commit;

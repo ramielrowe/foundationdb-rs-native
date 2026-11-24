@@ -527,7 +527,7 @@ impl RangeState {
     ) {
         let rows: Vec<KeyValue> = read.iter().map(|kv| kv.into_owned()).collect();
         let outcome = RangeReadOutcome {
-            rows: &rows,
+            rows,
             more: read.more(),
             read_to_begin: read.read_to_begin(),
             read_through_end: read.read_through_end(),
@@ -539,7 +539,7 @@ impl RangeState {
                 offset: s.offset,
             }
         }
-        cache.insert_read(reverse, &outcome, bound(begin), bound(end));
+        cache.insert_read(reverse, outcome, bound(begin), bound(end));
     }
 
     fn resolve(
