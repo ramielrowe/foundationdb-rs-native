@@ -30,6 +30,18 @@ pub struct PeerManagerConfig {
     pub handshake_timeout: Duration,
     /// The reconnect backoff.
     pub backoff: BackoffConfig,
+    /// `TLS_CLIENT_CONNECTION_THROTTLE_TIMEOUT` (11 s; `flow/Knobs.cpp` 7.4:137, 8.0:140): the
+    /// window, from a first failed TLS handshake with an address, in which later failures
+    /// are counted. See [`tls_throttle_attempts`](Self::tls_throttle_attempts).
+    pub tls_throttle_timeout: Duration,
+    /// `TLS_CLIENT_CONNECTION_THROTTLE_ATTEMPTS` (1; 7.4:139, 8.0:142): once this many TLS
+    /// handshakes with an address have failed *after the first* within
+    /// [`tls_throttle_timeout`](Self::tls_throttle_timeout) (so by default, from the second
+    /// failure), a connect to it does not dial for the rest of the window: it waits
+    /// [`connect_timeout`](Self::connect_timeout) and fails with
+    /// [`PeerError::TlsThrottled`](super::PeerError::TlsThrottled), as a C++ client does
+    /// (see the [module documentation](super#tls-handshake-throttle)).
+    pub tls_throttle_attempts: u32,
     /// `FAILURE_DETECTION_DELAY` (4 s; 7.4:324 and 8.0:323 of `flow/Knobs.cpp`): an address
     /// is marked failed once its connections have failed continuously for longer than this.
     /// It is also how long an *available* peer that failed waits before it is probed again
@@ -83,6 +95,8 @@ impl Default for PeerManagerConfig {
             connect_timeout: Duration::from_secs(2),
             handshake_timeout: Duration::from_secs(3),
             backoff: BackoffConfig::FDB_DEFAULT,
+            tls_throttle_timeout: Duration::from_secs(11),
+            tls_throttle_attempts: 1,
             failure_detection_delay: Duration::from_secs(4),
             failed_probe_interval: Duration::from_secs(1),
             monitor: MonitorConfig::FDB_DEFAULT,

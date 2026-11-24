@@ -16,7 +16,9 @@ see [Not supported yet](#not-supported-yet). The API may still change before 1.0
 FoundationDB **7.4** and **8.0** (tested with the `foundationdb/foundationdb:7.4.10` and
 `8.0.1` images). FDB has no protocol negotiation: the client announces the protocol version
 of the cluster it connects to and speaks that release's message schemas, so other releases
-(7.3 and earlier) are not supported.
+(7.3 and earlier) are not supported. How the client behaves toward a cluster (coordinators,
+`status json`, throttling, backoff, connections, upgrades), compared with `libfdb_c`, is in
+[docs/well-behaved-client.md](docs/well-behaved-client.md).
 
 ## Quick start
 

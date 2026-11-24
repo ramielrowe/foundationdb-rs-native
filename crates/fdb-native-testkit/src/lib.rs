@@ -1022,6 +1022,12 @@ impl FdbContainer {
             EXEC_TIMEOUT,
         )
     }
+
+    /// `fdbcli --exec 'status json'`, parsed (anything before the first `{` is dropped).
+    /// Blocking.
+    pub fn status_json(&self) -> Result<serde_json::Value> {
+        cluster::parse_status_output(&self.fdbcli("status json")?)
+    }
 }
 
 impl fmt::Display for FdbContainer {
