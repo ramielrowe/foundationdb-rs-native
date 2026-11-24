@@ -3,15 +3,16 @@
 # binary named `docker`, or have a name starting with `docker_`.
 [test-groups]
 docker = { max-threads = 4 }
-# Each multi-process cluster test runs 3-5 fdbserver containers for about a minute (and
-# must not also be in the `docker` group: the first matching override wins).
+# Each multi-process cluster test (the `cluster` and `cluster_faults` binaries) runs 3-5
+# fdbserver containers for a minute or more (and must not also be in the `docker` group: the
+# first matching override wins).
 cluster = { max-threads = 2 }
 
 [profile.default]
 fail-fast = true
 
 [[profile.default.overrides]]
-filter = 'binary(cluster)'
+filter = 'binary(cluster) | binary(cluster_faults)'
 test-group = 'cluster'
 
 [[profile.default.overrides]]
@@ -29,7 +30,7 @@ fail-fast = false
 retries = 0
 
 [[profile.ci.overrides]]
-filter = 'binary(cluster)'
+filter = 'binary(cluster) | binary(cluster_faults)'
 test-group = 'cluster'
 
 [[profile.ci.overrides]]

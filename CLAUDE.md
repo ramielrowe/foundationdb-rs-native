@@ -231,9 +231,14 @@ The legacy `BinaryWriter` vectors (`fixtures/binary-release-7.4/`, `fixtures/bin
 - **Multi-process clusters** (fault tests): `fdb_native_testkit::FdbCluster` starts 3-5 `fdbserver`
   containers on a dedicated, labelled docker network with static IPs (so restarts keep their
   addresses), `double` redundancy, and has by-ID helpers: `kill`/`stop`/`start_process`/`restart`,
+  `start_processes` (several at once, e.g. after the whole cluster was killed),
   `pause`/`unpause`, `exclude`/`include`, `set_coordinators`, `write_keys` + `small_shards()` for
   shard splits/moves, `status_json`/`wait_healthy`. A start takes ~40 s. Its tests live in the
-  `cluster` integration-test binary (nextest `cluster` group, max 2 at a time).
+  `cluster` integration-test binaries (nextest `cluster` group, max 2 at a time). The client's
+  fault-injection tests (`fdb-native-client` binary `cluster_faults`: kills, pause, coordinator
+  change, exclusion, lock, redundancy change, full restart, under a bank/counter/watch/range
+  workload whose invariants are checked) take ~8.5 min per image:
+  `cargo nextest run -p fdb-native-client --test cluster_faults --run-ignored only`.
 - **Safety rule**: tests must only ever target disposable containers started by
   `fdb-native-testkit`, never a shared or long-lived cluster. A malformed packet can make an
   FDB 7.4/8.0 server process exit.
