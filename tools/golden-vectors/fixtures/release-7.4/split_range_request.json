@@ -1,0 +1,113 @@
+{
+  "format_version": 1,
+  "name": "split_range_request",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageServerInterface::getRangeSplitPoints request (adjusted endpoint 12). 7.4: (keys, chunkSize, reply, tenantInfo, arena); 8.0: (keys, chunkSize, reply, limit, arena): tenantInfo removed and limit (i32, the most split points to return, -1 for no limit) added in its slot.",
+  "cpp_type": "SplitRangeRequest",
+  "file_identifier": 10725174,
+  "file_identifier_hex": "0x00a3a736",
+  "size": 192,
+  "bytes": "3400000036a7a30000000600080004000600140004000a001100040010000c0008000c00040008000c0018000c000400100014002a000000040000001400000080969800000000005400000038000000040000003e00000031000000000000000c000000010000000000000062000000040000000b000000617574687a2d746f6b656e00740000000e00000000009d5e0e00000000009d7e000000007c00000014000000040000000700000073706c69742f7a000700000073706c69742f6100",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SplitRangeRequest>",
+        "value": [
+          {
+            "field": "keys",
+            "slot": 0,
+            "type": "table<KeyRangeRef>",
+            "value": [
+              {
+                "field": "begin",
+                "slot": 0,
+                "type": "bytes",
+                "value": "73706c69742f61"
+              },
+              {
+                "field": "end",
+                "slot": 1,
+                "type": "bytes",
+                "value": "73706c69742f7a"
+              }
+            ]
+          },
+          {
+            "field": "chunkSize",
+            "slot": 1,
+            "type": "i64",
+            "value": 10000000
+          },
+          {
+            "field": "reply",
+            "slot": 2,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798990,
+                  "second": 9123448420122492942
+                }
+              }
+            ]
+          },
+          {
+            "field": "tenantInfo",
+            "slot": 3,
+            "type": "table<TenantInfo>",
+            "value": [
+              {
+                "field": "tenantId",
+                "slot": 0,
+                "type": "i64",
+                "value": 49
+              },
+              {
+                "field": "token",
+                "slot": 1,
+                "type": "optional<table<WipedString>>",
+                "tag": 1,
+                "value": {
+                  "type": "table<WipedString>",
+                  "value": [
+                    {
+                      "field": "ws",
+                      "slot": 0,
+                      "type": "bytes",
+                      "value": "617574687a2d746f6b656e"
+                    },
+                    {
+                      "field": "arena",
+                      "slot": null,
+                      "type": "arena",
+                      "value": null
+                    }
+                  ]
+                }
+              },
+              {
+                "field": "arena",
+                "slot": null,
+                "type": "arena",
+                "value": null
+              }
+            ]
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

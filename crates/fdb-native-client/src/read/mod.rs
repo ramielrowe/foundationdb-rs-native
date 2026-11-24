@@ -317,6 +317,58 @@
 //!   does reads up to `\xff\xff`. A reply with `more` but no rows, or with more rows than
 //!   asked, is `internal_error` (C++ asserts).
 //!
+//! ## Storage metrics
+//!
+//! [`Reader::get_estimated_range_size_bytes`] and [`Reader::get_range_split_points`] are
+//! what `Transaction::getEstimatedRangeSizeBytes` and `getRangeSplitPoints` do below the
+//! read-your-writes layer (`ReadYourWrites.actor.cpp` 7.4:1853-1880,
+//! `ReadYourWrites.cpp` 8.0:1840-1865, which pass them through: no read version, no conflict
+//! range, not counted in `reading`). Both locate the range's shards with
+//! `getKeyRangeLocations` (the cache if it has them all, checked against the failed
+//! endpoints of the request's own stream, else a ranged `GetKeyServerLocationsRequest`), and
+//! send each shard its part of the range, all at once (`waitForAll`). Neither reply is a
+//! `LoadBalancedReply`: the queue model learns no penalty from them, and a server's error
+//! (`wrong_shard_server` when it does not hold the part: `serveStorageMetricsRequests`,
+//! `fdbserver/include/fdbserver/StorageMetrics.actor.h` 7.4:247-290,
+//! `fdbserver/core/include/fdbserver/core/StorageMetrics.h` 8.0:314-321, and the server's
+//! handlers) is the envelope's.
+//!
+//! * **Estimated size.** `DatabaseContext::getStorageMetrics(keys, -1)` (NativeAPI
+//!   7.4:8502-8519, 8.0:6292-6309) is `getStorageMetricsLargeKeyRange` (7.4:8202-8239,
+//!   8.0:5993-6025): every shard (`std::numeric_limits<int>::max()` locations), at
+//!   `latestVersion` (the transaction is not passed without a tenant, 7.4:1860-1863), with
+//!   the regular commit proxies, then `doGetStorageMetrics` (7.4:8172-8200,
+//!   8.0:5964-5991) per shard: a `WaitMetricsRequest` with `min` zero and `max.bytes = -1`,
+//!   which the server answers at once with its byte-sample estimate of the part
+//!   (`StorageServerMetrics::waitMetrics`: a reply as soon as `min <= metrics <= max` does
+//!   not hold). `wrong_shard_server` and `all_alternatives_failed` invalidate the part's
+//!   cached locations and, after `WRONG_SHARD_SERVER_DELAY`, compute the part again as a
+//!   range of its own; `future_version` does the same after `FUTURE_VERSION_RETRY_DELAY`
+//!   (10 ms); any other error is returned. The parts' `bytes` are summed. There is no
+//!   sampling or accuracy knob on the client: the estimate is the servers' byte sample
+//!   (`BYTE_SAMPLING_*` server knobs), which a write reaches only after the server applied
+//!   it.
+//! * **Split points.** `getRangeSplitPoints` (7.4:8544-8606; 8.0:6376-6455, with
+//!   `RangeSplitPointsBuilder` 6332-6374) asks for at most `TOO_MANY` (1 000 000) shards,
+//!   sends each a `SplitRangeRequest(part, chunkSize)` (8.0 adds `limit`, -1 here: the API
+//!   has no limit), and builds `begin`, then for every shard after the first its begin (a
+//!   shard boundary is always a split point) and the server's points, then `end` unless it
+//!   is last already. The server walks its byte sample in steps of `chunkSize`
+//!   (`StorageServerMetrics::getSplitPoints`, `fdbserver/StorageMetrics.actor.cpp`
+//!   7.4:544-580, `fdbserver/core/StorageMetrics.cpp` 8.0:606-644). `wrong_shard_server` and
+//!   `all_alternatives_failed` invalidate the range's cached locations and start over after
+//!   `WRONG_SHARD_SERVER_DELAY`; any other error (`future_version` too) is returned. The
+//!   locations are asked with the transaction's read version if it has one, and of
+//!   provisional proxies if it uses them.
+//! * **Differences.** A boundary equal to the last point is left out (8.0's
+//!   `appendShardBoundary`; 7.4 repeats it when a 7.4 server returned the shard's end as a
+//!   split point, which its `> range.end` test allows), and the points continue from where
+//!   the shards stopped if a location reply did not reach the end (8.0; 7.4 assumes it
+//!   does), on both releases. An empty range is 0 / `[begin]` without a request (C++
+//!   asserts the range is not empty), the estimate's range is cut at `\xff\xff` (no shard
+//!   goes beyond it), and a `chunk_size` below 1 is `client_invalid_operation` (a storage
+//!   server's walk of its byte sample may never end for a negative one). The parts' sum saturates.
+//!
 //! ## Deliberate differences
 //!
 //! * **Lagging requests** are tasks on the runtime ([`Runtime::spawn`]), one per request, where
@@ -362,6 +414,7 @@ mod balance;
 mod grv;
 mod key;
 mod location;
+mod metrics;
 mod range;
 pub(crate) mod util;
 mod watch_lb;
@@ -1103,9 +1156,10 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
         let bound = 2 * lock(&self.locations).server_entries() + 64;
         let endpoints = lock(&self.state).failed_endpoints.len();
         let model = lock(&self.model).len();
-        // A server has an endpoint failure record per stream (`live_targets`: four), and a
-        // queue model entry per load-balanced stream (`getValue`, `getKey`, `getKeyValues`).
-        if endpoints <= 4 * bound && model <= 3 * bound {
+        // A server has an endpoint failure record per stream (`live_targets`: six), and a
+        // queue model entry per load-balanced stream (`getValue`, `getKey`, `getKeyValues`,
+        // `waitMetrics`, `getRangeSplitPoints`).
+        if endpoints <= 6 * bound && model <= 5 * bound {
             return;
         }
         let live = lock(&self.locations).live_targets();

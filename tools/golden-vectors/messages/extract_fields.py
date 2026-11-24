@@ -43,6 +43,10 @@ TABLES = {
     "GetKeyReply": {},
     "WatchValueRequest": {},
     "WatchValueReply": {},
+    "WaitMetricsRequest": {},
+    "StorageMetrics": {},
+    "SplitRangeRequest": {},
+    "SplitRangeReply": {},
     "PingRequest": {},  # FlowTransport's ping (well-known token WLTOKEN_PING_PACKET)
     "GetReadVersionRequest": {},
     "GetReadVersionReply": {},

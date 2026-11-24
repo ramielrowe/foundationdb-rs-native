@@ -70,6 +70,11 @@
 //!   `SizeLimit` option and `transaction_too_large`); with read-your-writes, every read
 //!   conflict range counts, as C++'s commit adds them with `addReadConflictRange`.
 //!
+//! * **Storage metrics** ([`get_estimated_range_size_bytes`](Transaction::get_estimated_range_size_bytes),
+//!   [`get_range_split_points`](Transaction::get_range_split_points)) pass through to the
+//!   storage servers' estimates, as in C++: no read version, no conflict range, not waited
+//!   for by the commit, and the transaction's writes are not in them.
+//!
 //! * **Watches** ([`watch`](Transaction::watch)) have the read-your-writes layer's semantics:
 //!   the watch works out the key's value with the transaction's own writes
 //!   (atomic operations included, with a read conflict range when the database's value
@@ -187,6 +192,7 @@ use crate::ryw::read::{BoxFuture, RywRead, RywSource};
 use crate::ryw::{self, ReadConflicts, SnapshotCache, WriteMap, WriteMapIter};
 use crate::watch::PendingWatches;
 
+mod metrics;
 mod mutation;
 pub mod options;
 mod range;

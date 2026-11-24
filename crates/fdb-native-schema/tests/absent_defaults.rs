@@ -21,8 +21,8 @@ use v7_4::{
     ClientTagThrottleLimits, ClientTrCommitCostEstimation, ClientVersionRef, CommitID,
     CommitProxyInterface, CommitTransactionRef, GetKeyReply, GetKeyServerLocationsReply,
     GetKeyValuesReply, GetValueReply, GrvProxyInterface, Hostname, KeyRangeRef, KeySelectorRef,
-    LocalityData, MutationRef, OpenDatabaseCoordRequest, StorageServerInterface, VersionHistory,
-    WatchValueReply,
+    LocalityData, MutationRef, OpenDatabaseCoordRequest, SplitRangeReply, StorageMetrics,
+    StorageServerInterface, VersionHistory, WatchValueReply,
 };
 
 /// A table with `value` first, as the reader sees it: `serializer(ar, value, tail)`.
@@ -256,6 +256,16 @@ fn zero_default_types() {
     let reply = absent_in_message!(GetKeyServerLocationsReply);
     assert_eq!(reply.results.len(), 0);
     assert!(reply.results_tss_mapping.is_empty() && reply.results_tag_mapping.is_empty());
+    // StorageMetrics: every member `= 0`; SplitRangeReply(): no split points.
+    assert_eq!(
+        absent_in_message!(StorageMetrics),
+        StorageMetrics::default()
+    );
+    assert_eq!(empty_in_message!(StorageMetrics), StorageMetrics::default());
+    assert_eq!(
+        absent_in_message!(SplitRangeReply),
+        SplitRangeReply::default()
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -382,6 +392,14 @@ fn v7_4_requests_compose_nested_defaults() {
         absent_in_message!(v7_4::TenantMode),
         v7_4::TenantMode::default()
     );
+
+    // WaitMetricsRequest() {} and SplitRangeRequest() {}: zero but `tenantInfo`.
+    let request = absent_in_message!(v7_4::WaitMetricsRequest);
+    assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(request, v7_4::WaitMetricsRequest::default());
+    let request = absent_in_message!(v7_4::SplitRangeRequest);
+    assert_eq!(request.tenant_info, v7_4::TenantInfo::NONE);
+    assert_eq!(request, v7_4::SplitRangeRequest::default());
 }
 
 // ---------------------------------------------------------------------------------------
@@ -419,6 +437,19 @@ fn v8_0_get_key_server_locations_request() {
         empty_in_message!(v8_0::GetKeyServerLocationsRequest).legacy_version,
         0
     );
+}
+
+#[test]
+fn v8_0_storage_metrics_requests() {
+    let request = absent_in_message!(v8_0::WaitMetricsRequest);
+    assert_eq!(request, v8_0::WaitMetricsRequest::default());
+    assert_eq!(request.legacy_version, 0);
+
+    // SplitRangeRequest() = default with `int limit = -1`.
+    let request = absent_in_message!(v8_0::SplitRangeRequest);
+    assert_eq!(request, v8_0::SplitRangeRequest::default());
+    assert_eq!(request.limit, -1);
+    assert_eq!(empty_in_message!(v8_0::SplitRangeRequest).limit, 0);
 }
 
 #[test]
