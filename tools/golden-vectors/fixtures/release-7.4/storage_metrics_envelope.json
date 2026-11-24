@@ -1,0 +1,61 @@
+{
+  "format_version": 1,
+  "name": "storage_metrics_envelope",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageMetrics as sent (ErrorOr<EnsureTable<StorageMetrics>> tag 2). Not a LoadBalancedReply: no penalty or error fields; a server's error comes as the envelope's error.",
+  "cpp_type": "ErrorOr<EnsureTable<StorageMetrics>>",
+  "file_identifier": 47176658,
+  "file_identifier_hex": "0x02cfdbd2",
+  "size": 96,
+  "bytes": "28000000d2dbcf020000000008000900080004000600060004000e002c0004000c0014001c0024001c00000008000000020000001a000000141a99be1c000000e8030000000000001400000000000000e0930400000000000400000000000000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<StorageMetrics>>>",
+        "tag": 2,
+        "value": {
+          "type": "ensure_table<table<StorageMetrics>>",
+          "value": {
+            "type": "table<StorageMetrics>",
+            "value": [
+              {
+                "field": "bytes",
+                "slot": 0,
+                "type": "i64",
+                "value": 123456789012
+              },
+              {
+                "field": "bytesWrittenPerKSecond",
+                "slot": 1,
+                "type": "i64",
+                "value": 1000
+              },
+              {
+                "field": "iosPerKSecond",
+                "slot": 2,
+                "type": "i64",
+                "value": 20
+              },
+              {
+                "field": "bytesReadPerKSecond",
+                "slot": 3,
+                "type": "i64",
+                "value": 300000
+              },
+              {
+                "field": "opsReadPerKSecond",
+                "slot": 4,
+                "type": "i64",
+                "value": 4
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

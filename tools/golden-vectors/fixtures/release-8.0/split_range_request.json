@@ -1,0 +1,77 @@
+{
+  "format_version": 1,
+  "name": "split_range_request",
+  "group": "storage",
+  "kind": "positive",
+  "description": "StorageServerInterface::getRangeSplitPoints request (adjusted endpoint 12). 7.4: (keys, chunkSize, reply, tenantInfo, arena); 8.0: (keys, chunkSize, reply, limit, arena): tenantInfo removed and limit (i32, the most split points to return, -1 for no limit) added in its slot.",
+  "cpp_type": "SplitRangeRequest",
+  "file_identifier": 10725174,
+  "file_identifier_hex": "0x00a3a736",
+  "size": 136,
+  "bytes": "2c00000036a7a3000000000006000800040006001400040008000c00040008000c0018000c0004001000140020000000040000001400000080969800000000002400000008000000110000003a0000000e00000000009d5e0e00000000009d7e000000004c00000014000000040000000700000073706c69742f7a000700000073706c69742f6100",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "table<SplitRangeRequest>",
+        "value": [
+          {
+            "field": "keys",
+            "slot": 0,
+            "type": "table<KeyRangeRef>",
+            "value": [
+              {
+                "field": "begin",
+                "slot": 0,
+                "type": "bytes",
+                "value": "73706c69742f61"
+              },
+              {
+                "field": "end",
+                "slot": 1,
+                "type": "bytes",
+                "value": "73706c69742f7a"
+              }
+            ]
+          },
+          {
+            "field": "chunkSize",
+            "slot": 1,
+            "type": "i64",
+            "value": 10000000
+          },
+          {
+            "field": "reply",
+            "slot": 2,
+            "type": "table<reply_promise>",
+            "value": [
+              {
+                "field": "token",
+                "slot": 0,
+                "type": "uid",
+                "value": {
+                  "first": 6817605410908798990,
+                  "second": 9123448420122492942
+                }
+              }
+            ]
+          },
+          {
+            "field": "limit",
+            "slot": 3,
+            "type": "i32",
+            "value": 17
+          },
+          {
+            "field": "arena",
+            "slot": null,
+            "type": "arena",
+            "value": null
+          }
+        ]
+      }
+    ]
+  }
+}

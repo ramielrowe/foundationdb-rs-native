@@ -1100,6 +1100,80 @@ impl From<&domain::WatchValueReply> for WatchValueReply {
 }
 
 // ---------------------------------------------------------------------------------------
+// Storage metrics.
+
+/// `StorageMetrics` (`serializer(ar, bytes, bytesWrittenPerKSecond, iosPerKSecond,
+/// bytesReadPerKSecond, opsReadPerKSecond)`), file identifier 13622226: `waitMetrics`'s
+/// reply and the bounds of its request.
+///
+/// Absent: every member has a `= 0` initializer (7.4 and 8.0): zero.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 13622226)]
+pub struct StorageMetrics {
+    /// `bytes`.
+    pub bytes: i64,
+    /// `bytesWrittenPerKSecond`.
+    pub bytes_written_per_ksecond: i64,
+    /// `iosPerKSecond`.
+    pub ios_per_ksecond: i64,
+    /// `bytesReadPerKSecond`.
+    pub bytes_read_per_ksecond: i64,
+    /// `opsReadPerKSecond`.
+    pub ops_read_per_ksecond: i64,
+}
+
+impl From<StorageMetrics> for domain::StorageMetrics {
+    fn from(m: StorageMetrics) -> Self {
+        domain::StorageMetrics {
+            bytes: m.bytes,
+            bytes_written_per_ksecond: m.bytes_written_per_ksecond,
+            ios_per_ksecond: m.ios_per_ksecond,
+            bytes_read_per_ksecond: m.bytes_read_per_ksecond,
+            ops_read_per_ksecond: m.ops_read_per_ksecond,
+        }
+    }
+}
+
+impl From<&domain::StorageMetrics> for StorageMetrics {
+    fn from(m: &domain::StorageMetrics) -> Self {
+        StorageMetrics {
+            bytes: m.bytes,
+            bytes_written_per_ksecond: m.bytes_written_per_ksecond,
+            ios_per_ksecond: m.ios_per_ksecond,
+            bytes_read_per_ksecond: m.bytes_read_per_ksecond,
+            ops_read_per_ksecond: m.ops_read_per_ksecond,
+        }
+    }
+}
+
+/// `SplitRangeReply` (`serializer(ar, splitPoints)`), file identifier 11813134: the split
+/// points of a `getRangeSplitPoints` request.
+///
+/// Absent: `SplitRangeReply()`, no split points.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+#[fdb(file_identifier = 11813134)]
+pub struct SplitRangeReply<'a> {
+    /// `splitPoints`.
+    pub split_points: Vec<&'a [u8]>,
+}
+
+impl From<SplitRangeReply<'_>> for domain::SplitRangeReply {
+    fn from(r: SplitRangeReply<'_>) -> Self {
+        domain::SplitRangeReply {
+            split_points: r.split_points.into_iter().map(<[u8]>::to_vec).collect(),
+        }
+    }
+}
+
+impl<'a> From<&'a domain::SplitRangeReply> for SplitRangeReply<'a> {
+    fn from(r: &'a domain::SplitRangeReply) -> Self {
+        SplitRangeReply {
+            split_points: r.split_points.iter().map(Vec::as_slice).collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Commit.
 
 /// `ClientTrCommitCostEstimation` (`serializer(ar, opsCount, writeCosts, clearIdxCosts,

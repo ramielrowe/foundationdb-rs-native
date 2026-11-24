@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "storage_metrics_error",
+  "group": "storage",
+  "kind": "positive",
+  "description": "Error reply envelope: ErrorOr<EnsureTable<StorageMetrics>> tag 1, Error 1001 (wrong_shard_server), as sendErrorWithPenalty sends it for a reply type that is not a LoadBalancedReply.",
+  "cpp_type": "ErrorOr<EnsureTable<StorageMetrics>>",
+  "file_identifier": 47176658,
+  "file_identifier_hex": "0x02cfdbd2",
+  "size": 56,
+  "bytes": "24000000d2dbcf0208000900080004000600060004000e002c0004000c0014001c0024001c000000080000000100000020000000e9030000",
+  "root": {
+    "type": "table<root>",
+    "value": [
+      {
+        "field": "0",
+        "slot": 0,
+        "type": "error_or<ensure_table<table<StorageMetrics>>>",
+        "tag": 1,
+        "value": {
+          "type": "table<Error>",
+          "value": [
+            {
+              "field": "error_code",
+              "slot": 0,
+              "type": "u16",
+              "value": 1001
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

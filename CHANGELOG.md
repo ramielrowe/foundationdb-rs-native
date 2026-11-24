@@ -27,6 +27,8 @@ link `libfdb_c`.
   * conflict ranges (`add_read_conflict_range`, `add_write_conflict_range` and their `_key`
     forms), `get_read_version` / `set_read_version`, `commit` (`CommitResult`),
     `committed_version`, `versionstamp`, `approximate_size`;
+  * storage metrics: `get_estimated_range_size_bytes` and `get_range_split_points`
+    (`fdb_c`'s, through the storage servers' `waitMetrics` and `getRangeSplitPoints`);
   * `on_error` with C++'s backoff, retry limit and retry predicates, `reset`, `cancel`,
     timeouts, used-during-commit protection;
   * `TransactionOption`: the options of `fdb.options` that apply to this client (timeouts,

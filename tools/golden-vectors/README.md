@@ -876,7 +876,8 @@ per entry the tag id and (version minus min version) in those widths; finally i6
   `getValue`; the other endpoints are `getAdjustedEndpoint(i)`: token (first + (i << 32),
   (second & 0xffffffff00000000) | (u32(second) + i)). The indices a client needs are the same
   on both branches: commit proxy 2 = `getKeyServersLocations`; storage server 1 = `getKey`,
-  2 = `getKeyValues`, 10 = `watchValue`. Later commit proxy indices differ (8.0 dropped
+  2 = `getKeyValues`, 4 = `waitMetrics`, 10 = `watchValue`, 12 = `getRangeSplitPoints`.
+  Later commit proxy indices differ (8.0 dropped
   `getHealthMetrics`, `getTenantId` and `getBlobGranuleLocations`, so for example
   `expireIdempotencyId` is 10 on 7.4 and 9 on 8.0).
 - **Well-known tokens** are `UID(-1, n)`: 0 endpoint not found, 1 ping, 2 unauthorized
@@ -887,6 +888,9 @@ per entry the tag id and (version minus min version) in those widths; finally i6
   `ReplyPromise<CachedSerialization<ClientDBInfo>>`, but `CachedSerialization` writes exactly
   `ErrorOr<EnsureTable<ClientDBInfo>>` (`client_db_info_envelope`).
 - **`WatchValueReply`'s file identifier is 3**, so its envelope's is `0x02000003`.
+- **`StorageMetrics` and `SplitRangeReply` are not `LoadBalancedReply`s**: they have no
+  penalty or error fields, and a storage server's error (`wrong_shard_server`) comes as the
+  envelope's error (`storage_metrics_error`).
 - A C++ writer that fills `GetKeyValuesReply::data` by appending must invalidate its cached
   size first (`VectorRef<_, String>` keeps a cached serialized size that `push_back` leaves at
   0); this does not affect readers.
@@ -904,6 +908,8 @@ The file identifiers of all covered types are the same on both branches. Schema 
 | `WatchValueRequest` | key@0 value@1 version@3 tags@4 debugID@6 reply@8 spanContext@9 **tenantInfo@10** | the same without tenantInfo |
 | `CommitTransactionRequest` | transaction@0 reply@1 flags@2 debugID@3 commitCostEstimation@5 tagSet@7 spanContext@9 **tenantInfo@10** idempotencyId@11 arena | ... spanContext@9 idempotencyId@10 arena |
 | `GetKeyServerLocationsRequest` | begin@0 end@1 limit@3 reverse@4 reply@5 spanContext@6 **tenant@7** **minTenantVersion@8** arena | ... spanContext@6 **legacyVersion@7** (i64) arena |
+| `WaitMetricsRequest` | keys@0 min@1 max@2 reply@3 **tenantInfo@4** **minVersion@5** arena | keys@0 min@1 max@2 reply@3 **legacyVersion@4** (i64) arena |
+| `SplitRangeRequest` | keys@0 chunkSize@1 reply@2 **tenantInfo@3** arena | keys@0 chunkSize@1 reply@2 **limit@3** (i32, default -1) arena |
 | `GetReadVersionRequest` | transactionCount@0 flags@1 tags@2 debugID@3 reply@5 spanContext@6 maxVersion@7 | the same plus **maxGrvQueueDelayMS@8** (`optional<i64>`) |
 | `GetReadVersionReply` | processBusyTime@0 ... proxyId@10 **proxyTagThrottledDuration@11** (f64) | ends at proxyId@10 |
 | `ClientDBInfo` | grvProxies@0 commitProxies@1 id@2 forward@3 history@5 **tenantMode@6** (`table<TenantMode>`: mode u32) **encryptKeyProxy@7** clusterId@9 clusterType@10 **metaclusterName@11** | grvProxies@0 commitProxies@1 id@2 forward@3 history@5 clusterId@6 clusterType@7 **nativeCdcEnabled@8 nativeCdcTagCount@9 cdcProxies@10 streamToCDCProxyId@11** |
@@ -918,7 +924,7 @@ the schema by the server's protocol version. Everything else covered (the replie
 
 ### Message vector catalog
 
-The same 33 vectors exist for both releases; the values differ only in fields that exist on
+The same 42 vectors exist for both releases; the values differ only in fields that exist on
 one branch. Group `storage`:
 
 | vector | `cpp_type` | covers |
@@ -936,6 +942,13 @@ one branch. Group `storage`:
 | `get_key_reply`, `get_key_reply_envelope` | `GetKeyReply`, `ErrorOr<...>` | `KeySelector` (`Standalone<KeySelectorRef>`) |
 | `watch_value_request` | `WatchValueRequest` | value and debugID present |
 | `watch_value_reply`, `watch_value_reply_envelope` | `WatchValueReply`, `ErrorOr<...>` | |
+| `wait_metrics_request` | `WaitMetricsRequest` | `StorageMetrics` bounds with every field distinct; 7.4: `TenantInfo` with a token and minVersion; 8.0: legacyVersion |
+| `wait_metrics_request_estimate` | `WaitMetricsRequest` | what `getEstimatedRangeSizeBytes` sends: `min` zero, `max.bytes` -1, `latestVersion` (7.4: `TenantInfo()`) |
+| `storage_metrics`, `storage_metrics_envelope` | `StorageMetrics`, `ErrorOr<...>` | the `waitMetrics` reply |
+| `storage_metrics_error` | `ErrorOr<EnsureTable<StorageMetrics>>` | 1001 `wrong_shard_server` |
+| `split_range_request` | `SplitRangeRequest` | 7.4: `TenantInfo` with a token; 8.0: limit |
+| `split_range_reply`, `split_range_reply_envelope` | `SplitRangeReply`, `ErrorOr<...>` | two split points (vector of strings) |
+| `split_range_reply_empty` | `ErrorOr<EnsureTable<SplitRangeReply>>` | no split points |
 
 Group `proxy`:
 

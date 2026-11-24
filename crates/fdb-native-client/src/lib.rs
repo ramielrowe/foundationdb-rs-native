@@ -78,7 +78,10 @@
 //!   [`commit`](Transaction::commit) ([`CommitResult`]),
 //!   [`get_versionstamp`](Transaction::get_versionstamp), [`watch`](Transaction::watch)
 //!   ([`Watch`]), [`on_error`](Transaction::on_error), [`reset`](Transaction::reset),
-//!   [`cancel`](Transaction::cancel), [`approximate_size`](Transaction::approximate_size) and
+//!   [`cancel`](Transaction::cancel), [`approximate_size`](Transaction::approximate_size),
+//!   the storage metrics
+//!   ([`get_estimated_range_size_bytes`](Transaction::get_estimated_range_size_bytes),
+//!   [`get_range_split_points`](Transaction::get_range_split_points)) and
 //!   [`TransactionOption`]s. Reads see the transaction's own writes (read-your-writes, as
 //!   every FoundationDB binding); see [`transaction`] for the semantics, ported from C++.
 //! * [`Error`]: the one error type, an FDB error code with C++'s retry predicates
