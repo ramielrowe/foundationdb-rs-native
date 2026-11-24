@@ -801,7 +801,7 @@ fn keys_of(read: &RangeRead) -> Vec<Vec<u8>> {
 }
 
 fn keys(rows: &[KeyValue]) -> Vec<Vec<u8>> {
-    rows.iter().map(|kv| kv.key.clone()).collect()
+    rows.iter().map(|kv| kv.key.to_vec()).collect()
 }
 
 fn ks(list: &[&[u8]]) -> Vec<Vec<u8>> {

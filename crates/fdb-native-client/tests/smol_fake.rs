@@ -449,8 +449,8 @@ async fn range_reads_with_limits_and_reverse() {
         .unwrap();
         assert_eq!(all.kvs.len(), 20);
         assert!(!all.more);
-        assert_eq!(all.kvs[0].key, [b'r', 0]);
-        assert_eq!(all.kvs[19].value, [19; 4]);
+        assert_eq!(all.kvs[0].key, &[b'r', 0][..]);
+        assert_eq!(all.kvs[19].value, &[19u8; 4][..]);
 
         let last3 = within(
             "last three",
@@ -464,7 +464,7 @@ async fn range_reads_with_limits_and_reverse() {
         )
         .await
         .unwrap();
-        let keys: Vec<_> = last3.kvs.iter().map(|kv| kv.key.clone()).collect();
+        let keys: Vec<_> = last3.kvs.iter().map(|kv| kv.key.to_vec()).collect();
         assert_eq!(keys, [[b'r', 19], [b'r', 18], [b'r', 17]]);
         assert!(last3.more);
 
@@ -481,7 +481,7 @@ async fn range_reads_with_limits_and_reverse() {
         .await
         .unwrap();
         assert_eq!(with_mine.kvs.len(), 21);
-        assert_eq!(with_mine.kvs[20].value, b"mine");
+        assert_eq!(with_mine.kvs[20].value, &b"mine"[..]);
     }
 }
 

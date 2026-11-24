@@ -415,7 +415,7 @@ pub(crate) async fn get<S: RywSource>(
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         let dependent = it.is_dependent();
         if it.is_kv()? {
-            return Ok(First::Done(it.kv()?.map(|kv| kv.value)));
+            return Ok(First::Done(it.kv()?.map(|kv| kv.value.to_vec())));
         }
         if it.is_empty_range()? {
             return Ok(First::Done(None));
@@ -435,7 +435,7 @@ pub(crate) async fn get<S: RywSource>(
         // A dependent write at the key: its operations apply to the value read.
         let it = iter(cache, &read.writes, read.bypass_unreadable, key);
         debug_assert!(it.is_kv().unwrap_or(false));
-        Ok(it.kv()?.map(|kv| kv.value))
+        Ok(it.kv()?.map(|kv| kv.value.to_vec()))
     })?
 }
 
@@ -455,7 +455,7 @@ pub(crate) fn get_key<'a, S: RywSource>(
             if result.read_through_end || result.rows.is_empty() {
                 return Ok(read.current_max_read_key().to_vec());
             }
-            Ok(result.rows[0].key.clone())
+            Ok(result.rows[0].key.to_vec())
         } else {
             key.offset += 1;
             let result = get_range_value_back(read, fge(Vec::new()), key, row_limit(1)).await?;
@@ -465,7 +465,7 @@ pub(crate) fn get_key<'a, S: RywSource>(
             if result.read_to_begin || result.rows.is_empty() {
                 return Ok(Vec::new());
             }
-            Ok(result.rows[0].key.clone())
+            Ok(result.rows[0].key.to_vec())
         }
     })
 }
@@ -542,7 +542,8 @@ impl RangeState {
         begin: &KeySelector,
         end: &KeySelector,
     ) {
-        let rows: Vec<KeyValue> = read.iter().map(|kv| kv.into_owned()).collect();
+        // The rows are slices of the replies (no copy): the cache shares them with the result.
+        let rows: Vec<KeyValue> = read.iter_shared().collect();
         let outcome = RangeReadOutcome {
             rows,
             more: read.more(),
@@ -784,7 +785,7 @@ impl RangeState {
         if is_first_greater_or_equal(&self.end) {
             let keep = self
                 .result
-                .partition_point(|kv| kv.key.as_slice() < self.end.key.as_slice());
+                .partition_point(|kv| &kv.key[..] < self.end.key.as_slice());
             if keep < self.result.len() {
                 more = false;
             }
@@ -1002,7 +1003,7 @@ impl RangeState {
             // The rows are descending: those at or after the begin come first.
             let keep = self
                 .result
-                .partition_point(|kv| kv.key.as_slice() >= self.begin.key.as_slice());
+                .partition_point(|kv| &kv.key[..] >= self.begin.key.as_slice());
             if keep < self.result.len() {
                 more = false;
             }
@@ -1260,14 +1261,14 @@ pub(crate) fn add_range_read_conflict(
         if reverse {
             // The rows are descending: the last one is the lowest key.
             if last.key < range_begin {
-                range_begin = last.key.clone();
+                range_begin = last.key.to_vec();
             }
             if end.offset > 0 && range_end <= first.key {
                 range_end = key_after(&first.key);
             }
         } else {
             if begin.offset <= 0 && first.key < range_begin {
-                range_begin = first.key.clone();
+                range_begin = first.key.to_vec();
             }
             if range_end <= last.key {
                 range_end = key_after(&last.key);

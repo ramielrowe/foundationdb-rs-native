@@ -2,6 +2,8 @@
 
 use core::iter::FusedIterator;
 
+use bytes::Bytes;
+
 use super::Cursor;
 use crate::{Decode, DecodeError, Encode, EncodeError, ObjectRef, Reader, Shape, Wire, Writer};
 
@@ -26,8 +28,8 @@ impl<'a> KeyValueRef<'a> {
     /// Copies the key and value (`KeyValue`, a `Standalone<KeyValueRef>`).
     pub fn into_owned(self) -> KeyValue {
         KeyValue {
-            key: self.key.to_vec(),
-            value: self.value.to_vec(),
+            key: Bytes::copy_from_slice(self.key),
+            value: Bytes::copy_from_slice(self.value),
         }
     }
 }
@@ -59,18 +61,34 @@ impl<'de: 'a, 'a> Decode<'de> for KeyValueRef<'a> {
     }
 }
 
-/// FDB's `KeyValue` (`Standalone<KeyValueRef>`): an owned key and value.
+/// FDB's `KeyValue` (`Standalone<KeyValueRef>`): a key and a value that own their bytes.
+///
+/// The bytes are [`Bytes`]: reference-counted, and possibly a slice of a larger shared
+/// buffer (the rows a [`SharedKeyValueVector`] gives are slices of one reply, as C++'s rows
+/// point into the reply's arena). Cloning a pair is two reference counts, not a copy. A pair
+/// keeps the whole buffer it is a slice of alive; copy it
+/// ([`Bytes::copy_from_slice`]) to keep a few rows of a large read for long.
+///
+/// ```
+/// use fdb_native_wire::KeyValue;
+///
+/// let kv = KeyValue::new(b"key".to_vec(), &b"value"[..]);
+/// assert_eq!(kv.key, b"key"[..]);
+/// assert_eq!(&kv.value[..], b"value");
+/// assert_eq!(kv.borrowed().value, b"value");
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyValue {
     /// The key.
-    pub key: Vec<u8>,
+    pub key: Bytes,
     /// The value.
-    pub value: Vec<u8>,
+    pub value: Bytes,
 }
 
 impl KeyValue {
-    /// A pair that owns its bytes.
-    pub fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> KeyValue {
+    /// A pair of these bytes (a `Vec<u8>`, a `&'static [u8]`, a `String` or a [`Bytes`]
+    /// are taken without a copy; [`KeyValueRef::into_owned`] copies borrowed ones).
+    pub fn new(key: impl Into<Bytes>, value: impl Into<Bytes>) -> KeyValue {
         KeyValue {
             key: key.into(),
             value: value.into(),
@@ -454,6 +472,145 @@ impl<'de> Decode<'de> for KeyValueVector {
     }
 }
 
+/// A validated pre-serialized key-value vector in a shared buffer ([`Bytes`]), for keeping
+/// a decoded reply's rows without copying them one by one: [`iter`](Self::iter) borrows the
+/// pairs, and [`shared`](Self::shared) gives them as [`KeyValue`]s that are slices of the
+/// buffer (a reference count each, no allocation).
+///
+/// [`slice_of`](Self::slice_of) takes the payload out of the received message's buffer
+/// without a copy; [`copy_from`](Self::copy_from) copies it once.
+///
+/// ```
+/// use bytes::Bytes;
+/// use fdb_native_wire::{KeyValueRef, KeyValueVector, KeyValueVectorRef, SharedKeyValueVector};
+///
+/// let message = Bytes::from(KeyValueVector::from_pairs([KeyValueRef::new(b"a", b"1")])?.into_payload());
+/// let view = KeyValueVectorRef::parse(&message)?;
+/// let rows = SharedKeyValueVector::slice_of(&message, view);
+/// let kv = rows.shared().next().unwrap();
+/// assert_eq!((&kv.key[..], &kv.value[..]), (&b"a"[..], &b"1"[..]));
+/// // The row is a slice of the message, not a copy.
+/// assert_eq!(kv.key.as_ptr(), message[8..].as_ptr());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SharedKeyValueVector {
+    /// The whole payload, count included; validated.
+    payload: Bytes,
+    count: u32,
+}
+
+impl Default for SharedKeyValueVector {
+    fn default() -> Self {
+        SharedKeyValueVector {
+            payload: Bytes::from_static(&EMPTY_PAYLOAD),
+            count: 0,
+        }
+    }
+}
+
+impl SharedKeyValueVector {
+    /// The pairs of `view`, which borrows from `buffer`: the payload becomes a slice of
+    /// `buffer` (no copy). A `view` that does not borrow from `buffer` is copied.
+    pub fn slice_of(buffer: &Bytes, view: KeyValueVectorRef<'_>) -> SharedKeyValueVector {
+        let base = buffer.as_ptr() as usize;
+        let start = view.payload.as_ptr() as usize;
+        let inside = start >= base
+            && start
+                .checked_add(view.payload.len())
+                .is_some_and(|end| end <= base + buffer.len());
+        if !inside {
+            return SharedKeyValueVector::copy_from(view);
+        }
+        SharedKeyValueVector {
+            payload: buffer.slice_ref(view.payload),
+            count: view.count,
+        }
+    }
+
+    /// The pairs of `view`, copied into a buffer of their own.
+    pub fn copy_from(view: KeyValueVectorRef<'_>) -> SharedKeyValueVector {
+        SharedKeyValueVector {
+            payload: Bytes::copy_from_slice(view.payload),
+            count: view.count,
+        }
+    }
+
+    /// The number of pairs.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether there are no pairs.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The blob payload, the count included.
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    /// Views the pairs.
+    pub fn borrowed(&self) -> KeyValueVectorRef<'_> {
+        KeyValueVectorRef {
+            payload: &self.payload,
+            count: self.count,
+        }
+    }
+
+    /// The pairs in order, borrowed.
+    pub fn iter(&self) -> KeyValueIter<'_> {
+        self.borrowed().iter()
+    }
+
+    /// The pairs in order, each a [`KeyValue`] whose key and value are slices of the
+    /// buffer.
+    pub fn shared(&self) -> SharedKeyValueIter<'_> {
+        SharedKeyValueIter {
+            payload: &self.payload,
+            inner: self.iter(),
+        }
+    }
+}
+
+impl From<KeyValueVector> for SharedKeyValueVector {
+    /// Takes the vector's buffer (no copy).
+    fn from(v: KeyValueVector) -> Self {
+        SharedKeyValueVector {
+            payload: Bytes::from(v.bytes),
+            count: v.count,
+        }
+    }
+}
+
+/// The pairs of a [`SharedKeyValueVector`] as [`KeyValue`]s that share its buffer.
+#[derive(Clone, Debug)]
+pub struct SharedKeyValueIter<'a> {
+    payload: &'a Bytes,
+    inner: KeyValueIter<'a>,
+}
+
+impl Iterator for SharedKeyValueIter<'_> {
+    type Item = KeyValue;
+
+    fn next(&mut self) -> Option<KeyValue> {
+        let kv = self.inner.next()?;
+        Some(KeyValue {
+            key: self.payload.slice_ref(kv.key),
+            value: self.payload.slice_ref(kv.value),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for SharedKeyValueIter<'_> {}
+
+impl FusedIterator for SharedKeyValueIter<'_> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +671,54 @@ mod tests {
             KeyValueVectorRef::parse(&[0; 4]).unwrap(),
             KeyValueVectorRef::EMPTY
         );
+    }
+
+    #[test]
+    fn shared_vector_slices_the_message_buffer() {
+        let buf = KeyValueVector::from_pairs([
+            KeyValueRef::new(b"ab", b""),
+            KeyValueRef::new(b"", b"xyz"),
+            KeyValueRef::new(b"k", b"v"),
+        ])
+        .unwrap();
+        // A message with the payload in its middle.
+        let mut message = b"head".to_vec();
+        message.extend_from_slice(buf.payload());
+        message.extend_from_slice(b"tail");
+        let message = Bytes::from(message);
+        let view = KeyValueVectorRef::parse(&message[4..message.len() - 4]).unwrap();
+        let shared = SharedKeyValueVector::slice_of(&message, view);
+        assert_eq!(shared.len(), 3);
+        assert_eq!(shared.borrowed(), view);
+        assert_eq!(shared.payload().as_ptr(), message[4..].as_ptr());
+        assert_eq!(
+            shared.iter().collect::<Vec<_>>(),
+            view.iter().collect::<Vec<_>>()
+        );
+        let rows: Vec<KeyValue> = shared.shared().collect();
+        assert_eq!(
+            rows,
+            view.iter().map(KeyValueRef::into_owned).collect::<Vec<_>>()
+        );
+        // Not copies: the key and value of the last row point into the message.
+        assert_eq!(
+            rows[2].key.as_ptr(),
+            view.iter().last().unwrap().key.as_ptr()
+        );
+        assert_eq!(shared.shared().len(), 3);
+
+        // A view of another buffer is copied.
+        let other = SharedKeyValueVector::slice_of(&Bytes::from_static(b"x"), view);
+        assert_eq!(other, shared);
+        assert_ne!(other.payload().as_ptr(), shared.payload().as_ptr());
+        assert_eq!(SharedKeyValueVector::copy_from(view), shared);
+
+        let owned: SharedKeyValueVector = buf.clone().into();
+        assert_eq!(owned.borrowed(), buf.borrowed());
+        assert_eq!(
+            SharedKeyValueVector::default().borrowed(),
+            KeyValueVectorRef::EMPTY
+        );
+        assert!(SharedKeyValueVector::default().shared().next().is_none());
     }
 }

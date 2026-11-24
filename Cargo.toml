@@ -20,6 +20,9 @@ fdb-native-transport = { version = "0.0.0", path = "crates/fdb-native-transport"
 # Persistent ordered map (MIT) for the client's write map: O(log n) structural sharing, so a
 # snapshot iterator makes the next write cost a path copy, not a copy of the whole map. MSRV 1.85.
 rpds = "1.2.1"
+# Shared byte buffers (MIT, no dependencies, MSRV 1.57): the rows of a range read are slices of
+# the reply they came in (`KeyValue`), so a row costs a reference count, not two allocations.
+bytes = "1.12.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -60,7 +60,7 @@ fn exact(limit: u32) -> RangeOptions {
 }
 
 fn keys(rows: &[KeyValue]) -> Vec<Vec<u8>> {
-    rows.iter().map(|kv| kv.key.clone()).collect()
+    rows.iter().map(|kv| kv.key.to_vec()).collect()
 }
 
 /// Writes `pairs` in a transaction of its own.

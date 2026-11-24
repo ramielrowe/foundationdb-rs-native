@@ -10,7 +10,7 @@
 //!
 //! | C++ type | Rust type | where it travels |
 //! | --- | --- | --- |
-//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` | [`KeyValueVectorRef`] (borrowed), [`KeyValueVector`] (owned) | `GetKeyValuesReply::data`, `GetKeyValuesStreamReply::data` |
+//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` | [`KeyValueVectorRef`] (borrowed), [`KeyValueVector`] (owned), [`SharedKeyValueVector`] (shared buffer) | `GetKeyValuesReply::data`, `GetKeyValuesStreamReply::data` |
 //! | `VersionVector` | [`VersionVector`] (with [`Tag`]) | `ssLatestCommitVersions` of the read requests, `GetReadVersionReply::ssVersionVectorDelta` |
 //! | `TagSet` | [`TagSetRef`] (borrowed), [`TagSet`] (owned) | `Optional<TagSet> tags` of the read requests, `CommitTransactionRequest::tagSet` |
 //! | `IdempotencyIdRef` | [`IdempotencyIdRef`] (borrowed), [`IdempotencyId`] (owned) | `CommitTransactionRequest::idempotencyId` |
@@ -30,7 +30,8 @@
 //!
 //! Memory used by a decode, as a multiple of the blob (the blob itself is bounded by the
 //! message size and the reader's work limit; bound untrusted messages): the KV view and
-//! `IdempotencyIdRef` borrow it (0, and `KeyValueVector` and `IdempotencyId` copy it, 1);
+//! `IdempotencyIdRef` borrow it (0, and `KeyValueVector` and `IdempotencyId` copy it, 1;
+//! `SharedKeyValueVector` shares the message's buffer, 0, or copies it, 1);
 //! a `VersionVector` keeps 16 bytes per entry and an entry takes at least 2 bytes of the
 //! blob (a 1-byte tag id and delta), so at most 8; a `TagSetRef` keeps a 16-byte slice per
 //! tag and a tag takes at least 1 byte (an empty tag), so at most 16, and an owned
@@ -56,7 +57,10 @@ mod tag_set;
 mod version_vector;
 
 pub use idempotency_id::{IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId};
-pub use kv::{KeyValue, KeyValueIter, KeyValueRef, KeyValueVector, KeyValueVectorRef};
+pub use kv::{
+    KeyValue, KeyValueIter, KeyValueRef, KeyValueVector, KeyValueVectorRef, SharedKeyValueIter,
+    SharedKeyValueVector,
+};
 pub use tag::Tag;
 pub use tag_set::{TagSet, TagSetRef};
 pub use version_vector::{INVALID_VERSION, TAG_LOCALITY_INVALID, Version, VersionVector};

@@ -193,7 +193,7 @@ fn fge(k: &[u8]) -> KeySelector {
 }
 
 fn keys_of(rows: &[KeyValue]) -> Vec<Vec<u8>> {
-    rows.iter().map(|kv| kv.key.clone()).collect()
+    rows.iter().map(|kv| kv.key.to_vec()).collect()
 }
 
 fn db(pairs: &[(&[u8], &[u8])]) -> BTreeMap<Vec<u8>, Vec<u8>> {

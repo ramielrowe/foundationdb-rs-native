@@ -1003,8 +1003,11 @@ async fn check(s: &Shared) -> String {
                 }
                 Ok(Snapshot {
                     counter: i64::from_le_bytes(counter[..8].try_into().unwrap()),
-                    marks: marks.into_iter().map(|kv| kv.key).collect(),
-                    xfers: xfers.into_iter().map(|kv| (kv.key, kv.value)).collect(),
+                    marks: marks.into_iter().map(|kv| kv.key.to_vec()).collect(),
+                    xfers: xfers
+                        .into_iter()
+                        .map(|kv| (kv.key.to_vec(), kv.value.to_vec()))
+                        .collect(),
                     balances,
                 })
             }

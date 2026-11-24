@@ -40,7 +40,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use fdb_native_wire::KeyValue;
+use fdb_native_wire::{Bytes, KeyValue};
 
 /// `allKeys.end`: the end of the key space a transaction can read (`\xff\xff`).
 const ALL_KEYS_END: &[u8] = b"\xff\xff";
@@ -149,6 +149,15 @@ impl<'a> ExtKey<'a> {
 
 impl<'a> From<&'a [u8]> for ExtKey<'a> {
     fn from(base: &'a [u8]) -> ExtKey<'a> {
+        ExtKey {
+            base,
+            extra_zero_bytes: 0,
+        }
+    }
+}
+
+impl<'a> From<&'a Bytes> for ExtKey<'a> {
+    fn from(base: &'a Bytes) -> ExtKey<'a> {
         ExtKey {
             base,
             extra_zero_bytes: 0,
@@ -289,7 +298,10 @@ impl SnapshotCache {
         let mut end = Vec::with_capacity(key.len() + 1);
         end.extend_from_slice(key);
         end.push(0);
-        let values = value.map(|v| KeyValue::new(key, v)).into_iter().collect();
+        let values = value
+            .map(|v| KeyValue::new(Bytes::copy_from_slice(key), Bytes::copy_from_slice(v)))
+            .into_iter()
+            .collect();
         self.entries.insert(key.to_vec(), Entry { end, values });
         true
     }
@@ -342,10 +354,8 @@ impl SnapshotCache {
         if new_begin >= new_end {
             return false;
         }
-        let lo = rows.partition_point(|kv| kv.key.as_slice() < new_begin);
-        let hi = rows
-            .partition_point(|kv| kv.key.as_slice() < new_end)
-            .max(lo);
+        let lo = rows.partition_point(|kv| &kv.key[..] < new_begin);
+        let hi = rows.partition_point(|kv| &kv.key[..] < new_end).max(lo);
         let new_end = new_end.to_vec();
         rows.truncate(hi);
         rows.drain(..lo);
@@ -443,7 +453,7 @@ impl SnapshotCache {
                     "value outside its entry"
                 );
                 if let Some(p) = prev_key {
-                    assert!(p < kv.key.as_slice(), "values not ascending");
+                    assert!(p < &kv.key[..], "values not ascending");
                 }
                 prev_key = Some(&kv.key);
             }
@@ -610,7 +620,7 @@ impl<'a> SnapshotCacheIter<'a> {
                 self.offset = 1; // unreachable: the last entry begins at \xff\xff > key
             }
         } else {
-            let idx = entry.values.partition_point(|kv| kv.key.as_slice() < key);
+            let idx = entry.values.partition_point(|kv| &kv.key[..] < key);
             let hit = entry.values.get(idx).is_some_and(|kv| kv.key == key);
             self.offset = idx * 2 + 1 + usize::from(hit);
         }
@@ -749,7 +759,7 @@ pub(crate) fn known_key_range(
     }
 
     if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
-        begin_key = begin_key.min(first.key.as_slice());
+        begin_key = begin_key.min(&first.key[..]);
         end_key = if let Some(rt) = outcome.read_through {
             end_key.max(ExtKey::from(rt))
         } else if !outcome.more && ExtKey::from(&last.key) < end_key {
@@ -789,7 +799,7 @@ pub(crate) fn known_key_range_back(
     if let (Some(first), Some(last)) = (outcome.rows.first(), outcome.rows.last()) {
         begin_key = if let Some(rt) = outcome.read_through {
             rt.min(begin_key)
-        } else if !outcome.more && last.key.as_slice() > begin_key {
+        } else if !outcome.more && &last.key[..] > begin_key {
             begin_key
         } else {
             &last.key

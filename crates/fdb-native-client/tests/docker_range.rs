@@ -138,7 +138,7 @@ async fn docker_get_range_matches_fdbcli() {
     }
     let all = parse_getrange(&cli(&fdb, "getrange gr/ gr0 10000").await);
     assert_eq!(all.len(), COUNT);
-    let keys: Vec<Vec<u8>> = all.iter().map(|kv| kv.key.clone()).collect();
+    let keys: Vec<Vec<u8>> = all.iter().map(|kv| kv.key.to_vec()).collect();
     let mut reversed = all.clone();
     reversed.reverse();
 

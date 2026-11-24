@@ -292,7 +292,7 @@ macro_rules! transaction_struct {
         ///         &RangeOptions::default(),
         ///     )
         ///     .await?;
-        /// assert!(range.kvs.iter().any(|kv| kv.key == b"c"));
+        /// assert!(range.kvs.iter().any(|kv| kv.key == b"c"[..]));
         /// tx.commit().await?;
         /// # let _ = (a, b);
         /// # Ok(())

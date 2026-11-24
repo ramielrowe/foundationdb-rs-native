@@ -2,7 +2,6 @@
 //! `fdb_transaction_get_range`), and the streams of batches and of rows that follow the
 //! bindings' iteration ([`RangeStream`], [`KeyValueStream`]).
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -314,17 +313,10 @@ impl<R: Runtime> Transaction<R> {
         let more = read.more();
         let mut kvs = read.into_key_values();
         let max_read_key = self.max_read_key_now(&start);
-        if !options.reverse
-            && kvs
-                .last()
-                .is_some_and(|kv| kv.key.as_slice() >= max_read_key)
-        {
+        if !options.reverse && kvs.last().is_some_and(|kv| &kv.key[..] >= max_read_key) {
             // `readThrough`: the rows in keys the transaction may not read are dropped, and
             // the range is then exhausted.
-            while kvs
-                .last()
-                .is_some_and(|kv| kv.key.as_slice() >= max_read_key)
-            {
+            while kvs.last().is_some_and(|kv| &kv.key[..] >= max_read_key) {
                 kvs.pop();
             }
             return Ok(RangeResult { kvs, more: false });
@@ -441,9 +433,9 @@ impl<R: Runtime> RangeStream<R> {
             self.options.limit -= read;
         }
         if self.options.reverse {
-            self.end = KeySelector::first_greater_or_equal(last.key.clone());
+            self.end = KeySelector::first_greater_or_equal(last.key.to_vec());
         } else {
-            self.begin = KeySelector::first_greater_than(last.key.clone());
+            self.begin = KeySelector::first_greater_than(last.key.to_vec());
         }
         self.options.iteration = self.options.iteration.saturating_add(1);
         true
@@ -516,14 +508,15 @@ impl<R: Runtime> Stream for RangeStream<R> {
 #[must_use = "streams do nothing unless polled"]
 pub struct KeyValueStream<R: Runtime> {
     batches: RangeStream<R>,
-    rows: VecDeque<KeyValue>,
+    /// The rest of the current batch.
+    rows: std::vec::IntoIter<KeyValue>,
 }
 
 impl<R: Runtime> fmt::Debug for KeyValueStream<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyValueStream")
             .field("batches", &self.batches)
-            .field("buffered", &self.rows.len())
+            .field("buffered", &self.rows.as_slice().len())
             .finish()
     }
 }
@@ -532,7 +525,7 @@ impl<R: Runtime> KeyValueStream<R> {
     fn new(batches: RangeStream<R>) -> KeyValueStream<R> {
         KeyValueStream {
             batches,
-            rows: VecDeque::new(),
+            rows: Vec::new().into_iter(),
         }
     }
 }
@@ -545,14 +538,14 @@ impl<R: Runtime> Stream for KeyValueStream<R> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         loop {
-            if let Some(row) = this.rows.pop_front() {
+            if let Some(row) = this.rows.next() {
                 return Poll::Ready(Some(Ok(row)));
             }
             match Pin::new(&mut this.batches).poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(Some(Ok(batch))) => this.rows.extend(batch.kvs),
+                Poll::Ready(Some(Ok(batch))) => this.rows = batch.kvs.into_iter(),
             }
         }
     }

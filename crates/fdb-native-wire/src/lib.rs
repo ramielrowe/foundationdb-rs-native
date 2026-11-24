@@ -138,7 +138,7 @@
 //!
 //! | C++ | Rust |
 //! | --- | --- |
-//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` (`GetKeyValuesReply::data`) | [`KeyValueVectorRef`] / [`KeyValueVector`] |
+//! | `VectorRef<KeyValueRef, VecSerStrategy::String>` (`GetKeyValuesReply::data`) | [`KeyValueVectorRef`] / [`KeyValueVector`] ([`SharedKeyValueVector`]: in a shared buffer) |
 //! | `VersionVector` (with `Tag`) | [`VersionVector`] ([`Tag`]) |
 //! | `TagSet` | [`TagSetRef`] / [`TagSet`] |
 //! | `IdempotencyIdRef` | [`IdempotencyIdRef`] / [`IdempotencyId`] |
@@ -224,11 +224,13 @@ mod writer;
 #[path = "private.rs"]
 pub mod __private;
 
+/// The shared byte buffers of [`KeyValue`] and [`SharedKeyValueVector`].
+pub use bytes::Bytes;
 pub use codec::{Decode, DecodeOwned, Encode, Wire};
 pub use codecs::{
     INVALID_VERSION, IdempotencyId, IdempotencyIdRef, InvalidIdempotencyId, KeyValue, KeyValueIter,
-    KeyValueRef, KeyValueVector, KeyValueVectorRef, TAG_LOCALITY_INVALID, Tag, TagSet, TagSetRef,
-    Version, VersionVector,
+    KeyValueRef, KeyValueVector, KeyValueVectorRef, SharedKeyValueIter, SharedKeyValueVector,
+    TAG_LOCALITY_INVALID, Tag, TagSet, TagSetRef, Version, VersionVector,
 };
 pub use error::{DecodeError, EncodeError, StrictCheck};
 #[cfg(feature = "derive")]
