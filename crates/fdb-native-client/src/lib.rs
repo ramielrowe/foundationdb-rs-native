@@ -89,6 +89,12 @@ pub mod commit;
 pub mod database;
 pub mod error;
 pub mod read;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "the RYW layer is built up piece by piece; the read path (ygr.3) consumes these"
+)]
+mod ryw;
 pub mod transaction;
 pub mod watch;
 
