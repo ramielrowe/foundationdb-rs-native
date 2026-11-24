@@ -1182,6 +1182,35 @@ async fn the_deferred_error_comes_before_the_cancellation() {
         tx.get_read_version().await.unwrap_err().code(),
         codes::KEY_TOO_LARGE
     );
+    // The commit too (`ThreadSafeTransaction::commit` checks the deferred error first): the
+    // bindingtester's `api` test, seed 1004 at 2000 operations on 8.0, sets an invalid read
+    // version (`version_invalid`, deferred), cancels, and commits.
+    assert_eq!(tx.commit().await.unwrap_err().code(), codes::KEY_TOO_LARGE);
+    let tx = env.db.create_transaction();
+    tx.set_read_version(-1);
+    tx.cancel();
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    assert_eq!(
+        tx.get_versionstamp().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    // A timeout that has passed does not hide it either.
+    let tx = env.db.create_transaction();
+    tx.set_option(TransactionOption::Timeout(Duration::from_millis(10)))
+        .unwrap();
+    tx.set_read_version(0);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        tx.commit().await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
+    assert_eq!(
+        tx.get(b"k").await.unwrap_err().code(),
+        codes::VERSION_INVALID
+    );
 }
 
 /// A handle of an earlier `run` attempt cannot reach the attempt in progress.

@@ -1436,12 +1436,30 @@ impl<R: Runtime> Transaction<R> {
     /// been sent, that error [`is_maybe_committed`](Error::is_maybe_committed).
     pub async fn commit(&self) -> Result<CommitResult, Error> {
         let sent = Arc::new(AtomicBool::new(false));
-        let epoch = self.state().epoch;
-        let result = match self.guarded(epoch, self.commit_inner(&sent, epoch)).await {
-            Ok(result) => result,
-            // Interrupted (cancelled, timed out, reset) once the request may have left.
-            Err(e) if sent.load(Ordering::SeqCst) => Err(e.into_maybe_committed()),
-            Err(e) => Err(e),
+        let (epoch, deferred) = {
+            let mut state = self.state();
+            // `ThreadSafeTransaction::commit` checks the deferred error first
+            // (`checkDeferredError`), before the transaction's cancellation or timeout,
+            // as every other operation does here.
+            let deferred = match self.is_stale(&state) {
+                true => None,
+                false => state.deferred.clone(),
+            };
+            if let Some(e) = &deferred {
+                // C++ leaves the `getVersionstamp` futures pending until the reset; they
+                // get the deferred error here, as the commit never will.
+                state.resolve_versionstamp(Err(e.clone()));
+            }
+            (state.epoch, deferred)
+        };
+        let result = match deferred {
+            Some(e) => Err(e),
+            None => match self.guarded(epoch, self.commit_inner(&sent, epoch)).await {
+                Ok(result) => result,
+                // Interrupted (cancelled, timed out, reset) once the request may have left.
+                Err(e) if sent.load(Ordering::SeqCst) => Err(e.into_maybe_committed()),
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = &result {
             // `commitAndWatch`: the watches fail with the commit's error.
