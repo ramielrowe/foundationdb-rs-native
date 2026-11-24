@@ -20,7 +20,7 @@ use fdb_native_schema::domain::{
 };
 use fdb_native_schema::{Request, SchemaVersion};
 use fdb_native_transport::connection::{PING_REPLY_OK, PingRequest, well_known};
-use fdb_native_transport::runtime::{Instant, Runtime, TokioRuntime, TokioTask};
+use fdb_native_transport::runtime::{Instant, Runtime, TokioRuntime};
 use fdb_native_transport::{Checksum, ConnectPacket, FrameConfig, FrameDecoder};
 use fdb_native_wire::{
     Endpoint, FdbError, NetworkAddress, NetworkAddressList, ProtocolVersion, Uid,
@@ -122,44 +122,52 @@ impl AsyncWrite for MemStream {
     }
 }
 
-/// Time and tasks from tokio, connections and names from a [`Net`].
+/// Time and tasks from `R` (tokio by default), connections and names from a [`Net`]. The
+/// fake servers always run on tokio, whatever `R` is: they only share streams and channels
+/// with the client under test, which are runtime-agnostic.
 #[derive(Clone)]
-pub struct MemRuntime {
-    tokio: TokioRuntime,
+pub struct MemRuntime<R: Runtime = TokioRuntime> {
+    inner: R,
     net: Arc<Net>,
 }
 
 impl MemRuntime {
     pub fn new(net: &Arc<Net>) -> MemRuntime {
+        MemRuntime::with_runtime(net, TokioRuntime::new())
+    }
+}
+
+impl<R: Runtime> MemRuntime<R> {
+    pub fn with_runtime(net: &Arc<Net>, inner: R) -> MemRuntime<R> {
         MemRuntime {
-            tokio: TokioRuntime::new(),
+            inner,
             net: net.clone(),
         }
     }
 }
 
-impl Runtime for MemRuntime {
+impl<R: Runtime> Runtime for MemRuntime<R> {
     type Stream = MemStream;
-    type Task<T: Send + 'static> = TokioTask<T>;
+    type Task<T: Send + 'static> = R::Task<T>;
 
     fn now(&self) -> Instant {
-        self.tokio.now()
+        self.inner.now()
     }
 
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
-        self.tokio.sleep(duration)
+        self.inner.sleep(duration)
     }
 
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
-        self.tokio.sleep_until(deadline)
+        self.inner.sleep_until(deadline)
     }
 
-    fn spawn<T, F>(&self, future: F) -> TokioTask<T>
+    fn spawn<T, F>(&self, future: F) -> R::Task<T>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.tokio.spawn(future)
+        self.inner.spawn(future)
     }
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<MemStream> {

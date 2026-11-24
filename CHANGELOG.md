@@ -43,7 +43,9 @@ link `libfdb_c`.
   `not_committed` (1020) that is maybe committed.
 * **TLS** (`tls` feature): `:tls` coordinators, `TlsConfig` and FDB's `FDB_TLS_*` variables,
   FDB's peer verification rules.
-* **Runtime**: runtime-agnostic (`runtime::Runtime`), tokio by default (`tokio` feature).
+* **Runtime**: runtime-agnostic (`runtime::Runtime`), tokio by default (`tokio` feature); a
+  second adapter for smol (`smol` feature: `SmolRuntime` over async-io, async-executor and
+  `blocking`, no tokio), whose test suites run in CI.
 * The read path (GRV batching, the location cache, load balancing as `LoadBalance.actor.h`
   does) and the commit path (proxies, `commit_unknown_result` handling) are ports of the C++
   client; they are public as the lower-layer modules `read`, `commit` and `cluster`.
@@ -58,7 +60,7 @@ with API 520+ offsets) and `Subspace`.
 ### fdb-native-transport, fdb-native-schema, fdb-native-wire
 
 FDB's connection protocol (ConnectPacket, framing with checksums, the connection monitor's
-pings, TLS with rustls), the per-release message schemas of 7.4 and 8.0, and the flatbuffers dialect
+pings, TLS with rustls, `Runtime` adapters for tokio and smol), the per-release message schemas of 7.4 and 8.0, and the flatbuffers dialect
 and binary codecs, checked against the C++ readers with golden vectors.
 
 ### API decisions made before the first release

@@ -148,8 +148,13 @@ The client is async and runtime-agnostic: it is written against the
 `fdb_native_transport::runtime::Runtime` trait (TCP connect, timers, task spawning, DNS),
 re-exported as `fdb_native_client::runtime`. The tokio adapter, `TokioRuntime`, is the default
 (`tokio` feature): `Database::open` uses the current tokio runtime (multi-threaded or
-current-thread). Any other executor works through `Database::open_with` and an adapter of the
-trait; futures are `Send`, so thread-local executors are not supported.
+current-thread). The second adapter is smol's, `SmolRuntime` (`smol` feature: async-io sockets and
+timers, async-executor tasks, no tokio): `Database::open_with(SmolRuntime::new(), ..)` runs the
+client's tasks on a process-wide executor with its own threads, so it works from any thread (see
+`examples/smol.rs`); `SmolRuntime::with_executor` runs them on an executor you drive. Any other
+executor works through `Database::open_with` and an adapter of the trait; futures are `Send`, so
+thread-local executors are not supported. The transport and client test suites run on both
+adapters in CI.
 
 A database spawns its background tasks when it is opened (the coordinators' long poll, a
 connection task per server), so open it inside the runtime. Reads run as tasks of their own.
@@ -162,6 +167,7 @@ connection task per server), so open it inside the runtime. Reads run as tasks o
 | Feature | Default | What it does |
 | --- | --- | --- |
 | `tokio` | yes | `Database::open` / `from_connection_string` on tokio, `TokioRuntime` as the default runtime type |
+| `smol` | no | `SmolRuntime`, the smol adapter, to open a `Database` over with `Database::open_with`; independent of `tokio` (`default-features = false, features = ["smol"]` builds without tokio) |
 | `tls` | no | TLS clusters (`:tls` coordinators) with rustls; certificates from `DatabaseOptions::tls` (`TlsConfig`) or FDB's `FDB_TLS_*` variables. Without it, a TLS cluster fails to open with `tls_error` (2107) |
 | `bench-internals` | no | a hidden facade for the RYW benchmarks; not part of the API |
 
@@ -212,6 +218,15 @@ FDB_GOLDEN_VECTORS_BIN=$PWD/tools/golden-vectors/build/golden-vectors \
   cargo nextest run -p fdb-native-wire --run-ignored only -E 'binary(cpp_crosscheck)'
 ```
 
+The smol adapter's tests (the adapter's own, the peer manager and client on smol against a fake
+cluster and TLS loopback, and docker tests of both) need the `smol` features:
+
+```bash
+cargo nextest run --workspace --features fdb-native-transport/smol,fdb-native-client/smol
+cargo nextest run --workspace --features fdb-native-transport/smol,fdb-native-client/smol \
+  --run-ignored only -E 'binary(docker_smol) | binary(smol_docker)'
+```
+
 Tests that need a live FoundationDB container are marked `#[ignore = "requires docker"]`.
 The `FDB_IMAGE` environment variable selects the server image
 (default `foundationdb/foundationdb:7.4.10`):
@@ -240,6 +255,7 @@ Lint and format checks, as run in CI:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features fdb-native-transport/tls,fdb-native-client/tls -- -D warnings
+cargo clippy --workspace --all-targets --features fdb-native-transport/smol,fdb-native-client/smol -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo build --workspace --examples
 ```
