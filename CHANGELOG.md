@@ -59,7 +59,9 @@ with API 520+ offsets) and `Subspace`.
 
 FDB's connection protocol (ConnectPacket, framing with checksums, the connection monitor's
 pings, TLS with rustls, `Runtime` adapters for tokio and smol), the per-release message schemas of 7.4 and 8.0, and the flatbuffers dialect
-and binary codecs, checked against the C++ readers with golden vectors.
+and binary codecs, checked against the C++ readers with golden vectors. As in C++, a peer made
+anew starts with its address available, and a failed peer that is referenced again is probed again
+(found by the deterministic simulation, `fdb-native-sim`, which is not published).
 
 ### API decisions made before the first release
 

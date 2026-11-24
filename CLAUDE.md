@@ -138,6 +138,29 @@ charges unchanged (`tools/golden-vectors/strict.h` mirrors them); `tests/bulk_ve
 bulk vector paths to the element-wise ones, and `tests/writer_reuse.rs` pins a reused `Writer` to a new one and
 the bytes of seeded messages (digests recorded from the pre-vvh.8 encoder).
 
+**Deterministic simulation** (`crates/fdb-native-sim`, dev-only, `publish = false`): the real
+client runs on `SimRuntime` (a seeded single-threaded executor with virtual time) against a model
+cluster on a fault-injecting in-memory network, all from one seed. `tests/sweep.rs` runs a seed
+sweep in the normal `cargo nextest run --workspace` (200 seeds, ~1 s on a laptop in debug; every
+tenth seed runs twice and must give the same trace hash) and asserts the invariants: at-most-once
+commits checked against the cluster's commit log, the bank workload's serializability, reads
+checked against the history, `on_error` backoff bounds, failure-monitor and load-balancing
+convergence, liveness after the faults heal, and no client task left after `Database::shutdown`.
+A failing seed prints its replay command:
+
+```bash
+FDB_SIM_SEEDS=2000 FDB_SIM_SEED_START=0 cargo nextest run -p fdb-native-sim --no-capture -E 'test(seed_sweep)'  # a bigger sweep (--release for 10^4+ seeds)
+FDB_SIM_SEED=1234 FDB_SIM_TRACE=1 cargo nextest run -p fdb-native-sim --no-capture -E 'test(replay_seed)'     # replay one seed with its trace (2: every poll and segment)
+```
+
+The seed decides the cluster's shape, the network's fault rates, the chaos schedule, the client's
+seeds and the stream's write promises (`seed % 4`: both `Runtime` safety constants true, both
+false, or one of each); `tests/faults.rs` turns write-time resets up under both settings. A client
+change that makes a seed nondeterministic (iterating a `HashMap` with effects, a `RandomState` RNG
+without a seed option) shows up as `NONDETERMINISTIC` in the sweep. The harness tolerates one known
+gap: the GRV batcher tasks outlive `Database::shutdown` until the database is dropped
+(`foundationdb-rs-native-x4q`).
+
 Tests run with [cargo-nextest](https://nexte.st/); config is in `.config/nextest.toml`
 (`default` and `ci` profiles). CI is `.github/workflows/ci.yml`.
 
@@ -153,6 +176,7 @@ targeting FDB 7.4 and 8.0 servers. Cargo workspace; all crates live under `crate
 - `fdb-native-tuple`: tuple and subspace layers; independent of the other crates.
 - `fdb-native-testkit`: Docker test harness (`publish = false`).
 - `fdb-native-stacktester`: binary for the bindingtester stack machine (`publish = false`).
+- `fdb-native-sim`: deterministic simulation (a seeded `Runtime`, a faulty network, a model cluster, workloads and invariants; `publish = false`); depends on `client`, `schema`, `transport`, `wire`.
 
 Outside the workspace, `tools/golden-vectors/` is a dev-only C++ tool that compiles FDB's
 flatbuffers headers and writes golden vectors to `tools/golden-vectors/fixtures/`. The fixtures
