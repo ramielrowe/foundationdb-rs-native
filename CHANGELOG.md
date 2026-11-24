@@ -116,6 +116,12 @@ These aligned behaviour with C++'s read-your-writes layer:
   progress end at once with `transaction_cancelled` (1025), also for a future the user still
   holds; nothing of the transaction outlives it (its tasks held it, and the database, until
   their reads ended).
+* **`get_versionstamp` after a sent commit was cut short is maybe committed.** When the
+  transaction is killed (`cancel`, the timeout, the drop of the last handle) after its commit
+  request may have reached a proxy, the future fails with that error marked
+  `is_maybe_committed()` (C++: a bare `transaction_cancelled`), as the commit's own result
+  already is; the stamp of a commit that may have succeeded is lost. Before the request was
+  sent the error is as before.
 * **Dropping a `watch` future before its read ends cancels the watch**: no read conflict
   range, no registration (the read went on and added its range), as C++'s `watch` actor is
   cancelled with its future.

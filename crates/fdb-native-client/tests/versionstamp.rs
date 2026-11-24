@@ -440,3 +440,74 @@ async fn an_unknown_commit_result_is_transaction_invalid_version_for_the_future(
         assert_eq!(tx.versionstamp(), None);
     }
 }
+
+/// A transaction killed (cancelled, timed out, its last handle dropped) after its commit
+/// request may have reached a proxy fails the `get_versionstamp` future maybe committed, as the
+/// commit's own error is: the commit may have succeeded and the stamp is lost, so a plain 1025
+/// would read as "nothing happened". Before the request was sent (the commit waits for its
+/// read version) the error is not maybe committed.
+#[tokio::test(start_paused = true)]
+async fn a_kill_after_the_commit_was_sent_fails_the_future_maybe_committed() {
+    use fdb_native_client::TransactionOption::Timeout;
+    #[derive(Clone, Copy, Debug)]
+    enum Kill {
+        Cancel,
+        Timeout,
+        /// The commit future is dropped (as an aborted task drops it), then the last handle.
+        DropTheHandles,
+    }
+    for schema in SCHEMAS {
+        let mut env = env(schema).await;
+        for kill in [Kill::Cancel, Kill::Timeout, Kill::DropTheHandles] {
+            for sent in [true, false] {
+                let what = format!("{schema} {kill:?} sent={sent}");
+                let tx = env.db.create_transaction();
+                if let Kill::Timeout = kill {
+                    tx.set_option(Timeout(Duration::from_secs(5))).unwrap();
+                }
+                tx.set(b"k", b"v");
+                let stamp = spawn(tx.get_versionstamp());
+                let commit = spawn({
+                    let tx = tx.clone();
+                    async move { tx.commit().await }
+                });
+                let grv = env.grv.next().await;
+                let _call = if sent {
+                    grv.reply_grv(100);
+                    Some(env.commit.next().await)
+                } else {
+                    None
+                };
+                let commit = match kill {
+                    Kill::Cancel => {
+                        tx.cancel();
+                        Some(commit)
+                    }
+                    Kill::Timeout => {
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        Some(commit)
+                    }
+                    Kill::DropTheHandles => {
+                        commit.abort();
+                        let _ = commit.await;
+                        drop(tx);
+                        None
+                    }
+                };
+                let e = done(stamp).await.unwrap_err();
+                let expected = match kill {
+                    Kill::Cancel | Kill::DropTheHandles => codes::TRANSACTION_CANCELLED,
+                    Kill::Timeout => codes::TRANSACTION_TIMED_OUT,
+                };
+                assert_eq!(e.code(), expected, "{what}: {e:?}");
+                assert_eq!(e.is_maybe_committed(), sent, "{what}: {e:?}");
+                if let Some(commit) = commit {
+                    // The commit's own error says the same.
+                    let c = done(commit).await.unwrap_err();
+                    assert_eq!(c.code(), expected, "{what}: {c:?}");
+                    assert_eq!(c.is_maybe_committed(), sent, "{what}: {c:?}");
+                }
+            }
+        }
+    }
+}

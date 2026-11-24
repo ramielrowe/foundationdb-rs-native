@@ -1928,3 +1928,58 @@ async fn a_read_future_no_longer_polled_does_not_hold_the_commit() {
 fn keys_list(keys: &[&[u8]]) -> Vec<Vec<u8>> {
     keys.iter().map(|k| k.to_vec()).collect()
 }
+
+/// A stream is a handle of the user: dropping the transaction (and its clones) while a stream
+/// is held does not cancel it (`RangeStream` holds a handle that counts, not a task's), so it
+/// reads its remaining batches (row streams and snapshot streams too).
+#[tokio::test(start_paused = true)]
+async fn a_range_stream_keeps_its_transaction_alive_after_the_other_handles_are_dropped() {
+    for schema in SCHEMAS {
+        let env = Env::new(schema, 1).await;
+        let all: Vec<Vec<u8>> = (0..60u8)
+            .map(|i| vec![b'a' + i / 10, b'0' + i % 10])
+            .collect();
+        for k in &all {
+            env.set_value(k, b"value");
+        }
+        let small = RangeOptions::default().mode(StreamingMode::Small);
+
+        // Batches: the first one read, then the transaction dropped.
+        let tx = env.transaction();
+        let mut batches = tx.get_ranges(fge(b""), fge(b"\xff"), small);
+        let first = within(
+            "first batch",
+            poll_fn(|cx| Pin::new(&mut batches).poll_next(cx)),
+        )
+        .await
+        .expect("a batch")
+        .unwrap();
+        assert!(first.more, "{schema}: the range has more batches");
+        let mut rows = first.kvs;
+        drop(tx);
+        for batch in collect(batches).await {
+            rows.extend(
+                batch
+                    .unwrap_or_else(|e| panic!("{schema}: after the drop: {e}"))
+                    .kvs,
+            );
+        }
+        assert_eq!(keys(&rows), all, "{schema}");
+
+        // Rows, and a snapshot stream.
+        let tx = env.transaction();
+        let rows = tx.get_ranges_keyvalues(fge(b""), fge(b"\xff"), small);
+        let snapshot = tx
+            .snapshot()
+            .get_ranges_keyvalues(fge(b""), fge(b"\xff"), small);
+        drop(tx);
+        for stream in [rows, snapshot] {
+            let rows: Vec<KeyValue> = collect(stream)
+                .await
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|e| panic!("{schema}: after the drop: {e}")))
+                .collect();
+            assert_eq!(keys(&rows), all, "{schema}");
+        }
+    }
+}

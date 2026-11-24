@@ -2738,3 +2738,29 @@ async fn the_size_limit_applies_to_what_the_commit_sends() {
         }
     }
 }
+
+/// `getMaxReadKey()` is looked at again after the wait of a read-your-writes read too
+/// (`ReadYourWrites.actor.cpp`: the selector and range reads): the `ReadSystemKeys` option
+/// set after the call and before the read's wait ends moves the bound the read resolves
+/// against from `\xff` to `\xff\xff`.
+#[tokio::test(start_paused = true)]
+async fn the_max_read_key_is_read_again_after_the_wait_of_a_ryw_read() {
+    for schema in [SchemaVersion::V7_4, SchemaVersion::V8_0] {
+        let env = Env::new(schema, 1).await;
+        env.set(&KEYS);
+        env.set(&[b"\xff/sys"]);
+        let tx = env.transaction();
+        assert_eq!(get_key(&tx, &fgt(b"x")).await, b"\xff", "{schema}: clamped");
+        let tx = env.transaction();
+        let reading = tx.get_key(&fgt(b"x"));
+        tx.set_option(TransactionOption::ReadSystemKeys).unwrap();
+        // The scan of `[x\0, \xff)` of the call finds nothing; what the selector then
+        // resolves to is the bound as it is after the wait (`getMaxReadKey()` again), which
+        // is `\xff\xff` now, not the `\xff` of the call.
+        assert_eq!(
+            within("get_key", reading).await.unwrap(),
+            KEY_SPACE_END,
+            "{schema}: the bound is read again after the wait"
+        );
+    }
+}
