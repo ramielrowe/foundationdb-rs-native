@@ -68,6 +68,7 @@ impl ServerInfo {
     }
 
     /// Where to send a `GetValueRequest`: the address and the `getValue` (base) token.
+    #[cfg(test)]
     pub(crate) fn target(&self) -> (NetworkAddress, Uid) {
         let interface = self.interface();
         (interface.address, interface.server.base.token)

@@ -357,14 +357,14 @@ impl LoadBalanced for GetKeyValues {
     type Output = KeyValuesReply;
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_key_values;
 
-    fn split(reply: GetKeyValuesReply<'_>) -> LoadBalancedReply<KeyValuesReply> {
+    fn split(reply: GetKeyValuesReply<'_>, keep: bool) -> LoadBalancedReply<KeyValuesReply> {
         (
             reply.penalty,
             reply.error.map(|e| e.code),
-            KeyValuesReply {
+            keep.then(|| KeyValuesReply {
                 data: reply.data.into_owned(),
                 more: reply.more,
-            },
+            }),
         )
     }
 }

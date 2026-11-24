@@ -129,6 +129,12 @@ impl Smoother {
 pub(crate) struct QueueData {
     /// Outstanding requests, each counted as the penalty it was sent with, smoothed.
     pub(crate) smooth_outstanding: Smoother,
+    /// How many requests are outstanding (counted by [`QueueModel::add_request`], released
+    /// by [`QueueModel::end_request`]). C++ has no such count: it keeps a `QueueData` as long
+    /// as the `QueueModel`. Here the data of endpoints nothing uses any more is pruned, and
+    /// an entry with outstanding requests must survive that, or their release would find no
+    /// entry (or a new one, which it would drive below zero).
+    outstanding: usize,
     pub(crate) latency: f64,
     /// The server's last reported penalty (1.0 by default).
     pub(crate) penalty: f64,
@@ -142,6 +148,7 @@ impl Default for QueueData {
     fn default() -> Self {
         QueueData {
             smooth_outstanding: Smoother::new(QUEUE_MODEL_SMOOTHING_AMOUNT),
+            outstanding: 0,
             latency: 0.001,
             penalty: 1.0,
             failed_until: 0.0,
@@ -151,8 +158,9 @@ impl Default for QueueData {
     }
 }
 
-/// `QueueModel` (`fdbrpc/QueueModel.cpp`), keyed by the endpoint token's `first`, with the
-/// second-request state (`secondMultiplier`, `secondBudget`).
+/// `QueueModel` (`fdbrpc/QueueModel.cpp`), keyed by the endpoint token's `first` (of the
+/// stream's own, adjusted endpoint: one server's `getValue`, `getKey` and `getKeyValues` are
+/// three entries, as `getAdjustedEndpoint` makes them), with the second-request state (`secondMultiplier`, `secondBudget`).
 #[derive(Debug)]
 pub(crate) struct QueueModel {
     data: HashMap<u64, QueueData>,
@@ -180,10 +188,15 @@ impl QueueModel {
         let d = self.data.entry(id).or_default();
         let penalty = d.penalty;
         d.smooth_outstanding.add_delta(penalty, now);
+        d.outstanding += 1;
         penalty
     }
 
-    /// `endRequest`.
+    /// `endRequest`. An endpoint with no data (never counted, or pruned: [`retain`] keeps
+    /// the ones with outstanding requests, so that is not expected) is left alone, not
+    /// created with a negative outstanding count.
+    ///
+    /// [`retain`]: Self::retain
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn end_request(
         &mut self,
@@ -195,8 +208,11 @@ impl QueueModel {
         future_version: bool,
         now: f64,
     ) {
-        let d = self.data.entry(id).or_default();
+        let Some(d) = self.data.get_mut(&id) else {
+            return;
+        };
         d.smooth_outstanding.add_delta(-delta, now);
+        d.outstanding = d.outstanding.saturating_sub(1);
         d.latency = if clean {
             latency
         } else {
@@ -224,9 +240,27 @@ impl QueueModel {
         self.data.len()
     }
 
-    /// Keeps the data of the endpoints `keep` accepts.
+    /// Keeps the data of the endpoints `keep` accepts, and of those with outstanding
+    /// requests (a lagging request can outlive the shard that used its endpoint).
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
-        self.data.retain(|id, _| keep(*id));
+        self.data.retain(|id, d| d.outstanding > 0 || keep(*id));
+    }
+
+    /// What the model knows of each endpoint, by token.
+    pub(crate) fn stats(&self) -> Vec<EndpointStats> {
+        let mut stats: Vec<EndpointStats> = self
+            .data
+            .iter()
+            .map(|(id, d)| EndpointStats {
+                token_first: *id,
+                latency: d.latency,
+                penalty: d.penalty,
+                outstanding: d.outstanding,
+                outstanding_total: d.smooth_outstanding.total,
+            })
+            .collect();
+        stats.sort_by_key(|e| e.token_first);
+        stats
     }
 
     /// `getMeasurement`.
@@ -272,6 +306,32 @@ fn second_delay_secs(best_time: f64, next_time: f64, multiplier: f64) -> Option<
     } else {
         Some(delay)
     }
+}
+
+/// What the queue model knows of one endpoint (`QueueData`), for tests.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EndpointStats {
+    /// The endpoint token's `first` (the model's key).
+    pub token_first: u64,
+    /// The latency of the last request that was measured.
+    pub latency: f64,
+    /// The last penalty the server reported.
+    pub penalty: f64,
+    /// How many requests are outstanding.
+    pub outstanding: usize,
+    /// The penalties of the outstanding requests, summed (not smoothed).
+    pub outstanding_total: f64,
+}
+
+/// What the load balancer is holding on to, for tests.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadBalanceStats {
+    /// The queue model's endpoints, by token.
+    pub endpoints: Vec<EndpointStats>,
+    /// Lagging requests that have not ended.
+    pub lagging_requests: usize,
 }
 
 /// `ModelHolder`: a request counted in the model, released once with its outcome, or as
@@ -324,14 +384,9 @@ impl<R: Runtime, W> ModelHolder<R, W> {
 
 impl<R: Runtime, W> Drop for ModelHolder<R, W> {
     fn drop(&mut self) {
-        if !self.released {
-            // `~ModelHolder`: unclean, no latency, no penalty. Time is not needed for that,
-            // except to update the smoother, which the next use does anyway.
-            let mut model = lock(&self.shared.model);
-            let d = model.data.entry(self.id).or_default();
-            let time = d.smooth_outstanding.time;
-            d.smooth_outstanding.add_delta(-self.delta, time);
-        }
+        // `~ModelHolder` is `release(false, false, -1.0, false)`: unclean, no latency, no
+        // penalty, with the smoother brought up to the current time.
+        self.release(false, false, -1.0, false);
     }
 }
 
@@ -704,8 +759,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
     /// `~RequestData` / `makeLaggingRequest` does. Only idempotent reads are sent this way;
     /// there is no `AtMostOnce` mode here (commits do not use this balancer).
     ///
-    /// The failure monitor is asked about the stream's own endpoint, as C++ does; the queue
-    /// model is kept per server (by its `getValue` token), where C++ keeps it per endpoint.
+    /// The failure monitor and the queue model are asked about the stream's own endpoint, as
+    /// in C++ (`getAdjustedEndpoint`): what is learned of `getKeyValues` does not drive the
+    /// hedging, penalties or `failed_until` of `getValue` and `getKey`.
     pub(crate) async fn load_balance<Q: LoadBalanced>(
         &self,
         location: &Location,
@@ -724,8 +780,9 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>> Shared<R, W> {
             .iter()
             .map(|s| s.target_for(Q::STREAM))
             .collect();
-        // The queue model's ids.
-        let ids: Vec<u64> = alternatives.iter().map(|s| s.target().1.first).collect();
+        // The queue model's ids: the token's `first` of the stream's own endpoint (as C++'s
+        // `getAdjustedEndpoint` makes it), so that each stream is modelled on its own.
+        let ids: Vec<u64> = targets.iter().map(|(_, token)| token.first).collect();
         let count_best = location.best_count.max(1);
         let (mut best_alt, mut next_alt) = {
             let mut rng = lock(&self.rng);
@@ -1056,7 +1113,7 @@ impl<R: Runtime, W: StreamWrapper<R::Stream>, Q: LoadBalanced> Drop for RequestD
         let task = self.shared.rt.spawn(async move {
             let (mut holder, result) = response.await;
             // Only what the model learns from it matters: the reply is not used.
-            let _ = check_and_process::<R, W, Q>(result, &mut holder, tried_all);
+            let _ = check_and_process::<R, W, Q>(result, &mut holder, tried_all, false);
         });
         self.shared.add_lagging(task);
     }
@@ -1067,24 +1124,19 @@ impl<R: Runtime, W> Shared<R, W> {
     /// can be cancelled with the reader. As C++ does, past
     /// `MAX_LAGGING_REQUESTS_OUTSTANDING` it cancels them all and starts over.
     fn add_lagging(&self, task: R::Task<()>) {
-        let mut lagging = lock(&self.lagging);
-        if lagging.tasks.len() >= lagging.prune_at {
-            lagging.tasks.retain(|t| !t.is_finished());
-            lagging.prune_at = (2 * lagging.tasks.len()).max(64);
-        }
-        if lagging.tasks.len() > MAX_LAGGING_REQUESTS_OUTSTANDING {
-            for old in lagging.tasks.drain(..) {
-                old.abort();
-            }
-            lagging.prune_at = 64;
-        }
-        lagging.tasks.push(task);
+        lock(&self.lagging).add(task, MAX_LAGGING_REQUESTS_OUTSTANDING);
     }
 
     /// Cancels the lagging requests (the reader ended).
     pub(super) fn abort_lagging(&self) {
-        for task in lock(&self.lagging).tasks.drain(..) {
-            task.abort();
+        lock(&self.lagging).abort_all();
+    }
+
+    /// What the queue model and the lagging requests hold, for tests.
+    pub(super) fn load_balance_stats(&self) -> LoadBalanceStats {
+        LoadBalanceStats {
+            endpoints: lock(&self.model).stats(),
+            lagging_requests: lock(&self.lagging).live(),
         }
     }
 }
@@ -1096,12 +1148,44 @@ pub(crate) struct Lagging<R: Runtime> {
     prune_at: usize,
 }
 
+/// The size of the task list at which finished tasks are first dropped from it.
+const LAGGING_PRUNE_AT: usize = 64;
+
 impl<R: Runtime> Default for Lagging<R> {
     fn default() -> Self {
         Lagging {
             tasks: Vec::new(),
-            prune_at: 64,
+            prune_at: LAGGING_PRUNE_AT,
         }
+    }
+}
+
+impl<R: Runtime> Lagging<R> {
+    /// Keeps `task`. Past `limit` requests that have not ended, cancels them all first (as
+    /// C++ does past `MAX_LAGGING_REQUESTS_OUTSTANDING`): the bound counts the live
+    /// requests, not the finished ones the list has not dropped yet.
+    pub(crate) fn add(&mut self, task: R::Task<()>, limit: usize) {
+        if self.tasks.len() >= self.prune_at || self.tasks.len() > limit {
+            self.tasks.retain(|t| !t.is_finished());
+            self.prune_at = (2 * self.tasks.len()).max(LAGGING_PRUNE_AT);
+        }
+        if self.tasks.len() > limit {
+            self.abort_all();
+        }
+        self.tasks.push(task);
+    }
+
+    /// Cancels every lagging request and starts over.
+    pub(crate) fn abort_all(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        self.prune_at = LAGGING_PRUNE_AT;
+    }
+
+    /// How many requests have not ended.
+    pub(crate) fn live(&self) -> usize {
+        self.tasks.iter().filter(|t| !t.is_finished()).count()
     }
 }
 
@@ -1119,7 +1203,7 @@ fn process<R: Runtime, W, Q: LoadBalanced>(
     tried_all: bool,
 ) -> Outcome<Q::Output> {
     let (mut holder, result) = sent;
-    check_and_process::<R, W, Q>(result, &mut holder, tried_all)
+    check_and_process::<R, W, Q>(result, &mut holder, tried_all, true)
 }
 
 /// A request [`Shared::load_balance`] sends to one stream of a shard's storage servers, whose
@@ -1129,19 +1213,20 @@ pub(crate) trait LoadBalanced: Request + Clone + Send + 'static {
     type Output;
     /// The stream (`StorageServerInterface`'s adjusted-endpoint index).
     const STREAM: u32;
-    /// The reply's penalty, error code and result.
-    fn split(reply: Self::Reply<'_>) -> LoadBalancedReply<Self::Output>;
+    /// The reply's penalty, error code and result; the result (a copy out of the reply) only
+    /// if `keep` (a lagging request's reply is only learned from).
+    fn split(reply: Self::Reply<'_>, keep: bool) -> LoadBalancedReply<Self::Output>;
 }
 
 impl LoadBalanced for GetValue {
     type Output = Option<Vec<u8>>;
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_value;
 
-    fn split(reply: GetValueReply<'_>) -> LoadBalancedReply<Option<Vec<u8>>> {
+    fn split(reply: GetValueReply<'_>, keep: bool) -> LoadBalancedReply<Option<Vec<u8>>> {
         (
             reply.penalty,
             reply.error.map(|e| e.code),
-            reply.value.map(<[u8]>::to_vec),
+            keep.then(|| reply.value.map(<[u8]>::to_vec)),
         )
     }
 }
@@ -1150,17 +1235,18 @@ impl LoadBalanced for GetKey {
     type Output = KeySelector;
     const STREAM: u32 = STORAGE_SERVER_STREAMS.get_key;
 
-    fn split(reply: GetKeyReply<'_>) -> LoadBalancedReply<KeySelector> {
+    fn split(reply: GetKeyReply<'_>, keep: bool) -> LoadBalancedReply<KeySelector> {
         (
             reply.penalty,
             reply.error.map(|e| e.code),
-            reply.sel.into_owned(),
+            keep.then(|| reply.sel.into_owned()),
         )
     }
 }
 
-/// A decoded `LoadBalancedReply`: its penalty, its error code, and its result.
-pub(crate) type LoadBalancedReply<T> = (f64, Option<u16>, T);
+/// A decoded `LoadBalancedReply`: its penalty, its error code, and its result (`None` if it
+/// was not asked for).
+pub(crate) type LoadBalancedReply<T> = (f64, Option<u16>, Option<T>);
 
 enum Outcome<T> {
     Done(T),
@@ -1169,16 +1255,19 @@ enum Outcome<T> {
 }
 
 /// `RequestData::checkAndProcessResultImpl` (`LoadBalance.actor.h` 7.4:572-627,
-/// `LoadBalance.h` 8.0:175-229) for a `LoadBalancedReply`, not `AtMostOnce`.
+/// `LoadBalance.h` 8.0:175-229) for a `LoadBalancedReply`, not `AtMostOnce`. `keep` is
+/// whether the reply's result is wanted: a lagging request's is not (its outcome is `Retry`,
+/// which nothing reads), so it is not copied out of the reply.
 fn check_and_process<R: Runtime, W, Q: LoadBalanced>(
     result: Result<(SchemaVersion, Vec<u8>), RequestError>,
     holder: &mut ModelHolder<R, W>,
     tried_all: bool,
+    keep: bool,
 ) -> Outcome<Q::Output> {
     // The reply decoded: `Ok` is a `LoadBalancedReply` (penalty, error, result).
     let decoded: Result<LoadBalancedReply<Q::Output>, RequestError> = match result {
         Ok((schema, payload)) => match Q::decode_reply(schema, &payload) {
-            Ok(Ok(reply)) => Ok(Q::split(reply)),
+            Ok(Ok(reply)) => Ok(Q::split(reply, keep)),
             Ok(Err(e)) => Err(RequestError::from_reply_error(e)),
             Err(e) => Err(RequestError::Decode(e)),
         },
@@ -1202,7 +1291,9 @@ fn check_and_process<R: Runtime, W, Q: LoadBalanced>(
         return Outcome::Retry;
     }
     match decoded {
-        Ok((_, None, value)) => Outcome::Done(value),
+        Ok((_, None, Some(value))) => Outcome::Done(value),
+        // Only when the result was not asked for.
+        Ok((_, None, None)) => Outcome::Retry,
         Ok((_, Some(code), _)) if received_response => Outcome::Fail(Error::new(code)),
         Err(e) if received_response => Outcome::Fail(client_error(e)),
         _ if tried_all && err_code == PROCESS_BEHIND => Outcome::Fail(Error::new(PROCESS_BEHIND)),
@@ -1213,6 +1304,7 @@ fn check_and_process<R: Runtime, W, Q: LoadBalanced>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fdb_native_transport::runtime::TokioRuntime;
 
     #[test]
     fn smoother_follows_the_total() {
@@ -1353,6 +1445,142 @@ mod tests {
         let b = g.get(other, 6.0);
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(b.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_endpoint_with_outstanding_requests_survives_pruning() {
+        let mut m = QueueModel::default();
+        let a = m.add_request(1, 0.0);
+        let b = m.add_request(1, 0.0);
+        m.add_request(2, 0.0);
+        let d2 = m.measurement(2).penalty;
+        m.end_request(2, 0.01, 1.0, d2, true, false, 0.01);
+        // Nothing is live: the endpoint without requests goes, the other stays.
+        m.retain(|_| false);
+        assert_eq!(m.len(), 1);
+        // Its requests end, after the prune, with nothing driving the count below zero.
+        m.end_request(1, 0.5, 1.0, a, true, false, 1.0);
+        assert_eq!(m.stats()[0].outstanding, 1);
+        m.retain(|_| false);
+        assert_eq!(m.len(), 1, "one request is still out");
+        m.end_request(1, 0.5, 1.0, b, true, false, 2.0);
+        let stats = m.stats();
+        assert_eq!((stats[0].outstanding, stats[0].outstanding_total), (0, 0.0));
+        assert_eq!(stats[0].latency, 0.5);
+        m.retain(|_| false);
+        assert_eq!(m.len(), 0);
+    }
+
+    #[test]
+    fn ending_a_request_of_a_forgotten_endpoint_creates_nothing() {
+        let mut m = QueueModel::default();
+        m.end_request(7, 0.5, 4.0, 1.0, true, true, 1.0);
+        assert_eq!(m.len(), 0);
+        // A new entry of the same endpoint is not driven negative by the old request.
+        m.add_request(7, 2.0);
+        assert_eq!(m.stats()[0].outstanding_total, 1.0);
+    }
+
+    #[test]
+    fn an_abandoned_request_is_released_without_latency_or_penalty() {
+        // What `~ModelHolder` does: `release(false, false, -1.0, false)`.
+        let mut m = QueueModel::default();
+        let delta = m.add_request(1, 0.0);
+        m.end_request(1, 0.0, -1.0, delta, false, false, 4.0);
+        let stats = m.stats();
+        assert_eq!(
+            stats[0].latency, 0.001,
+            "an unclean end keeps the larger latency"
+        );
+        assert_eq!(stats[0].penalty, 1.0);
+        assert_eq!((stats[0].outstanding, stats[0].outstanding_total), (0, 0.0));
+        // The smoother was brought up to the end's time: 4 s with 1 outstanding.
+        let smooth = m.measurement(1).smooth_outstanding.smooth_total(4.0);
+        assert!((smooth - (1.0 - (-2.0f64).exp())).abs() < 1e-9, "{smooth}");
+    }
+
+    /// A task that never ends on its own, and says when it was dropped.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_task(rt: &TokioRuntime) -> (<TokioRuntime as Runtime>::Task<()>, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let task = rt.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (task, dropped)
+    }
+
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lagging_bound_counts_live_tasks() {
+        let rt = TokioRuntime::new();
+        let mut lagging = Lagging::<TokioRuntime>::default();
+        // Four that never end, then five that do: nine listed, past the bound of eight, but
+        // only once the five have finished are they not live.
+        let mut flags = Vec::new();
+        for _ in 0..4 {
+            let (task, dropped) = pending_task(&rt);
+            flags.push(dropped);
+            lagging.add(task, 8);
+        }
+        for _ in 0..5 {
+            lagging.add(rt.spawn(async {}), 8);
+        }
+        settle().await;
+        assert_eq!(lagging.tasks.len(), 9);
+        assert_eq!(lagging.live(), 4);
+        // The next one finds the list past the bound: it drops the finished ones, and the
+        // live ones are within the bound, so none is cancelled.
+        let (task, dropped) = pending_task(&rt);
+        flags.push(dropped);
+        lagging.add(task, 8);
+        settle().await;
+        assert_eq!(lagging.tasks.len(), 5);
+        assert_eq!(lagging.live(), 5);
+        assert!(flags.iter().all(|d| !d.load(Ordering::SeqCst)));
+
+        // Past the bound of live tasks, all are cancelled and it starts over.
+        for _ in 0..5 {
+            let (task, dropped) = pending_task(&rt);
+            flags.push(dropped);
+            lagging.add(task, 8);
+        }
+        settle().await;
+        let cancelled = flags.iter().filter(|d| d.load(Ordering::SeqCst)).count();
+        assert_eq!(cancelled, 9, "the nine that were live");
+        assert_eq!(lagging.live(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_the_lagging_requests_ends_them() {
+        let rt = TokioRuntime::new();
+        let mut lagging = Lagging::<TokioRuntime>::default();
+        let flags: Vec<_> = (0..3)
+            .map(|_| {
+                let (task, dropped) = pending_task(&rt);
+                lagging.add(task, 100);
+                dropped
+            })
+            .collect();
+        settle().await;
+        assert_eq!(lagging.live(), 3);
+        assert!(flags.iter().all(|d| !d.load(Ordering::SeqCst)));
+        lagging.abort_all();
+        settle().await;
+        assert_eq!(lagging.live(), 0);
+        assert!(flags.iter().all(|d| d.load(Ordering::SeqCst)));
     }
 
     #[test]

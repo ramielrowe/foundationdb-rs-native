@@ -1601,3 +1601,264 @@ async fn the_metadata_version_cache_is_bounded() {
         }
     }
 }
+
+// ---- load-balancing review follow-ups (9q8.10) ----------------------------------------------
+
+use fdb_native_client::KeySelector;
+use fdb_native_client::read::{EndpointStats, RangeOptions};
+use fdb_native_schema::domain::{GetKeyValues, GetKeyValuesReply};
+use fdb_native_schema::streams::STORAGE_SERVER_STREAMS;
+
+/// The queue model's key for `storage`'s endpoint of `stream`.
+fn model_key(storage: &FakeStorage, stream: u32) -> u64 {
+    storage.server.base.adjusted(stream).token.first
+}
+
+fn endpoint(reader: &Reader<MemRuntime>, key: u64) -> Option<EndpointStats> {
+    reader
+        .load_balance_stats()
+        .endpoints
+        .into_iter()
+        .find(|e| e.token_first == key)
+}
+
+/// The index of the storage server the reader considers first for `key`.
+async fn first_choice(cluster: &Cluster, reader: &Reader<MemRuntime>, key: &[u8]) -> usize {
+    let order = reader.locate(key).await.unwrap().servers;
+    cluster
+        .storage
+        .iter()
+        .position(|s| s.server.id == order[0].id)
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lagging_reply_updates_the_model_and_the_counts_return_to_zero() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, _grv, _commit) = Cluster::ready(schema, 2).await;
+        cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+        cluster.set(b"k", b"v");
+        let reader = cluster.reader();
+        let version = within("GRV", reader.get_read_version()).await.unwrap();
+        for _ in 0..400 {
+            timed_get(&reader, b"k", version).await;
+        }
+        let slow = first_choice(&cluster, &reader, b"k").await;
+        let key = model_key(&cluster.storage[slow], STORAGE_SERVER_STREAMS.get_value);
+        let before = endpoint(&reader, key).unwrap();
+        assert!(before.latency < 0.1, "{schema}: {before:?}");
+        assert_eq!(reader.load_balance_stats().lagging_requests, 0);
+
+        cluster.storage[slow].set(|b| b.delay = Duration::from_secs(5));
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert!(took < Duration::from_millis(50), "{schema}: {took:?}");
+
+        // The slow request goes on as a lagging request: counted, and not yet measured.
+        assert_eq!(reader.load_balance_stats().lagging_requests, 1, "{schema}");
+        let during = endpoint(&reader, key).unwrap();
+        assert_eq!(during.outstanding, 1, "{schema}");
+        assert_eq!(during.outstanding_total, 1.0, "{schema}");
+        assert!(during.latency < 0.1, "{schema}: {during:?}");
+
+        // Its reply updates the latency, and every count is released.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let after = endpoint(&reader, key).unwrap();
+        assert!(
+            (5.0..5.1).contains(&after.latency),
+            "{schema}: {:?}",
+            after.latency
+        );
+        let stats = reader.load_balance_stats();
+        assert_eq!(stats.lagging_requests, 0, "{schema}");
+        for e in &stats.endpoints {
+            assert_eq!(
+                (e.outstanding, e.outstanding_total),
+                (0, 0.0),
+                "{schema}: {e:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lagging_request_outliving_its_pruned_endpoint_keeps_the_counts_sound() {
+    let (mut cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V8_0, 2).await;
+    cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+    cluster.set(b"k", b"v");
+    let reader = cluster.reader();
+    let version = within("GRV", reader.get_read_version()).await.unwrap();
+    for _ in 0..400 {
+        timed_get(&reader, b"k", version).await;
+    }
+    // The first choice is slow: its request lags behind the second one's.
+    let slow = first_choice(&cluster, &reader, b"k").await;
+    let lagging_key = model_key(&cluster.storage[slow], STORAGE_SERVER_STREAMS.get_value);
+    const SLOW: Duration = Duration::from_secs(600);
+    cluster.storage[slow].set(|b| b.delay = SLOW);
+    let (value, took) = timed_get(&reader, b"k", version).await;
+    assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    assert!(took < Duration::from_millis(50), "{took:?}");
+    cluster.storage[slow].set(|b| b.delay = Duration::ZERO);
+    assert_eq!(endpoint(&reader, lagging_key).unwrap().outstanding, 1);
+
+    // The slow server restarts its storage role again and again, so that the model keeps
+    // endpoints nothing uses, until it prunes them: its old endpoint is not used by any
+    // cached shard, but a request is still out on it.
+    let mut pruned = false;
+    let mut size = 0;
+    for n in 0..400u64 {
+        cluster.storage[slow].move_to(Uid::new(0x9000 + n, 0x30));
+        cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+        reader.invalidate_locations(&range(b"", KEY_SPACE_END));
+        let (value, _) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        let now = reader.load_balance_stats().endpoints.len();
+        if now < size {
+            pruned = true;
+            break;
+        }
+        size = now;
+    }
+    assert!(pruned, "the model was never pruned");
+    let kept = endpoint(&reader, lagging_key).expect("an endpoint with a request out is kept");
+    assert_eq!((kept.outstanding, kept.outstanding_total), (1, 1.0));
+
+    // The reply comes after the prune: it is released, not subtracted from nothing.
+    tokio::time::sleep(SLOW + Duration::from_secs(10)).await;
+    let stats = reader.load_balance_stats();
+    assert_eq!(stats.lagging_requests, 0);
+    for e in &stats.endpoints {
+        assert_eq!(
+            (e.outstanding, e.outstanding_total),
+            (0, 0.0),
+            "no count below zero: {e:?}"
+        );
+    }
+    let released = endpoint(&reader, lagging_key).expect("learned from the late reply");
+    assert!(
+        (SLOW.as_secs_f64() - 1.0..SLOW.as_secs_f64() + 1.0).contains(&released.latency),
+        "{released:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_reader_cancels_its_lagging_requests() {
+    let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 2).await;
+    cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+    cluster.set(b"k", b"v");
+    let baseline = Arc::strong_count(&cluster.monitor);
+    let reader = cluster.reader();
+    let version = within("GRV", reader.get_read_version()).await.unwrap();
+    for _ in 0..400 {
+        timed_get(&reader, b"k", version).await;
+    }
+    let slow = first_choice(&cluster, &reader, b"k").await;
+    cluster.storage[slow].set(|b| b.delay = Duration::from_secs(3600));
+    let (value, _) = timed_get(&reader, b"k", version).await;
+    assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    assert_eq!(reader.load_balance_stats().lagging_requests, 1);
+    assert!(Arc::strong_count(&cluster.monitor) > baseline);
+
+    // A lagging request holds the reader's state (and with it the monitor): dropping the
+    // last handle must cancel it, long before its reply is due.
+    drop(reader);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(Arc::strong_count(&cluster.monitor), baseline);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_range_read_does_not_change_get_value_hedging() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, _grv, _commit) = Cluster::ready(schema, 2).await;
+        cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+        cluster.set(b"k", b"v");
+        // Both servers answer `getKeyValues` (with no rows), after `range_delay`.
+        let range_delay = Arc::new(Mutex::new(Duration::ZERO));
+        for storage in &cluster.storage {
+            let delay = range_delay.clone();
+            let token = storage
+                .server
+                .base
+                .adjusted(STORAGE_SERVER_STREAMS.get_key_values)
+                .token;
+            storage.process.handle(token, move |incoming: Incoming| {
+                let (_, reply) =
+                    GetKeyValues::decode_request(incoming.schema, &incoming.payload).unwrap();
+                let answer = GetKeyValuesReply {
+                    version: 1000,
+                    ..GetKeyValuesReply::default()
+                };
+                let payload = GetKeyValues::encode_reply(incoming.schema, &Ok(answer)).unwrap();
+                Action::Reply {
+                    token: reply,
+                    payload,
+                    delay: *delay.lock().unwrap(),
+                }
+            });
+        }
+        let reader = cluster.reader();
+        let version = within("GRV", reader.get_read_version()).await.unwrap();
+        for _ in 0..400 {
+            timed_get(&reader, b"k", version).await;
+        }
+        let first = first_choice(&cluster, &reader, b"k").await;
+
+        // Range reads that take 5 s on both servers.
+        *range_delay.lock().unwrap() = Duration::from_secs(5);
+        let (begin, end) = (
+            KeySelector::first_greater_or_equal(b"a".to_vec()),
+            KeySelector::first_greater_or_equal(b"z".to_vec()),
+        );
+        let options = RangeOptions::with_limit(10);
+        for _ in 0..6 {
+            let read = reader.get_range(&begin, &end, &options, version);
+            within("range", read).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        for (i, storage) in cluster.storage.iter().enumerate() {
+            let range_key = model_key(storage, STORAGE_SERVER_STREAMS.get_key_values);
+            let range = endpoint(&reader, range_key).unwrap();
+            assert!(range.latency >= 5.0, "{schema} server {i}: {range:?}");
+            let get_key = model_key(storage, STORAGE_SERVER_STREAMS.get_value);
+            let get = endpoint(&reader, get_key).unwrap();
+            assert!(get.latency < 0.1, "{schema} server {i}: {get:?}");
+        }
+
+        // So the first choice for a `getValue` that is slow is raced after a fraction of a
+        // millisecond, not after the 5 s a range read takes.
+        cluster.storage[first].set(|b| b.delay = Duration::from_secs(5));
+        let served = |i: usize| cluster.storage[i].served();
+        let before = (served(first), served(1 - first));
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]), "{schema}");
+        assert!(took < Duration::from_millis(50), "{schema}: {took:?}");
+        assert_eq!(
+            (served(first) - before.0, served(1 - first) - before.1),
+            (1, 1),
+            "{schema}: both were asked"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn max_grv_queue_delay_is_validated() {
+    for schema in SchemaVersion::ALL {
+        let (cluster, _grv, _commit) = Cluster::ready(schema, 1).await;
+        let reader = cluster.reader();
+        let with = |ms: i64| {
+            let mut options = ReadVersionOptions::default();
+            options.max_grv_queue_delay_ms = Some(ms);
+            options
+        };
+        for bad in [-1, i64::from(i32::MAX) + 1, i64::MIN, i64::MAX] {
+            let e = reader.get_read_version_with(with(bad)).await.unwrap_err();
+            assert_eq!(e.code(), codes::INVALID_OPTION_VALUE, "{schema}: {bad}");
+        }
+        for good in [0, 1, i64::from(i32::MAX)] {
+            within("GRV", reader.get_read_version_with(with(good)))
+                .await
+                .unwrap_or_else(|e| panic!("{schema}: {good}: {e}"));
+        }
+    }
+}
