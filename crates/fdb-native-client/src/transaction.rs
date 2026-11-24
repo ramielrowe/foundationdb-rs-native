@@ -152,7 +152,9 @@
 //! `~ReadYourWritesTransaction` cancels it (7.4:2774-2776, 8.0:2688-2690): its reads in
 //! progress end at once with `transaction_cancelled` (1025), and so does a read future the
 //! user still holds; its watches that wait for a commit fail with it, and the
-//! [`get_versionstamp`](Transaction::get_versionstamp) futures too (unless it committed).
+//! [`get_versionstamp`](Transaction::get_versionstamp) futures too (unless it committed;
+//! if its commit had been sent, the error is
+//! [maybe committed](Error::is_maybe_committed)).
 //! Nothing of the transaction (its tasks, its read version request, its handle of the
 //! [`Database`]) outlives it.
 //!
@@ -545,7 +547,15 @@ impl State {
     /// reset, and interrupts those in progress.
     fn kill(&mut self, error: Error) {
         let error = self.dead.get_or_insert(error).clone();
-        self.resolve_versionstamp(Err(error.clone()));
+        // The stamp is lost when a commit that may have reached a proxy was ended here: the
+        // future says so (the commit's own result does, see `commit`).
+        let stamp_error = match &self.commit {
+            CommitStage::Started(sent) if sent.load(Ordering::SeqCst) => {
+                error.clone().into_maybe_committed()
+            }
+            _ => error.clone(),
+        };
+        self.resolve_versionstamp(Err(stamp_error));
         self.interrupt(|| Interrupt::Abort(error.clone()));
     }
 
@@ -1724,8 +1734,13 @@ impl<R: Runtime> Transaction<R> {
     /// * `transaction_cancelled` (1025) if the transaction is reset (or `on_error` retries
     ///   it) first, or [`cancel`](Self::cancel)led; `transaction_timed_out` (1031) **when the
     ///   timeout passes** (the future does not wait for an operation to notice it, as C++'s
-    ///   `resetPromise` does); the error that killed the transaction otherwise. A commit that
-    ///   was sent may still have committed in all these cases (the stamp is then lost).
+    ///   `resetPromise` does); the error that killed the transaction otherwise. When
+    ///   [`cancel`](Self::cancel), the timeout or the drop of the last handle kills the
+    ///   transaction **after its commit request may have been sent**, that error
+    ///   [`is_maybe_committed`](Error::is_maybe_committed), as the commit's own error is: the
+    ///   commit may have succeeded and the stamp is lost (C++ gives a bare error). Before the
+    ///   request was sent it is not maybe committed. (A `reset`, which starts over, gives a
+    ///   plain `transaction_cancelled`.)
     ///
     /// Unlike C++ (where a call after the commit started is `used_during_commit`), a call
     /// after the commit **succeeded** returns the stamp at once, and does not disturb the

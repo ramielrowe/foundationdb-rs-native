@@ -475,6 +475,17 @@ impl<R: Runtime> Database<R> {
     /// `used_during_commit` (reported as [maybe committed](Error::is_maybe_committed), since
     /// the first one may have committed).
     ///
+    /// **A handle kept past the attempt keeps that attempt alive.** The transaction is
+    /// cancelled when the last handle of the user is dropped
+    /// ([Dropping a transaction](crate::transaction#dropping-a-transaction)), and a clone of
+    /// the handle `f` got, or a [`RangeStream`](crate::RangeStream) it started, is such a
+    /// handle. If `f` lets one escape (a spawned task holding a clone, a returned stream),
+    /// the attempt's reads, watches and `get_versionstamp` futures are not cancelled when
+    /// `run` returns: they go on until that handle is dropped. When the loop retries, the
+    /// reset ends them with `transaction_cancelled` and the handle is stale (see
+    /// [Handles of a retry loop](crate::transaction#handles-of-a-retry-loop)); after the
+    /// attempt that `run` returns, nothing resets it. `run` does not wait for such handles.
+    ///
     /// # Idempotency
     ///
     /// **A transaction that ends in `commit_unknown_result` may have committed, and `run`

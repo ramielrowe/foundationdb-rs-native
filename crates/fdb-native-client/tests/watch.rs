@@ -1496,3 +1496,50 @@ async fn a_watch_reads_through_the_transactions_cache() {
         resolved("the watch of n", &mut by_n).await.unwrap();
     }
 }
+
+/// Dropping the last handle of a transaction cancels its watches and frees their slots
+/// (`outstanding_watches`): one registered but waiting for the commit, and one whose read is
+/// still in progress. A watch the commit started survives the drop and frees its slot when it
+/// fires.
+#[tokio::test(start_paused = true)]
+async fn dropping_the_handles_cancels_the_watches_and_frees_their_slots() {
+    for schema in SCHEMAS {
+        let env = standard(schema).await;
+        let tx = env.db.create_transaction();
+        let mut registered = tx.watch(b"k").await.unwrap();
+        let reading = tx.watch(b"j");
+        assert_eq!(
+            env.db.outstanding_watches(),
+            1,
+            "{schema}: the registered one"
+        );
+        drop(tx);
+        assert_eq!(
+            code(resolved("registered", &mut registered).await),
+            codes::TRANSACTION_CANCELLED,
+            "{schema}"
+        );
+        assert_eq!(
+            within("reading", reading).await.unwrap_err().code(),
+            codes::TRANSACTION_CANCELLED,
+            "{schema}"
+        );
+        assert_eq!(
+            env.db.outstanding_watches(),
+            0,
+            "{schema}: the slots are free"
+        );
+
+        // A watch registered, then committed, survives the drop of the transaction.
+        let tx = env.db.create_transaction();
+        let mut watch = tx.watch(b"k").await.unwrap();
+        tx.commit().await.unwrap();
+        drop(tx);
+        until("the watch request", || env.request_count() == 1).await;
+        assert!(pending(&mut watch).await, "{schema}");
+        assert_eq!(env.db.outstanding_watches(), 1, "{schema}");
+        env.set_value(b"k", Some(b"v"));
+        resolved("fires", &mut watch).await.unwrap();
+        assert_eq!(env.db.outstanding_watches(), 0, "{schema}");
+    }
+}

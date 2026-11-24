@@ -1567,3 +1567,87 @@ async fn shutdown_stops_the_read_version_batchers_while_a_transaction_is_held() 
         );
     }
 }
+
+/// A commit run by a clone survives the drop of every other handle of the user: the clone is a
+/// handle of the user, so the transaction is not cancelled while the commit runs (it would be
+/// if the commit's task held a handle that does not count). The request is sent, a late answer
+/// is the result, and the `get_versionstamp` future waiting meanwhile gets its stamp.
+#[tokio::test(start_paused = true)]
+async fn a_commit_on_a_clone_survives_dropping_the_other_handles() {
+    for schema in SCHEMAS {
+        let mut env = env(schema).await;
+        let tx = env.db.create_transaction();
+        tx.set(b"k", b"v");
+        tx.set_versionstamped_value(b"s", &[0u8; 14]);
+        let stamp = tx.get_versionstamp();
+        let handle = spawn({
+            let tx = tx.clone();
+            async move { tx.commit().await }
+        });
+        // Dropped while the commit waits for its read version, and again once it is sent.
+        let grv = env.grv.next().await;
+        drop(tx);
+        grv.reply_grv(100);
+        let call = env.commit.next().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !handle.is_finished(),
+            "{schema}: the commit is still waiting"
+        );
+        call.reply_commit(committed(120, 0));
+        let result = done(handle)
+            .await
+            .unwrap_or_else(|e| panic!("{schema}: {e}"));
+        assert_eq!(result.committed_version(), 120, "{schema}");
+        let stamp = stamp.await.unwrap_or_else(|e| panic!("{schema}: {e}"));
+        assert_eq!(&stamp[..8], &120i64.to_be_bytes(), "{schema}");
+    }
+}
+
+/// `Database::shutdown` during a commit. Once the request was sent the commit may have been
+/// applied: the commit and the `get_versionstamp` future fail maybe committed
+/// (`commit_unknown_result`, 1021). Before it was sent (the transaction waits for its read
+/// version) it did not commit: `operation_cancelled` (1101) and no request goes to the proxy.
+/// The `get_versionstamp` future gets `transaction_invalid_version` either way (the commit
+/// failed; the transaction was not killed).
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_a_sent_commit_is_maybe_committed_and_during_an_unsent_one_is_not() {
+    for schema in SCHEMAS {
+        for sent in [true, false] {
+            let mut env = env(schema).await;
+            let tx = env.db.create_transaction();
+            tx.set(b"k", b"v");
+            let stamp = tx.get_versionstamp();
+            let handle = spawn({
+                let tx = tx.clone();
+                async move { tx.commit().await }
+            });
+            let grv = env.grv.next().await;
+            let _call = if sent {
+                grv.reply_grv(100);
+                Some(env.commit.next().await)
+            } else {
+                None
+            };
+            env.db.shutdown().await;
+            let e = done(handle).await.unwrap_err();
+            let what = format!("{schema} sent={sent}: {e:?}");
+            assert_eq!(e.is_maybe_committed(), sent, "{what}");
+            // The commit failed, whatever the reason: `transaction_invalid_version`.
+            let stamp = stamp.await.unwrap_err();
+            assert_eq!(
+                stamp.code(),
+                codes::TRANSACTION_INVALID_VERSION,
+                "{what}: {stamp:?}"
+            );
+            if sent {
+                assert_eq!(e.code(), codes::COMMIT_UNKNOWN_RESULT, "{what}");
+            } else {
+                assert_eq!(e.code(), codes::OPERATION_CANCELLED, "{what}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(env.commit.try_next().is_none(), "{what}: nothing was sent");
+            }
+            drop(grv);
+        }
+    }
+}
