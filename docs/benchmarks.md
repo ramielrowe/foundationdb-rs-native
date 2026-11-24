@@ -26,7 +26,7 @@ absolute capabilities of either client; treat differences under about 20% as noi
   millisecond for its read version. The batcher now waits out such a delay on the clock, which
   keeps C++'s batching (60 transactions per GRV request at 256); that cost CPU at concurrency
   1 (47 vs 30 us per transaction), until a lone request stopped waiting for company that
-  cannot come (yw5: 18 us per transaction, [below](#waiting-less-yw5)).
+  cannot come (yw5: 18 us per transaction, [below](#waiting-less-yw5-iqy)).
 * **Once the read version is paid for, reads are on par or faster.** 100 gets in one
   transaction: p50 28 us vs 38 us per get at concurrency 1, and 386k vs 272k gets/s at
   concurrency 256 (native spreads the work over the tokio worker threads; libfdb_c's single
@@ -57,7 +57,7 @@ absolute capabilities of either client; treat differences under about 20% as noi
   transaction that had not written, SipHash. Native uses several cores where libfdb_c is
   capped at about one network thread, so it wins on throughput at equal application threads
   (429k vs 178k gets/s at 256 after e82). At concurrency 1 the GRV batcher's clock wait
-  dominated (bead `foundationdb-rs-native-yw5`, fixed: [below](#waiting-less-yw5)).
+  dominated (bead `foundationdb-rs-native-yw5`, fixed: [below](#waiting-less-yw5-iqy)).
   [Details](#range-scans-and-cpu-per-operation-s1t-e82).
 
 ## What is compared
@@ -330,7 +330,7 @@ the rule that this client sends no more requests than C++ ([well-behaved
 client](well-behaved-client.md)). Waiting on the clock keeps C++'s batching and its throughput
 at 256 is as good; its cost is the polling while a batch waits, which at concurrency 1 (where
 nothing can join) is about 25 us of CPU per transaction (bead `foundationdb-rs-native-yw5`,
-fixed: [below](#waiting-less-yw5)).
+fixed: [below](#waiting-less-yw5-iqy)).
 
 The same audit of the other sleeps: the commit, location and load-balancer backoffs, the
 `wrong_shard_server` and `future_version` delays, watch polling and the transport's timeouts
@@ -338,8 +338,9 @@ are all 10 ms or more (or randomized retry delays off the hot path), so a tick o
 not matter. The load balancer's second-request delay (`delay(0)` when the first replica is far
 slower than the second, else at least `BASE_SECOND_REQUEST_TIME`, 0.5 ms) was the other
 sub-millisecond timer: its `delay(0)` is now immediate instead of the next tick, and the
-0.5 ms+ hedge still rounds up to 1-2 ms on tokio, which only delays the second request of a
-read whose first replica is slow (bead `foundationdb-rs-native-iqy`).
+0.5 ms+ hedge rounded up to 1-2 ms on tokio, which only delayed the second request of a
+read whose first replica is slow (bead `foundationdb-rs-native-iqy`, fixed:
+[below](#waiting-less-yw5-iqy)).
 
 **Before and after**, side by side: one `fdb-bench serve` cluster (single process, 7.4.10),
 `fdb-bench worker` cells of the build before the fix (`ee25ccf`), the build with it, and
@@ -373,7 +374,7 @@ The older `native+fix` column in the main table (suite `single-4t-grvfix`) is th
 send-after-one-yield experiment, built from a scratch copy before the fix and run at another
 time; it is kept for reference.
 
-## Waiting less (yw5)
+## Waiting less (yw5, iqy)
 
 **yw5: the batch wait that nothing can join.** 8jn's `BatchDelay` polls the clock for
 `batchTime` (tens of microseconds on a LAN) so that requests arriving meanwhile join the
@@ -411,10 +412,46 @@ else. Pinned by `a_lone_grv_does_not_poll_the_clock_while_it_waits` (13 clock re
 read version, 46 with the wait) next to 8jn's `a_lone_grv_does_not_wait_for_a_timer_tick` and
 `grv_requests_arriving_during_the_batch_time_join_the_batch`.
 
-The raw lines of the table are in
+**iqy: the second-request delay below the timer tick.** C++ arms
+`delay(secondMultiplier * latency(second) + BASE_SECOND_REQUEST_TIME)` (`LoadBalance.h` 8.0:412-415),
+at least 0.5 ms, and flow's `delay` is precise. On tokio `sleep_until` of such a deadline
+completed 1.0 to 1.5 ms late (measured: 400 samples, multi-thread runtime, lateness past the
+deadline, p50: 1.01 ms for a 50 us wait, 1.52 ms for 550 us, 1.17 ms for 900 us, 1.07 ms for
+2 ms), so a hedge that C++ sends at 0.55 ms went out at 1.5 to 2 ms. The load balancer now arms
+it with a new `Runtime::sleep_until_precise` (default: `sleep_until`, which is precise on smol
+and the simulator). On tokio a multi-thread runtime gives a deadline under 4 ms away to a
+helper thread (`runtime/precise.rs`, std only, started by the first such sleep and stopped with
+the runtime): a heap of deadlines and a condition variable that waits for the earliest; a timer
+dropped before it fires (the normal case: the reply beats the hedge) is marked cancelled and
+skipped, and registering wakes the thread only if it waits for a later deadline. Its wake-ups
+are 54 to 80 us late (the kernel's 50 us timer slack; `prctl(PR_SET_TIMERSLACK)` would need
+`unsafe`, which the workspace forbids), against 1.0 to 1.5 ms. A current-thread runtime keeps
+tokio's timer, because its clock may be paused and the helper thread keeps real time; so does
+any wait of 4 ms or more, where a tick of rounding does not matter and an abandoned deadline
+would sit in the helper's heap. Pinned by
+`a_second_request_is_sent_at_its_sub_millisecond_delay_on_tokio` (the fastest of 8 hedged
+reads takes under 0.95 ms; the coarse timer never gets below 1.0) and the `precise_sleep_*`
+tests of the adapter.
+
+Every read of a replicated shard arms this timer, so its cost is on the get path: a 3-process
+cluster (`double`, 2 replicas), fresh-transaction gets, median of 5 runs, hedge on tokio's
+timer vs on the helper thread:
+
+| conc | ops/s tokio timer / helper thread | CPU us/op | p50 |
+|---:|---:|---:|---:|
+| 1 | 10.8k / 10.7k | 20.4 / 21.8 | 91 us / 92 us |
+| 16 | 115k / 114k | 13.5 / 14.1 | 138 us / 139 us |
+| 256 | 456k / 467k | 8.2 / 7.9 | 518 us / 516 us |
+
+At most 0.6 us (4%) at 16, within noise at 256, 1.4 us at 1 (3 runs, where the helper thread
+is woken for most reads). Not measured: reads with a genuinely slow replica on a real cluster
+(the test above stands in for it).
+
+The raw lines of both tables are in
 [benchmarks-data/2026-11-24/yw5-iqy](benchmarks-data/2026-11-24/yw5-iqy) (one JSON line per
-cell and repetition: `build` is `base` (before) or `new` (after), `grv_tx` and `grv_batches`
-the batcher's counters).
+cell and repetition: `build` is `base`/`mid` (before) or `new`/`iqy` (after), `grv_tx` and
+`grv_batches` the batcher's counters; the `triple-get-hedge` file has runs of 3 and 5
+repetitions for concurrency 1/16/256 and 16/256).
 
 ## Range scans and CPU per operation (s1t, e82)
 
@@ -577,8 +614,8 @@ python3 -I tools/bench/perf_callers.py get.data memcmp   # who calls a leaf (fir
 | bead | priority | what |
 |---|---|---|
 | `foundationdb-rs-native-8jn` | P2 | GRV batcher sleep rounds up to 1 ms on tokio: every transaction pays about 1 ms before its first read (fixed, [above](#the-grv-batcher-fix-8jn)) |
-| `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency (fixed: 18 us per get at 1, [above](#waiting-less-yw5)) |
-| `foundationdb-rs-native-iqy` | P4 | Load balancer second-request delay (at least 0.5 ms) rounds up to the timer tick on tokio |
+| `foundationdb-rs-native-yw5` | P3 | GRV `BatchDelay` polls the clock while a batch waits: about 25 us more CPU per transaction at low concurrency (fixed: 18 us per get at 1, [above](#waiting-less-yw5-iqy)) |
+| `foundationdb-rs-native-iqy` | P4 | Load balancer second-request delay (at least 0.5 ms) rounds up to the timer tick on tokio (fixed: a helper-thread timer, [above](#waiting-less-yw5-iqy)) |
 | `foundationdb-rs-native-s1t` | P3 | Range scans 1.7 to 2.4 times slower than libfdb_c: per-row key/value allocations (fixed: 1.2 to 1.4, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
 | `foundationdb-rs-native-e82` | P3 | Client CPU per operation 1.5 to 2 times libfdb_c: RYW iterators, hashing, Writer allocations, clock reads (fixed: 1.15 to 1.6, [above](#range-scans-and-cpu-per-operation-s1t-e82)) |
 | `foundationdb-rs-native-rrx` | P3 | Range scans after s1t: 8 reference counts per row through the snapshot cache; keep reply buffers and row offsets there |

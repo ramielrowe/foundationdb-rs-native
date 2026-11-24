@@ -176,6 +176,10 @@ impl<R: Runtime> Runtime for MemRuntime<R> {
         self.inner.sleep_until(deadline)
     }
 
+    fn sleep_until_precise(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
+        self.inner.sleep_until_precise(deadline)
+    }
+
     fn spawn<T, F>(&self, future: F) -> R::Task<T>
     where
         F: Future<Output = T> + Send + 'static,

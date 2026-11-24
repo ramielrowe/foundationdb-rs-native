@@ -256,7 +256,9 @@
 //!     `SECOND_REQUEST_MAX_BUDGET`, 100) and lowers `secondMultiplier` by
 //!     `SECOND_REQUEST_MULTIPLIER_DECAY` (0.00025; not below 1), and a second request costs 1
 //!     and raises `secondMultiplier` by `SECOND_REQUEST_MULTIPLIER_GROWTH` (0.01); the timer
-//!     is spent either way. The first good reply of the two wins; an error reply that is
+//!     is spent either way. The delay is timed with [`Runtime::sleep_until_precise`], since
+//!     flow's `delay` is precise and 0.5 ms is below tokio's timer tick. The first good reply
+//!     of the two wins; an error reply that is
 //!     returned (`wrong_shard_server`, ...) ends the call too; one that is retried
 //!     (`server_overloaded`, `process_behind` before all were tried, a lost connection)
 //!     leaves the other to answer, or goes on to the next replica. A request that no

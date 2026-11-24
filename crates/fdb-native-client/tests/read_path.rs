@@ -1356,6 +1356,58 @@ async fn a_slow_replica_is_raced_by_a_second_request() {
     }
 }
 
+/// On tokio's real clock (a multi-thread runtime): the second request of a read whose first
+/// replica is slow goes out at `latency + BASE_SECOND_REQUEST_TIME`, about 0.55 ms here, as in
+/// C++, not on the timer tick after it (tokio's `sleep_until` of that deadline completes after
+/// 1.0 to 2.1 ms: bead `foundationdb-rs-native-iqy`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_request_is_sent_at_its_sub_millisecond_delay_on_tokio() {
+    let mut hedged = Vec::new();
+    // Each cluster gives one sample: the model learns the slow replica's latency from it, and
+    // the next second request would go out at once. On a real clock the replica the model
+    // picks first is not known beforehand: a read that took less than the delay was served by
+    // the fast one and is not a sample.
+    for _ in 0..40 {
+        if hedged.len() >= 5 {
+            break;
+        }
+        let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V8_0, 2).await;
+        cluster.set_shards(&[(b"", KEY_SPACE_END, &[0, 1])]);
+        cluster.set(b"k", b"v");
+        let reader = cluster.reader();
+        let version = within("GRV", reader.get_read_version()).await.unwrap();
+        for _ in 0..400 {
+            let (value, _) = timed_get(&reader, b"k", version).await;
+            assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        }
+        let order = reader.locate(b"k").await.unwrap().servers;
+        let slow = cluster
+            .storage
+            .iter()
+            .position(|s| s.server.id == order[0].id)
+            .unwrap();
+        cluster.storage[slow].set(|b| b.delay = Duration::from_millis(300));
+        let (value, took) = timed_get(&reader, b"k", version).await;
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert!(took < Duration::from_millis(200), "{took:?}");
+        if took >= Duration::from_micros(450) {
+            hedged.push(took);
+        }
+    }
+    hedged.sort();
+    assert!(
+        hedged.len() >= 3,
+        "only {} hedged reads: {hedged:?}",
+        hedged.len()
+    );
+    // Not every sample: a loaded machine deschedules the timer thread now and then.
+    assert!(
+        hedged[0] < Duration::from_micros(950),
+        "the fastest hedged read took {:?}: {hedged:?}",
+        hedged[0]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn no_budget_no_second_request() {
     let (cluster, _grv, _commit) = Cluster::ready(SchemaVersion::V7_4, 2).await;

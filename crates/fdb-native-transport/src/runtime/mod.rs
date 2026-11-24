@@ -83,7 +83,9 @@
 //! [`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION) (tokio's timer wheel rounds a
 //! deadline up to its next millisecond tick and fires it on the tick after:
 //! `sleep(0)` to `sleep(900us)` take 1.05 to 2.07 ms; smol's async-io reactor
-//! times its waits to the microsecond on Linux and the BSDs). A deadline in
+//! times its waits to the microsecond on Linux and the BSDs;
+//! [`sleep_until_precise`](Runtime::sleep_until_precise) gives tokio's callers the same
+//! for a deadline under a few milliseconds away). A deadline in
 //! the past completes without waiting for a later deadline, but not
 //! necessarily at its first poll: tokio fires a deadline of a few
 //! microseconds ago on its next tick, about 1 ms later. Code that may compute
@@ -120,6 +122,8 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 mod time;
 
+#[cfg(feature = "tokio")]
+mod precise;
 #[cfg(feature = "smol")]
 mod smol_rt;
 #[cfg(feature = "tokio")]
@@ -200,6 +204,18 @@ pub trait Runtime: Clone + Send + Sync + 'static {
     /// already has (though possibly not until the timer's next tick, see
     /// [`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION)).
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send;
+
+    /// Like [`sleep_until`](Runtime::sleep_until), for a deadline that is soon and has to be
+    /// met to within microseconds rather than a timer tick: a speculative second request
+    /// that C++ sends at its `delay` of about 0.5 ms. Where the runtime's timer is coarse
+    /// ([`TIMER_RESOLUTION`](Runtime::TIMER_RESOLUTION)) it takes a more precise means that
+    /// may cost more per timer (tokio: a helper thread that is woken at the earliest deadline
+    /// and skips the ones dropped first; see [`TokioRuntime`]). Never completes before the
+    /// deadline. The default is `sleep_until`, which is precise where `TIMER_RESOLUTION` is
+    /// zero (smol, the simulator).
+    fn sleep_until_precise(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
+        self.sleep_until(deadline)
+    }
 
     /// Runs `future` to completion on the executor as an independent task.
     ///

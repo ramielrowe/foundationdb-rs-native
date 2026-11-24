@@ -22,6 +22,7 @@ use std::future::Future;
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -30,10 +31,16 @@ use tokio::net::TcpStream;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 
+use super::precise::{PreciseSleep, PreciseTimers};
 use super::{Instant, JoinError, Runtime, TaskHandle};
 
 /// How far in the future a deadline that overflows tokio's clock is clamped.
 const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
+
+/// The longest wait that [`sleep_until_precise`](Runtime::sleep_until_precise) gives to the
+/// helper thread: a few ticks of tokio's timer, past which its rounding no longer matters and
+/// its timers are cheaper than keeping a deadline in the helper thread's heap until it passes.
+const PRECISE_MAX_WAIT: Duration = Duration::from_millis(4);
 
 /// [`Runtime`] backed by a tokio runtime.
 ///
@@ -42,6 +49,9 @@ const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30);
 #[derive(Clone, Debug)]
 pub struct TokioRuntime {
     handle: Handle,
+    /// The helper-thread timer of [`Runtime::sleep_until_precise`], started on first use and
+    /// stopped with the last clone of this runtime (and the last sleep on it).
+    timers: Arc<PreciseTimers>,
 }
 
 impl TokioRuntime {
@@ -55,7 +65,7 @@ impl TokioRuntime {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         match Handle::try_current() {
-            Ok(handle) => Self { handle },
+            Ok(handle) => Self::with_handle(handle),
             Err(e) => panic!(
                 "TokioRuntime::new must be called inside a tokio runtime \
                  (use TokioRuntime::with_handle otherwise): {e}"
@@ -65,7 +75,10 @@ impl TokioRuntime {
 
     /// Uses the tokio runtime behind `handle`.
     pub fn with_handle(handle: Handle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            timers: PreciseTimers::new(),
+        }
     }
 
     /// The tokio runtime handle this adapter drives.
@@ -129,6 +142,31 @@ impl Runtime for TokioRuntime {
         tokio::time::sleep_until(Self::tokio_instant(deadline))
     }
 
+    /// Waits on a helper thread's timer for a deadline less than 4 ms away, on a multi-thread
+    /// runtime: there tokio's clock is the system clock, which the thread's timer reads. A
+    /// current-thread runtime (whose clock may be paused) and longer waits use tokio's timer,
+    /// as [`sleep_until`](Runtime::sleep_until) does.
+    ///
+    /// The thread is started by the first such sleep that is polled before its deadline. Its
+    /// timer is the kernel's, so a wake-up is 50 to 60 us late on Linux (timer slack); tokio's
+    /// takes 0.55 to 1.5 ms more than that for a deadline 500 us away.
+    fn sleep_until_precise(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
+        let timer = (self.handle.runtime_flavor() != RuntimeFlavor::CurrentThread)
+            .then(|| deadline.to_std())
+            .flatten()
+            .filter(|at| at.saturating_duration_since(std::time::Instant::now()) < PRECISE_MAX_WAIT)
+            .map(|at| self.timers.sleep_until(at));
+        match timer {
+            Some(timer) => TokioPreciseSleep::Timer(timer),
+            None => {
+                let _enter = self.handle.enter();
+                TokioPreciseSleep::Tokio(Box::pin(tokio::time::sleep_until(Self::tokio_instant(
+                    deadline,
+                ))))
+            }
+        }
+    }
+
     fn spawn<T, F>(&self, future: F) -> TokioTask<T>
     where
         F: Future<Output = T> + Send + 'static,
@@ -146,6 +184,23 @@ impl Runtime for TokioRuntime {
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let addrs = Entered::new(&self.handle, tokio::net::lookup_host((host, port))).await?;
         Ok(addrs.collect())
+    }
+}
+
+/// The future of [`TokioRuntime::sleep_until_precise`].
+enum TokioPreciseSleep {
+    Timer(PreciseSleep),
+    Tokio(Pin<Box<tokio::time::Sleep>>),
+}
+
+impl Future for TokioPreciseSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut *self {
+            TokioPreciseSleep::Timer(sleep) => Pin::new(sleep).poll(cx),
+            TokioPreciseSleep::Tokio(sleep) => sleep.as_mut().poll(cx),
+        }
     }
 }
 
@@ -631,5 +686,90 @@ mod tests {
         // `spawn_connection` connects, sleeps briefly, then drops the stream.
         spawn_connection(rt, addr).await.unwrap();
         server.await.unwrap();
+    }
+
+    /// On a multi-thread runtime a precise sleep of 500 us is never early and takes well under
+    /// the 1.05 to 2.07 ms that `sleep_until` takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn precise_sleep_honours_sub_millisecond_deadlines() {
+        let rt = TokioRuntime::new();
+        let wait = Duration::from_micros(500);
+        let mut took = Vec::new();
+        for _ in 0..100 {
+            let start = std::time::Instant::now();
+            rt.sleep_until_precise(rt.now() + wait).await;
+            let t = start.elapsed();
+            assert!(t >= wait, "{t:?}");
+            took.push(t);
+        }
+        took.sort();
+        // The median, not the maximum: a loaded machine deschedules the timer thread now and
+        // then.
+        assert!(took[50] < Duration::from_micros(900), "{took:?}");
+    }
+
+    /// Timers fire in deadline order whatever the order they were armed in, a deadline that
+    /// has passed completes at once, and timers dropped before their deadline do not delay or
+    /// confuse the others.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn precise_sleeps_fire_in_deadline_order_and_cancel() {
+        let rt = TokioRuntime::new();
+        let start = rt.now();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (i, ms) in [3_u64, 1, 2].into_iter().enumerate() {
+            let rt2 = rt.clone();
+            let order = order.clone();
+            tasks.push(rt.spawn(async move {
+                rt2.sleep_until_precise(start + Duration::from_millis(ms))
+                    .await;
+                order.lock().unwrap().push(i);
+            }));
+        }
+        // Armed and abandoned: they must not fire anything or keep the thread busy.
+        for _ in 0..50 {
+            let mut gone = Box::pin(rt.sleep_until_precise(start + Duration::from_micros(1500)));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(gone.as_mut().poll(&mut cx).is_pending());
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), [1, 2, 0]);
+        // A deadline in the past: ready at its first poll.
+        let mut past = Box::pin(rt.sleep_until_precise(start));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(past.as_mut().poll(&mut cx).is_ready());
+        // The abandoned entries leave the heap as their deadline passes.
+        for _ in 0..100 {
+            if rt.timers.len() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{} timers left in the heap", rt.timers.len());
+    }
+
+    /// A paused clock (current-thread runtime) is tokio's to advance: the precise sleep follows
+    /// it instead of the helper thread's real time.
+    #[tokio::test(start_paused = true)]
+    async fn precise_sleep_follows_a_paused_clock() {
+        let rt = TokioRuntime::new();
+        let start = rt.now();
+        rt.sleep_until_precise(start + Duration::from_micros(500))
+            .await;
+        assert!(rt.now() - start >= Duration::from_micros(500));
+        assert_eq!(rt.timers.len(), 0, "no helper timer was armed");
+    }
+
+    /// Longer waits stay on tokio's timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn precise_sleep_of_a_long_wait_uses_tokios_timer() {
+        let rt = TokioRuntime::new();
+        let start = std::time::Instant::now();
+        rt.sleep_until_precise(rt.now() + Duration::from_millis(20))
+            .await;
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert_eq!(rt.timers.len(), 0);
     }
 }
